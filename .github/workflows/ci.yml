@@ -12,6 +12,24 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  workflow-lint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download actionlint
+        id: actionlint
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12 "$RUNNER_TEMP/actionlint"
+
+      - name: Check workflow files
+        shell: bash
+        run: ${{ steps.actionlint.outputs.executable }} -color
+
   test:
     name: Test and audit
     runs-on: ubuntu-latest

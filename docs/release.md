@@ -120,6 +120,14 @@ release/Video_For_Lazies-v0.1.0-win-x64.zip
 
 If `7z.exe` is available on the Windows host, the local script also creates a versioned `.7z` archive. The GitHub Actions release workflow uploads the final `.zip` artifacts and combined checksum file.
 
+## Workflow Linting
+
+CI runs `actionlint` v1.7.12 against GitHub Actions workflows. Run the same check locally before committing workflow changes:
+
+```bash
+actionlint -color
+```
+
 Required portable payload on all platforms:
 
 - app executable
