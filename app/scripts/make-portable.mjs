@@ -40,7 +40,7 @@ async function main() {
   await copyPortableArtifacts({
     builtBinaryPath,
     outPath,
-    companionDirs: isWin ? listPortableCompanionDirs() : [],
+    companionDirs: listPortableCompanionDirs(),
     companionFiles: listPortableCompanionFiles(generatedDocs),
     cleanupPaths: listPortableLegacyPaths(),
   });

@@ -30,7 +30,7 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../.ffmpeg-bundle/windows-x64/ffmpeg-sidecar": "ffmpeg-sidecar"
+      "../.ffmpeg-bundle/current/ffmpeg-sidecar": "ffmpeg-sidecar"
     },
     "icon": [
       "icons/32x32.png",

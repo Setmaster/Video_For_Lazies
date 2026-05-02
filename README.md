@@ -27,7 +27,7 @@ It is not trying to replace a nonlinear editor. There are no multi-track timelin
 
 ## Status
 
-The current app is the Tauri desktop version in [`app/`](app/). Windows portable builds can bundle a pinned FFmpeg sidecar, including `ffprobe`, so end users do not need to install FFmpeg separately for that build.
+The current app is the Tauri desktop version in [`app/`](app/). Windows x64 and Linux x64 portable builds bundle pinned FFmpeg sidecars, including `ffprobe`, so end users do not need to install FFmpeg separately for those builds.
 
 Source and release checks are documented in [`docs/release.md`](docs/release.md).
 
@@ -35,11 +35,11 @@ Source and release checks are documented in [`docs/release.md`](docs/release.md)
 
 - Node.js
 - Rust toolchain
-- FFmpeg and FFprobe on `PATH` for development and non-Windows builds, unless you set:
+- FFmpeg and FFprobe are bundled for Windows x64 and Linux x64 builds. For unsupported platforms or custom runtime builds, install FFmpeg on `PATH` or set:
   - `VFL_FFMPEG_PATH`
   - `VFL_FFPROBE_PATH`
 
-Windows portable releases stage the pinned FFmpeg sidecar automatically.
+Windows and Linux portable releases stage the pinned FFmpeg sidecar automatically.
 
 ## Run From Source
 
@@ -69,7 +69,7 @@ This writes a portable folder at:
 release/Video_For_Lazies/
 ```
 
-The folder contains the app executable and required project/legal files. Windows portable folders also include the bundled `ffmpeg-sidecar/` and run a packaged-app startup smoke check. Linux portable folders currently resolve `ffmpeg` and `ffprobe` from `PATH`, or from `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH`.
+The folder contains the app executable, bundled `ffmpeg-sidecar/`, and required project/legal files. Windows portable folders also run a packaged-app startup smoke check. Linux portable folders verify the bundled FFmpeg and FFprobe with an encode/probe smoke.
 
 To produce a verified release archive:
 
@@ -86,7 +86,7 @@ Draft release builds are handled by the `Portable Release` GitHub Actions workfl
 
 - Size targets use decimal MB: `1 MB = 1,000,000 bytes`.
 - Set size limit to `0`, or leave it empty, to disable size targeting.
-- Bundled Windows MP4 export uses H.264 when the staged FFmpeg sidecar exposes `libx264`.
+- Bundled MP4 export uses H.264 when the staged FFmpeg sidecar exposes `libx264`.
 - If the active FFmpeg build does not expose `libx264`, MP4 export falls back to `mpeg4`.
 - Process media files you trust. Video For Lazies runs FFmpeg locally as your user, so hostile media exercises the active FFmpeg build.
 
@@ -118,7 +118,7 @@ The app icon is generated from [`docs/assets/app-icon.html`](docs/assets/app-ico
 
 Video For Lazies is licensed under GPL-3.0-or-later. See [`LICENSE`](LICENSE).
 
-Windows portable builds bundle a pinned GPL FFmpeg runtime as a sidecar. Runtime resolution order is:
+Windows x64 and Linux x64 portable builds bundle pinned GPL FFmpeg runtimes as sidecars. Runtime resolution order is:
 
 1. `VFL_FFMPEG_PATH` / `VFL_FFPROBE_PATH`
 2. bundled `ffmpeg-sidecar/` next to the app executable

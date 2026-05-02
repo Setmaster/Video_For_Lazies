@@ -48,7 +48,9 @@ test("portable third-party notices include dependency inventories and bundled si
     ],
   });
 
-  assert.match(notice, /Windows FFmpeg Sidecar/);
+  assert.match(notice, /FFmpeg Sidecars/);
+  assert.match(notice, /Windows x64/);
+  assert.match(notice, /Linux x64/);
   assert.match(notice, /BtbN build recipe archive/);
   assert.match(notice, /x264 source archive/);
   assert.match(notice, /\| react \| 19\.2\.4 \| MIT \| runtime \|/);

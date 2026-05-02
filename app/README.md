@@ -4,8 +4,8 @@ Rust + Tauri desktop app for exporting videos (optionally under a size limit), b
 
 ## Requirements
 
-- Windows release builds bundle `ffmpeg` and `ffprobe` automatically.
-- Dev and non-Windows environments can still use `ffmpeg` and `ffprobe` on `PATH`
+- Windows x64 and Linux x64 release builds bundle `ffmpeg` and `ffprobe` automatically.
+- Unsupported platforms and custom runtime builds can still use `ffmpeg` and `ffprobe` on `PATH`
   - Or set `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH`
 - Node.js and Rust toolchain
 
@@ -22,7 +22,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-On Windows, the Tauri build now runs `npm run prepare:ffmpeg-sidecar` first to stage the pinned GPL FFmpeg bundle and its license/source metadata.
+On Windows and Linux x64, the Tauri build runs `npm run prepare:ffmpeg-sidecar` first to stage the pinned GPL FFmpeg bundle and its license/source metadata.
 
 ## Portable Folder
 
@@ -32,8 +32,9 @@ npm run portable
 
 Writes a portable folder at `release/Video_For_Lazies/`.
 That folder contains the app executable and required legal/readme files.
-On Windows it also contains the bundled `ffmpeg-sidecar/`, runs a startup smoke check against the packaged app window, and fails the build if the portable release comes up on an obviously wrong surface.
-On Linux, `ffmpeg` and `ffprobe` are still resolved from `PATH` or the `VFL_FFMPEG_PATH` / `VFL_FFPROBE_PATH` environment variables.
+On Windows and Linux it also contains the bundled `ffmpeg-sidecar/`.
+On Windows, verification runs a startup smoke check against the packaged app window and fails the build if the portable release comes up on an obviously wrong surface.
+On Linux, verification runs the bundled FFmpeg and FFprobe through an encode/probe smoke.
 This path builds the portable release directly and does not require the WiX / NSIS installer steps.
 
 ## Portable Release Archive
@@ -44,7 +45,7 @@ npm run release:portable
 
 Builds `release/Video_For_Lazies/`, packages a versioned x64 zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted zip.
 
-On Windows, verification also runs startup smoke, the packaged interaction/export smoke, a second tight-target 1080p MP4 smoke, and an encoder check that the shipped sidecar exposes `libx264`.
+On both platforms, verification checks that the shipped sidecar exposes `libx264` and can encode/probe a sample MP4. On Windows, verification also runs startup smoke, the packaged interaction/export smoke, and a second tight-target 1080p MP4 smoke.
 
 The GitHub `Portable Release` workflow builds Linux and Windows x64 zips, creates release notes from the commit range since the previous release tag, and attaches the final zip assets plus a combined checksum file to a draft GitHub Release by default.
 
@@ -86,11 +87,11 @@ cargo test
 
 ## FFmpeg runtime notes
 
-- Runtime resolution order is env override -> bundled Windows `ffmpeg-sidecar` -> `PATH`.
-- The bundled Windows package uses a pinned GPL shared build and includes `libx264`, so bundled MP4 export uses H.264 by default.
+- Runtime resolution order is env override -> bundled `ffmpeg-sidecar` -> `PATH`.
+- The bundled Windows and Linux packages use pinned GPL shared builds and include `libx264`, so bundled MP4 export uses H.264 by default.
 - If the active FFmpeg build does not expose `libx264`, MP4 export still falls back to `mpeg4`.
 - Exact bundle/source provenance lives in [`../docs/ffmpeg-bundling.md`](../docs/ffmpeg-bundling.md).
 
 ## License
 
-Video For Lazies is licensed under GPL-3.0-or-later. The Windows portable build bundles a pinned GPL FFmpeg sidecar; see [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) and [`../docs/ffmpeg-bundling.md`](../docs/ffmpeg-bundling.md).
+Video For Lazies is licensed under GPL-3.0-or-later. The Windows and Linux portable builds bundle pinned GPL FFmpeg sidecars; see [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) and [`../docs/ffmpeg-bundling.md`](../docs/ffmpeg-bundling.md).

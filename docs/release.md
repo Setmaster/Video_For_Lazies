@@ -84,7 +84,7 @@ Release notes follow this template:
 <portable zip assets and checksum file>
 
 ## Runtime Notes
-<Windows sidecar and Linux FFmpeg requirements>
+<Bundled FFmpeg sidecar notes>
 
 ## Verification
 <workflow verification summary>
@@ -142,15 +142,15 @@ Required portable payload on all platforms:
 - `SOURCE.md`
 - `FFMPEG_BUNDLING.md`
 
-Additional required Windows payload:
+Additional required sidecar payload on Windows and Linux:
 
 - `ffmpeg-sidecar/` with FFmpeg binaries, FFmpeg license text, bundle notices, and source/provenance archives
 - `ffmpeg-sidecar/source/ffmpeg-75d37c499da2a9fd50e3ef5a69c7dd87cd96f62a.tar.gz`
 - `ffmpeg-sidecar/source/btbn-ffmpeg-builds-28ae7513e7b6477da5c9ba7edb07aa940d485fa2.tar.gz`
 - `ffmpeg-sidecar/source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
-Linux artifacts currently do not bundle FFmpeg. They require `ffmpeg` and `ffprobe` on `PATH`, or `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH` set at runtime.
+Linux sidecar-specific payload also includes root `ffmpeg` and `ffprobe` wrapper scripts, `bin/ffmpeg`, `bin/ffprobe`, and the required shared libraries in `ffmpeg-sidecar/lib/`.
 
 ## Unsigned Alpha Note
 
-The first public Windows binary may be an unsigned portable alpha. Release notes should say that Windows may show SmartScreen or antivirus warnings because the executable is unsigned. Release notes should also state that Linux portable zips require the local machine to provide FFmpeg/FFprobe at runtime.
+The first public Windows binary may be an unsigned portable alpha. Release notes should say that Windows may show SmartScreen or antivirus warnings because the executable is unsigned.

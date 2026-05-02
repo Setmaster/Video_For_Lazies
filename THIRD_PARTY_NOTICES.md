@@ -2,12 +2,13 @@
 
 Video For Lazies is licensed under GPL-3.0-or-later.
 
-## FFmpeg
+## FFmpeg Sidecars
 
-Windows portable builds bundle a pinned GPL FFmpeg runtime as `ffmpeg-sidecar/`.
+Windows x64 and Linux x64 portable builds bundle pinned GPL FFmpeg runtimes as `ffmpeg-sidecar/`.
 
 - Provider: BtbN FFmpeg Builds
-- Variant: `win64-gpl-shared`
+- Windows variant: `win64-gpl-shared`
+- Linux variant: `linux64-gpl-shared`
 - FFmpeg bundle details, checksums, corresponding source archives, and build-provenance archives: [docs/ffmpeg-bundling.md](docs/ffmpeg-bundling.md)
 
 The staged sidecar includes upstream FFmpeg license text, bundle notices, and source/provenance archives under `ffmpeg-sidecar/source/`.

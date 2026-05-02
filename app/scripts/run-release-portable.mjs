@@ -8,7 +8,8 @@ import {
   appRoot,
   getPortableOutputDir,
   getPortableReleaseParentDir,
-  windowsSourceArchiveNames,
+  ffmpegSidecarResourceTarget,
+  getFfmpegSourceArchiveNames,
 } from "./ffmpegBundle.mjs";
 import { runPortableSmoke } from "./run-portable-smoke.mjs";
 import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
@@ -158,11 +159,60 @@ async function locateExtractedPortableDir(extractRoot, { platform = process.plat
   throw new Error(`Could not locate extracted portable folder under ${extractRoot}`);
 }
 
-async function assertBundledLibx264(portableDir) {
-  const ffmpegPath = path.resolve(portableDir, "ffmpeg-sidecar", "ffmpeg.exe");
+function getBundledExecutablePath(portableDir, name, { platform = process.platform } = {}) {
+  const suffix = platform === "win32" ? ".exe" : "";
+  return path.resolve(portableDir, ffmpegSidecarResourceTarget, `${name}${suffix}`);
+}
+
+async function assertBundledLibx264(portableDir, { platform = process.platform } = {}) {
+  const ffmpegPath = getBundledExecutablePath(portableDir, "ffmpeg", { platform });
   const encoders = await captureStdout(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-encoders"]);
   if (!/\blibx264\b/.test(encoders)) {
     throw new Error(`Bundled ffmpeg is missing libx264: ${ffmpegPath}`);
+  }
+}
+
+async function runBundledEncodeSmoke(portableDir, { platform = process.platform } = {}) {
+  const ffmpegPath = getBundledExecutablePath(portableDir, "ffmpeg", { platform });
+  const ffprobePath = getBundledExecutablePath(portableDir, "ffprobe", { platform });
+  const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-bundled-ffmpeg-smoke-"));
+  try {
+    const outputPath = path.resolve(tempRoot, "out.mp4");
+    await runChecked(ffmpegPath, [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=160x90:rate=15",
+      "-t",
+      "0.5",
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      outputPath,
+    ]);
+
+    const duration = Number.parseFloat(await captureStdout(
+      ffprobePath,
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        outputPath,
+      ],
+    ));
+    if (!Number.isFinite(duration) || duration <= 0) {
+      throw new Error(`Bundled ffprobe returned an invalid duration: ${duration}`);
+    }
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
   }
 }
 
@@ -186,13 +236,13 @@ async function assertPortableLegalPayload(portableDir, { platform = process.plat
     await assertPortableFile(portableDir, relativePath);
   }
 
-  if (platform === "win32") {
-    const windowsRequiredFiles = [
-      path.join("ffmpeg-sidecar", "LICENSE.txt"),
-      path.join("ffmpeg-sidecar", "FFMPEG_BUNDLE_NOTICES.txt"),
-      ...windowsSourceArchiveNames.map((name) => path.join("ffmpeg-sidecar", "source", name)),
+  if (platform === "win32" || platform === "linux") {
+    const sidecarRequiredFiles = [
+      path.join(ffmpegSidecarResourceTarget, "LICENSE.txt"),
+      path.join(ffmpegSidecarResourceTarget, "FFMPEG_BUNDLE_NOTICES.txt"),
+      ...getFfmpegSourceArchiveNames({ platform }).map((name) => path.join(ffmpegSidecarResourceTarget, "source", name)),
     ];
-    for (const relativePath of windowsRequiredFiles) {
+    for (const relativePath of sidecarRequiredFiles) {
       await assertPortableFile(portableDir, relativePath);
     }
   }
@@ -206,13 +256,14 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
   console.log(`Verifying extracted ${label} artifact: ${portableDir}`);
   await assertPortableExecutable(portableDir, { platform });
   await assertPortableLegalPayload(portableDir, { platform });
+  await assertBundledLibx264(portableDir, { platform });
+  await runBundledEncodeSmoke(portableDir, { platform });
 
   if (platform !== "win32") {
-    console.log("Linux portable payload verified. FFmpeg and FFprobe are still resolved from PATH or env vars at runtime.");
+    console.log("Linux portable payload verified with bundled FFmpeg and FFprobe.");
     return;
   }
 
-  await assertBundledLibx264(portableDir);
   await runPortableSmoke({ portableDir });
   await runPortableExportSmoke({ portableDir });
   await runPortableExportSmoke({

@@ -8,9 +8,30 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 
 import {
+  buildLinuxBundleNotice,
   buildWindowsBundleNotice,
+  currentSidecarDir,
   getTauriSidecarOutputDirs,
-  tauriWindowsSidecarResourceTarget,
+  tauriSidecarResourceTarget,
+  linuxBuildScriptsArchivePath,
+  linuxBuildScriptsUrl,
+  linuxBundleArchivePath,
+  linuxBundleAssetUrl,
+  linuxBundleExpandedRootName,
+  linuxBundleRoot,
+  linuxDownloadsDir,
+  linuxInternalRuntimeExecutables,
+  linuxRuntimeExecutables,
+  linuxRuntimeLibraries,
+  linuxSidecarDir,
+  linuxSidecarLicenseName,
+  linuxSidecarNoticeName,
+  linuxSourceArchiveNames,
+  linuxSourceArchivePath,
+  linuxSourceDir,
+  linuxSourceUrl,
+  linuxX264SourceArchivePath,
+  linuxX264SourceUrl,
   windowsBundleArchivePath,
   windowsBundleAssetUrl,
   windowsBundleExpandedRootName,
@@ -23,7 +44,6 @@ import {
   windowsSidecarLicenseName,
   windowsSidecarNoticeName,
   windowsSourceArchivePath,
-  windowsSourceArchiveName,
   windowsSourceArchiveNames,
   windowsSourceDir,
   windowsSourceUrl,
@@ -33,6 +53,7 @@ import {
 } from "./ffmpegBundle.mjs";
 
 const WINDOWS_X64_BUNDLE = FFMPEG_BUNDLE.windowsX64;
+const LINUX_X64_BUNDLE = FFMPEG_BUNDLE.linuxX64;
 
 async function pathExists(targetPath) {
   try {
@@ -145,6 +166,20 @@ async function runPowerShell(command) {
   });
 }
 
+async function runChecked(command, args, options = {}) {
+  await new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: "inherit", ...options });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`${command} exited with code ${code}`));
+    });
+  });
+}
+
 async function captureStdout(command, args) {
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -180,6 +215,12 @@ async function extractZipToTemp(zipPath) {
   return extractionRoot;
 }
 
+async function extractTarXzToTemp(archivePath) {
+  const extractionRoot = await fsp.mkdtemp(path.resolve(tmpdir(), "vfl-ffmpeg-sidecar-"));
+  await runChecked("tar", ["-xf", archivePath, "-C", extractionRoot]);
+  return extractionRoot;
+}
+
 async function clearTauriSidecarOutputs() {
   for (const outputDir of getTauriSidecarOutputDirs()) {
     await fsp.rm(outputDir, { recursive: true, force: true });
@@ -187,29 +228,42 @@ async function clearTauriSidecarOutputs() {
 }
 
 async function ensurePlaceholderSidecar() {
-  await fsp.mkdir(windowsSidecarDir, { recursive: true });
-  const placeholderPath = path.resolve(windowsSidecarDir, "README.txt");
+  await fsp.mkdir(currentSidecarDir, { recursive: true });
+  const placeholderPath = path.resolve(currentSidecarDir, "README.txt");
   await fsp.writeFile(
     placeholderPath,
     [
-      "Windows FFmpeg sidecar resources are populated on Windows build hosts.",
-      `Target folder name: ${tauriWindowsSidecarResourceTarget}`,
+      "FFmpeg sidecar resources are populated on supported release build hosts.",
+      `Target folder name: ${tauriSidecarResourceTarget}`,
       "",
     ].join("\n"),
     "utf8",
   );
 }
 
-async function verifyWindowsBundleCapabilities() {
-  const ffmpegPath = path.resolve(windowsSidecarDir, "ffmpeg.exe");
+async function syncCurrentSidecarFrom(sourceDir) {
+  await fsp.rm(currentSidecarDir, { recursive: true, force: true });
+  await fsp.mkdir(path.dirname(currentSidecarDir), { recursive: true });
+  await fsp.cp(sourceDir, currentSidecarDir, { recursive: true });
+}
+
+async function verifyBundleCapabilities(ffmpegPath, label) {
   if (!(await pathExists(ffmpegPath))) {
-    throw new Error(`Bundled ffmpeg.exe missing after staging: ${ffmpegPath}`);
+    throw new Error(`Bundled ffmpeg missing after staging for ${label}: ${ffmpegPath}`);
   }
 
   const encoders = await captureStdout(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-encoders"]);
   if (!/\blibx264\b/.test(encoders)) {
-    throw new Error(`Pinned Windows FFmpeg bundle is missing libx264: ${ffmpegPath}`);
+    throw new Error(`Pinned ${label} FFmpeg bundle is missing libx264: ${ffmpegPath}`);
   }
+}
+
+async function verifyWindowsBundleCapabilities() {
+  await verifyBundleCapabilities(path.resolve(windowsSidecarDir, "ffmpeg.exe"), "Windows");
+}
+
+async function verifyLinuxBundleCapabilities() {
+  await verifyBundleCapabilities(path.resolve(linuxSidecarDir, "ffmpeg"), "Linux");
 }
 
 async function stageWindowsBundle() {
@@ -253,6 +307,7 @@ async function stageWindowsBundle() {
     if (currentNotice === expectedNotice) {
       await fsp.rm(placeholderReadmePath, { force: true });
       await verifyWindowsBundleCapabilities();
+      await syncCurrentSidecarFrom(windowsSidecarDir);
       return;
     }
   }
@@ -298,21 +353,140 @@ async function stageWindowsBundle() {
     }
     await fsp.writeFile(noticePath, expectedNotice, "utf8");
     await verifyWindowsBundleCapabilities();
+    await syncCurrentSidecarFrom(windowsSidecarDir);
+  } finally {
+    await fsp.rm(extractRoot, { recursive: true, force: true });
+  }
+}
+
+function linuxWrapperScript(binaryName) {
+  return [
+    "#!/usr/bin/env sh",
+    "set -eu",
+    'SIDE_CAR_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
+    'export LD_LIBRARY_PATH="$SIDE_CAR_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+    `exec "$SIDE_CAR_DIR/bin/${binaryName}" "$@"`,
+    "",
+  ].join("\n");
+}
+
+async function stageLinuxBundle() {
+  await fsp.mkdir(linuxBundleRoot, { recursive: true });
+  await fsp.mkdir(linuxDownloadsDir, { recursive: true });
+  await clearTauriSidecarOutputs();
+
+  await ensureDownloadedFile(
+    linuxBundleArchivePath,
+    linuxBundleAssetUrl,
+    LINUX_X64_BUNDLE.assetSha256,
+  );
+  await ensureDownloadedFile(
+    linuxSourceArchivePath,
+    linuxSourceUrl,
+    LINUX_X64_BUNDLE.sourceSha256,
+  );
+  await ensureDownloadedFile(
+    linuxBuildScriptsArchivePath,
+    linuxBuildScriptsUrl,
+    LINUX_X64_BUNDLE.buildScriptsSha256,
+  );
+  await ensureDownloadedFile(
+    linuxX264SourceArchivePath,
+    linuxX264SourceUrl,
+    LINUX_X64_BUNDLE.x264Sha256,
+  );
+
+  const expectedNotice = buildLinuxBundleNotice();
+  const noticePath = path.resolve(linuxSidecarDir, linuxSidecarNoticeName);
+  const expectedRuntimePaths = [
+    ...linuxRuntimeExecutables.map((name) => path.resolve(linuxSidecarDir, name)),
+    ...linuxInternalRuntimeExecutables.map((name) => path.resolve(linuxSidecarDir, "bin", name)),
+    ...linuxRuntimeLibraries.map((name) => path.resolve(linuxSidecarDir, "lib", name)),
+  ];
+  const stagedSourcePaths = linuxSourceArchiveNames.map((name) => path.resolve(linuxSourceDir, name));
+
+  if (
+    await pathExists(noticePath)
+    && (await Promise.all(stagedSourcePaths.map(pathExists))).every(Boolean)
+    && (await Promise.all(expectedRuntimePaths.map(pathExists))).every(Boolean)
+  ) {
+    const currentNotice = await fsp.readFile(noticePath, "utf8");
+    if (currentNotice === expectedNotice) {
+      await verifyLinuxBundleCapabilities();
+      await syncCurrentSidecarFrom(linuxSidecarDir);
+      return;
+    }
+  }
+
+  const extractRoot = await extractTarXzToTemp(linuxBundleArchivePath);
+  try {
+    const bundleRoot = path.resolve(extractRoot, linuxBundleExpandedRootName);
+    const bundleBinDir = path.resolve(bundleRoot, "bin");
+    const bundleLibDir = path.resolve(bundleRoot, "lib");
+
+    await fsp.rm(linuxSidecarDir, { recursive: true, force: true });
+    await fsp.mkdir(path.resolve(linuxSidecarDir, "bin"), { recursive: true });
+    await fsp.mkdir(path.resolve(linuxSidecarDir, "lib"), { recursive: true });
+    await fsp.mkdir(linuxSourceDir, { recursive: true });
+
+    for (const entryName of linuxInternalRuntimeExecutables) {
+      const sourcePath = path.resolve(bundleBinDir, entryName);
+      const outputPath = path.resolve(linuxSidecarDir, "bin", entryName);
+      await fsp.copyFile(sourcePath, outputPath);
+      await fsp.chmod(outputPath, 0o755);
+    }
+
+    for (const libraryName of linuxRuntimeLibraries) {
+      await fsp.copyFile(
+        path.resolve(bundleLibDir, libraryName),
+        path.resolve(linuxSidecarDir, "lib", libraryName),
+      );
+    }
+
+    for (const executableName of linuxRuntimeExecutables) {
+      const wrapperPath = path.resolve(linuxSidecarDir, executableName);
+      await fsp.writeFile(wrapperPath, linuxWrapperScript(executableName), "utf8");
+      await fsp.chmod(wrapperPath, 0o755);
+    }
+
+    await fsp.copyFile(
+      path.resolve(bundleRoot, linuxSidecarLicenseName),
+      path.resolve(linuxSidecarDir, linuxSidecarLicenseName),
+    );
+    for (const sourceArchivePath of [
+      linuxSourceArchivePath,
+      linuxBuildScriptsArchivePath,
+      linuxX264SourceArchivePath,
+    ]) {
+      await fsp.copyFile(
+        sourceArchivePath,
+        path.resolve(linuxSourceDir, path.basename(sourceArchivePath)),
+      );
+    }
+    await fsp.writeFile(noticePath, expectedNotice, "utf8");
+    await verifyLinuxBundleCapabilities();
+    await syncCurrentSidecarFrom(linuxSidecarDir);
   } finally {
     await fsp.rm(extractRoot, { recursive: true, force: true });
   }
 }
 
 async function main() {
-  if (process.platform !== "win32") {
-    await ensurePlaceholderSidecar();
-    await clearTauriSidecarOutputs();
-    console.log("Skipping FFmpeg sidecar sync on non-Windows host.");
+  if (process.platform === "win32" && process.arch === "x64") {
+    await stageWindowsBundle();
+    console.log(`FFmpeg sidecar staged at ${currentSidecarDir}`);
     return;
   }
 
-  await stageWindowsBundle();
-  console.log(`FFmpeg sidecar staged at ${windowsSidecarDir}`);
+  if (process.platform === "linux" && process.arch === "x64") {
+    await stageLinuxBundle();
+    console.log(`FFmpeg sidecar staged at ${currentSidecarDir}`);
+    return;
+  }
+
+  await ensurePlaceholderSidecar();
+  await clearTauriSidecarOutputs();
+  console.log(`Skipping FFmpeg sidecar sync on unsupported host: ${process.platform}/${process.arch}.`);
 }
 
 export {
@@ -321,5 +495,6 @@ export {
   ensurePlaceholderSidecar,
   main as syncFfmpegSidecar,
   sha256File,
+  stageLinuxBundle,
   stageWindowsBundle,
 };

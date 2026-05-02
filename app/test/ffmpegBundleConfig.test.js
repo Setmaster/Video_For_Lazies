@@ -5,8 +5,8 @@ import path from "node:path";
 import url from "node:url";
 
 import {
-  tauriWindowsSidecarResourceSource,
-  tauriWindowsSidecarResourceTarget,
+  tauriSidecarResourceSource,
+  tauriSidecarResourceTarget,
 } from "../scripts/ffmpegBundle.mjs";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
@@ -23,26 +23,40 @@ test("tauri build hooks prepare the bundled ffmpeg sidecar", async () => {
   assert.match(json?.build?.beforeBuildCommand ?? "", /prepare:ffmpeg-sidecar/);
   assert.match(json?.build?.beforeDevCommand ?? "", /prepare:ffmpeg-sidecar/);
   assert.match(bundleRaw, /win64-gpl-shared/);
+  assert.match(bundleRaw, /linux64-gpl-shared/);
   assert.match(bundleRaw, /autobuild-2026-05-02-13-12/);
   assert.match(bundleRaw, /ffmpeg-n8\.1-11-g75d37c499d-win64-gpl-shared-8\.1\.zip/);
+  assert.match(bundleRaw, /ffmpeg-n8\.1-11-g75d37c499d-linux64-gpl-shared-8\.1\.tar\.xz/);
   assert.match(bundleRaw, /pinned GPL shared build/i);
   assert.match(bundleRaw, /buildScriptsCommit/);
   assert.match(bundleRaw, /x264Commit/);
   assert.match(bundleRaw, /windowsSourceArchiveNames/);
+  assert.match(bundleRaw, /linuxSourceArchiveNames/);
   assert.match(syncRaw, /windowsBuildScriptsArchivePath/);
   assert.match(syncRaw, /windowsX264SourceArchivePath/);
+  assert.match(syncRaw, /linuxBuildScriptsArchivePath/);
+  assert.match(syncRaw, /linuxX264SourceArchivePath/);
+  assert.match(syncRaw, /linuxWrapperScript/);
+  assert.match(syncRaw, /LD_LIBRARY_PATH/);
   assert.match(syncRaw, /downloadFileWithCurl/);
   assert.match(syncRaw, /missing libx264/i);
 });
 
-test("tauri config maps the staged ffmpeg sidecar into app resources", async () => {
+test("tauri config maps the generated current ffmpeg sidecar into app resources", async () => {
   const confPath = path.resolve(__dirname, "../src-tauri/tauri.conf.json");
+  const buildScriptPath = path.resolve(__dirname, "../src-tauri/build.rs");
+  const makePortablePath = path.resolve(__dirname, "../scripts/make-portable.mjs");
   const raw = await fs.readFile(confPath, "utf8");
+  const buildScriptRaw = await fs.readFile(buildScriptPath, "utf8");
+  const makePortableRaw = await fs.readFile(makePortablePath, "utf8");
   const json = JSON.parse(raw);
   const resources = json?.bundle?.resources;
 
   assert.equal(typeof resources, "object");
-  assert.equal(resources?.[tauriWindowsSidecarResourceSource], tauriWindowsSidecarResourceTarget);
+  assert.equal(resources?.[tauriSidecarResourceSource], tauriSidecarResourceTarget);
+  assert.match(buildScriptRaw, /\.ffmpeg-bundle/);
+  assert.match(buildScriptRaw, /current/);
+  assert.match(makePortableRaw, /listPortableCompanionDirs\(\)/);
 });
 
 test("tauri window config keeps a supported minimum app size", async () => {
@@ -117,8 +131,9 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(wrapperRaw, /-SizeLimitMb/);
   assert.match(wrapperRaw, /-InputWidth/);
   assert.match(releaseRaw, /assertBundledLibx264/);
+  assert.match(releaseRaw, /runBundledEncodeSmoke/);
   assert.match(releaseRaw, /missing libx264/);
-  assert.match(releaseRaw, /windowsSourceArchiveNames/);
+  assert.match(releaseRaw, /getFfmpegSourceArchiveNames/);
   assert.match(appRaw, /smokeStatusWriteRef/);
   assert.match(appRaw, /trimStartS: extra\.trimStartS \?\? null/);
   assert.match(appRaw, /expectedDurationS: extra\.expectedDurationS \?\? null/);

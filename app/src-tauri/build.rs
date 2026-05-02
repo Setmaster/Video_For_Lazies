@@ -11,7 +11,7 @@ fn ensure_ffmpeg_sidecar_placeholder() {
     let sidecar_dir = PathBuf::from(manifest_dir)
         .join("..")
         .join(".ffmpeg-bundle")
-        .join("windows-x64")
+        .join("current")
         .join("ffmpeg-sidecar");
 
     let _ = fs::create_dir_all(&sidecar_dir);
@@ -24,7 +24,7 @@ fn ensure_ffmpeg_sidecar_placeholder() {
     if sidecar_is_empty && !placeholder_path.exists() {
         let _ = fs::write(
             placeholder_path,
-            "Windows FFmpeg sidecar resources are populated on Windows build hosts.\n",
+            "FFmpeg sidecar resources are populated on supported release build hosts.\n",
         );
     }
 }

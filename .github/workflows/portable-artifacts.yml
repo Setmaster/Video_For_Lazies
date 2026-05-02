@@ -71,6 +71,7 @@ jobs:
             pkg-config \
             unzip \
             wget \
+            xz-utils \
             zip
 
       - name: Set up Node.js

@@ -2,7 +2,7 @@
 
 Video For Lazies source code is distributed from this repository.
 
-Windows portable builds also include a pinned GPL FFmpeg sidecar. The exact FFmpeg binary archive, checksums, upstream FFmpeg source archive, BtbN build recipe archive, x264 source archive, and source checksums are documented in [docs/ffmpeg-bundling.md](docs/ffmpeg-bundling.md). The portable folder includes a copy as `FFMPEG_BUNDLING.md`.
+Windows and Linux portable builds also include pinned GPL FFmpeg sidecars. The exact FFmpeg binary archives, checksums, upstream FFmpeg source archive, BtbN build recipe archive, x264 source archive, and source checksums are documented in [docs/ffmpeg-bundling.md](docs/ffmpeg-bundling.md). The portable folder includes a copy as `FFMPEG_BUNDLING.md`.
 
 The bundled FFmpeg source/provenance archives are staged inside the portable folder at:
 

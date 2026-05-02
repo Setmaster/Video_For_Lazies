@@ -18,7 +18,7 @@ const FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const CROP_DETECT_TIMEOUT: Duration = Duration::from_secs(60);
 const FRAME_EXTRACT_TIMEOUT: Duration = Duration::from_secs(45);
 const ENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const WINDOWS_FFMPEG_SIDECAR_DIR: &str = "ffmpeg-sidecar";
+const FFMPEG_SIDECAR_DIR: &str = "ffmpeg-sidecar";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -204,16 +204,13 @@ fn current_executable_dir() -> Option<PathBuf> {
 fn bundled_sidecar_candidate(
     executable_dir: Option<&Path>,
     stem: &str,
-    is_windows: bool,
+    binary_suffix: &str,
 ) -> Option<PathBuf> {
-    if !is_windows {
-        return None;
-    }
     let executable_dir = executable_dir?;
     Some(
         executable_dir
-            .join(WINDOWS_FFMPEG_SIDECAR_DIR)
-            .join(format!("{stem}.exe")),
+            .join(FFMPEG_SIDECAR_DIR)
+            .join(format!("{stem}{binary_suffix}")),
     )
 }
 
@@ -234,7 +231,11 @@ fn resolve_binary_path(
 fn default_ffmpeg() -> String {
     resolve_binary_path(
         trimmed_env_var("VFL_FFMPEG_PATH"),
-        bundled_sidecar_candidate(current_executable_dir().as_deref(), "ffmpeg", cfg!(windows)),
+        bundled_sidecar_candidate(
+            current_executable_dir().as_deref(),
+            "ffmpeg",
+            std::env::consts::EXE_SUFFIX,
+        ),
         "ffmpeg",
     )
 }
@@ -245,7 +246,7 @@ fn default_ffprobe() -> String {
         bundled_sidecar_candidate(
             current_executable_dir().as_deref(),
             "ffprobe",
-            cfg!(windows),
+            std::env::consts::EXE_SUFFIX,
         ),
         "ffprobe",
     )
@@ -253,7 +254,7 @@ fn default_ffprobe() -> String {
 
 fn binary_not_found_message(binary_name: &str, env_var: &str, tried: &str) -> String {
     format!(
-        "{binary_name} was not found.\n\nOn Windows release builds, the app first looks for a bundled runtime in `{WINDOWS_FFMPEG_SIDECAR_DIR}` next to the app executable. Otherwise install FFmpeg and ensure `{binary_name}` is on PATH, or set `{env_var}` to the full path.\n\nTried: {tried}"
+        "{binary_name} was not found.\n\nRelease builds first look for a bundled runtime in `{FFMPEG_SIDECAR_DIR}` next to the app executable. Otherwise install FFmpeg and ensure `{binary_name}` is on PATH, or set `{env_var}` to the full path.\n\nTried: {tried}"
     )
 }
 
@@ -2215,16 +2216,21 @@ mod tests {
     }
 
     #[test]
-    fn bundled_sidecar_candidate_uses_windows_release_layout() {
+    fn bundled_sidecar_candidate_uses_release_sidecar_layout() {
         let executable_dir = PathBuf::from(r"C:\Example\Documents");
-        let candidate = bundled_sidecar_candidate(Some(&executable_dir), "ffprobe", true).unwrap();
+        let candidate =
+            bundled_sidecar_candidate(Some(&executable_dir), "ffprobe", ".exe").unwrap();
         assert_eq!(
             candidate,
-            executable_dir
-                .join(WINDOWS_FFMPEG_SIDECAR_DIR)
-                .join("ffprobe.exe")
+            executable_dir.join(FFMPEG_SIDECAR_DIR).join("ffprobe.exe")
         );
-        assert!(bundled_sidecar_candidate(Some(&executable_dir), "ffprobe", false).is_none());
+
+        let linux_candidate =
+            bundled_sidecar_candidate(Some(&executable_dir), "ffprobe", "").unwrap();
+        assert_eq!(
+            linux_candidate,
+            executable_dir.join(FFMPEG_SIDECAR_DIR).join("ffprobe")
+        );
     }
 
     #[test]
