@@ -2387,7 +2387,7 @@ function App() {
               </div>
 
               <div className="vfl-stack-lg vfl-general-side">
-                <div className="vfl-section vfl-sticky-card">
+                <div className="vfl-section">
                   <div className="vfl-section-title">Current plan</div>
                   <div className="vfl-muted vfl-section-caption">
                     A quick read on the source file and what the current settings will produce.

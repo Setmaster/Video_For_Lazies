@@ -119,10 +119,14 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(releaseRaw, /inputHeight:\s*1080/);
 });
 
-test("general tab only uses the wide sticky layout when both width and height can support it", async () => {
+test("general tab side panel keeps current plan in normal flow", async () => {
   const cssPath = path.resolve(__dirname, "../src/App.css");
+  const appPath = path.resolve(__dirname, "../src/App.tsx");
   const raw = await fs.readFile(cssPath, "utf8");
+  const appRaw = await fs.readFile(appPath, "utf8");
 
   assert.match(raw, /@media \(min-width: 1180px\) and \(min-height: 820px\)\s*\{\s*\.vfl-grid-general/s);
-  assert.match(raw, /@media \(min-width: 1320px\) and \(min-height: 900px\)\s*\{\s*\.vfl-general-side \.vfl-sticky-card/s);
+  assert.doesNotMatch(raw, /\.vfl-general-side\s+\.vfl-sticky-card/);
+  assert.doesNotMatch(raw, /position:\s*sticky/);
+  assert.doesNotMatch(appRaw, /vfl-sticky-card/);
 });
