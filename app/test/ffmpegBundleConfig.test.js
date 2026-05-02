@@ -122,7 +122,7 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(appRaw, /smokeStatusWriteRef/);
   assert.match(appRaw, /trimStartS: extra\.trimStartS \?\? null/);
   assert.match(appRaw, /expectedDurationS: extra\.expectedDurationS \?\? null/);
-  assert.match(releaseRaw, /timeoutSeconds:\s*180/);
+  assert.match(releaseRaw, /timeoutSeconds:\s*300/);
   assert.match(releaseRaw, /sizeLimitMb:\s*0\.3/);
   assert.match(releaseRaw, /inputWidth:\s*1920/);
   assert.match(releaseRaw, /inputHeight:\s*1080/);

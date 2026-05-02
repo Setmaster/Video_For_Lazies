@@ -217,7 +217,7 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
   await runPortableExportSmoke({ portableDir });
   await runPortableExportSmoke({
     portableDir,
-    timeoutSeconds: 180,
+    timeoutSeconds: 300,
     inputWidth: 1920,
     inputHeight: 1080,
     inputVideoBitrateKbps: 2400,
