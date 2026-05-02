@@ -2215,9 +2215,12 @@ mod tests {
     fn bundled_sidecar_candidate_uses_windows_release_layout() {
         let executable_dir = PathBuf::from(r"C:\Example\Documents");
         let candidate = bundled_sidecar_candidate(Some(&executable_dir), "ffprobe", true).unwrap();
-        let candidate = candidate.to_string_lossy();
-        assert!(candidate.starts_with(r"C:\Example\Documents"));
-        assert!(candidate.ends_with("/ffmpeg-sidecar/ffprobe.exe"));
+        assert_eq!(
+            candidate,
+            executable_dir
+                .join(WINDOWS_FFMPEG_SIDECAR_DIR)
+                .join("ffprobe.exe")
+        );
         assert!(bundled_sidecar_candidate(Some(&executable_dir), "ffprobe", false).is_none());
     }
 
