@@ -41,6 +41,10 @@ jobs:
         run: npm ci
         working-directory: app
 
+      - name: Check synchronized app version
+        run: npm run version:check
+        working-directory: app
+
       - name: Audit npm dependencies
         run: npm audit --audit-level=moderate
         working-directory: app

@@ -24,26 +24,29 @@ npm run tauri build
 
 On Windows, the Tauri build now runs `npm run prepare:ffmpeg-sidecar` first to stage the pinned GPL FFmpeg bundle and its license/source metadata.
 
-## Portable Folder (Windows)
+## Portable Folder
 
 ```bash
 npm run portable
 ```
 
 Writes a portable folder at `release/Video_For_Lazies/`.
-That folder contains `Video_For_Lazies.exe`, required legal/readme files, and the bundled `ffmpeg-sidecar/`.
-On Windows, this command also runs a startup smoke check against the packaged app window and fails the build if the portable release comes up on an obviously wrong surface.
+That folder contains the app executable and required legal/readme files.
+On Windows it also contains the bundled `ffmpeg-sidecar/`, runs a startup smoke check against the packaged app window, and fails the build if the portable release comes up on an obviously wrong surface.
+On Linux, `ffmpeg` and `ffprobe` are still resolved from `PATH` or the `VFL_FFMPEG_PATH` / `VFL_FFPROBE_PATH` environment variables.
 This path builds the portable release directly and does not require the WiX / NSIS installer steps.
 
-## Portable Release Archive (Windows)
+## Portable Release Archive
 
 ```bash
 npm run release:portable
 ```
 
-Builds `release/Video_For_Lazies/`, packages `release/Video_For_Lazies-win-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted zip with startup, the packaged interaction/export smoke, a second tight-target 1080p MP4 smoke, and an encoder check that the shipped sidecar exposes `libx264`.
+Builds `release/Video_For_Lazies/`, packages a versioned x64 zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted zip.
 
-If `7z.exe` is available on the Windows host, this command also writes `release/Video_For_Lazies-win-x64.7z`.
+On Windows, verification also runs startup smoke, the packaged interaction/export smoke, a second tight-target 1080p MP4 smoke, and an encoder check that the shipped sidecar exposes `libx264`.
+
+If `7z.exe` is available on the Windows host, this command also writes a versioned `.7z` archive.
 
 ## Tests
 

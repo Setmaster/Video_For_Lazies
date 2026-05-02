@@ -1,0 +1,102 @@
+name: Portable Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build. Must match app metadata, for example 0.1.0."
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: windows-2022
+            target: win-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config \
+            unzip \
+            wget \
+            zip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install npm dependencies
+        run: npm ci
+        working-directory: app
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node scripts/check-version.mjs --value "$REQUESTED_VERSION")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        working-directory: app
+
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=moderate
+        working-directory: app
+
+      - name: Test frontend utilities
+        run: npm test
+        working-directory: app
+
+      - name: Test Rust backend
+        run: cargo test --manifest-path app/src-tauri/Cargo.toml
+
+      - name: Build portable zip
+        run: npm run release:portable
+        working-directory: app
+
+      - name: Upload private portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Video_For_Lazies-v${{ steps.version.outputs.version }}-${{ matrix.target }}-${{ steps.version.outputs.short_sha }}
+          path: |
+            release/Video_For_Lazies-v${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

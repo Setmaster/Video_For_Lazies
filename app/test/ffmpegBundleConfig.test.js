@@ -56,6 +56,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   const packageJsonPath = path.resolve(__dirname, "../package.json");
   const smokeWrapperPath = path.resolve(__dirname, "../scripts/run-portable-smoke.mjs");
   const exportSmokeWrapperPath = path.resolve(__dirname, "../scripts/run-portable-export-smoke.mjs");
+  const makePortablePath = path.resolve(__dirname, "../scripts/make-portable.mjs");
   const releaseRunnerPath = path.resolve(__dirname, "../scripts/run-release-portable.mjs");
   const smokePowerShellPath = path.resolve(__dirname, "../scripts/windows-portable-smoke.ps1");
   const exportSmokePowerShellPath = path.resolve(__dirname, "../scripts/windows-portable-export-smoke.ps1");
@@ -65,9 +66,11 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   const smokeScript = json?.scripts?.["smoke:portable"] ?? "";
   const exportSmokeScript = json?.scripts?.["smoke:portable:export"] ?? "";
   const releaseScript = json?.scripts?.["release:portable"] ?? "";
+  const makePortableRaw = await fs.readFile(makePortablePath, "utf8");
 
   await fs.access(smokeWrapperPath);
   await fs.access(exportSmokeWrapperPath);
+  await fs.access(makePortablePath);
   await fs.access(releaseRunnerPath);
   await fs.access(smokePowerShellPath);
   await fs.access(exportSmokePowerShellPath);
@@ -77,6 +80,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   assert.equal(smokeScript, "node scripts/run-portable-smoke.mjs");
   assert.equal(exportSmokeScript, "node scripts/run-portable-export-smoke.mjs");
   assert.equal(releaseScript, "node scripts/run-release-portable.mjs");
+  assert.match(makePortableRaw, /cleanupPaths:\s*listPortableLegacyPaths\(\)/);
   assert.doesNotMatch(portableScript, /\bcargo build\b/);
 });
 

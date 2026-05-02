@@ -39,7 +39,7 @@ async function main() {
     outPath,
     companionDirs: isWin ? listPortableCompanionDirs() : [],
     companionFiles: listPortableCompanionFiles(),
-    cleanupPaths: isWin ? listPortableLegacyPaths() : [],
+    cleanupPaths: listPortableLegacyPaths(),
   });
 
   console.log(`Portable folder written to: ${outDir}`);

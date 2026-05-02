@@ -4,17 +4,26 @@ import path from "node:path";
 import url from "node:url";
 import { spawn } from "node:child_process";
 
-import { appRoot, getPortableOutputDir } from "./ffmpegBundle.mjs";
+import {
+  appRoot,
+  getPortableOutputDir,
+  getPortableReleaseParentDir,
+  windowsSourceArchiveName,
+} from "./ffmpegBundle.mjs";
 import { runPortableSmoke } from "./run-portable-smoke.mjs";
 import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
 import {
   buildChecksumLines,
   getPortableChecksumPath,
+  getPortableExecutableName,
   getPortableSevenZipPath,
+  getPortableTargetLabel,
   getPortableZipPath,
 } from "./portableRelease.mjs";
+import { getProjectVersion } from "./versioning.mjs";
 
 const __filename = url.fileURLToPath(import.meta.url);
+
 function psQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
@@ -81,6 +90,10 @@ function sleep(ms) {
 }
 
 async function findSevenZip() {
+  if (process.platform !== "win32") {
+    return null;
+  }
+
   try {
     const output = await captureStdout("where.exe", ["7z.exe"]);
     return output
@@ -97,11 +110,17 @@ async function createZipArchive(portableDir, zipPath) {
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       await fs.rm(zipPath, { force: true });
-      await runChecked("powershell.exe", [
-        "-NoProfile",
-        "-Command",
-        `$ErrorActionPreference='Stop'; Compress-Archive -LiteralPath ${psQuote(portableDir)} -DestinationPath ${psQuote(zipPath)} -Force`,
-      ]);
+      if (process.platform === "win32") {
+        await runChecked("powershell.exe", [
+          "-NoProfile",
+          "-Command",
+          `$ErrorActionPreference='Stop'; Compress-Archive -LiteralPath ${psQuote(portableDir)} -DestinationPath ${psQuote(zipPath)} -Force`,
+        ]);
+      } else {
+        await runChecked("zip", ["-r", "-q", zipPath, path.basename(portableDir)], {
+          cwd: path.dirname(portableDir),
+        });
+      }
       return;
     } catch (error) {
       lastError = error;
@@ -118,11 +137,17 @@ async function createZipArchive(portableDir, zipPath) {
 
 async function extractZipArchive(zipPath, extractRoot) {
   await fs.rm(extractRoot, { recursive: true, force: true });
-  await runChecked("powershell.exe", [
-    "-NoProfile",
-    "-Command",
-    `$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath ${psQuote(zipPath)} -DestinationPath ${psQuote(extractRoot)} -Force`,
-  ]);
+  if (process.platform === "win32") {
+    await runChecked("powershell.exe", [
+      "-NoProfile",
+      "-Command",
+      `$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath ${psQuote(zipPath)} -DestinationPath ${psQuote(extractRoot)} -Force`,
+    ]);
+    return;
+  }
+
+  await fs.mkdir(extractRoot, { recursive: true });
+  await runChecked("unzip", ["-q", zipPath, "-d", extractRoot]);
 }
 
 async function createSevenZipArchive(sevenZipExe, portableDir, archivePath) {
@@ -136,9 +161,10 @@ async function extractSevenZipArchive(sevenZipExe, archivePath, extractRoot) {
   await runChecked(sevenZipExe, ["x", archivePath, `-o${extractRoot}`, "-y"]);
 }
 
-async function locateExtractedPortableDir(extractRoot) {
+async function locateExtractedPortableDir(extractRoot, { platform = process.platform } = {}) {
+  const executableName = getPortableExecutableName({ platform });
   const directPath = path.resolve(extractRoot, path.basename(getPortableOutputDir()));
-  if (await exists(path.resolve(directPath, "Video_For_Lazies.exe"))) {
+  if (await exists(path.resolve(directPath, executableName))) {
     return directPath;
   }
 
@@ -149,7 +175,7 @@ async function locateExtractedPortableDir(extractRoot) {
     for (const entry of entries) {
       const entryPath = path.resolve(currentDir, entry.name);
       if (entry.isDirectory()) {
-        if (await exists(path.resolve(entryPath, "Video_For_Lazies.exe"))) {
+        if (await exists(path.resolve(entryPath, executableName))) {
           return entryPath;
         }
         queue.push(entryPath);
@@ -168,28 +194,52 @@ async function assertBundledLibx264(portableDir) {
   }
 }
 
-async function assertPortableLegalPayload(portableDir) {
+async function assertPortableFile(portableDir, relativePath) {
+  const filePath = path.resolve(portableDir, relativePath);
+  if (!(await exists(filePath))) {
+    throw new Error(`Portable artifact is missing required file: ${relativePath}`);
+  }
+}
+
+async function assertPortableLegalPayload(portableDir, { platform = process.platform } = {}) {
   const requiredFiles = [
     "README.md",
     "LICENSE.txt",
     "THIRD_PARTY_NOTICES.md",
     "SOURCE.md",
     "FFMPEG_BUNDLING.md",
-    path.join("ffmpeg-sidecar", "LICENSE.txt"),
-    path.join("ffmpeg-sidecar", "FFMPEG_BUNDLE_NOTICES.txt"),
   ];
 
   for (const relativePath of requiredFiles) {
-    const filePath = path.resolve(portableDir, relativePath);
-    if (!(await exists(filePath))) {
-      throw new Error(`Portable artifact is missing required legal/source file: ${relativePath}`);
+    await assertPortableFile(portableDir, relativePath);
+  }
+
+  if (platform === "win32") {
+    const windowsRequiredFiles = [
+      path.join("ffmpeg-sidecar", "LICENSE.txt"),
+      path.join("ffmpeg-sidecar", "FFMPEG_BUNDLE_NOTICES.txt"),
+      path.join("ffmpeg-sidecar", "source", windowsSourceArchiveName),
+    ];
+    for (const relativePath of windowsRequiredFiles) {
+      await assertPortableFile(portableDir, relativePath);
     }
   }
 }
 
-async function verifyPortableArtifact(portableDir, label) {
+async function assertPortableExecutable(portableDir, { platform = process.platform } = {}) {
+  await assertPortableFile(portableDir, getPortableExecutableName({ platform }));
+}
+
+async function verifyPortableArtifact(portableDir, label, { platform = process.platform } = {}) {
   console.log(`Verifying extracted ${label} artifact: ${portableDir}`);
-  await assertPortableLegalPayload(portableDir);
+  await assertPortableExecutable(portableDir, { platform });
+  await assertPortableLegalPayload(portableDir, { platform });
+
+  if (platform !== "win32") {
+    console.log("Linux portable payload verified. FFmpeg and FFprobe are still resolved from PATH or env vars at runtime.");
+    return;
+  }
+
   await assertBundledLibx264(portableDir);
   await runPortableSmoke({ portableDir });
   await runPortableExportSmoke({ portableDir });
@@ -203,20 +253,27 @@ async function verifyPortableArtifact(portableDir, label) {
   });
 }
 
-async function main() {
-  if (process.platform !== "win32") {
-    throw new Error("release:portable must run on Windows.");
+async function runPortableBuild() {
+  if (process.platform === "win32") {
+    await runChecked("cmd.exe", ["/d", "/s", "/c", "npm run portable"], { cwd: appRoot });
+    return;
   }
 
-  await runChecked("cmd.exe", ["/d", "/s", "/c", "npm run portable"], { cwd: appRoot });
+  await runChecked("npm", ["run", "portable"], { cwd: appRoot });
+}
+
+async function main() {
+  const version = await getProjectVersion();
+  const targetLabel = getPortableTargetLabel();
+
+  await runPortableBuild();
 
   const portableDir = getPortableOutputDir();
   if (!(await exists(portableDir))) {
     throw new Error(`Portable folder not found: ${portableDir}`);
   }
 
-  const zipPath = getPortableZipPath();
-  const sevenZipPath = getPortableSevenZipPath();
+  const zipPath = getPortableZipPath({ version });
   const checksumPath = getPortableChecksumPath();
   const archives = [];
 
@@ -224,10 +281,11 @@ async function main() {
   archives.push(zipPath);
 
   const sevenZipExe = await findSevenZip();
-  if (sevenZipExe) {
+  const sevenZipPath = process.platform === "win32" ? getPortableSevenZipPath({ version }) : null;
+  if (sevenZipExe && sevenZipPath) {
     await createSevenZipArchive(sevenZipExe, portableDir, sevenZipPath);
     archives.push(sevenZipPath);
-  } else {
+  } else if (sevenZipPath) {
     console.log("Skipping .7z artifact because 7z.exe is not available.");
     await fs.rm(sevenZipPath, { force: true });
   }
@@ -242,7 +300,7 @@ async function main() {
     await extractZipArchive(zipPath, zipExtractRoot);
     await verifyPortableArtifact(await locateExtractedPortableDir(zipExtractRoot), "zip");
 
-    if (sevenZipExe && await exists(sevenZipPath)) {
+    if (sevenZipExe && sevenZipPath && await exists(sevenZipPath)) {
       const sevenZipExtractRoot = path.resolve(extractRoot, "7z");
       await extractSevenZipArchive(sevenZipExe, sevenZipPath, sevenZipExtractRoot);
       await verifyPortableArtifact(await locateExtractedPortableDir(sevenZipExtractRoot), "7z");
@@ -257,11 +315,12 @@ async function main() {
     }
   }
 
-  console.log("Portable release artifacts ready:");
+  console.log(`Portable ${targetLabel} release artifacts ready:`);
   for (const archivePath of archives) {
     console.log(`- ${archivePath}`);
   }
   console.log(`- ${checksumPath}`);
+  console.log(`Release directory: ${getPortableReleaseParentDir()}`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {

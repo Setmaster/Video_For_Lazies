@@ -3,12 +3,39 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { getPortableReleaseParentDir } from "./ffmpegBundle.mjs";
+import { normalizeVersionInput } from "./versioning.mjs";
 
-export function getPortableArchiveBaseName({ platform = process.platform, arch = process.arch } = {}) {
-  if (platform !== "win32") {
-    throw new Error(`Portable release artifacts are only supported on Windows hosts (got ${platform}).`);
+export function getPortablePlatformLabel(platform = process.platform) {
+  if (platform === "win32") {
+    return "win";
   }
-  return `Video_For_Lazies-win-${arch}`;
+  if (platform === "linux") {
+    return "linux";
+  }
+  throw new Error(`Portable release artifacts are only supported on Windows and Linux hosts (got ${platform}).`);
+}
+
+export function getPortableArchLabel(arch = process.arch) {
+  if (arch !== "x64") {
+    throw new Error(`Portable release artifacts are only supported for x64 hosts (got ${arch}).`);
+  }
+  return "x64";
+}
+
+export function getPortableTargetLabel({ platform = process.platform, arch = process.arch } = {}) {
+  return `${getPortablePlatformLabel(platform)}-${getPortableArchLabel(arch)}`;
+}
+
+export function getPortableExecutableName({ platform = process.platform } = {}) {
+  return getPortablePlatformLabel(platform) === "win" ? "Video_For_Lazies.exe" : "video_for_lazies";
+}
+
+export function getPortableArchiveBaseName({
+  platform = process.platform,
+  arch = process.arch,
+  version,
+} = {}) {
+  return `Video_For_Lazies-v${normalizeVersionInput(version)}-${getPortableTargetLabel({ platform, arch })}`;
 }
 
 export function getPortableZipPath(options) {
