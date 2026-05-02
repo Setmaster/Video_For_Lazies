@@ -1,4 +1,4 @@
-name: Portable Artifacts
+name: Portable Release
 
 on:
   workflow_dispatch:
@@ -7,6 +7,24 @@ on:
         description: "Version to build. Must match app metadata, for example 0.1.0."
         required: true
         type: string
+      release_notes:
+        description: "Curated release summary or changelog. Leave blank to generate from commits."
+        required: false
+        type: string
+      previous_tag:
+        description: "Optional previous release tag for changelog range, for example v0.1.0 or none."
+        required: false
+        type: string
+      draft:
+        description: "Create a draft release for review."
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease."
+        required: true
+        default: true
+        type: boolean
   push:
     tags:
       - "v*.*.*"
@@ -32,7 +50,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -54,7 +74,7 @@ jobs:
             zip
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -71,7 +91,7 @@ jobs:
         id: version
         shell: bash
         env:
-          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+          REQUESTED_VERSION: ${{ github.event.inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
           VERSION="$(node scripts/check-version.mjs --value "$REQUESTED_VERSION")"
@@ -95,7 +115,7 @@ jobs:
         working-directory: app
 
       - name: Upload private portable artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Video_For_Lazies-v${{ steps.version.outputs.version }}-${{ matrix.target }}-${{ steps.version.outputs.short_sha }}
           path: |
@@ -103,3 +123,98 @@ jobs:
             release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: portable
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+        working-directory: app
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node scripts/check-version.mjs --value "$REQUESTED_VERSION")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        working-directory: app
+
+      - name: Download portable artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: Video_For_Lazies-v${{ steps.version.outputs.version }}-*
+          path: release/downloaded-artifacts
+
+      - name: Stage release assets
+        run: node scripts/prepare-release-assets.mjs --input release/downloaded-artifacts --output release/release-assets
+        working-directory: app
+
+      - name: Generate release notes
+        env:
+          VFL_RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+          VFL_PREVIOUS_TAG: ${{ github.event.inputs.previous_tag }}
+        run: node scripts/generate-release-notes.mjs --version "${{ steps.version.outputs.version }}" --output release/RELEASE_NOTES.md
+        working-directory: app
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_RELEASE: ${{ github.event.inputs.draft }}
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          TARGET_SHA: ${{ steps.version.outputs.target_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists."
+            exit 1
+          fi
+
+          if git rev-parse "$RELEASE_TAG^{commit}" >/dev/null 2>&1; then
+            TAG_SHA="$(git rev-parse "$RELEASE_TAG^{commit}")"
+            if [[ "$TAG_SHA" != "$TARGET_SHA" ]]; then
+              echo "Tag $RELEASE_TAG points at $TAG_SHA, expected $TARGET_SHA."
+              exit 1
+            fi
+          fi
+
+          args=(
+            "$RELEASE_TAG"
+            release/release-assets/*
+            --target "$TARGET_SHA"
+            --title "Video For Lazies $RELEASE_TAG"
+            --notes-file release/RELEASE_NOTES.md
+            --fail-on-no-commits
+          )
+
+          if [[ "${DRAFT_RELEASE:-true}" == "true" ]]; then
+            args+=(--draft)
+          fi
+          if [[ "${PRERELEASE:-true}" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${args[@]}"

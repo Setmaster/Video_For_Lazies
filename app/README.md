@@ -48,6 +48,8 @@ On Windows, verification also runs startup smoke, the packaged interaction/expor
 
 If `7z.exe` is available on the Windows host, this command also writes a versioned `.7z` archive.
 
+The GitHub `Portable Release` workflow builds Linux and Windows x64 zips, creates release notes from the commit range since the previous release tag, and attaches the final zip assets plus a combined checksum file to a draft GitHub Release by default.
+
 ## Tests
 
 ```bash

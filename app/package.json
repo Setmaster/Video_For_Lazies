@@ -11,6 +11,8 @@
     "smoke:portable": "node scripts/run-portable-smoke.mjs",
     "smoke:portable:export": "node scripts/run-portable-export-smoke.mjs",
     "release:portable": "node scripts/run-release-portable.mjs",
+    "release:notes": "node scripts/generate-release-notes.mjs",
+    "release:assets": "node scripts/prepare-release-assets.mjs",
     "version:check": "node scripts/check-version.mjs",
     "version:set": "node scripts/set-version.mjs",
     "test": "node --test",

@@ -49,14 +49,53 @@ git rev-list --all | xargs git grep -n -F "C:/Users/local-username" -- 2>/dev/nu
 
 If a real local identifier appears in committed history, rewrite history from a clean worktree with `git filter-repo`, then force-push only after the owner explicitly approves the push.
 
-## Portable Release Artifacts
+## Portable Release Workflow
 
-The `Portable Artifacts` GitHub Actions workflow builds private x64 artifacts for:
+The `Portable Release` GitHub Actions workflow builds private x64 artifacts for:
 
 - `linux-x64`
 - `win-x64`
 
-It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow uploads private Actions artifacts only; it does not create a GitHub Release, publish binaries publicly, or change repository visibility.
+It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds both portable zips, creates release notes, stages a combined `SHA256SUMS.txt`, and creates a GitHub Release with the final assets. It defaults to a draft prerelease so the generated changelog and uploaded binaries can be reviewed before publishing. The workflow does not change repository visibility.
+
+Manual dispatch inputs:
+
+- `version`: required SemVer value, for example `0.1.1`; must match app metadata.
+- `release_notes`: optional curated changelog or summary. If blank, the workflow generates a summary from commits.
+- `previous_tag`: optional changelog start tag. Use `none` for a first release.
+- `draft`: defaults to `true`.
+- `prerelease`: defaults to `true`.
+
+Release notes follow this template:
+
+```text
+# Video For Lazies vX.Y.Z
+
+## Release Summary
+<curated notes, or generated summary>
+
+## Changes
+<categorized commits since previous release tag>
+
+## Artifacts
+<portable zip assets and checksum file>
+
+## Runtime Notes
+<Windows sidecar and Linux FFmpeg requirements>
+
+## Verification
+<workflow verification summary>
+```
+
+Recommended manual protocol for an agent-triggered release:
+
+1. Run `git fetch --tags origin`.
+2. Find the previous release tag with `git tag --merged HEAD --sort=-version:refname --list 'v[0-9]*'`.
+3. Review commits since that tag with `git log --oneline <previous-tag>..HEAD`, or use `git log --oneline HEAD` for the first release.
+4. Write the curated `release_notes` input using the template above.
+5. Trigger `Portable Release` with `draft=true`.
+6. Review the draft release notes, Linux zip, Windows zip, and `SHA256SUMS.txt`.
+7. Publish the draft only when the owner wants that release visible to repo collaborators.
 
 Run locally on Linux or Windows:
 
@@ -79,7 +118,7 @@ Windows artifact example:
 release/Video_For_Lazies-v0.1.0-win-x64.zip
 ```
 
-If `7z.exe` is available on the Windows host, the script also creates a versioned `.7z` archive. The GitHub Actions workflow uploads the `.zip` artifact and checksum file.
+If `7z.exe` is available on the Windows host, the local script also creates a versioned `.7z` archive. The GitHub Actions release workflow uploads the final `.zip` artifacts and combined checksum file.
 
 Required portable payload on all platforms:
 
