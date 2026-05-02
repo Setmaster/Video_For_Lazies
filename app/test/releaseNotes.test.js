@@ -48,6 +48,18 @@ test("release notes renderer uses the defined template and curated notes", () =>
   assert.match(notes, /runtime codec behavior depends on the local FFmpeg/);
 });
 
+test("release notes renderer describes the first release without a fake range", () => {
+  const notes = renderReleaseNotes({
+    version: "0.1.0",
+    previousTag: null,
+    commits: [{ sha: "abcdef123456", subject: "Initial public release" }],
+    targetLabels: ["linux-x64"],
+  });
+
+  assert.match(notes, /Initial release generated from 1 commit for v0\.1\.0\./);
+  assert.doesNotMatch(notes, /first release\.\./);
+});
+
 test("manual release notes are trimmed before rendering", () => {
   assert.equal(normalizeManualNotes("\n  summary\n"), "summary");
 });

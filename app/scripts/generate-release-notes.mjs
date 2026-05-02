@@ -104,6 +104,14 @@ export function normalizeManualNotes(notes) {
   return String(notes ?? "").trim();
 }
 
+function formatGeneratedSummary({ commits, previousTag, tag }) {
+  const commitWord = commits.length === 1 ? "commit" : "commits";
+  if (previousTag) {
+    return `Release generated from ${commits.length} ${commitWord} in ${previousTag}..${tag}.`;
+  }
+  return `Initial release generated from ${commits.length} ${commitWord} for ${tag}.`;
+}
+
 function formatCommitLine(commit) {
   return `- ${cleanCommitSubject(commit.subject)} (${shortSha(commit.sha)})`;
 }
@@ -116,7 +124,6 @@ export function renderReleaseNotes({
   targetLabels = ["linux-x64", "win-x64"],
 } = {}) {
   const tag = normalizeTag(version);
-  const rangeLabel = previousTag ? `${previousTag}..${tag}` : `first release..${tag}`;
   const grouped = new Map(CATEGORY_ORDER.map((category) => [category, []]));
 
   for (const commit of commits) {
@@ -134,7 +141,7 @@ export function renderReleaseNotes({
   if (normalizedManualNotes) {
     lines.push(normalizedManualNotes, "");
   } else {
-    lines.push(`Release generated from ${commits.length} commit${commits.length === 1 ? "" : "s"} in ${rangeLabel}.`, "");
+    lines.push(formatGeneratedSummary({ commits, previousTag, tag }), "");
   }
 
   lines.push("## Changes", "");
