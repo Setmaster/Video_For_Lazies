@@ -26,6 +26,11 @@ test("tauri build hooks prepare the bundled ffmpeg sidecar", async () => {
   assert.match(bundleRaw, /autobuild-2026-05-02-13-12/);
   assert.match(bundleRaw, /ffmpeg-n8\.1-11-g75d37c499d-win64-gpl-shared-8\.1\.zip/);
   assert.match(bundleRaw, /pinned GPL shared build/i);
+  assert.match(bundleRaw, /buildScriptsCommit/);
+  assert.match(bundleRaw, /x264Commit/);
+  assert.match(bundleRaw, /windowsSourceArchiveNames/);
+  assert.match(syncRaw, /windowsBuildScriptsArchivePath/);
+  assert.match(syncRaw, /windowsX264SourceArchivePath/);
   assert.match(syncRaw, /missing libx264/i);
 });
 
@@ -82,6 +87,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   assert.equal(exportSmokeScript, "node scripts/run-portable-export-smoke.mjs");
   assert.equal(releaseScript, "node scripts/run-release-portable.mjs");
   assert.match(makePortableRaw, /cleanupPaths:\s*listPortableLegacyPaths\(\)/);
+  assert.match(makePortableRaw, /generatePortableDocs/);
   assert.doesNotMatch(portableScript, /\bcargo build\b/);
 });
 
@@ -111,6 +117,7 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(wrapperRaw, /-InputWidth/);
   assert.match(releaseRaw, /assertBundledLibx264/);
   assert.match(releaseRaw, /missing libx264/);
+  assert.match(releaseRaw, /windowsSourceArchiveNames/);
   assert.match(appRaw, /smokeStatusWriteRef/);
   assert.match(appRaw, /trimStartS: extra\.trimStartS \?\? null/);
   assert.match(appRaw, /expectedDurationS: extra\.expectedDurationS \?\? null/);

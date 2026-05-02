@@ -8,6 +8,7 @@ import {
   listPortableCompanionDirs,
   listPortableCompanionFiles,
 } from "./ffmpegBundle.mjs";
+import { generatePortableDocs } from "./generate-portable-docs.mjs";
 import { copyPortableArtifacts } from "./portableArtifacts.mjs";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
@@ -34,11 +35,13 @@ const outName = isWin ? "Video_For_Lazies.exe" : packageName;
 const outPath = path.resolve(outDir, outName);
 
 async function main() {
+  const generatedDocs = await generatePortableDocs();
+
   await copyPortableArtifacts({
     builtBinaryPath,
     outPath,
     companionDirs: isWin ? listPortableCompanionDirs() : [],
-    companionFiles: listPortableCompanionFiles(),
+    companionFiles: listPortableCompanionFiles(generatedDocs),
     cleanupPaths: listPortableLegacyPaths(),
   });
 

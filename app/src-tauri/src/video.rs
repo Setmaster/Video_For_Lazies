@@ -400,10 +400,10 @@ fn parse_encoder_names(stdout: &str) -> HashSet<String> {
 
 fn cached_encoder_names(ffmpeg_bin: &str) -> Result<HashSet<String>, String> {
     let cache = ENCODER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(existing) = guard.get(ffmpeg_bin) {
-            return Ok(existing.clone());
-        }
+    if let Ok(guard) = cache.lock()
+        && let Some(existing) = guard.get(ffmpeg_bin)
+    {
+        return Ok(existing.clone());
     }
 
     let mut cmd = command_no_window(ffmpeg_bin);
@@ -503,7 +503,7 @@ fn output_extension(format: OutputFormat) -> &'static str {
 }
 
 fn even_at_least_two(value: u32) -> u32 {
-    let even = if value % 2 == 0 {
+    let even = if value & 1 == 0 {
         value
     } else {
         value.saturating_sub(1)
@@ -766,15 +766,14 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
 
     if duration_s <= 0.0 {
         for stream in &parsed.streams {
-            if stream.codec_type.as_deref() == Some("video") {
-                if let Some(d) = stream
+            if stream.codec_type.as_deref() == Some("video")
+                && let Some(d) = stream
                     .duration
                     .as_deref()
                     .and_then(|d| d.parse::<f64>().ok())
-                {
-                    duration_s = d;
-                    break;
-                }
+            {
+                duration_s = d;
+                break;
             }
         }
     }
@@ -787,14 +786,14 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     let mut height = 0u32;
     let mut frame_rate = None;
     for stream in &parsed.streams {
-        if stream.codec_type.as_deref() == Some("video") {
-            if let (Some(w), Some(h)) = (stream.width, stream.height) {
-                width = w;
-                height = h;
-                frame_rate = parse_ffprobe_rate(stream.avg_frame_rate.as_deref())
-                    .or_else(|| parse_ffprobe_rate(stream.r_frame_rate.as_deref()));
-                break;
-            }
+        if stream.codec_type.as_deref() == Some("video")
+            && let (Some(w), Some(h)) = (stream.width, stream.height)
+        {
+            width = w;
+            height = h;
+            frame_rate = parse_ffprobe_rate(stream.avg_frame_rate.as_deref())
+                .or_else(|| parse_ffprobe_rate(stream.r_frame_rate.as_deref()));
+            break;
         }
     }
     if width == 0 || height == 0 {
@@ -1262,6 +1261,7 @@ fn emit_progress(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_with_progress(
     window: &Window,
     job_id: u64,
@@ -1341,10 +1341,10 @@ fn run_ffmpeg_with_progress(
                 .unwrap_or_default();
             if idle_for >= ENCODE_IDLE_TIMEOUT {
                 watchdog_timed_out.store(true, Ordering::Relaxed);
-                if let Ok(mut guard) = watchdog_child_slot.lock() {
-                    if let Some(child) = guard.as_mut() {
-                        let _ = child.kill();
-                    }
+                if let Ok(mut guard) = watchdog_child_slot.lock()
+                    && let Some(child) = guard.as_mut()
+                {
+                    let _ = child.kill();
                 }
                 break;
             }
@@ -1357,10 +1357,10 @@ fn run_ffmpeg_with_progress(
 
     for line_res in reader.lines() {
         if cancel.load(Ordering::Relaxed) {
-            if let Ok(mut guard) = child_slot.lock() {
-                if let Some(child) = guard.as_mut() {
-                    let _ = child.kill();
-                }
+            if let Ok(mut guard) = child_slot.lock()
+                && let Some(child) = guard.as_mut()
+            {
+                let _ = child.kill();
             }
             break;
         }
@@ -1369,10 +1369,10 @@ fn run_ffmpeg_with_progress(
             Ok(line) => line,
             Err(e) => {
                 read_error = Some(format!("Failed reading ffmpeg output: {e}"));
-                if let Ok(mut guard) = child_slot.lock() {
-                    if let Some(child) = guard.as_mut() {
-                        let _ = child.kill();
-                    }
+                if let Ok(mut guard) = child_slot.lock()
+                    && let Some(child) = guard.as_mut()
+                {
+                    let _ = child.kill();
                 }
                 break;
             }
@@ -1532,19 +1532,20 @@ pub fn run_encode_job(
             return Err("Input file has no audio stream.".to_string());
         }
 
-        let mut args: Vec<String> = Vec::new();
-        args.push("-y".to_string());
-        args.push("-hide_banner".to_string());
-        args.push("-loglevel".to_string());
-        args.push("error".to_string());
-        args.push("-i".to_string());
-        args.push(input_str.clone());
-        args.push("-progress".to_string());
-        args.push("pipe:1".to_string());
-        args.push("-nostats".to_string());
-        args.push("-map".to_string());
-        args.push("0:a:0".to_string());
-        args.push("-vn".to_string());
+        let mut args = vec![
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            input_str.clone(),
+            "-progress".to_string(),
+            "pipe:1".to_string(),
+            "-nostats".to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-vn".to_string(),
+        ];
 
         if let Some(af) = audio_filters {
             args.push("-af".to_string());
@@ -1628,21 +1629,21 @@ pub fn run_encode_job(
         };
 
         if should_try_stream_copy {
-            let mut args: Vec<String> = Vec::new();
-            args.push("-y".to_string());
-            args.push("-hide_banner".to_string());
-            args.push("-loglevel".to_string());
-            args.push("error".to_string());
-            args.push("-i".to_string());
-            args.push(input_str.clone());
-            args.push("-progress".to_string());
-            args.push("pipe:1".to_string());
-            args.push("-nostats".to_string());
-
-            args.push("-map".to_string());
-            args.push("0:v:0".to_string());
-            args.push("-c:v".to_string());
-            args.push("copy".to_string());
+            let mut args = vec![
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-i".to_string(),
+                input_str.clone(),
+                "-progress".to_string(),
+                "pipe:1".to_string(),
+                "-nostats".to_string(),
+                "-map".to_string(),
+                "0:v:0".to_string(),
+                "-c:v".to_string(),
+                "copy".to_string(),
+            ];
 
             if request.audio_enabled && probe.has_audio {
                 args.push("-map".to_string());
@@ -1715,21 +1716,21 @@ pub fn run_encode_job(
             .quality_mode
             .ok_or_else(|| "Missing quality settings for export format.".to_string())?;
 
-        let mut args: Vec<String> = Vec::new();
-        args.push("-y".to_string());
-        args.push("-hide_banner".to_string());
-        args.push("-loglevel".to_string());
-        args.push("error".to_string());
-        args.push("-i".to_string());
-        args.push(input_str.clone());
-        args.push("-progress".to_string());
-        args.push("pipe:1".to_string());
-        args.push("-nostats".to_string());
-
-        args.push("-map".to_string());
-        args.push("0:v:0".to_string());
-        args.push("-c:v".to_string());
-        args.push(video_codec.to_string());
+        let mut args = vec![
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            input_str.clone(),
+            "-progress".to_string(),
+            "pipe:1".to_string(),
+            "-nostats".to_string(),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-c:v".to_string(),
+            video_codec.to_string(),
+        ];
 
         // NOTE: This "no size target" path uses the codec plan defaults.
         // If/when we expose advanced encoding knobs (CRF, preset, audio bitrate, etc),
@@ -1865,27 +1866,28 @@ pub fn run_encode_job(
         let passlog_str = passlog_prefix.to_string_lossy().to_string();
 
         // Pass 1
-        let mut pass1: Vec<String> = Vec::new();
-        pass1.push("-y".to_string());
-        pass1.push("-hide_banner".to_string());
-        pass1.push("-loglevel".to_string());
-        pass1.push("error".to_string());
-        pass1.push("-i".to_string());
-        pass1.push(input_str.clone());
-        pass1.push("-progress".to_string());
-        pass1.push("pipe:1".to_string());
-        pass1.push("-nostats".to_string());
-        pass1.push("-map".to_string());
-        pass1.push("0:v:0".to_string());
-        pass1.push("-c:v".to_string());
-        pass1.push(video_codec.to_string());
-        pass1.push("-b:v".to_string());
-        pass1.push(format!("{}k", plan.video_bitrate_kbps.max(min_video_kbps)));
-        pass1.push("-pass".to_string());
-        pass1.push("1".to_string());
-        pass1.push("-passlogfile".to_string());
-        pass1.push(passlog_str.clone());
-        pass1.push("-an".to_string());
+        let mut pass1 = vec![
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            input_str.clone(),
+            "-progress".to_string(),
+            "pipe:1".to_string(),
+            "-nostats".to_string(),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-c:v".to_string(),
+            video_codec.to_string(),
+            "-b:v".to_string(),
+            format!("{}k", plan.video_bitrate_kbps.max(min_video_kbps)),
+            "-pass".to_string(),
+            "1".to_string(),
+            "-passlogfile".to_string(),
+            passlog_str.clone(),
+            "-an".to_string(),
+        ];
         if let Some(vf) = &video_filters {
             pass1.push("-vf".to_string());
             pass1.push(vf.clone());
@@ -1918,26 +1920,27 @@ pub fn run_encode_job(
         }
 
         // Pass 2
-        let mut pass2: Vec<String> = Vec::new();
-        pass2.push("-y".to_string());
-        pass2.push("-hide_banner".to_string());
-        pass2.push("-loglevel".to_string());
-        pass2.push("error".to_string());
-        pass2.push("-i".to_string());
-        pass2.push(input_str.clone());
-        pass2.push("-progress".to_string());
-        pass2.push("pipe:1".to_string());
-        pass2.push("-nostats".to_string());
-        pass2.push("-map".to_string());
-        pass2.push("0:v:0".to_string());
-        pass2.push("-c:v".to_string());
-        pass2.push(video_codec.to_string());
-        pass2.push("-b:v".to_string());
-        pass2.push(format!("{}k", plan.video_bitrate_kbps.max(min_video_kbps)));
-        pass2.push("-pass".to_string());
-        pass2.push("2".to_string());
-        pass2.push("-passlogfile".to_string());
-        pass2.push(passlog_str.clone());
+        let mut pass2 = vec![
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            input_str.clone(),
+            "-progress".to_string(),
+            "pipe:1".to_string(),
+            "-nostats".to_string(),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-c:v".to_string(),
+            video_codec.to_string(),
+            "-b:v".to_string(),
+            format!("{}k", plan.video_bitrate_kbps.max(min_video_kbps)),
+            "-pass".to_string(),
+            "2".to_string(),
+            "-passlogfile".to_string(),
+            passlog_str.clone(),
+        ];
 
         if let Some(vf) = &video_filters {
             pass2.push("-vf".to_string());
@@ -2357,7 +2360,7 @@ Encoders:
     #[test]
     fn plan_bitrates_drops_audio_when_budget_too_low() {
         let plan = plan_bitrates(1.0, 600.0, true, 96, 32, 50, 0.95).unwrap();
-        assert_eq!(plan.include_audio, false);
+        assert!(!plan.include_audio);
         assert_eq!(plan.audio_bitrate_kbps, 0);
         assert!(plan.video_bitrate_kbps > 0);
     }
@@ -2365,7 +2368,7 @@ Encoders:
     #[test]
     fn plan_bitrates_includes_audio_when_budget_allows() {
         let plan = plan_bitrates(8.0, 10.0, true, 96, 32, 50, 0.95).unwrap();
-        assert_eq!(plan.include_audio, true);
+        assert!(plan.include_audio);
         assert!(plan.audio_bitrate_kbps >= 32);
         assert!(plan.video_bitrate_kbps >= 50);
     }
@@ -2373,7 +2376,7 @@ Encoders:
     #[test]
     fn plan_bitrates_respects_video_floor_without_audio() {
         let plan = plan_bitrates(0.1, 120.0, false, 96, 32, 384, 0.95).unwrap();
-        assert_eq!(plan.include_audio, false);
+        assert!(!plan.include_audio);
         assert_eq!(plan.audio_bitrate_kbps, 0);
         assert_eq!(plan.video_bitrate_kbps, 384);
     }
@@ -2381,7 +2384,7 @@ Encoders:
     #[test]
     fn plan_bitrates_drops_audio_when_remaining_budget_is_below_audio_minimum() {
         let plan = plan_bitrates(0.3, 60.0, true, 96, 32, 384, 0.95).unwrap();
-        assert_eq!(plan.include_audio, false);
+        assert!(!plan.include_audio);
         assert_eq!(plan.audio_bitrate_kbps, 0);
         assert_eq!(plan.video_bitrate_kbps, 384);
     }

@@ -43,7 +43,9 @@ test("release notes renderer uses the defined template and curated notes", () =>
   assert.match(notes, /add release flow \(abcdef1\)/);
   assert.match(notes, /### Fixed/);
   assert.match(notes, /Video_For_Lazies-v0\.1\.1-linux-x64\.zip/);
-  assert.match(notes, /Linux x64 portable releases currently require/);
+  assert.match(notes, /Windows portable zips are unsigned/);
+  assert.match(notes, /Linux x64 portable releases require/);
+  assert.match(notes, /runtime codec behavior depends on the local FFmpeg/);
 });
 
 test("manual release notes are trimmed before rendering", () => {

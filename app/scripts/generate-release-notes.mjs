@@ -157,8 +157,10 @@ export function renderReleaseNotes({
   lines.push("- `SHA256SUMS.txt`", "");
 
   lines.push("## Runtime Notes", "");
-  lines.push("- Windows x64 portable releases bundle the pinned GPL FFmpeg sidecar, including FFmpeg source availability files.");
-  lines.push("- Linux x64 portable releases currently require `ffmpeg` and `ffprobe` on `PATH`, or `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH` at runtime.");
+  lines.push("- Windows x64 portable releases bundle the pinned GPL FFmpeg sidecar and include FFmpeg source plus build-provenance archives in the portable payload.");
+  lines.push("- Windows portable zips are unsigned and may trigger SmartScreen or antivirus reputation warnings. Verify the SHA256 checksum before running.");
+  lines.push("- Linux x64 portable releases require `ffmpeg` and `ffprobe` on `PATH`, or `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH` at runtime.");
+  lines.push("- Linux portable zips are payload-verified by the workflow, but runtime codec behavior depends on the local FFmpeg/FFprobe installation.");
   lines.push("- Repository visibility is not changed by this release workflow.", "");
 
   lines.push("## Verification", "");

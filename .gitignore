@@ -4,6 +4,10 @@ __pycache__/
 *.log.*
 ffmpeg2pass*.log*
 *.tmp
+.env
+.env.*
+*.env
+!.env.example
 .DS_Store
 .venv/
 venv/

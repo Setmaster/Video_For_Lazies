@@ -6,7 +6,11 @@ Security reports are accepted for the current `main` branch and the latest publi
 
 ## Reporting a Vulnerability
 
-Please report security issues privately by emailing the maintainer address listed on the project profile, or by using GitHub's private vulnerability reporting if it is enabled for this repository.
+Please report security issues through GitHub private vulnerability reporting:
+
+```text
+https://github.com/Setmaster/Video_For_Lazies/security/advisories/new
+```
 
 Do not include secrets, private media, or sensitive personal files in a public issue.
 

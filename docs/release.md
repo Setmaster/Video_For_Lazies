@@ -38,7 +38,10 @@ git push origin main v0.1.1
 - Confirm `npm audit --audit-level=moderate` is clean.
 - Run `npm test`, `npx tsc --noEmit`, `npm run build`, and `cargo test --manifest-path app/src-tauri/Cargo.toml`.
 - Confirm no tracked secrets, local usernames, private paths, or generated release artifacts are present.
+- Confirm reachable commit author and committer emails are approved public identities, preferably GitHub noreply addresses.
 - Confirm `LICENSE`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`, and `SOURCE.md` are present.
+- Confirm GitHub private vulnerability reporting is enabled before changing repository visibility.
+- Confirm `SECURITY.md` points reporters to GitHub private vulnerability reporting, not a public personal email.
 - Before changing repository visibility, scan committed history for local-machine identifiers:
 
 ```bash
@@ -87,7 +90,7 @@ Release notes follow this template:
 <workflow verification summary>
 ```
 
-Recommended manual protocol for an agent-triggered release:
+Recommended manual release protocol:
 
 1. Run `git fetch --tags origin`.
 2. Find the previous release tag with `git tag --merged HEAD --sort=-version:refname --list 'v[0-9]*'`.
@@ -95,7 +98,9 @@ Recommended manual protocol for an agent-triggered release:
 4. Write the curated `release_notes` input using the template above.
 5. Trigger `Portable Release` with `draft=true`.
 6. Review the draft release notes, Linux zip, Windows zip, and `SHA256SUMS.txt`.
-7. Publish the draft only when the owner wants that release visible to repo collaborators.
+7. Confirm the draft release is backed by the intended public `vX.Y.Z` tag.
+8. Confirm generated `SOURCE.md` in each zip names the intended release tag and source commit.
+9. Publish the draft only when the owner wants that release visible to repo collaborators.
 
 Run locally on Linux or Windows:
 
@@ -139,10 +144,13 @@ Required portable payload on all platforms:
 
 Additional required Windows payload:
 
-- `ffmpeg-sidecar/` with FFmpeg binaries, FFmpeg license text, bundle notices, and source archive
+- `ffmpeg-sidecar/` with FFmpeg binaries, FFmpeg license text, bundle notices, and source/provenance archives
+- `ffmpeg-sidecar/source/ffmpeg-75d37c499da2a9fd50e3ef5a69c7dd87cd96f62a.tar.gz`
+- `ffmpeg-sidecar/source/btbn-ffmpeg-builds-28ae7513e7b6477da5c9ba7edb07aa940d485fa2.tar.gz`
+- `ffmpeg-sidecar/source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
 Linux artifacts currently do not bundle FFmpeg. They require `ffmpeg` and `ffprobe` on `PATH`, or `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH` set at runtime.
 
 ## Unsigned Alpha Note
 
-The first public Windows binary may be an unsigned portable alpha. Release notes should say that Windows may show SmartScreen or antivirus warnings because the executable is unsigned.
+The first public Windows binary may be an unsigned portable alpha. Release notes should say that Windows may show SmartScreen or antivirus warnings because the executable is unsigned. Release notes should also state that Linux portable zips require the local machine to provide FFmpeg/FFprobe at runtime.

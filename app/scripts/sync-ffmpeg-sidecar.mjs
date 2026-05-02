@@ -16,14 +16,19 @@ import {
   windowsBundleExpandedRootName,
   windowsBundleRoot,
   windowsDownloadsDir,
+  windowsBuildScriptsArchivePath,
+  windowsBuildScriptsUrl,
   windowsRuntimeExecutables,
   windowsSidecarDir,
   windowsSidecarLicenseName,
   windowsSidecarNoticeName,
   windowsSourceArchivePath,
   windowsSourceArchiveName,
+  windowsSourceArchiveNames,
   windowsSourceDir,
   windowsSourceUrl,
+  windowsX264SourceArchivePath,
+  windowsX264SourceUrl,
   FFMPEG_BUNDLE,
 } from "./ffmpegBundle.mjs";
 
@@ -184,16 +189,26 @@ async function stageWindowsBundle() {
     windowsSourceUrl,
     WINDOWS_X64_BUNDLE.sourceSha256,
   );
+  await ensureDownloadedFile(
+    windowsBuildScriptsArchivePath,
+    windowsBuildScriptsUrl,
+    WINDOWS_X64_BUNDLE.buildScriptsSha256,
+  );
+  await ensureDownloadedFile(
+    windowsX264SourceArchivePath,
+    windowsX264SourceUrl,
+    WINDOWS_X64_BUNDLE.x264Sha256,
+  );
 
   const expectedNotice = buildWindowsBundleNotice();
   const noticePath = path.resolve(windowsSidecarDir, windowsSidecarNoticeName);
   const placeholderReadmePath = path.resolve(windowsSidecarDir, "README.txt");
   const expectedRuntimePaths = windowsRuntimeExecutables.map((name) => path.resolve(windowsSidecarDir, name));
-  const stagedSourcePath = path.resolve(windowsSourceDir, windowsSourceArchiveName);
+  const stagedSourcePaths = windowsSourceArchiveNames.map((name) => path.resolve(windowsSourceDir, name));
 
   if (
     await pathExists(noticePath)
-    && await pathExists(stagedSourcePath)
+    && (await Promise.all(stagedSourcePaths.map(pathExists))).every(Boolean)
     && (await Promise.all(expectedRuntimePaths.map(pathExists))).every(Boolean)
   ) {
     const currentNotice = await fsp.readFile(noticePath, "utf8");
@@ -233,10 +248,16 @@ async function stageWindowsBundle() {
       path.resolve(bundleRoot, windowsSidecarLicenseName),
       path.resolve(windowsSidecarDir, windowsSidecarLicenseName),
     );
-    await fsp.copyFile(
+    for (const sourceArchivePath of [
       windowsSourceArchivePath,
-      path.resolve(windowsSourceDir, windowsSourceArchiveName),
-    );
+      windowsBuildScriptsArchivePath,
+      windowsX264SourceArchivePath,
+    ]) {
+      await fsp.copyFile(
+        sourceArchivePath,
+        path.resolve(windowsSourceDir, path.basename(sourceArchivePath)),
+      );
+    }
     await fsp.writeFile(noticePath, expectedNotice, "utf8");
     await verifyWindowsBundleCapabilities();
   } finally {

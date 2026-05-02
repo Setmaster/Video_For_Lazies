@@ -87,6 +87,32 @@ fn parse_smoke_output_format(raw: &str) -> Result<video::OutputFormat, String> {
     }
 }
 
+fn validate_smoke_status_path(raw: &str) -> Result<String, String> {
+    let path = PathBuf::from(raw);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "VFL_SMOKE_STATUS must include a folder.".to_string())?;
+    if !parent.exists() {
+        return Err("VFL_SMOKE_STATUS folder must already exist.".to_string());
+    }
+
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve system temporary directory: {e}"))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve VFL_SMOKE_STATUS folder: {e}"))?;
+
+    if !parent.starts_with(&temp_root) {
+        return Err(
+            "VFL_SMOKE_STATUS must point inside the system temporary directory.".to_string(),
+        );
+    }
+
+    Ok(path.to_string_lossy().to_string())
+}
+
 fn parse_smoke_config_from_env(
     env: &HashMap<String, String>,
 ) -> Result<Option<AppSmokeConfig>, String> {
@@ -109,6 +135,7 @@ fn parse_smoke_config_from_env(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "VFL_SMOKE_STATUS is required when VFL_SMOKE_INPUT is set.".to_string())?;
+    let status_path = validate_smoke_status_path(status_path)?;
 
     let format = parse_smoke_output_format(
         env.get("VFL_SMOKE_FORMAT")
@@ -141,7 +168,7 @@ fn parse_smoke_config_from_env(
     Ok(Some(AppSmokeConfig {
         input_path: input_path.to_string(),
         output_path: output_path.to_string(),
-        status_path: status_path.to_string(),
+        status_path,
         format,
         size_limit_mb,
         trim_start_s,
@@ -180,13 +207,12 @@ fn merge_smoke_stage_history(existing: Option<&AppSmokeStatus>, next_stage: &str
         .map(|status| status.stage_history.clone())
         .unwrap_or_default();
 
-    if history.is_empty() {
-        if let Some(previous_stage) = existing
+    if history.is_empty()
+        && let Some(previous_stage) = existing
             .map(|status| status.stage.trim())
             .filter(|stage| !stage.is_empty())
-        {
-            history.push(previous_stage.to_string());
-        }
+    {
+        history.push(previous_stage.to_string());
     }
 
     if !history.iter().any(|stage| stage == next_stage) {
@@ -345,12 +371,10 @@ fn start_encode(
         };
 
         let manager: State<'_, JobManager> = app_handle.state();
-        if let Ok(mut guard) = manager.current.lock() {
-            if let Some(handle) = guard.as_ref() {
-                if handle.job_id == job_id {
-                    *guard = None;
-                }
-            }
+        if let Ok(mut guard) = manager.current.lock()
+            && guard.as_ref().is_some_and(|handle| handle.job_id == job_id)
+        {
+            *guard = None;
         }
     });
 
@@ -375,10 +399,10 @@ fn cancel_encode(state: State<'_, JobManager>, jobId: u64) -> Result<(), String>
 
     handle.cancel.store(true, Ordering::Relaxed);
 
-    if let Ok(mut guard) = handle.child.lock() {
-        if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
-        }
+    if let Ok(mut guard) = handle.child.lock()
+        && let Some(child) = guard.as_mut()
+    {
+        let _ = child.kill();
     }
 
     Ok(())
@@ -413,12 +437,23 @@ mod tests {
     };
     use crate::video::OutputFormat;
     use std::collections::HashMap;
+    use std::fs;
 
     fn smoke_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect()
+    }
+
+    fn temp_smoke_status_path(label: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "vfl_smoke_status_test_{}_{}",
+            std::process::id(),
+            label
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("status.json").to_string_lossy().to_string()
     }
 
     #[test]
@@ -439,10 +474,11 @@ mod tests {
 
     #[test]
     fn parse_smoke_config_reads_defaults() {
+        let status_path = temp_smoke_status_path("defaults");
         let env = smoke_env(&[
             ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
             ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
-            ("VFL_SMOKE_STATUS", r"C:\tmp\status.json"),
+            ("VFL_SMOKE_STATUS", &status_path),
         ]);
 
         assert_eq!(
@@ -450,7 +486,7 @@ mod tests {
             Some(AppSmokeConfig {
                 input_path: r"C:\tmp\input.mp4".to_string(),
                 output_path: r"C:\tmp\output.mp4".to_string(),
-                status_path: r"C:\tmp\status.json".to_string(),
+                status_path,
                 format: OutputFormat::Mp4,
                 size_limit_mb: 0.0,
                 trim_start_s: 0.0,
@@ -461,10 +497,11 @@ mod tests {
 
     #[test]
     fn parse_smoke_config_reads_optional_values() {
+        let status_path = temp_smoke_status_path("optional");
         let env = smoke_env(&[
             ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
             ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.webm"),
-            ("VFL_SMOKE_STATUS", r"C:\tmp\status.json"),
+            ("VFL_SMOKE_STATUS", &status_path),
             ("VFL_SMOKE_FORMAT", "webm"),
             ("VFL_SMOKE_SIZE_LIMIT_MB", "12.5"),
             ("VFL_SMOKE_TRIM_START_S", "0.25"),
@@ -476,7 +513,7 @@ mod tests {
             Some(AppSmokeConfig {
                 input_path: r"C:\tmp\input.mp4".to_string(),
                 output_path: r"C:\tmp\output.webm".to_string(),
-                status_path: r"C:\tmp\status.json".to_string(),
+                status_path,
                 format: OutputFormat::Webm,
                 size_limit_mb: 12.5,
                 trim_start_s: 0.25,
@@ -493,11 +530,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_smoke_config_rejects_invalid_ranges() {
+    fn parse_smoke_config_rejects_status_path_outside_temp_dir() {
+        let non_temp_status = std::env::current_dir().unwrap().join("smoke-status.json");
+        let status_path = non_temp_status.to_string_lossy().to_string();
         let env = smoke_env(&[
             ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
             ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
-            ("VFL_SMOKE_STATUS", r"C:\tmp\status.json"),
+            ("VFL_SMOKE_STATUS", &status_path),
+        ]);
+        let err = parse_smoke_config_from_env(&env).unwrap_err();
+        assert!(err.contains("VFL_SMOKE_STATUS"));
+    }
+
+    #[test]
+    fn parse_smoke_config_rejects_invalid_ranges() {
+        let status_path = temp_smoke_status_path("ranges");
+        let env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
             ("VFL_SMOKE_TRIM_START_S", "2"),
             ("VFL_SMOKE_TRIM_END_S", "1"),
         ]);

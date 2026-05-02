@@ -80,7 +80,7 @@ npm run release:portable
 
 That command builds the portable folder, creates a versioned x64 zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted archive.
 
-Private release builds are handled by the `Portable Release` GitHub Actions workflow on manual dispatch or `v*.*.*` tags. It builds both x64 portable zips, generates release notes from the commits since the previous release tag, uploads the zips plus `SHA256SUMS.txt` to a GitHub Release, and defaults to a draft release for review. The workflow does not change repository visibility.
+Draft release builds are handled by the `Portable Release` GitHub Actions workflow on manual dispatch or `v*.*.*` tags. It builds both x64 portable zips, generates release notes from the commits since the previous release tag, uploads the zips plus `SHA256SUMS.txt` to a GitHub Release, and defaults to a draft release for review. The workflow does not change repository visibility.
 
 ## Usage Notes
 
@@ -88,6 +88,7 @@ Private release builds are handled by the `Portable Release` GitHub Actions work
 - Set size limit to `0`, or leave it empty, to disable size targeting.
 - Bundled Windows MP4 export uses H.264 when the staged FFmpeg sidecar exposes `libx264`.
 - If the active FFmpeg build does not expose `libx264`, MP4 export falls back to `mpeg4`.
+- Process media files you trust. Video For Lazies runs FFmpeg locally as your user, so hostile media exercises the active FFmpeg build.
 
 ## Tests
 
@@ -123,7 +124,7 @@ Windows portable builds bundle a pinned GPL FFmpeg runtime as a sidecar. Runtime
 2. bundled `ffmpeg-sidecar/` next to the app executable
 3. plain `ffmpeg` / `ffprobe` on `PATH`
 
-Bundle provenance, exact URLs, checksums, and corresponding source information are documented in [`docs/ffmpeg-bundling.md`](docs/ffmpeg-bundling.md). Third-party notices are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), and source availability notes are in [`SOURCE.md`](SOURCE.md).
+Bundle provenance, exact URLs, checksums, and corresponding source information are documented in [`docs/ffmpeg-bundling.md`](docs/ffmpeg-bundling.md). Third-party notices are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), and source availability notes are in [`SOURCE.md`](SOURCE.md). Portable builds copy generated release-specific versions of those notice files into each zip.
 
 ## Security
 

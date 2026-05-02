@@ -8,7 +8,7 @@ import {
   appRoot,
   getPortableOutputDir,
   getPortableReleaseParentDir,
-  windowsSourceArchiveName,
+  windowsSourceArchiveNames,
 } from "./ffmpegBundle.mjs";
 import { runPortableSmoke } from "./run-portable-smoke.mjs";
 import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
@@ -190,7 +190,7 @@ async function assertPortableLegalPayload(portableDir, { platform = process.plat
     const windowsRequiredFiles = [
       path.join("ffmpeg-sidecar", "LICENSE.txt"),
       path.join("ffmpeg-sidecar", "FFMPEG_BUNDLE_NOTICES.txt"),
-      path.join("ffmpeg-sidecar", "source", windowsSourceArchiveName),
+      ...windowsSourceArchiveNames.map((name) => path.join("ffmpeg-sidecar", "source", name)),
     ];
     for (const relativePath of windowsRequiredFiles) {
       await assertPortableFile(portableDir, relativePath);
