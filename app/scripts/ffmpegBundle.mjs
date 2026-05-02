@@ -10,11 +10,12 @@ export const tauriRoot = path.resolve(appRoot, "src-tauri");
 export const FFMPEG_BUNDLE = Object.freeze({
   windowsX64: {
     variant: "win64-gpl-shared",
-    assetName: "ffmpeg-n8.0-latest-win64-gpl-shared-8.0.zip",
-    assetSha256: "68de96f55cc76d4ce656fee1889fab5b694edb42d23383d3d37f867d85727fc0",
-    versionString: "n8.0.1-76-gfa4ee7ab3c-20260315",
-    sourceCommit: "fa4ee7ab3c1734795149f6dbc3746e834e859e8c",
-    sourceSha256: "b362a977a041c89494172007244e89b183b621a04af392cef90ae8a9609bdfac",
+    releaseTag: "autobuild-2026-05-02-13-12",
+    assetName: "ffmpeg-n8.1-11-g75d37c499d-win64-gpl-shared-8.1.zip",
+    assetSha256: "80a686ecdbb35a1d454ee25c0395dc728a5d280eda129dc7364b16a7474a92d1",
+    versionString: "n8.1-11-g75d37c499d-20260502",
+    sourceCommit: "75d37c499da2a9fd50e3ef5a69c7dd87cd96f62a",
+    sourceSha256: "6eeab8eb0491f8722575d0c2ee07bebc2687bb4e77bbfb89f37eceac42f3ed99",
   },
 });
 
@@ -28,7 +29,7 @@ export const windowsSourceDir = path.resolve(windowsSidecarDir, "source");
 export const tauriWindowsSidecarResourceSource = "../.ffmpeg-bundle/windows-x64/ffmpeg-sidecar";
 export const tauriWindowsSidecarResourceTarget = "ffmpeg-sidecar";
 
-export const windowsBundleAssetUrl = `https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${WINDOWS_X64_BUNDLE.assetName}`;
+export const windowsBundleAssetUrl = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${WINDOWS_X64_BUNDLE.releaseTag}/${WINDOWS_X64_BUNDLE.assetName}`;
 export const windowsBundleArchivePath = path.resolve(windowsDownloadsDir, WINDOWS_X64_BUNDLE.assetName);
 export const windowsBundleExpandedRootName = WINDOWS_X64_BUNDLE.assetName.replace(/\.zip$/i, "");
 export const windowsSourceArchiveName = `ffmpeg-${WINDOWS_X64_BUNDLE.sourceCommit}.tar.gz`;

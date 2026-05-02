@@ -23,7 +23,8 @@ test("tauri build hooks prepare the bundled ffmpeg sidecar", async () => {
   assert.match(json?.build?.beforeBuildCommand ?? "", /prepare:ffmpeg-sidecar/);
   assert.match(json?.build?.beforeDevCommand ?? "", /prepare:ffmpeg-sidecar/);
   assert.match(bundleRaw, /win64-gpl-shared/);
-  assert.match(bundleRaw, /ffmpeg-n8\.0-latest-win64-gpl-shared-8\.0\.zip/);
+  assert.match(bundleRaw, /autobuild-2026-05-02-13-12/);
+  assert.match(bundleRaw, /ffmpeg-n8\.1-11-g75d37c499d-win64-gpl-shared-8\.1\.zip/);
   assert.match(bundleRaw, /pinned GPL shared build/i);
   assert.match(syncRaw, /missing libx264/i);
 });

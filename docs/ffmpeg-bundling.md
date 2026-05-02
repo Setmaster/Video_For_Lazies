@@ -18,25 +18,26 @@ This app now bundles FFmpeg for Windows release builds so end users do not need 
 
 - Provider: BtbN FFmpeg Builds
 - Variant: `win64-gpl-shared`
+- BtbN release tag: `autobuild-2026-05-02-13-12`
 - Binary archive:
-  `https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.0-latest-win64-gpl-shared-8.0.zip`
+  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-05-02-13-12/ffmpeg-n8.1-11-g75d37c499d-win64-gpl-shared-8.1.zip`
 - Binary archive SHA256:
-  `68de96f55cc76d4ce656fee1889fab5b694edb42d23383d3d37f867d85727fc0`
+  `80a686ecdbb35a1d454ee25c0395dc728a5d280eda129dc7364b16a7474a92d1`
 - FFmpeg version string from the bundle:
-  `n8.0.1-76-gfa4ee7ab3c-20260315`
+  `n8.1-11-g75d37c499d-20260502`
 
 Note:
 
-- BtbN serves this archive through the repo's `releases/download/latest/...` route. The bundle sync intentionally verifies the pinned SHA256 so upstream refreshes fail loudly instead of silently changing the shipped runtime.
+- The bundle sync uses a specific BtbN release tag and verifies the pinned SHA256 so upstream changes fail loudly instead of silently changing the shipped runtime.
 
 ## Corresponding source snapshot
 
 - Upstream mirror:
   `https://github.com/FFmpeg/FFmpeg`
 - Exact source archive:
-  `https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/fa4ee7ab3c1734795149f6dbc3746e834e859e8c`
+  `https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/75d37c499da2a9fd50e3ef5a69c7dd87cd96f62a`
 - Source archive SHA256:
-  `b362a977a041c89494172007244e89b183b621a04af392cef90ae8a9609bdfac`
+  `6eeab8eb0491f8722575d0c2ee07bebc2687bb4e77bbfb89f37eceac42f3ed99`
 
 The staged Windows sidecar includes:
 
@@ -45,7 +46,7 @@ The staged Windows sidecar includes:
 - required shared FFmpeg DLLs from the pinned archive
 - upstream `LICENSE.txt`
 - `FFMPEG_BUNDLE_NOTICES.txt`
-- `source/ffmpeg-fa4ee7ab3c1734795149f6dbc3746e834e859e8c.tar.gz`
+- `source/ffmpeg-75d37c499da2a9fd50e3ef5a69c7dd87cd96f62a.tar.gz`
 
 ## Codec behavior
 
