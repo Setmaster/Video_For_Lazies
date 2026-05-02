@@ -80,8 +80,6 @@ npm run release:portable
 
 That command builds the portable folder, creates a versioned x64 zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted archive.
 
-If `7z.exe` is available on the Windows host, the release script also emits a `.7z` archive.
-
 Private release builds are handled by the `Portable Release` GitHub Actions workflow on manual dispatch or `v*.*.*` tags. It builds both x64 portable zips, generates release notes from the commits since the previous release tag, uploads the zips plus `SHA256SUMS.txt` to a GitHub Release, and defaults to a draft release for review. The workflow does not change repository visibility.
 
 ## Usage Notes

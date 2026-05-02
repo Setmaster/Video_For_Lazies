@@ -12,7 +12,7 @@ This app now bundles FFmpeg for Windows release builds so end users do not need 
 - `npm run tauri build` and `npm run portable` trigger that staging automatically through Tauri's `beforeBuildCommand`.
 - The portable release format is now a folder: `release/Video_For_Lazies/Video_For_Lazies.exe` plus `release/Video_For_Lazies/ffmpeg-sidecar/`.
 - The portable build now also runs a Windows startup smoke (`app/scripts/windows-portable-smoke.ps1`) after packaging. It launches the portable exe, captures the app window, and fails the build if the rendered surface is overwhelmingly bright/white, which catches regressions like the accidental dev-surface/localhost build.
-- `npm run release:portable` packages a versioned Windows zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted zip with startup plus packaged interaction/export smoke. That release smoke routes input through the shared drop logic, asserts crop-enabled playback before encode, verifies the output file from the extracted artifact, runs a second tight-target 1080p MP4 smoke, and fails if the shipped `ffmpeg-sidecar` is missing `libx264`. When `7z.exe` is available, it also emits a versioned `.7z` archive.
+- `npm run release:portable` packages a versioned Windows zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted zip with startup plus packaged interaction/export smoke. That release smoke routes input through the shared drop logic, asserts crop-enabled playback before encode, verifies the output file from the extracted artifact, runs a second tight-target 1080p MP4 smoke, and fails if the shipped `ffmpeg-sidecar` is missing `libx264`.
 
 ## Pinned Windows bundle
 

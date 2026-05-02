@@ -118,7 +118,7 @@ Windows artifact example:
 release/Video_For_Lazies-v0.1.0-win-x64.zip
 ```
 
-If `7z.exe` is available on the Windows host, the local script also creates a versioned `.7z` archive. The GitHub Actions release workflow uploads the final `.zip` artifacts and combined checksum file.
+GitHub release assets are intentionally zip-only for now: the Linux zip, the Windows zip, and the combined checksum file.
 
 ## Workflow Linting
 

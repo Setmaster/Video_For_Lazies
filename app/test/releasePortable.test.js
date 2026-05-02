@@ -10,7 +10,6 @@ import {
   getPortableExecutableName,
   getPortableTargetLabel,
   getPortableChecksumPath,
-  getPortableSevenZipPath,
   getPortableZipPath,
 } from "../scripts/portableRelease.mjs";
 
@@ -20,7 +19,6 @@ test("portable release artifact names are stable and versioned for Windows x64",
   assert.equal(getPortableExecutableName(options), "Video_For_Lazies.exe");
   assert.equal(getPortableArchiveBaseName(options), "Video_For_Lazies-v0.1.0-win-x64");
   assert.match(getPortableZipPath(options), /Video_For_Lazies-v0\.1\.0-win-x64\.zip$/);
-  assert.match(getPortableSevenZipPath(options), /Video_For_Lazies-v0\.1\.0-win-x64\.7z$/);
   assert.match(getPortableChecksumPath(), /SHA256SUMS\.txt$/);
 });
 
@@ -42,16 +40,16 @@ test("portable release helpers reject unsupported archive targets", () => {
 test("buildChecksumLines emits sorted sha256 entries", async () => {
   const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-release-checksum-test-"));
   try {
-    const zPath = path.resolve(tempRoot, "b.zip");
-    const sevenZipPath = path.resolve(tempRoot, "a.7z");
-    await fs.writeFile(zPath, "zip-bytes");
-    await fs.writeFile(sevenZipPath, "7z-bytes");
+    const firstZipPath = path.resolve(tempRoot, "b.zip");
+    const secondZipPath = path.resolve(tempRoot, "a.zip");
+    await fs.writeFile(firstZipPath, "zip-b-bytes");
+    await fs.writeFile(secondZipPath, "zip-a-bytes");
 
-    const lines = await buildChecksumLines([zPath, sevenZipPath]);
+    const lines = await buildChecksumLines([firstZipPath, secondZipPath]);
     const entries = lines.trim().split("\n");
 
     assert.equal(entries.length, 2);
-    assert.match(entries[0], /\s+a\.7z$/);
+    assert.match(entries[0], /\s+a\.zip$/);
     assert.match(entries[1], /\s+b\.zip$/);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });

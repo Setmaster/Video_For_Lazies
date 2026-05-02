@@ -42,10 +42,6 @@ export function getPortableZipPath(options) {
   return path.resolve(getPortableReleaseParentDir(), `${getPortableArchiveBaseName(options)}.zip`);
 }
 
-export function getPortableSevenZipPath(options) {
-  return path.resolve(getPortableReleaseParentDir(), `${getPortableArchiveBaseName(options)}.7z`);
-}
-
 export function getPortableChecksumPath() {
   return path.resolve(getPortableReleaseParentDir(), "SHA256SUMS.txt");
 }

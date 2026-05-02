@@ -16,7 +16,6 @@ import {
   buildChecksumLines,
   getPortableChecksumPath,
   getPortableExecutableName,
-  getPortableSevenZipPath,
   getPortableTargetLabel,
   getPortableZipPath,
 } from "./portableRelease.mjs";
@@ -89,22 +88,6 @@ function sleep(ms) {
   });
 }
 
-async function findSevenZip() {
-  if (process.platform !== "win32") {
-    return null;
-  }
-
-  try {
-    const output = await captureStdout("where.exe", ["7z.exe"]);
-    return output
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean) ?? null;
-  } catch {
-    return null;
-  }
-}
-
 async function createZipArchive(portableDir, zipPath) {
   let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -148,17 +131,6 @@ async function extractZipArchive(zipPath, extractRoot) {
 
   await fs.mkdir(extractRoot, { recursive: true });
   await runChecked("unzip", ["-q", zipPath, "-d", extractRoot]);
-}
-
-async function createSevenZipArchive(sevenZipExe, portableDir, archivePath) {
-  await fs.rm(archivePath, { force: true });
-  await runChecked(sevenZipExe, ["a", "-t7z", archivePath, portableDir]);
-}
-
-async function extractSevenZipArchive(sevenZipExe, archivePath, extractRoot) {
-  await fs.rm(extractRoot, { recursive: true, force: true });
-  await fs.mkdir(extractRoot, { recursive: true });
-  await runChecked(sevenZipExe, ["x", archivePath, `-o${extractRoot}`, "-y"]);
 }
 
 async function locateExtractedPortableDir(extractRoot, { platform = process.platform } = {}) {
@@ -275,22 +247,9 @@ async function main() {
 
   const zipPath = getPortableZipPath({ version });
   const checksumPath = getPortableChecksumPath();
-  const archives = [];
 
   await createZipArchive(portableDir, zipPath);
-  archives.push(zipPath);
-
-  const sevenZipExe = await findSevenZip();
-  const sevenZipPath = process.platform === "win32" ? getPortableSevenZipPath({ version }) : null;
-  if (sevenZipExe && sevenZipPath) {
-    await createSevenZipArchive(sevenZipExe, portableDir, sevenZipPath);
-    archives.push(sevenZipPath);
-  } else if (sevenZipPath) {
-    console.log("Skipping .7z artifact because 7z.exe is not available.");
-    await fs.rm(sevenZipPath, { force: true });
-  }
-
-  await fs.writeFile(checksumPath, await buildChecksumLines(archives));
+  await fs.writeFile(checksumPath, await buildChecksumLines([zipPath]));
 
   const extractRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-portable-release-"));
   let keepExtractRoot = false;
@@ -299,12 +258,6 @@ async function main() {
     const zipExtractRoot = path.resolve(extractRoot, "zip");
     await extractZipArchive(zipPath, zipExtractRoot);
     await verifyPortableArtifact(await locateExtractedPortableDir(zipExtractRoot), "zip");
-
-    if (sevenZipExe && sevenZipPath && await exists(sevenZipPath)) {
-      const sevenZipExtractRoot = path.resolve(extractRoot, "7z");
-      await extractSevenZipArchive(sevenZipExe, sevenZipPath, sevenZipExtractRoot);
-      await verifyPortableArtifact(await locateExtractedPortableDir(sevenZipExtractRoot), "7z");
-    }
   } catch (error) {
     keepExtractRoot = true;
     console.error(`Portable release verification artifacts kept at: ${extractRoot}`);
@@ -316,9 +269,7 @@ async function main() {
   }
 
   console.log(`Portable ${targetLabel} release artifacts ready:`);
-  for (const archivePath of archives) {
-    console.log(`- ${archivePath}`);
-  }
+  console.log(`- ${zipPath}`);
   console.log(`- ${checksumPath}`);
   console.log(`Release directory: ${getPortableReleaseParentDir()}`);
 }
