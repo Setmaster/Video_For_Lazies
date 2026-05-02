@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible problem in Video For Lazies.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach private videos or files that contain sensitive information.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Use the release version, commit, or "main".
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows portable build
+        - Windows development build
+        - Linux development build
+        - macOS development build
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include input format, selected settings, and what command or button you used.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Click ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Include visible errors. Redact paths, usernames, and filenames if needed.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Optional. Redact private paths and filenames.
+      render: shell

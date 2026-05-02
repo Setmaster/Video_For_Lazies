@@ -1,0 +1,34 @@
+{
+  "name": "video-for-lazies",
+  "private": true,
+  "version": "0.1.0",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "prepare:ffmpeg-sidecar": "node scripts/run-sync-ffmpeg-sidecar.mjs",
+    "smoke:portable": "node scripts/run-portable-smoke.mjs",
+    "smoke:portable:export": "node scripts/run-portable-export-smoke.mjs",
+    "release:portable": "node scripts/run-release-portable.mjs",
+    "test": "node --test",
+    "preview": "vite preview",
+    "portable": "tauri build --no-bundle && node scripts/make-portable.mjs && npm run smoke:portable",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}

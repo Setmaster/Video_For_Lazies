@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=1024, initial-scale=1">
+    <title>Video For Lazies App Icon</title>
+    <style>
+      html,
+      body {
+        width: 1024px;
+        height: 1024px;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      body {
+        display: grid;
+        place-items: center;
+      }
+
+      svg {
+        display: block;
+        width: 1024px;
+        height: 1024px;
+      }
+    </style>
+  </head>
+  <body>
+    <svg viewBox="0 0 1024 1024" role="img" aria-label="Video For Lazies icon" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="tile" x1="166" y1="130" x2="850" y2="900" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#17263A"/>
+          <stop offset="0.58" stop-color="#0B1420"/>
+          <stop offset="1" stop-color="#071019"/>
+        </linearGradient>
+        <linearGradient id="cyanTeal" x1="240" y1="252" x2="787" y2="743" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#68B8FF"/>
+          <stop offset="1" stop-color="#32D4B7"/>
+        </linearGradient>
+        <linearGradient id="timeline" x1="282" y1="712" x2="760" y2="712" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#35D3B4"/>
+          <stop offset="0.68" stop-color="#5CC8FF"/>
+          <stop offset="1" stop-color="#FFC46B"/>
+        </linearGradient>
+        <filter id="shadow" x="-20%" y="-18%" width="140%" height="140%" color-interpolation-filters="sRGB">
+          <feDropShadow dx="0" dy="34" stdDeviation="38" flood-color="#000000" flood-opacity="0.42"/>
+        </filter>
+        <filter id="glow" x="-35%" y="-35%" width="170%" height="170%" color-interpolation-filters="sRGB">
+          <feGaussianBlur stdDeviation="10" result="blur"/>
+          <feMerge>
+            <feMergeNode in="blur"/>
+            <feMergeNode in="SourceGraphic"/>
+          </feMerge>
+        </filter>
+      </defs>
+
+      <rect x="72" y="72" width="880" height="880" rx="206" fill="url(#tile)" filter="url(#shadow)"/>
+      <rect x="91" y="91" width="842" height="842" rx="188" fill="none" stroke="#EDF4FF" stroke-opacity="0.09" stroke-width="18"/>
+
+      <circle cx="248" cy="230" r="210" fill="#65B7FF" opacity="0.12"/>
+      <circle cx="820" cy="810" r="250" fill="#35D3B4" opacity="0.09"/>
+
+      <rect x="230" y="268" width="564" height="350" rx="54" fill="#091522" stroke="#21334B" stroke-width="18"/>
+      <rect x="282" y="320" width="460" height="246" rx="28" fill="#111D2B" stroke="url(#cyanTeal)" stroke-width="28"/>
+
+      <path d="M281 396H742" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
+      <path d="M281 488H742" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
+      <path d="M435 320V566" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
+      <path d="M589 320V566" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
+
+      <path d="M286 290H404" stroke="#FFC46B" stroke-width="38" stroke-linecap="round"/>
+      <path d="M286 290V408" stroke="#FFC46B" stroke-width="38" stroke-linecap="round"/>
+      <path d="M738 596H620" stroke="#35D3B4" stroke-width="38" stroke-linecap="round"/>
+      <path d="M738 596V478" stroke="#35D3B4" stroke-width="38" stroke-linecap="round"/>
+
+      <circle cx="512" cy="443" r="86" fill="#EDF4FF" fill-opacity="0.12" stroke="#EDF4FF" stroke-opacity="0.2" stroke-width="7"/>
+      <path d="M487 394L570 443L487 492V394Z" fill="#FFFFFF"/>
+
+      <rect x="218" y="696" width="588" height="54" rx="27" fill="#EDF4FF" fill-opacity="0.12"/>
+      <rect x="304" y="708" width="388" height="30" rx="15" fill="url(#timeline)" filter="url(#glow)"/>
+      <rect x="296" y="668" width="52" height="108" rx="24" fill="#DFF0FF"/>
+      <rect x="668" y="668" width="52" height="108" rx="24" fill="#DFF0FF"/>
+
+      <circle cx="796" cy="250" r="33" fill="#FFC46B"/>
+      <circle cx="796" cy="250" r="15" fill="#071019" fill-opacity="0.9"/>
+    </svg>
+  </body>
+</html>

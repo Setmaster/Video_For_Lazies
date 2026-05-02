@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=1600, initial-scale=1">
+    <title>Video For Lazies README Banner</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+        background: #071019;
+        color: #edf4ff;
+        --ink: #edf4ff;
+        --muted: rgba(237, 244, 255, 0.64);
+        --faint: rgba(237, 244, 255, 0.36);
+        --panel: rgba(13, 22, 34, 0.86);
+        --panel-strong: rgba(17, 29, 43, 0.92);
+        --line: rgba(237, 244, 255, 0.12);
+        --line-strong: rgba(237, 244, 255, 0.2);
+        --cyan: #65b7ff;
+        --teal: #35d3b4;
+        --rose: #ff6b8a;
+        --amber: #ffc46b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 1600px;
+        height: 640px;
+        margin: 0;
+        overflow: hidden;
+        background: #071019;
+      }
+
+      body {
+        display: grid;
+        place-items: center;
+      }
+
+      .banner {
+        position: relative;
+        width: 1600px;
+        height: 640px;
+        overflow: hidden;
+        background:
+          linear-gradient(128deg, rgba(101, 183, 255, 0.13), transparent 36%),
+          linear-gradient(28deg, rgba(53, 211, 180, 0.12), transparent 42%),
+          linear-gradient(180deg, #0d1724 0%, #071019 100%);
+      }
+
+      .banner::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+        background-size: 80px 80px;
+        mask-image: linear-gradient(90deg, rgba(0, 0, 0, 0.48), rgba(0, 0, 0, 0.12));
+        pointer-events: none;
+      }
+
+      .banner::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(90deg, rgba(7, 16, 25, 0.08), transparent 18%, transparent 78%, rgba(7, 16, 25, 0.18)),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 18%, rgba(0, 0, 0, 0.24));
+        pointer-events: none;
+      }
+
+      .layout {
+        position: relative;
+        z-index: 1;
+        height: 100%;
+        display: grid;
+        grid-template-columns: 470px 1fr;
+        gap: 40px;
+        align-items: center;
+        padding: 54px 64px;
+      }
+
+      .brand {
+        display: flex;
+        flex-direction: column;
+        gap: 30px;
+      }
+
+      .mark-row {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+      }
+
+      .mark {
+        width: 76px;
+        height: 76px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        background: rgba(255, 255, 255, 0.06);
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
+      }
+
+      .eyebrow {
+        margin: 0 0 8px;
+        color: var(--muted);
+        font-size: 18px;
+        font-weight: 600;
+      }
+
+      h1 {
+        margin: 0;
+        color: #ffffff;
+        font-size: 66px;
+        line-height: 0.98;
+        font-weight: 760;
+        letter-spacing: 0;
+      }
+
+      .tagline {
+        margin: 0;
+        max-width: 390px;
+        color: rgba(237, 244, 255, 0.74);
+        font-size: 24px;
+        line-height: 1.36;
+        font-weight: 500;
+      }
+
+      .pills {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        max-width: 430px;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
+        padding: 7px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.055);
+        color: rgba(237, 244, 255, 0.74);
+        font-size: 15px;
+        font-weight: 600;
+      }
+
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      .dot.cyan {
+        color: var(--cyan);
+      }
+
+      .dot.teal {
+        color: var(--teal);
+      }
+
+      .dot.amber {
+        color: var(--amber);
+      }
+
+      .window {
+        position: relative;
+        justify-self: end;
+        width: 968px;
+        height: 512px;
+        border: 1px solid rgba(237, 244, 255, 0.16);
+        border-radius: 8px;
+        background: rgba(9, 15, 24, 0.9);
+        box-shadow:
+          0 34px 90px rgba(0, 0, 0, 0.42),
+          inset 0 1px 0 rgba(255, 255, 255, 0.06);
+        overflow: hidden;
+      }
+
+      .window-top {
+        height: 54px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.035);
+      }
+
+      .traffic {
+        display: flex;
+        gap: 8px;
+      }
+
+      .traffic span {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.22);
+      }
+
+      .traffic span:nth-child(1) {
+        background: var(--rose);
+      }
+
+      .traffic span:nth-child(2) {
+        background: var(--amber);
+      }
+
+      .traffic span:nth-child(3) {
+        background: var(--teal);
+      }
+
+      .window-title {
+        flex: 1;
+        min-width: 0;
+        color: rgba(237, 244, 255, 0.68);
+        font-size: 15px;
+        font-weight: 600;
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: rgba(237, 244, 255, 0.7);
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      .status-light {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--teal);
+        box-shadow: 0 0 20px rgba(53, 211, 180, 0.75);
+      }
+
+      .app {
+        display: grid;
+        grid-template-columns: 1fr 260px;
+        gap: 16px;
+        height: calc(100% - 54px);
+        padding: 18px;
+      }
+
+      .main-pane,
+      .side-pane,
+      .preview,
+      .control-strip,
+      .field,
+      .export-bar {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+
+      .main-pane {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        gap: 14px;
+        padding: 14px;
+      }
+
+      .tabs {
+        display: flex;
+        width: fit-content;
+        padding: 4px;
+        gap: 4px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.045);
+      }
+
+      .tab {
+        padding: 8px 16px;
+        border-radius: 6px;
+        color: var(--faint);
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .tab.active {
+        background: rgba(101, 183, 255, 0.16);
+        color: #dff0ff;
+        box-shadow: inset 0 0 0 1px rgba(101, 183, 255, 0.22);
+      }
+
+      .preview {
+        position: relative;
+        overflow: hidden;
+        min-height: 250px;
+        background:
+          linear-gradient(135deg, rgba(101, 183, 255, 0.18), transparent 44%),
+          linear-gradient(35deg, rgba(255, 107, 138, 0.1), transparent 38%),
+          #0a121e;
+      }
+
+      .preview::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(90deg, rgba(255, 255, 255, 0.055) 1px, transparent 1px),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+        background-size: 56px 56px;
+        opacity: 0.5;
+      }
+
+      .frame {
+        position: absolute;
+        left: 116px;
+        top: 48px;
+        width: 420px;
+        height: 188px;
+        border: 2px solid rgba(101, 183, 255, 0.72);
+        border-radius: 8px;
+        background:
+          linear-gradient(130deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.02)),
+          rgba(8, 15, 26, 0.62);
+        box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.16);
+      }
+
+      .frame::before,
+      .frame::after {
+        content: "";
+        position: absolute;
+        inset: 33.33% 0 auto;
+        height: 1px;
+        background: rgba(237, 244, 255, 0.26);
+      }
+
+      .frame::after {
+        inset: auto 0 33.33%;
+      }
+
+      .frame-grid {
+        position: absolute;
+        inset: 0;
+        border-radius: 7px;
+        background:
+          linear-gradient(90deg, transparent 33.2%, rgba(237, 244, 255, 0.26) 33.2%, rgba(237, 244, 255, 0.26) 33.6%, transparent 33.6%, transparent 66.4%, rgba(237, 244, 255, 0.26) 66.4%, rgba(237, 244, 255, 0.26) 66.8%, transparent 66.8%);
+      }
+
+      .play {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 64px;
+        height: 64px;
+        border-radius: 50%;
+        transform: translate(-50%, -50%);
+        background: rgba(237, 244, 255, 0.12);
+        border: 1px solid rgba(237, 244, 255, 0.24);
+      }
+
+      .play::before {
+        content: "";
+        position: absolute;
+        left: 26px;
+        top: 19px;
+        border-left: 18px solid #ffffff;
+        border-top: 12px solid transparent;
+        border-bottom: 12px solid transparent;
+      }
+
+      .timeline {
+        position: absolute;
+        left: 66px;
+        right: 66px;
+        bottom: 28px;
+        height: 8px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.11);
+      }
+
+      .selection {
+        position: absolute;
+        left: 18%;
+        right: 21%;
+        top: 0;
+        bottom: 0;
+        border-radius: 999px;
+        background: linear-gradient(90deg, var(--teal), var(--cyan));
+      }
+
+      .handle {
+        position: absolute;
+        top: 50%;
+        width: 18px;
+        height: 28px;
+        border-radius: 6px;
+        transform: translate(-50%, -50%);
+        background: #dff0ff;
+        box-shadow: 0 10px 22px rgba(0, 0, 0, 0.28);
+      }
+
+      .handle.start {
+        left: 18%;
+      }
+
+      .handle.end {
+        left: 79%;
+      }
+
+      .control-strip {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 12px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .field {
+        min-height: 70px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .label {
+        margin-bottom: 9px;
+        color: var(--faint);
+        font-size: 12px;
+        font-weight: 760;
+      }
+
+      .value {
+        color: rgba(237, 244, 255, 0.85);
+        font-size: 18px;
+        font-weight: 740;
+      }
+
+      .mini-line {
+        width: 100%;
+        height: 7px;
+        margin-top: 11px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.11);
+        overflow: hidden;
+      }
+
+      .mini-line span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--teal), var(--cyan));
+      }
+
+      .side-pane {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        gap: 14px;
+        padding: 14px;
+        background: var(--panel-strong);
+      }
+
+      .side-title {
+        display: grid;
+        gap: 5px;
+      }
+
+      .side-title strong {
+        color: #ffffff;
+        font-size: 18px;
+      }
+
+      .side-title span {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .stack {
+        display: grid;
+        gap: 10px;
+        align-content: start;
+      }
+
+      .metric {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 11px 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+        color: rgba(237, 244, 255, 0.8);
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      .metric span:first-child {
+        color: var(--faint);
+      }
+
+      .export-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 58px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .progress {
+        flex: 1;
+        height: 9px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.11);
+        overflow: hidden;
+      }
+
+      .progress span {
+        display: block;
+        width: 68%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--teal), var(--cyan), var(--amber));
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 92px;
+        height: 34px;
+        border-radius: 7px;
+        border: 1px solid rgba(101, 183, 255, 0.42);
+        background: rgba(101, 183, 255, 0.16);
+        color: #dff0ff;
+        font-size: 14px;
+        font-weight: 780;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="banner" aria-label="Video For Lazies README banner">
+      <section class="layout">
+        <div class="brand">
+          <div class="mark-row">
+            <img class="mark" src="../../app/public/icon.png" alt="">
+            <div>
+              <p class="eyebrow">Desktop video workflow</p>
+              <h1>Video<br>For Lazies</h1>
+            </div>
+          </div>
+          <p class="tagline">A focused Tauri app for trimming, cropping, compressing, and exporting video with FFmpeg.</p>
+          <div class="pills" aria-hidden="true">
+            <span class="pill"><span class="dot cyan"></span>Trim</span>
+            <span class="pill"><span class="dot teal"></span>Crop</span>
+            <span class="pill"><span class="dot amber"></span>Compress</span>
+          </div>
+        </div>
+
+        <div class="window" aria-hidden="true">
+          <div class="window-top">
+            <div class="traffic"><span></span><span></span><span></span></div>
+            <div class="window-title">Video For Lazies</div>
+            <div class="status"><span class="status-light"></span>Ready</div>
+          </div>
+
+          <div class="app">
+            <section class="main-pane">
+              <div class="tabs">
+                <span class="tab active">Composing</span>
+                <span class="tab">General</span>
+              </div>
+
+              <div class="preview">
+                <div class="frame">
+                  <div class="frame-grid"></div>
+                  <div class="play"></div>
+                </div>
+                <div class="timeline">
+                  <div class="selection"></div>
+                  <span class="handle start"></span>
+                  <span class="handle end"></span>
+                </div>
+              </div>
+
+              <div class="control-strip">
+                <div class="field">
+                  <div class="label">Start</div>
+                  <div class="value">00:12</div>
+                  <div class="mini-line"><span style="width: 24%"></span></div>
+                </div>
+                <div class="field">
+                  <div class="label">Crop</div>
+                  <div class="value">16:9</div>
+                  <div class="mini-line"><span style="width: 62%"></span></div>
+                </div>
+                <div class="field">
+                  <div class="label">Speed</div>
+                  <div class="value">1.00x</div>
+                  <div class="mini-line"><span style="width: 50%"></span></div>
+                </div>
+              </div>
+            </section>
+
+            <aside class="side-pane">
+              <div class="side-title">
+                <strong>Current plan</strong>
+                <span>mp4 export with H.264 sidecar</span>
+              </div>
+              <div class="stack">
+                <div class="metric"><span>Format</span><strong>MP4</strong></div>
+                <div class="metric"><span>Size</span><strong>No limit</strong></div>
+                <div class="metric"><span>Audio</span><strong>On</strong></div>
+                <div class="metric"><span>Max edge</span><strong>1080</strong></div>
+              </div>
+              <div class="export-bar">
+                <div class="progress"><span></span></div>
+                <div class="button">Export</div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
