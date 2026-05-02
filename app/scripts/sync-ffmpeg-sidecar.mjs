@@ -57,7 +57,9 @@ async function sha256File(filePath) {
 async function downloadFile(url, destinationPath) {
   const response = await fetch(url);
   if (!response.ok || !response.body) {
-    throw new Error(`Download failed (${response.status}) for ${url}`);
+    await response.body?.cancel();
+    await downloadFileWithCurl(url, destinationPath);
+    return;
   }
 
   await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
@@ -65,6 +67,42 @@ async function downloadFile(url, destinationPath) {
   const tempPath = `${destinationPath}.partial`;
   const fileStream = fs.createWriteStream(tempPath);
   await pipeline(Readable.fromWeb(response.body), fileStream);
+  await fsp.rename(tempPath, destinationPath);
+}
+
+async function downloadFileWithCurl(url, destinationPath) {
+  await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
+  const tempPath = `${destinationPath}.partial`;
+  await fsp.rm(tempPath, { force: true });
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(
+      "curl",
+      [
+        "--location",
+        "--fail",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--user-agent",
+        "Video-For-Lazies-release-builder",
+        "--output",
+        tempPath,
+        url,
+      ],
+      { stdio: "inherit" },
+    );
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`curl exited with code ${code} while downloading ${url}`));
+    });
+  });
+
   await fsp.rename(tempPath, destinationPath);
 }
 

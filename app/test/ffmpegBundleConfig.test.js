@@ -31,6 +31,7 @@ test("tauri build hooks prepare the bundled ffmpeg sidecar", async () => {
   assert.match(bundleRaw, /windowsSourceArchiveNames/);
   assert.match(syncRaw, /windowsBuildScriptsArchivePath/);
   assert.match(syncRaw, /windowsX264SourceArchivePath/);
+  assert.match(syncRaw, /downloadFileWithCurl/);
   assert.match(syncRaw, /missing libx264/i);
 });
 
