@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   assertSynchronizedVersion,
   normalizeVersionInput,
+  parseCargoLockPackageVersion,
   readProjectVersions,
 } from "../scripts/versioning.mjs";
 
@@ -33,4 +34,16 @@ test("version metadata exposes the expected locations", async () => {
     "app/src-tauri/Cargo.toml",
     "app/src-tauri/Cargo.lock",
   ]);
+});
+
+test("Cargo.lock version parsing accepts CRLF line endings", () => {
+  const raw = [
+    "[[package]]",
+    "name = \"video_for_lazies\"",
+    "version = \"0.1.0\"",
+    "dependencies = []",
+    "",
+  ].join("\r\n");
+
+  assert.equal(parseCargoLockPackageVersion(raw, "video_for_lazies"), "0.1.0");
 });

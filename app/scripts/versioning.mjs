@@ -28,9 +28,9 @@ function parseCargoPackageVersion(raw, fileLabel) {
   return match[1];
 }
 
-function parseCargoLockPackageVersion(raw, packageName) {
+export function parseCargoLockPackageVersion(raw, packageName) {
   const blockPattern = new RegExp(
-    `\\[\\[package\\]\\]\\nname = "${packageName}"\\nversion = "([^"]+)"`,
+    `\\[\\[package\\]\\]\\r?\\nname = "${packageName}"\\r?\\nversion = "([^"]+)"`,
     "m",
   );
   const match = raw.match(blockPattern);
@@ -53,7 +53,7 @@ function replaceCargoPackageVersion(raw, version, fileLabel) {
 
 function replaceCargoLockPackageVersion(raw, packageName, version) {
   const blockPattern = new RegExp(
-    `(\\[\\[package\\]\\]\\nname = "${packageName}"\\nversion = ")[^"]+(")`,
+    `(\\[\\[package\\]\\]\\r?\\nname = "${packageName}"\\r?\\nversion = ")[^"]+(")`,
     "m",
   );
   const replaced = raw.replace(blockPattern, `$1${version}$2`);
