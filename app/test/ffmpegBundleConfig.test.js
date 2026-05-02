@@ -135,6 +135,8 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(releaseRaw, /missing libx264/);
   assert.match(releaseRaw, /getFfmpegSourceArchiveNames/);
   assert.match(appRaw, /smokeStatusWriteRef/);
+  assert.match(appRaw, /smokeStageHistoryRef/);
+  assert.match(appRaw, /stageHistory: smokeStageHistoryRef\.current/);
   assert.match(appRaw, /trimStartS: extra\.trimStartS \?\? null/);
   assert.match(appRaw, /expectedDurationS: extra\.expectedDurationS \?\? null/);
   assert.match(releaseRaw, /timeoutSeconds:\s*300/);

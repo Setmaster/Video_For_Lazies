@@ -202,7 +202,11 @@ fn read_smoke_status_file(path: &Path) -> Option<AppSmokeStatus> {
     serde_json::from_slice::<AppSmokeStatus>(&raw).ok()
 }
 
-fn merge_smoke_stage_history(existing: Option<&AppSmokeStatus>, next_stage: &str) -> Vec<String> {
+fn merge_smoke_stage_history(
+    existing: Option<&AppSmokeStatus>,
+    incoming_history: &[String],
+    next_stage: &str,
+) -> Vec<String> {
     let mut history = existing
         .map(|status| status.stage_history.clone())
         .unwrap_or_default();
@@ -213,6 +217,12 @@ fn merge_smoke_stage_history(existing: Option<&AppSmokeStatus>, next_stage: &str
             .filter(|stage| !stage.is_empty())
     {
         history.push(previous_stage.to_string());
+    }
+
+    for stage in incoming_history {
+        if !history.iter().any(|existing_stage| existing_stage == stage) {
+            history.push(stage.clone());
+        }
     }
 
     if !history.iter().any(|stage| stage == next_stage) {
@@ -319,8 +329,11 @@ fn write_smoke_status(status: AppSmokeStatus) -> Result<(), String> {
     let existing_status = read_smoke_status_file(status_path);
     let mut next_status = status;
     merge_smoke_optional_fields(existing_status.as_ref(), &mut next_status);
-    next_status.stage_history =
-        merge_smoke_stage_history(existing_status.as_ref(), &next_status.stage);
+    next_status.stage_history = merge_smoke_stage_history(
+        existing_status.as_ref(),
+        &next_status.stage_history,
+        &next_status.stage,
+    );
 
     write_smoke_status_file(status_path, &next_status)
 }
@@ -559,7 +572,7 @@ mod tests {
     #[test]
     fn merge_smoke_stage_history_starts_with_current_stage() {
         assert_eq!(
-            merge_smoke_stage_history(None, "detected"),
+            merge_smoke_stage_history(None, &[], "detected"),
             vec!["detected".to_string()]
         );
     }
@@ -584,7 +597,7 @@ mod tests {
         };
 
         assert_eq!(
-            merge_smoke_stage_history(Some(&existing), "interaction-ready"),
+            merge_smoke_stage_history(Some(&existing), &[], "interaction-ready"),
             vec![
                 "detected".to_string(),
                 "input-applied".to_string(),
@@ -610,8 +623,42 @@ mod tests {
         };
 
         assert_eq!(
-            merge_smoke_stage_history(Some(&existing), "encoding"),
+            merge_smoke_stage_history(Some(&existing), &[], "encoding"),
             vec!["preview-ready".to_string(), "encoding".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_smoke_stage_history_preserves_incoming_frontend_history() {
+        let existing = AppSmokeStatus {
+            stage: "input-applied".to_string(),
+            ok: None,
+            message: None,
+            output_path: None,
+            output_size_bytes: None,
+            trim_start_s: None,
+            trim_end_s: None,
+            expected_duration_s: None,
+            stage_history: vec!["detected".to_string(), "input-applied".to_string()],
+        };
+
+        assert_eq!(
+            merge_smoke_stage_history(
+                Some(&existing),
+                &[
+                    "detected".to_string(),
+                    "input-applied".to_string(),
+                    "probe-ready".to_string(),
+                    "preview-ready".to_string(),
+                ],
+                "preview-ready",
+            ),
+            vec![
+                "detected".to_string(),
+                "input-applied".to_string(),
+                "probe-ready".to_string(),
+                "preview-ready".to_string(),
+            ]
         );
     }
 

@@ -195,6 +195,7 @@ function App() {
   const trimDragCleanupRef = useRef<(() => void) | null>(null);
   const smokeConfigRef = useRef<AppSmokeConfig | null>(null);
   const smokeStageRef = useRef<string | null>(null);
+  const smokeStageHistoryRef = useRef<string[]>([]);
   const smokeStatusWriteRef = useRef<Promise<void>>(Promise.resolve());
   const smokeAppliedRef = useRef(false);
   const smokeStartRef = useRef(false);
@@ -223,6 +224,9 @@ function App() {
     if (stage !== SMOKE_SUCCESS_STAGE && stage !== SMOKE_ERROR_STAGE && nextRank >= 0 && currentRank >= nextRank) return;
 
     smokeStageRef.current = stage;
+    if (!smokeStageHistoryRef.current.includes(stage)) {
+      smokeStageHistoryRef.current = [...smokeStageHistoryRef.current, stage];
+    }
     smokeStatusWriteRef.current = smokeStatusWriteRef.current.then(async () => {
       try {
         await invoke("write_smoke_status", {
@@ -235,6 +239,7 @@ function App() {
             trimStartS: extra.trimStartS ?? null,
             trimEndS: extra.trimEndS ?? null,
             expectedDurationS: extra.expectedDurationS ?? null,
+            stageHistory: smokeStageHistoryRef.current,
           },
         });
       } catch (error) {
@@ -392,6 +397,7 @@ function App() {
         if (stop || !config) return;
 
         smokeStageRef.current = null;
+        smokeStageHistoryRef.current = [];
         smokeStatusWriteRef.current = Promise.resolve();
         smokeAppliedRef.current = false;
         smokeStartRef.current = false;
