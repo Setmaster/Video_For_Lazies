@@ -1,10 +1,10 @@
 param(
   [Parameter(Mandatory = $true)][string]$PortableDir,
   [string]$ScreenshotPath,
-  [int]$StartupTimeoutSeconds = 20,
+  [int]$StartupTimeoutSeconds = 30,
   [int]$InitialDelaySeconds = 5,
-  [int]$RetryDelaySeconds = 3,
-  [int]$MaxAttempts = 3,
+  [int]$RetryDelaySeconds = 4,
+  [int]$MaxAttempts = 8,
   [double]$MaxAverageLuminance = 120,
   [double]$MaxBrightRatio = 0.10,
   [double]$MinDarkRatio = 0.35
