@@ -95,8 +95,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(node scripts/check-version.mjs --value "$REQUESTED_VERSION")"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "short_sha=${GITHUB_SHA::7}"
+          } >> "$GITHUB_OUTPUT"
         working-directory: app
 
       - name: Audit npm dependencies
@@ -155,9 +157,11 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(node scripts/check-version.mjs --value "$REQUESTED_VERSION")"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "target_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "tag=v$VERSION"
+            echo "target_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
         working-directory: app
 
       - name: Download portable artifacts
