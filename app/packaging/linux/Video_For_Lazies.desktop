@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Video For Lazies
+Comment=Focused FFmpeg video export tool
+Exec=sh -c "cd \"\\$(dirname \"\\$1\")\" && exec ./video_for_lazies" sh %k
+Icon=Video_For_Lazies
+Terminal=false
+Categories=AudioVideo;Video;

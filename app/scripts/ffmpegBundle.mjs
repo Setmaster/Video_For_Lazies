@@ -58,6 +58,8 @@ export const currentSidecarDir = path.resolve(currentBundleRoot, ffmpegSidecarRe
 
 export const tauriSidecarResourceSource = `../.ffmpeg-bundle/${CURRENT_SIDECAR_ROOT}/${ffmpegSidecarResourceTarget}`;
 export const tauriSidecarResourceTarget = ffmpegSidecarResourceTarget;
+export const portableLinuxDesktopFileName = "Video_For_Lazies.desktop";
+export const portableLinuxIconFileName = "Video_For_Lazies.png";
 
 // Backward-compatible export names for tests/scripts that still refer to the old Windows-only config.
 export const tauriWindowsSidecarResourceSource = tauriSidecarResourceSource;
@@ -226,9 +228,9 @@ export function listPortableCompanionDirs() {
   ];
 }
 
-export function listPortableCompanionFiles({ thirdPartyNoticesPath, sourceNoticePath } = {}) {
+export function listPortableCompanionFiles({ thirdPartyNoticesPath, sourceNoticePath, platform = process.platform } = {}) {
   const portableDir = getPortableOutputDir();
-  return [
+  const files = [
     {
       name: "README.md",
       sourcePath: path.resolve(repoRoot, "README.md"),
@@ -255,4 +257,22 @@ export function listPortableCompanionFiles({ thirdPartyNoticesPath, sourceNotice
       outputPath: path.resolve(portableDir, "FFMPEG_BUNDLING.md"),
     },
   ];
+
+  if (platform === "linux") {
+    files.push(
+      {
+        name: portableLinuxIconFileName,
+        sourcePath: path.resolve(appRoot, "src-tauri", "icons", "icon.png"),
+        outputPath: path.resolve(portableDir, portableLinuxIconFileName),
+      },
+      {
+        name: portableLinuxDesktopFileName,
+        sourcePath: path.resolve(appRoot, "packaging", "linux", portableLinuxDesktopFileName),
+        outputPath: path.resolve(portableDir, portableLinuxDesktopFileName),
+        mode: 0o755,
+      },
+    );
+  }
+
+  return files;
 }

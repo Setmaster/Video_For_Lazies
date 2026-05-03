@@ -5,6 +5,9 @@ import path from "node:path";
 import url from "node:url";
 
 import {
+  listPortableCompanionFiles,
+  portableLinuxDesktopFileName,
+  portableLinuxIconFileName,
   tauriSidecarResourceSource,
   tauriSidecarResourceTarget,
 } from "../scripts/ffmpegBundle.mjs";
@@ -57,6 +60,16 @@ test("tauri config maps the generated current ffmpeg sidecar into app resources"
   assert.match(buildScriptRaw, /\.ffmpeg-bundle/);
   assert.match(buildScriptRaw, /current/);
   assert.match(makePortableRaw, /listPortableCompanionDirs\(\)/);
+});
+
+test("linux portable payload includes launcher icon files", () => {
+  const linuxFiles = new Set(listPortableCompanionFiles({ platform: "linux" }).map((file) => file.name));
+  const windowsFiles = new Set(listPortableCompanionFiles({ platform: "win32" }).map((file) => file.name));
+
+  assert.ok(linuxFiles.has(portableLinuxIconFileName));
+  assert.ok(linuxFiles.has(portableLinuxDesktopFileName));
+  assert.equal(windowsFiles.has(portableLinuxIconFileName), false);
+  assert.equal(windowsFiles.has(portableLinuxDesktopFileName), false);
 });
 
 test("tauri window config keeps a supported minimum app size", async () => {

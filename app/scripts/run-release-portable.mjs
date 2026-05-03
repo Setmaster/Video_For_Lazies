@@ -10,6 +10,8 @@ import {
   getPortableReleaseParentDir,
   ffmpegSidecarResourceTarget,
   getFfmpegSourceArchiveNames,
+  portableLinuxDesktopFileName,
+  portableLinuxIconFileName,
 } from "./ffmpegBundle.mjs";
 import { runPortableSmoke } from "./run-portable-smoke.mjs";
 import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
@@ -245,6 +247,11 @@ async function assertPortableLegalPayload(portableDir, { platform = process.plat
     for (const relativePath of sidecarRequiredFiles) {
       await assertPortableFile(portableDir, relativePath);
     }
+  }
+
+  if (platform === "linux") {
+    await assertPortableFile(portableDir, portableLinuxIconFileName);
+    await assertPortableFile(portableDir, portableLinuxDesktopFileName);
   }
 }
 

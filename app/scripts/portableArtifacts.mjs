@@ -35,10 +35,13 @@ export async function copyPortableArtifacts({
     }
   }
 
-  for (const { name, sourcePath, outputPath } of companionFiles) {
+  for (const { name, sourcePath, outputPath, mode } of companionFiles) {
     try {
       await fs.mkdir(path.dirname(outputPath), { recursive: true });
       await fs.copyFile(sourcePath, outputPath);
+      if (mode !== undefined) {
+        await fs.chmod(outputPath, mode);
+      }
     } catch (e) {
       console.error(`Failed to copy portable companion file: ${name}`);
       console.error(`Expected: ${sourcePath}`);

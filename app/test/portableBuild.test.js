@@ -15,6 +15,8 @@ test("copyPortableArtifacts copies the app binary, bundled sidecar, and legal fi
     const sidecarOutput = path.resolve(tempRoot, "release", "Video_For_Lazies", "ffmpeg-sidecar");
     const readmeSource = path.resolve(tempRoot, "docs", "README.md");
     const readmeOutput = path.resolve(tempRoot, "release", "Video_For_Lazies", "README.md");
+    const desktopSource = path.resolve(tempRoot, "docs", "Video_For_Lazies.desktop");
+    const desktopOutput = path.resolve(tempRoot, "release", "Video_For_Lazies", "Video_For_Lazies.desktop");
     const legacyExe = path.resolve(tempRoot, "release", "Video_For_Lazies.exe");
     const legacySidecar = path.resolve(tempRoot, "release", "ffmpeg-sidecar");
 
@@ -27,6 +29,7 @@ test("copyPortableArtifacts copies the app binary, bundled sidecar, and legal fi
     await fs.writeFile(path.resolve(sidecarSource, "ffprobe.exe"), "ffprobe");
     await fs.writeFile(path.resolve(sidecarSource, "FFMPEG_BUNDLE_NOTICES.txt"), "notice");
     await fs.writeFile(readmeSource, "readme");
+    await fs.writeFile(desktopSource, "desktop");
     await fs.writeFile(legacyExe, "stale-binary");
     await fs.writeFile(path.resolve(legacySidecar, "ffmpeg.exe"), "stale-ffmpeg");
 
@@ -46,6 +49,12 @@ test("copyPortableArtifacts copies the app binary, bundled sidecar, and legal fi
           sourcePath: readmeSource,
           outputPath: readmeOutput,
         },
+        {
+          name: "Video_For_Lazies.desktop",
+          sourcePath: desktopSource,
+          outputPath: desktopOutput,
+          mode: 0o755,
+        },
       ],
       cleanupPaths: [legacyExe, legacySidecar],
     });
@@ -54,6 +63,8 @@ test("copyPortableArtifacts copies the app binary, bundled sidecar, and legal fi
     assert.equal(await fs.readFile(path.resolve(sidecarOutput, "ffmpeg.exe"), "utf8"), "ffmpeg");
     assert.equal(await fs.readFile(path.resolve(sidecarOutput, "ffprobe.exe"), "utf8"), "ffprobe");
     assert.equal(await fs.readFile(readmeOutput, "utf8"), "readme");
+    assert.equal(await fs.readFile(desktopOutput, "utf8"), "desktop");
+    assert.equal((await fs.stat(desktopOutput)).mode & 0o777, 0o755);
     await assert.rejects(fs.access(legacyExe));
     await assert.rejects(fs.access(legacySidecar));
   } finally {
