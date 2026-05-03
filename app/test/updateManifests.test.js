@@ -59,7 +59,12 @@ test("payload manifests are generated and validated for a portable folder", asyn
     assert.equal(manifest.appId, APP_ID);
     assert.equal(manifest.version, "1.2.3");
     assert.equal(manifest.target, "linux-x64");
-    assert.ok(manifest.files.some((entry) => entry.path === "video_for_lazies" && entry.mode === 0o755));
+    const executableEntry = manifest.files.find((entry) => entry.path === "video_for_lazies");
+    assert.ok(executableEntry);
+    assert.equal(typeof executableEntry.mode, "number");
+    if (process.platform !== "win32") {
+      assert.equal(executableEntry.mode, 0o755);
+    }
 
     const validated = await validatePayloadManifest({
       portableDir,
