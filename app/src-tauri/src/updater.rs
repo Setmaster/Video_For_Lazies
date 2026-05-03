@@ -1434,7 +1434,7 @@ fn helper_executable_name() -> Result<&'static str, String> {
 fn executable_suffix() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        return ".exe";
+        ".exe"
     }
     #[cfg(not(target_os = "windows"))]
     {
