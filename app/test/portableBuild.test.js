@@ -64,7 +64,9 @@ test("copyPortableArtifacts copies the app binary, bundled sidecar, and legal fi
     assert.equal(await fs.readFile(path.resolve(sidecarOutput, "ffprobe.exe"), "utf8"), "ffprobe");
     assert.equal(await fs.readFile(readmeOutput, "utf8"), "readme");
     assert.equal(await fs.readFile(desktopOutput, "utf8"), "desktop");
-    assert.equal((await fs.stat(desktopOutput)).mode & 0o777, 0o755);
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(desktopOutput)).mode & 0o777, 0o755);
+    }
     await assert.rejects(fs.access(legacyExe));
     await assert.rejects(fs.access(legacySidecar));
   } finally {
