@@ -8,6 +8,12 @@ Video For Lazies is a small desktop app for the video jobs that should not requi
 
 It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local tool: drag in a file, choose the output shape, and get a predictable export without opening a heavyweight timeline.
 
+<p align="center">
+  <a href="https://github.com/Setmaster/Video_For_Lazies/releases" aria-label="Download the latest Video For Lazies release">
+    <img src="https://img.shields.io/github/v/release/Setmaster/Video_For_Lazies?include_prereleases&label=Download&labelColor=06111D&color=35D3B4&style=for-the-badge" alt="Download latest release">
+  </a>
+</p>
+
 ## Highlights
 
 - Trim clips with direct in/out handles, keyboard nudges, and a live preview.
