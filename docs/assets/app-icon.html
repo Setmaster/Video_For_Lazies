@@ -29,61 +29,42 @@
   <body>
     <svg viewBox="0 0 1024 1024" role="img" aria-label="Video For Lazies icon" xmlns="http://www.w3.org/2000/svg">
       <defs>
-        <linearGradient id="tile" x1="166" y1="130" x2="850" y2="900" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#17263A"/>
-          <stop offset="0.58" stop-color="#0B1420"/>
+        <linearGradient id="tile" x1="124" y1="96" x2="902" y2="926" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#69C3FF"/>
+          <stop offset="0.52" stop-color="#32D4B7"/>
+          <stop offset="1" stop-color="#159A84"/>
+        </linearGradient>
+        <linearGradient id="panel" x1="220" y1="266" x2="800" y2="726" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#12243A"/>
           <stop offset="1" stop-color="#071019"/>
         </linearGradient>
-        <linearGradient id="cyanTeal" x1="240" y1="252" x2="787" y2="743" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#68B8FF"/>
-          <stop offset="1" stop-color="#32D4B7"/>
+        <linearGradient id="track" x1="264" y1="746" x2="760" y2="746" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#FFFFFF"/>
+          <stop offset="1" stop-color="#B9E8FF"/>
         </linearGradient>
-        <linearGradient id="timeline" x1="282" y1="712" x2="760" y2="712" gradientUnits="userSpaceOnUse">
-          <stop stop-color="#35D3B4"/>
-          <stop offset="0.68" stop-color="#5CC8FF"/>
-          <stop offset="1" stop-color="#FFC46B"/>
-        </linearGradient>
-        <filter id="shadow" x="-20%" y="-18%" width="140%" height="140%" color-interpolation-filters="sRGB">
-          <feDropShadow dx="0" dy="34" stdDeviation="38" flood-color="#000000" flood-opacity="0.42"/>
+        <filter id="tileShadow" x="-20%" y="-18%" width="140%" height="140%" color-interpolation-filters="sRGB">
+          <feDropShadow dx="0" dy="34" stdDeviation="34" flood-color="#000000" flood-opacity="0.34"/>
         </filter>
-        <filter id="glow" x="-35%" y="-35%" width="170%" height="170%" color-interpolation-filters="sRGB">
-          <feGaussianBlur stdDeviation="10" result="blur"/>
-          <feMerge>
-            <feMergeNode in="blur"/>
-            <feMergeNode in="SourceGraphic"/>
-          </feMerge>
+        <filter id="panelShadow" x="-18%" y="-18%" width="136%" height="136%" color-interpolation-filters="sRGB">
+          <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000000" flood-opacity="0.32"/>
         </filter>
       </defs>
 
-      <rect x="72" y="72" width="880" height="880" rx="206" fill="url(#tile)" filter="url(#shadow)"/>
-      <rect x="91" y="91" width="842" height="842" rx="188" fill="none" stroke="#EDF4FF" stroke-opacity="0.09" stroke-width="18"/>
+      <rect x="48" y="48" width="928" height="928" rx="216" fill="url(#tile)" filter="url(#tileShadow)"/>
+      <path d="M137 287C137 208.6 200.6 145 279 145H745C823.4 145 887 208.6 887 287V744C887 822.4 823.4 886 745 886H279C200.6 886 137 822.4 137 744V287Z" fill="#FFFFFF" opacity="0.11"/>
+      <path d="M139 224C158.5 171.7 209.3 134 269 134H756C831.1 134 892 194.9 892 270" fill="none" stroke="#FFFFFF" stroke-width="25" stroke-linecap="round" opacity="0.2"/>
+      <path d="M852 794C827.6 847.5 773.6 884 711 884H282C206.9 884 146 823.1 146 748" fill="none" stroke="#055C52" stroke-width="28" stroke-linecap="round" opacity="0.42"/>
 
-      <circle cx="248" cy="230" r="210" fill="#65B7FF" opacity="0.12"/>
-      <circle cx="820" cy="810" r="250" fill="#35D3B4" opacity="0.09"/>
+      <rect x="178" y="250" width="668" height="468" rx="118" fill="#071019" opacity="0.3"/>
+      <rect x="198" y="226" width="628" height="448" rx="104" fill="url(#panel)" stroke="#D9F6FF" stroke-opacity="0.28" stroke-width="18" filter="url(#panelShadow)"/>
 
-      <rect x="230" y="268" width="564" height="350" rx="54" fill="#091522" stroke="#21334B" stroke-width="18"/>
-      <rect x="282" y="320" width="460" height="246" rx="28" fill="#111D2B" stroke="url(#cyanTeal)" stroke-width="28"/>
+      <path d="M437 346L437 554L612 450L437 346Z" fill="#FFFFFF"/>
+      <path d="M437 346L437 554L612 450L437 346Z" fill="#FFFFFF" opacity="0.98"/>
 
-      <path d="M281 396H742" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
-      <path d="M281 488H742" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
-      <path d="M435 320V566" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
-      <path d="M589 320V566" stroke="#EDF4FF" stroke-opacity="0.16" stroke-width="8"/>
-
-      <path d="M286 290H404" stroke="#FFC46B" stroke-width="38" stroke-linecap="round"/>
-      <path d="M286 290V408" stroke="#FFC46B" stroke-width="38" stroke-linecap="round"/>
-      <path d="M738 596H620" stroke="#35D3B4" stroke-width="38" stroke-linecap="round"/>
-      <path d="M738 596V478" stroke="#35D3B4" stroke-width="38" stroke-linecap="round"/>
-
-      <circle cx="512" cy="443" r="86" fill="#EDF4FF" fill-opacity="0.12" stroke="#EDF4FF" stroke-opacity="0.2" stroke-width="7"/>
-      <path d="M487 394L570 443L487 492V394Z" fill="#FFFFFF"/>
-
-      <rect x="218" y="696" width="588" height="54" rx="27" fill="#EDF4FF" fill-opacity="0.12"/>
-      <rect x="304" y="708" width="388" height="30" rx="15" fill="url(#timeline)" filter="url(#glow)"/>
-      <rect x="296" y="668" width="52" height="108" rx="24" fill="#DFF0FF"/>
-      <rect x="668" y="668" width="52" height="108" rx="24" fill="#DFF0FF"/>
-
-      <circle cx="796" cy="250" r="33" fill="#FFC46B"/>
-      <circle cx="796" cy="250" r="15" fill="#071019" fill-opacity="0.9"/>
+      <rect x="258" y="730" width="508" height="54" rx="27" fill="#071019" fill-opacity="0.38"/>
+      <rect x="320" y="742" width="384" height="30" rx="15" fill="url(#track)" opacity="0.92"/>
+      <rect x="270" y="682" width="88" height="154" rx="44" fill="#FFFFFF"/>
+      <rect x="666" y="682" width="88" height="154" rx="44" fill="#FFFFFF"/>
     </svg>
   </body>
 </html>
