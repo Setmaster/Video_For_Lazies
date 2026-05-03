@@ -25,23 +25,27 @@ Use Video For Lazies when you need a focused export pass instead of a full editi
 
 It is not trying to replace a nonlinear editor. There are no multi-track timelines, effects stacks, or media bins.
 
-## Status
+## Download
 
-The current app is the Tauri desktop version in [`app/`](app/). Windows x64 and Linux x64 portable builds bundle pinned FFmpeg sidecars, including `ffprobe`, so end users do not need to install FFmpeg separately for those builds.
+Download the current prerelease from [GitHub Releases](https://github.com/Setmaster/Video_For_Lazies/releases).
 
-Source and release checks are documented in [`docs/release.md`](docs/release.md).
+- Windows x64: `Video_For_Lazies-v0.1.0-win-x64.zip`
+- Linux x64: `Video_For_Lazies-v0.1.0-linux-x64.zip`
+- Checksums: `SHA256SUMS.txt`
 
-## Requirements
+The portable builds bundle pinned FFmpeg sidecars, including `ffprobe`, so end users do not need to install FFmpeg separately for supported Windows and Linux releases.
+
+Windows builds are unsigned, so Windows may show SmartScreen or antivirus reputation warnings until the project has signing and reputation history. Verify the checksum before running downloaded binaries.
+
+## From Source
+
+Requirements:
 
 - Node.js
 - Rust toolchain
-- FFmpeg and FFprobe are bundled for Windows x64 and Linux x64 builds. For unsupported platforms or custom runtime builds, install FFmpeg on `PATH` or set:
-  - `VFL_FFMPEG_PATH`
-  - `VFL_FFPROBE_PATH`
+- FFmpeg and FFprobe on `PATH`, or set `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH`
 
-Windows and Linux portable releases stage the pinned FFmpeg sidecar automatically.
-
-## Run From Source
+Run the app:
 
 ```bash
 cd app
@@ -49,7 +53,7 @@ npm install
 npm run tauri dev
 ```
 
-## Build
+Build the app:
 
 ```bash
 cd app
@@ -80,7 +84,7 @@ npm run release:portable
 
 That command builds the portable folder, creates a versioned x64 zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted archive.
 
-Draft release builds are handled by the `Portable Release` GitHub Actions workflow on manual dispatch or `v*.*.*` tags. It builds both x64 portable zips, generates release notes from the commits since the previous release tag, uploads the zips plus `SHA256SUMS.txt` to a GitHub Release, and defaults to a draft release for review. The workflow does not change repository visibility.
+Release process details are in [`docs/release.md`](docs/release.md).
 
 ## Usage Notes
 
@@ -99,20 +103,6 @@ npx tsc --noEmit
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
-
-## Project Layout
-
-```text
-app/                  Tauri, React, and Rust app
-app/src/              Frontend UI
-app/src-tauri/        Rust backend and FFmpeg command layer
-app/scripts/          Portable build, smoke, and FFmpeg sidecar scripts
-docs/                 Release and FFmpeg bundling docs
-docs/assets/          README banner and icon source/generated assets
-```
-
-The README banner is generated from [`docs/assets/readme-banner.html`](docs/assets/readme-banner.html).
-The app icon is generated from [`docs/assets/app-icon.html`](docs/assets/app-icon.html).
 
 ## FFmpeg And Licensing
 
