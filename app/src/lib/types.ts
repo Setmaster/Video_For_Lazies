@@ -66,6 +66,7 @@ export interface AppSmokeConfig {
   sizeLimitMb: number;
   trimStartS: number;
   trimEndS?: number | null;
+  skipPreviewInteractions?: boolean | null;
 }
 
 export interface AppSmokeStatus {

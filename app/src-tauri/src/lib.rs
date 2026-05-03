@@ -32,6 +32,7 @@ struct AppSmokeConfig {
     size_limit_mb: f64,
     trim_start_s: f64,
     trim_end_s: Option<f64>,
+    skip_preview_interactions: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -84,6 +85,18 @@ fn parse_smoke_output_format(raw: &str) -> Result<video::OutputFormat, String> {
         "webm" => Ok(video::OutputFormat::Webm),
         "mp3" => Ok(video::OutputFormat::Mp3),
         _ => Err("VFL_SMOKE_FORMAT must be one of: mp4, webm, mp3.".to_string()),
+    }
+}
+
+fn parse_smoke_bool(env: &HashMap<String, String>, key: &str) -> Result<bool, String> {
+    let Some(raw) = env.get(key) else {
+        return Ok(false);
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        _ => Err(format!("{key} must be a boolean value.")),
     }
 }
 
@@ -147,6 +160,7 @@ fn parse_smoke_config_from_env(
     let trim_start_s = parse_smoke_f64(env, "VFL_SMOKE_TRIM_START_S", Some(0.0))?
         .ok_or_else(|| "VFL_SMOKE_TRIM_START_S parsing failed.".to_string())?;
     let trim_end_s = parse_smoke_f64(env, "VFL_SMOKE_TRIM_END_S", None)?;
+    let skip_preview_interactions = parse_smoke_bool(env, "VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS")?;
 
     if size_limit_mb < 0.0 {
         return Err("VFL_SMOKE_SIZE_LIMIT_MB must be >= 0.".to_string());
@@ -173,6 +187,7 @@ fn parse_smoke_config_from_env(
         size_limit_mb,
         trim_start_s,
         trim_end_s,
+        skip_preview_interactions,
     }))
 }
 
@@ -504,6 +519,7 @@ mod tests {
                 size_limit_mb: 0.0,
                 trim_start_s: 0.0,
                 trim_end_s: None,
+                skip_preview_interactions: false,
             })
         );
     }
@@ -519,6 +535,7 @@ mod tests {
             ("VFL_SMOKE_SIZE_LIMIT_MB", "12.5"),
             ("VFL_SMOKE_TRIM_START_S", "0.25"),
             ("VFL_SMOKE_TRIM_END_S", "1.5"),
+            ("VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS", "true"),
         ]);
 
         assert_eq!(
@@ -531,6 +548,7 @@ mod tests {
                 size_limit_mb: 12.5,
                 trim_start_s: 0.25,
                 trim_end_s: Some(1.5),
+                skip_preview_interactions: true,
             })
         );
     }

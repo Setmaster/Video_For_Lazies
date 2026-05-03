@@ -1,6 +1,8 @@
 # Release Checklist
 
-This project is not publicized or released by the build scripts. Repository visibility and GitHub Releases are manual owner actions.
+The repository is public, but release publication is still an owner-approved action. Build scripts create artifacts and GitHub release drafts; they do not decide when a stable release should be published.
+
+`main` is the stable-release branch. Use `dev` for development, then merge to `main` only after the owner approves the final readiness report.
 
 ## Versioning Protocol
 
@@ -26,23 +28,25 @@ npm run version:set -- 0.1.1
 npm run version:check -- 0.1.1
 ```
 
-For tagged artifact builds, commit the version bump first, then tag the same commit:
+For stable tagged artifact builds, commit the version bump on `dev`, merge the approved result to `main`, then tag the `main` commit:
 
 ```bash
 git tag v0.1.1
 git push origin main v0.1.1
 ```
 
-## Source-Public Gate
+For draft prereleases or release-candidate checks before approval, run the manual workflow from the development branch and leave the release as a draft.
+
+## Public Source Gate
 
 - Confirm `npm audit --audit-level=moderate` is clean.
-- Run `npm test`, `npx tsc --noEmit`, `npm run build`, and `cargo test --manifest-path app/src-tauri/Cargo.toml`.
+- Run `npm test`, `npx tsc --noEmit`, `npm run build`, `cargo fmt --manifest-path app/src-tauri/Cargo.toml --check`, `cargo test --manifest-path app/src-tauri/Cargo.toml`, `cargo clippy --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings`, and `cd app/src-tauri && cargo audit`.
 - Confirm no tracked secrets, local usernames, private paths, or generated release artifacts are present.
 - Confirm reachable commit author and committer emails are approved public identities, preferably GitHub noreply addresses.
 - Confirm `LICENSE`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`, and `SOURCE.md` are present.
-- Confirm GitHub private vulnerability reporting is enabled before changing repository visibility.
+- Confirm GitHub private vulnerability reporting is enabled.
 - Confirm `SECURITY.md` points reporters to GitHub private vulnerability reporting, not a public personal email.
-- Before changing repository visibility, scan committed history for local-machine identifiers:
+- Scan committed history for local-machine identifiers:
 
 ```bash
 git rev-list --all | xargs git grep -n -F "local-username" -- 2>/dev/null || true
@@ -50,24 +54,24 @@ git rev-list --all | xargs git grep -n -F "/home/local-username" -- 2>/dev/null 
 git rev-list --all | xargs git grep -n -F "C:/Users/local-username" -- 2>/dev/null || true
 ```
 
-If a real local identifier appears in committed history, rewrite history from a clean worktree with `git filter-repo`, then force-push only after the owner explicitly approves the push.
+If a real local identifier appears in committed history, stop and get owner approval before any history rewrite or force-push.
 
 ## Portable Release Workflow
 
-The `Portable Release` GitHub Actions workflow builds private x64 artifacts for:
+The `Portable Release` GitHub Actions workflow builds verified x64 artifacts for:
 
 - `linux-x64`
 - `win-x64`
 
-It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds both portable zips, creates release notes, stages a combined `SHA256SUMS.txt`, and creates a GitHub Release with the final assets. It defaults to a draft prerelease so the generated changelog and uploaded binaries can be reviewed before publishing. The workflow does not change repository visibility.
+It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds both portable zips, creates release notes, stages a combined `SHA256SUMS.txt`, and creates a GitHub Release with the final assets. It defaults to a draft prerelease so the generated changelog and uploaded binaries can be reviewed before publishing.
 
 Manual dispatch inputs:
 
 - `version`: required SemVer value, for example `0.1.1`; must match app metadata.
 - `release_notes`: optional curated changelog or summary. If blank, the workflow generates a summary from commits.
 - `previous_tag`: optional changelog start tag. Use `none` for a first release.
-- `draft`: defaults to `true`.
-- `prerelease`: defaults to `true`.
+- `draft`: defaults to `true`; keep this enabled until final review is complete.
+- `prerelease`: defaults to `true`; set to `false` for an owner-approved stable release.
 
 Release notes follow this template:
 
@@ -90,7 +94,7 @@ Release notes follow this template:
 <workflow verification summary>
 ```
 
-Recommended manual release protocol:
+Recommended manual draft protocol:
 
 1. Run `git fetch --tags origin`.
 2. Find the previous release tag with `git tag --merged HEAD --sort=-version:refname --list 'v[0-9]*'`.
@@ -100,7 +104,7 @@ Recommended manual release protocol:
 6. Review the draft release notes, Linux zip, Windows zip, and `SHA256SUMS.txt`.
 7. Confirm the draft release is backed by the intended public `vX.Y.Z` tag.
 8. Confirm generated `SOURCE.md` in each zip names the intended release tag and source commit.
-9. Publish the draft only when the owner wants that release visible to repo collaborators.
+9. Publish the draft only when the owner wants that release visible to the public.
 
 Run locally on Linux or Windows:
 
@@ -114,13 +118,13 @@ The script builds `release/Video_For_Lazies/`, creates a versioned zip, writes `
 Linux artifact example:
 
 ```text
-release/Video_For_Lazies-v0.1.0-linux-x64.zip
+release/Video_For_Lazies-vX.Y.Z-linux-x64.zip
 ```
 
 Windows artifact example:
 
 ```text
-release/Video_For_Lazies-v0.1.0-win-x64.zip
+release/Video_For_Lazies-vX.Y.Z-win-x64.zip
 ```
 
 GitHub release assets are intentionally zip-only for now: the Linux zip, the Windows zip, and the combined checksum file.
@@ -150,6 +154,8 @@ Additional required sidecar payload on Windows and Linux:
 - `ffmpeg-sidecar/source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
 Linux sidecar-specific payload also includes root `ffmpeg` and `ffprobe` wrapper scripts, `bin/ffmpeg`, `bin/ffprobe`, and the required shared libraries in `ffmpeg-sidecar/lib/`.
+
+Linux release verification also launches the extracted packaged app in smoke mode, using Xvfb when no display is available, and requires the app to probe, encode, and write a readable trimmed MP4. The Windows smoke additionally verifies preview playback and trim/crop interactions.
 
 ## Unsigned Alpha Note
 

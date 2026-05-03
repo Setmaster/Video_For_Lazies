@@ -1247,6 +1247,16 @@ button.danger:hover:enabled {
   font-variant-numeric: tabular-nums;
 }
 
+.vfl-export-result-note {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(245, 205, 92, 0.35);
+  background: rgba(245, 205, 92, 0.1);
+  color: #f9df91;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .vfl-export-result-path {
   padding: 8px 10px;
   border-radius: var(--radius-sm);

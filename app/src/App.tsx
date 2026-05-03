@@ -59,6 +59,7 @@ type LastExportResult = {
   outputSizeBytes: number | null;
   durationS: number | null;
   format: OutputFormat;
+  message: string | null;
   completedAtMs: number;
 };
 
@@ -792,6 +793,9 @@ function App() {
       if (plannedSummary.totalKbps !== null && plannedSummary.totalKbps < 160 && format !== "mp3") {
         warnings.push("This target leaves a very low bitrate for video. Lower Max edge, trim shorter, or raise the size limit.");
       }
+      if (format !== "mp3" && probe.hasAudio && audioEnabled && plannedSummary.totalKbps !== null && plannedSummary.totalKbps < 82) {
+        warnings.push("This target is too tight to keep audio; export may remove it to prioritize a playable video.");
+      }
       if (
         plannedSummary.totalKbps !== null &&
         plannedSummary.w !== null &&
@@ -808,7 +812,7 @@ function App() {
     }
 
     return warnings;
-  }, [probe, plannedSummary, format]);
+  }, [probe, plannedSummary, format, audioEnabled]);
 
   function handleDroppedPaths(paths: string[]) {
     const action = resolveDroppedVideoAction({
@@ -1006,7 +1010,7 @@ function App() {
       return;
     }
 
-    if (previewError) {
+    if (!smokeConfig.skipPreviewInteractions && previewError) {
       void reportSmokeFailure(`Packaged app smoke preview failed: ${previewError}`);
       return;
     }
@@ -1017,36 +1021,58 @@ function App() {
       message: `Source probed: ${probe.width}x${probe.height}, ${formatClock(probe.durationS)}`,
     });
 
-    if (!previewReady || !previewMediaReady) return;
-
-    void reportSmokeStatus("preview-ready", {
-      message: "Preview loaded and ready for packaged export smoke.",
-    });
-
-    if (!smokeInteractionDoneRef.current) {
-      if (smokeInteractionRunningRef.current) return;
-
-      smokeInteractionRunningRef.current = true;
-      void (async () => {
-        const result = await runSmokeInteractionChecks();
-        smokeInteractionRunningRef.current = false;
-
-        if (!result.ok) {
-          await reportSmokeFailure(result.message);
-          return;
-        }
-
+    if (smokeConfig.skipPreviewInteractions) {
+      if (!smokeInteractionDoneRef.current) {
+        const trimStartS = Math.max(0, smokeConfig.trimStartS);
+        const trimEndS = Math.max(trimStartS, Math.min(probe.durationS, smokeConfig.trimEndS ?? probe.durationS));
+        smokeMetricsRef.current = {
+          trimStartS,
+          trimEndS,
+          expectedDurationS: Math.max(0, trimEndS - trimStartS),
+        };
         smokeInteractionDoneRef.current = true;
-        await reportSmokeStatus("interaction-ready", {
-          message: result.message,
-          trimStartS: result.trimStartS ?? null,
-          trimEndS: result.trimEndS ?? null,
-          expectedDurationS: result.expectedDurationS ?? null,
+        void reportSmokeStatus("interaction-ready", {
+          message: "Headless packaged export smoke skipped preview playback checks after the source probe completed.",
+          trimStartS,
+          trimEndS,
+          expectedDurationS: Math.max(0, trimEndS - trimStartS),
         });
-        setStatus("Smoke: interaction checks passed.");
-      })();
-      return;
+        setStatus("Smoke: headless export checks ready.");
+      }
+    } else {
+      if (!previewReady || !previewMediaReady) return;
+
+      void reportSmokeStatus("preview-ready", {
+        message: "Preview loaded and ready for packaged export smoke.",
+      });
+
+      if (!smokeInteractionDoneRef.current) {
+        if (smokeInteractionRunningRef.current) return;
+
+        smokeInteractionRunningRef.current = true;
+        void (async () => {
+          const result = await runSmokeInteractionChecks();
+          smokeInteractionRunningRef.current = false;
+
+          if (!result.ok) {
+            await reportSmokeFailure(result.message);
+            return;
+          }
+
+          smokeInteractionDoneRef.current = true;
+          await reportSmokeStatus("interaction-ready", {
+            message: result.message,
+            trimStartS: result.trimStartS ?? null,
+            trimEndS: result.trimEndS ?? null,
+            expectedDurationS: result.expectedDurationS ?? null,
+          });
+          setStatus("Smoke: interaction checks passed.");
+        })();
+        return;
+      }
     }
+
+    if (!smokeInteractionDoneRef.current) return;
 
     if (jobId !== null || smokeStartRef.current) return;
 
@@ -1132,6 +1158,7 @@ function App() {
           outputSizeBytes: p.outputSizeBytes ?? null,
           durationS: pendingEncode?.durationS ?? plannedSummary?.durationS ?? null,
           format: pendingEncode?.format ?? formatRef.current,
+          message: p.message ?? null,
           completedAtMs: Date.now(),
         });
         pendingEncodeRef.current = null;
@@ -2452,6 +2479,7 @@ function App() {
                         {lastExportDurationText ? `${lastExportDurationText} • ` : ""}
                         {new Date(lastExport.completedAtMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </div>
+                      {lastExport.message ? <div className="vfl-export-result-note">{lastExport.message}</div> : null}
                       <div className="vfl-export-result-path">{lastExport.outputPath}</div>
                       <div className="vfl-actions vfl-actions-secondary">
                         <button onClick={() => void openOutputFile(lastExport.outputPath)}>Open file</button>

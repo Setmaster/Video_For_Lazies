@@ -126,6 +126,15 @@ struct EncodePlan {
     include_audio: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SizeLimitedEncodeContract {
+    planned_width: u32,
+    planned_height: u32,
+    min_video_kbps: u32,
+    plan: EncodePlan,
+    audio_removed_for_size_target: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoCodec {
     LibX264,
@@ -1468,6 +1477,64 @@ fn map_mpeg4_size_limit_error(
     error
 }
 
+fn build_size_limited_encode_contract(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    selected_video_codec: VideoCodec,
+    output_duration_s: f64,
+    include_audio: bool,
+) -> Result<SizeLimitedEncodeContract, String> {
+    let (planned_width, planned_height) = estimated_output_dimensions(request, probe);
+    let min_video_kbps = minimum_video_bitrate_kbps(
+        selected_video_codec,
+        planned_width,
+        planned_height,
+        probe.frame_rate,
+    );
+    let plan = plan_bitrates(
+        request.size_limit_mb,
+        output_duration_s,
+        include_audio,
+        96,
+        32,
+        min_video_kbps,
+        0.95,
+    )?;
+    let audio_removed_for_size_target = include_audio && !plan.include_audio;
+
+    Ok(SizeLimitedEncodeContract {
+        planned_width,
+        planned_height,
+        min_video_kbps,
+        plan,
+        audio_removed_for_size_target,
+    })
+}
+
+fn size_limited_completion_message(
+    met_target: bool,
+    selected_video_codec: VideoCodec,
+    video_bitrate_kbps: u32,
+    min_video_kbps: u32,
+    audio_removed_for_size_target: bool,
+) -> Option<String> {
+    let mut messages = Vec::new();
+
+    if !met_target {
+        if selected_video_codec == VideoCodec::Mpeg4 && video_bitrate_kbps <= min_video_kbps {
+            messages.push("Still above size limit. The bundled MP4 fallback codec cannot go lower at this resolution. Try a larger size limit, WebM, or reduce Max edge.");
+        } else {
+            messages.push("Still above size limit.");
+        }
+    }
+
+    if audio_removed_for_size_target {
+        messages.push("Audio was removed to fit the size target.");
+    }
+
+    (!messages.is_empty()).then(|| messages.join(" "))
+}
+
 pub fn run_encode_job(
     window: &Window,
     job_id: u64,
@@ -1830,22 +1897,18 @@ pub fn run_encode_job(
     let selected_video_codec = codec_selection
         .video_codec
         .ok_or_else(|| "Missing video codec selection.".to_string())?;
-    let (planned_width, planned_height) = estimated_output_dimensions(&request, &probe);
-    let min_video_kbps = minimum_video_bitrate_kbps(
+    let contract = build_size_limited_encode_contract(
+        &request,
+        &probe,
         selected_video_codec,
-        planned_width,
-        planned_height,
-        probe.frame_rate,
-    );
-    let mut plan = plan_bitrates(
-        request.size_limit_mb,
         output_duration_s,
         include_audio,
-        96,
-        32,
-        min_video_kbps,
-        0.95,
     )?;
+    let planned_width = contract.planned_width;
+    let planned_height = contract.planned_height;
+    let min_video_kbps = contract.min_video_kbps;
+    let audio_removed_for_size_target = contract.audio_removed_for_size_target;
+    let mut plan = contract.plan;
 
     let video_codec = selected_video_codec.as_ffmpeg_name();
     let audio_codec = codec_selection
@@ -2019,18 +2082,13 @@ pub fn run_encode_job(
                 ok: true,
                 output_path: Some(output_path.to_string_lossy().to_string()),
                 output_size_bytes: Some(out_size),
-                message: if met_target {
-                    None
-                } else if selected_video_codec == VideoCodec::Mpeg4
-                    && plan.video_bitrate_kbps <= min_video_kbps
-                {
-                    Some(
-                        "Done, but still above size limit. The bundled MP4 fallback codec cannot go lower at this resolution. Try a larger size limit, WebM, or reduce Max edge."
-                            .to_string(),
-                    )
-                } else {
-                    Some("Done, but still above size limit.".to_string())
-                },
+                message: size_limited_completion_message(
+                    met_target,
+                    selected_video_codec,
+                    plan.video_bitrate_kbps,
+                    min_video_kbps,
+                    audio_removed_for_size_target,
+                ),
             });
         }
 
@@ -2045,16 +2103,13 @@ pub fn run_encode_job(
                 ok: true,
                 output_path: Some(output_path.to_string_lossy().to_string()),
                 output_size_bytes: Some(out_size),
-                message: if selected_video_codec == VideoCodec::Mpeg4
-                    && plan.video_bitrate_kbps <= min_video_kbps
-                {
-                    Some(
-                        "Done, but still above size limit. The bundled MP4 fallback codec cannot go lower at this resolution. Try a larger size limit, WebM, or reduce Max edge."
-                            .to_string(),
-                    )
-                } else {
-                    Some("Done, but still above size limit.".to_string())
-                },
+                message: size_limited_completion_message(
+                    false,
+                    selected_video_codec,
+                    plan.video_bitrate_kbps,
+                    min_video_kbps,
+                    audio_removed_for_size_target,
+                ),
             });
         }
         let _ = fs::remove_file(&temp_output);
@@ -2393,6 +2448,55 @@ Encoders:
         assert!(!plan.include_audio);
         assert_eq!(plan.audio_bitrate_kbps, 0);
         assert_eq!(plan.video_bitrate_kbps, 384);
+    }
+
+    #[test]
+    fn size_limited_contract_records_audio_removal_for_tight_budget() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.3;
+        req.trim = Some(Trim {
+            start_s: 0.0,
+            end_s: Some(60.0),
+        });
+        let probe = VideoProbe {
+            duration_s: 60.0,
+            width: 1280,
+            height: 720,
+            frame_rate: Some(30.0),
+            has_audio: true,
+        };
+
+        let contract =
+            build_size_limited_encode_contract(&req, &probe, VideoCodec::LibX264, 60.0, true)
+                .unwrap();
+
+        assert!(!contract.plan.include_audio);
+        assert!(contract.audio_removed_for_size_target);
+        assert_eq!(contract.plan.audio_bitrate_kbps, 0);
+        assert!(contract.plan.video_bitrate_kbps >= contract.min_video_kbps);
+    }
+
+    #[test]
+    fn size_limited_contract_keeps_audio_when_budget_allows() {
+        let req = base_request();
+        let probe = probe_10s_1920x1080_audio();
+
+        let contract =
+            build_size_limited_encode_contract(&req, &probe, VideoCodec::LibX264, 10.0, true)
+                .unwrap();
+
+        assert!(contract.plan.include_audio);
+        assert!(!contract.audio_removed_for_size_target);
+        assert!(contract.plan.audio_bitrate_kbps >= 32);
+        assert!(contract.plan.video_bitrate_kbps >= contract.min_video_kbps);
+    }
+
+    #[test]
+    fn size_limited_completion_message_discloses_audio_removal() {
+        let message =
+            size_limited_completion_message(true, VideoCodec::LibX264, 50, 50, true).unwrap();
+        assert!(message.contains("Audio was removed"));
+        assert!(!message.contains("Still above"));
     }
 
     #[test]

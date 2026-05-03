@@ -266,8 +266,22 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
   await assertBundledLibx264(portableDir, { platform });
   await runBundledEncodeSmoke(portableDir, { platform });
 
+  if (platform === "linux") {
+    await runPortableExportSmoke({ portableDir });
+    await runPortableExportSmoke({
+      portableDir,
+      timeoutSeconds: 300,
+      inputWidth: 1920,
+      inputHeight: 1080,
+      inputVideoBitrateKbps: 2400,
+      sizeLimitMb: 0.3,
+    });
+    console.log("Linux portable payload verified with bundled FFmpeg, FFprobe, and packaged app export smokes.");
+    return;
+  }
+
   if (platform !== "win32") {
-    console.log("Linux portable payload verified with bundled FFmpeg and FFprobe.");
+    console.log("Portable payload verified with bundled FFmpeg and FFprobe.");
     return;
   }
 

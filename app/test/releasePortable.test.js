@@ -12,6 +12,7 @@ import {
   getPortableChecksumPath,
   getPortableZipPath,
 } from "../scripts/portableRelease.mjs";
+import { buildLinuxLaunchCommand } from "../scripts/run-portable-export-smoke.mjs";
 
 test("portable release artifact names are stable and versioned for Windows x64", () => {
   const options = { platform: "win32", arch: "x64", version: "0.1.0" };
@@ -54,4 +55,21 @@ test("buildChecksumLines emits sorted sha256 entries", async () => {
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("Linux packaged app smoke uses xvfb when no display is available", () => {
+  assert.deepEqual(
+    buildLinuxLaunchCommand("/tmp/Video_For_Lazies/video_for_lazies", { env: {} }),
+    {
+      command: "xvfb-run",
+      args: ["-a", "/tmp/Video_For_Lazies/video_for_lazies"],
+    },
+  );
+  assert.deepEqual(
+    buildLinuxLaunchCommand("/tmp/Video_For_Lazies/video_for_lazies", { env: { DISPLAY: ":99" } }),
+    {
+      command: "/tmp/Video_For_Lazies/video_for_lazies",
+      args: [],
+    },
+  );
 });

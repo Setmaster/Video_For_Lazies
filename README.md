@@ -9,8 +9,8 @@ Video For Lazies is a small desktop app for the video jobs that should not requi
 It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local tool: drag in a file, choose the output shape, and get a predictable export without opening a heavyweight timeline.
 
 <p align="center">
-  <a href="https://github.com/Setmaster/Video_For_Lazies/releases" aria-label="Download the latest Video For Lazies release">
-    <img src="https://img.shields.io/github/v/release/Setmaster/Video_For_Lazies?include_prereleases&label=Download&labelColor=06111D&color=35D3B4&style=for-the-badge" alt="Download latest release">
+  <a href="https://github.com/Setmaster/Video_For_Lazies/releases/latest" aria-label="Download the latest Video For Lazies release">
+    <img src="https://img.shields.io/github/v/release/Setmaster/Video_For_Lazies?label=Download&labelColor=06111D&color=35D3B4&style=for-the-badge" alt="Download latest release">
   </a>
 </p>
 
@@ -33,15 +33,32 @@ It is not trying to replace a nonlinear editor. There are no multi-track timelin
 
 ## Download
 
-Download the current prerelease from [GitHub Releases](https://github.com/Setmaster/Video_For_Lazies/releases).
+Download the latest stable portable zip from [GitHub Releases](https://github.com/Setmaster/Video_For_Lazies/releases/latest).
 
-- Windows x64: `Video_For_Lazies-v0.1.0-win-x64.zip`
-- Linux x64: `Video_For_Lazies-v0.1.0-linux-x64.zip`
+- Windows x64: `Video_For_Lazies-vX.Y.Z-win-x64.zip`
+- Linux x64: `Video_For_Lazies-vX.Y.Z-linux-x64.zip`
 - Checksums: `SHA256SUMS.txt`
 
 The portable builds bundle pinned FFmpeg sidecars, including `ffprobe`, so end users do not need to install FFmpeg separately for supported Windows and Linux releases.
 
 Windows builds are unsigned, so Windows may show SmartScreen or antivirus reputation warnings until the project has signing and reputation history. Verify the checksum before running downloaded binaries.
+
+Verify on Linux:
+
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing
+unzip Video_For_Lazies-vX.Y.Z-linux-x64.zip
+./Video_For_Lazies/video_for_lazies
+```
+
+Verify on Windows PowerShell:
+
+```powershell
+Get-FileHash .\Video_For_Lazies-vX.Y.Z-win-x64.zip -Algorithm SHA256
+Select-String -Path .\SHA256SUMS.txt -Pattern "Video_For_Lazies-vX.Y.Z-win-x64.zip"
+Expand-Archive .\Video_For_Lazies-vX.Y.Z-win-x64.zip -DestinationPath .
+.\Video_For_Lazies\Video_For_Lazies.exe
+```
 
 ## From Source
 
@@ -79,7 +96,7 @@ This writes a portable folder at:
 release/Video_For_Lazies/
 ```
 
-The folder contains the app executable, bundled `ffmpeg-sidecar/`, and required project/legal files. Windows portable folders also run a packaged-app startup smoke check. Linux portable folders verify the bundled FFmpeg and FFprobe with an encode/probe smoke.
+The folder contains the app executable, bundled `ffmpeg-sidecar/`, and required project/legal files. Windows portable folders run packaged-app startup and export smoke checks. Linux portable folders verify the bundled FFmpeg/FFprobe and run packaged-app export smoke checks under Xvfb when needed.
 
 To produce a verified release archive:
 
@@ -88,7 +105,7 @@ cd app
 npm run release:portable
 ```
 
-That command builds the portable folder, creates a versioned x64 zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted archive.
+That command builds the portable folder, creates a versioned x64 zip such as `release/Video_For_Lazies-vX.Y.Z-win-x64.zip` or `release/Video_For_Lazies-vX.Y.Z-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted archive.
 
 Release process details are in [`docs/release.md`](docs/release.md).
 

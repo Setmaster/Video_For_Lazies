@@ -11,8 +11,8 @@ body:
     id: version
     attributes:
       label: App version
-      description: Use the release version, commit, or "main".
-      placeholder: "0.1.0"
+      description: Use the release version, commit, or branch name.
+      placeholder: "1.0.0"
     validations:
       required: true
   - type: dropdown
@@ -20,11 +20,31 @@ body:
     attributes:
       label: Platform
       options:
-        - Windows portable build
+        - Windows x64 portable zip
+        - Linux x64 portable zip
         - Windows development build
         - Linux development build
-        - macOS development build
         - Other
+    validations:
+      required: true
+  - type: input
+    id: release_asset
+    attributes:
+      label: Release asset or build source
+      description: Name the zip, workflow artifact, local build command, or commit used.
+      placeholder: "Video_For_Lazies-v1.0.0-win-x64.zip"
+    validations:
+      required: true
+  - type: dropdown
+    id: ffmpeg_source
+    attributes:
+      label: FFmpeg source
+      description: Tell us whether the bundled sidecar or an override/PATH FFmpeg was active.
+      options:
+        - Bundled sidecar
+        - VFL_FFMPEG_PATH / VFL_FFPROBE_PATH override
+        - ffmpeg / ffprobe from PATH
+        - Not sure
     validations:
       required: true
   - type: textarea
