@@ -1537,28 +1537,9 @@ mod tests {
     fn payload_manifest_validation_rejects_extra_files() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        write_payload_file(root, "video_for_lazies", b"app", Some(0o755));
-        write_payload_file(root, "vfl-update-helper", b"helper", Some(0o755));
-        write_payload_file(root, "README.md", b"readme", Some(0o644));
-        write_payload_file(root, "LICENSE.txt", b"license", Some(0o644));
-        write_payload_file(root, "THIRD_PARTY_NOTICES.md", b"notices", Some(0o644));
-        write_payload_file(root, "SOURCE.md", b"source", Some(0o644));
-        write_payload_file(root, "FFMPEG_BUNDLING.md", b"bundle", Some(0o644));
-        write_payload_file(
-            root,
-            "ffmpeg-sidecar/LICENSE.txt",
-            b"ffmpeg-license",
-            Some(0o644),
-        );
-        write_payload_file(
-            root,
-            "ffmpeg-sidecar/FFMPEG_BUNDLE_NOTICES.txt",
-            b"ffmpeg-notices",
-            Some(0o644),
-        );
-        write_payload_file(root, "Video_For_Lazies.png", b"icon", Some(0o644));
-        write_payload_file(root, "Video_For_Lazies.desktop", b"desktop", Some(0o755));
-        let manifest = manifest_from_dir(root, "1.2.3", "linux-x64");
+        let target = current_target().unwrap();
+        write_minimal_payload(root, "app", None);
+        let manifest = manifest_from_dir(root, "1.2.3", target);
         fs::write(
             root.join(PAYLOAD_MANIFEST_FILE_NAME),
             serde_json::to_vec(&manifest).unwrap(),
@@ -1566,8 +1547,7 @@ mod tests {
         .unwrap();
         write_payload_file(root, "extra.txt", b"extra", Some(0o644));
 
-        let err =
-            validate_payload_manifest(root, &manifest, "1.2.3", "linux-x64", true).unwrap_err();
+        let err = validate_payload_manifest(root, &manifest, "1.2.3", target, true).unwrap_err();
         assert!(err.contains("exactly match"));
     }
 
