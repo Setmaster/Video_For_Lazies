@@ -9,9 +9,9 @@ import {
 } from "../scripts/versioning.mjs";
 
 test("project version metadata is synchronized", async () => {
-  const { version, versions } = await assertSynchronizedVersion("0.1.0");
+  const { version, versions } = await assertSynchronizedVersion();
 
-  assert.equal(version, "0.1.0");
+  assert.match(version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
   assert.ok(versions.length >= 5);
   assert.ok(versions.every((entry) => entry.version === version));
 });
