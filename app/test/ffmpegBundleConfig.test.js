@@ -97,6 +97,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   const raw = await fs.readFile(packageJsonPath, "utf8");
   const json = JSON.parse(raw);
   const portableScript = json?.scripts?.portable ?? "";
+  const updateHelperScript = json?.scripts?.["build:update-helper"] ?? "";
   const smokeScript = json?.scripts?.["smoke:portable"] ?? "";
   const exportSmokeScript = json?.scripts?.["smoke:portable:export"] ?? "";
   const releaseScript = json?.scripts?.["release:portable"] ?? "";
@@ -111,7 +112,9 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   await fs.access(exportSmokePowerShellPath);
   assert.match(portableScript, /\btauri build\b/);
   assert.match(portableScript, /--no-bundle/);
+  assert.match(portableScript, /build:update-helper/);
   assert.match(portableScript, /smoke:portable/);
+  assert.match(updateHelperScript, /--bin vfl-update-helper/);
   assert.equal(smokeScript, "node scripts/run-portable-smoke.mjs");
   assert.equal(exportSmokeScript, "node scripts/run-portable-export-smoke.mjs");
   assert.equal(releaseScript, "node scripts/run-release-portable.mjs");

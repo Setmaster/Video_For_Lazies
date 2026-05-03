@@ -1,23 +1,25 @@
 {
   "name": "video-for-lazies",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:update-helper": "cargo build --release --manifest-path src-tauri/Cargo.toml --bin vfl-update-helper",
     "prepare:ffmpeg-sidecar": "node scripts/run-sync-ffmpeg-sidecar.mjs",
     "smoke:portable": "node scripts/run-portable-smoke.mjs",
     "smoke:portable:export": "node scripts/run-portable-export-smoke.mjs",
     "release:portable": "node scripts/run-release-portable.mjs",
     "release:notes": "node scripts/generate-release-notes.mjs",
     "release:assets": "node scripts/prepare-release-assets.mjs",
+    "release:manifest:sign": "node scripts/sign-update-manifest.mjs",
     "version:check": "node scripts/check-version.mjs",
     "version:set": "node scripts/set-version.mjs",
     "test": "node --test",
     "preview": "vite preview",
-    "portable": "tauri build --no-bundle && node scripts/make-portable.mjs && npm run smoke:portable",
+    "portable": "tauri build --no-bundle && npm run build:update-helper && node scripts/make-portable.mjs && npm run smoke:portable",
     "tauri": "tauri"
   },
   "dependencies": {

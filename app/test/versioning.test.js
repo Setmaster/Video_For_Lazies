@@ -33,6 +33,7 @@ test("version metadata exposes the expected locations", async () => {
     "app/src-tauri/tauri.conf.json",
     "app/src-tauri/Cargo.toml",
     "app/src-tauri/Cargo.lock",
+    "app/src/App.tsx APP_VERSION",
   ]);
 });
 

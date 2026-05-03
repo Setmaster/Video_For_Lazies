@@ -161,10 +161,13 @@ export function renderReleaseNotes({
   for (const targetLabel of targetLabels) {
     lines.push(`- \`Video_For_Lazies-v${version}-${targetLabel}.zip\``);
   }
-  lines.push("- `SHA256SUMS.txt`", "");
+  lines.push("- `SHA256SUMS.txt`");
+  lines.push("- `vfl-update-manifest-v1.json`");
+  lines.push("- `vfl-update-manifest-v1.json.sig`", "");
 
   lines.push("## Runtime Notes", "");
   lines.push("- Windows x64 and Linux x64 portable releases bundle pinned GPL FFmpeg sidecars and include FFmpeg source plus build-provenance archives in the portable payload.");
+  lines.push("- Updater-capable releases verify a signed update manifest before downloading or applying future portable updates.");
   lines.push("- Windows portable zips are unsigned and may trigger SmartScreen or antivirus reputation warnings. Verify the SHA256 checksum before running.");
   lines.push("- `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH` remain available for custom runtime overrides on both platforms.");
   lines.push("- Repository visibility is not changed by this release workflow.", "");

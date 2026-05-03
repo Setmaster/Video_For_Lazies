@@ -147,6 +147,50 @@ button {
   max-width: 34rem;
 }
 
+.vfl-update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(81, 210, 179, 0.32);
+  background:
+    linear-gradient(135deg, rgba(81, 210, 179, 0.16), rgba(var(--accent), 0.08)),
+    rgba(255, 255, 255, 0.035);
+}
+
+.vfl-update-copy {
+  min-width: 0;
+}
+
+.vfl-update-kicker {
+  color: rgba(142, 232, 210, 0.9);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.vfl-update-title {
+  color: #fff;
+  font-size: 13.5px;
+  font-weight: 700;
+}
+
+.vfl-update-summary {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.vfl-update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
 /* ── file cards (header) ──────────────────────────────── */
 .vfl-file-row {
   display: grid;

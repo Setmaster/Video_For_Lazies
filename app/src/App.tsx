@@ -14,6 +14,8 @@ import type {
   EncodeProgressPayload,
   EncodeRequest,
   OutputFormat,
+  UpdateApplyResponse,
+  UpdateCheckResponse,
   VideoProbe,
 } from "./lib/types";
 import {
@@ -36,6 +38,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
+const APP_VERSION = "1.1.0";
 
 type TrimFocusTarget = "preview" | "start" | "end";
 type TrimTimeline = {
@@ -187,6 +190,9 @@ function App() {
   const [smokeConfig, setSmokeConfig] = useState<AppSmokeConfig | null>(null);
   const [previewMediaReady, setPreviewMediaReady] = useState(false);
   const [lastExport, setLastExport] = useState<LastExportResult | null>(null);
+  const [updateNotice, setUpdateNotice] = useState<UpdateCheckResponse | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
 
   const jobIdRef = useRef<number | null>(null);
   const formatRef = useRef<OutputFormat>(format);
@@ -285,6 +291,32 @@ function App() {
       previewSelectionTimeRef.current = previewTimeS;
     }
   }, [activeTrimTarget, previewPlaying, previewTimeS]);
+
+  useEffect(() => {
+    let stop = false;
+
+    void (async () => {
+      try {
+        await invoke("finalize_update_startup");
+      } catch (error) {
+        console.warn("Failed to finalize pending update state:", error);
+      }
+
+      try {
+        const result = await invoke<UpdateCheckResponse>("check_for_update", { force: false });
+        if (!stop && result.status === "available") {
+          setUpdateNotice(result);
+          setUpdateStatus(null);
+        }
+      } catch (error) {
+        console.warn("Failed to check for updates:", error);
+      }
+    })();
+
+    return () => {
+      stop = true;
+    };
+  }, []);
 
   useEffect(() => () => {
     if (trimDragCleanupRef.current) {
@@ -1769,6 +1801,38 @@ function App() {
     setTrimEnd("");
   }
 
+  async function dismissUpdate(choice: "remindLater" | "skip7days" | "dismiss") {
+    if (!updateNotice?.latestVersion) {
+      setUpdateNotice(null);
+      return;
+    }
+
+    try {
+      await invoke("record_update_prompt_choice", {
+        choice,
+        version: updateNotice.latestVersion,
+      });
+    } catch (error) {
+      console.warn("Failed to store update prompt choice:", error);
+    } finally {
+      setUpdateNotice(null);
+      setUpdateStatus(null);
+    }
+  }
+
+  async function applyUpdate() {
+    if (updateBusy) return;
+    setUpdateBusy(true);
+    setUpdateStatus("Preparing update...");
+    try {
+      const result = await invoke<UpdateApplyResponse>("prepare_and_apply_update");
+      setUpdateStatus(result.message);
+    } catch (error) {
+      setUpdateStatus(coerceErrorMessage(error, "Update failed."));
+      setUpdateBusy(false);
+    }
+  }
+
   const sizeLimitEnabled = sizeLimitMb.trim() !== "" && Number(sizeLimitMb) > 0;
   const trimSelectionStyle =
     trimTimeline && previewDurationS > 0
@@ -1796,6 +1860,29 @@ function App() {
         </div>
       ) : null}
       <header className="vfl-header">
+        {updateNotice ? (
+          <div className="vfl-update-banner" role="status" aria-live="polite">
+            <div className="vfl-update-copy">
+              <div className="vfl-update-kicker">Update available</div>
+              <div className="vfl-update-title">
+                Video For Lazies {updateNotice.latestVersion}
+                {updateNotice.artifact?.sizeBytes ? ` (${(updateNotice.artifact.sizeBytes / (1024 * 1024)).toFixed(1)} MB)` : ""}
+              </div>
+              <div className="vfl-update-summary">{updateStatus ?? updateNotice.notes?.summary ?? "A new portable release is ready."}</div>
+            </div>
+            <div className="vfl-update-actions">
+              <button className="primary" onClick={() => void applyUpdate()} disabled={updateBusy || jobId !== null}>
+                {updateBusy ? "Updating..." : "Update now"}
+              </button>
+              <button onClick={() => void dismissUpdate("remindLater")} disabled={updateBusy}>
+                Remind me later
+              </button>
+              <button onClick={() => void dismissUpdate("skip7days")} disabled={updateBusy}>
+                Skip
+              </button>
+            </div>
+          </div>
+        ) : null}
         <div className="vfl-header-top">
           <div className="vfl-title">
             <div className="vfl-title-main">Video For Lazies</div>
@@ -2512,7 +2599,7 @@ function App() {
                   <div className="vfl-legal-list">
                     <div className="vfl-legal-row">
                       <div className="vfl-summary-label">App</div>
-                      <div className="vfl-summary-value">Video For Lazies 0.1.0, GPL-3.0-or-later</div>
+                      <div className="vfl-summary-value">Video For Lazies {APP_VERSION}, GPL-3.0-or-later</div>
                     </div>
                     <div className="vfl-legal-row">
                       <div className="vfl-summary-label">Runtime</div>

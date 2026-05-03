@@ -11,6 +11,7 @@ const packageLockPath = path.resolve(appRoot, "package-lock.json");
 const tauriConfigPath = path.resolve(appRoot, "src-tauri", "tauri.conf.json");
 const cargoTomlPath = path.resolve(appRoot, "src-tauri", "Cargo.toml");
 const cargoLockPath = path.resolve(appRoot, "src-tauri", "Cargo.lock");
+const appTsxPath = path.resolve(appRoot, "src", "App.tsx");
 
 export function normalizeVersionInput(value) {
   const normalized = String(value ?? "").trim().replace(/^v/, "");
@@ -63,6 +64,22 @@ function replaceCargoLockPackageVersion(raw, packageName, version) {
   return replaced;
 }
 
+function parseFrontendAppVersion(raw) {
+  const match = raw.match(/^const APP_VERSION = "([^"]+)";$/m);
+  if (!match) {
+    throw new Error("Could not find APP_VERSION in App.tsx.");
+  }
+  return match[1];
+}
+
+function replaceFrontendAppVersion(raw, version) {
+  const replaced = raw.replace(/^const APP_VERSION = "[^"]+";$/m, `const APP_VERSION = "${version}";`);
+  if (replaced === raw) {
+    throw new Error("Could not update APP_VERSION in App.tsx.");
+  }
+  return replaced;
+}
+
 async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
 }
@@ -77,6 +94,7 @@ export async function readProjectVersions() {
   const tauriConfig = await readJson(tauriConfigPath);
   const cargoToml = await fs.readFile(cargoTomlPath, "utf8");
   const cargoLock = await fs.readFile(cargoLockPath, "utf8");
+  const appTsx = await fs.readFile(appTsxPath, "utf8");
 
   return [
     { label: "app/package.json", version: packageJson.version },
@@ -85,6 +103,7 @@ export async function readProjectVersions() {
     { label: "app/src-tauri/tauri.conf.json", version: tauriConfig.version },
     { label: "app/src-tauri/Cargo.toml", version: parseCargoPackageVersion(cargoToml, "Cargo.toml") },
     { label: "app/src-tauri/Cargo.lock", version: parseCargoLockPackageVersion(cargoLock, "video_for_lazies") },
+    { label: "app/src/App.tsx APP_VERSION", version: parseFrontendAppVersion(appTsx) },
   ];
 }
 
@@ -130,6 +149,7 @@ export async function setProjectVersion(versionInput) {
   const tauriConfig = await readJson(tauriConfigPath);
   const cargoToml = await fs.readFile(cargoTomlPath, "utf8");
   const cargoLock = await fs.readFile(cargoLockPath, "utf8");
+  const appTsx = await fs.readFile(appTsxPath, "utf8");
 
   packageJson.version = version;
   packageLock.version = version;
@@ -144,6 +164,7 @@ export async function setProjectVersion(versionInput) {
   await writeJson(tauriConfigPath, tauriConfig);
   await fs.writeFile(cargoTomlPath, replaceCargoPackageVersion(cargoToml, version, "Cargo.toml"));
   await fs.writeFile(cargoLockPath, replaceCargoLockPackageVersion(cargoLock, "video_for_lazies", version));
+  await fs.writeFile(appTsxPath, replaceFrontendAppVersion(appTsx, version));
 
   return assertSynchronizedVersion(version);
 }

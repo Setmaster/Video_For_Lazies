@@ -4,8 +4,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { repoRoot } from "./ffmpegBundle.mjs";
+import { writeUpdateManifest } from "./updateManifests.mjs";
 
 const REQUIRED_ZIP_SUFFIXES = ["linux-x64.zip", "win-x64.zip"];
+const RELEASE_ZIP_PATTERN = /^Video_For_Lazies-v(.+)-(linux|win)-x64\.zip$/;
 
 function parseArgs(argv) {
   const options = {};
@@ -75,6 +77,26 @@ export async function prepareReleaseAssets({ inputDir, outputDir } = {}) {
     copiedFiles.push(outputPath);
   }
 
+  const payloadManifestFiles = files
+    .filter((filePath) => /Video_For_Lazies-v.+-(linux|win)-x64\.payload-manifest\.json$/.test(path.basename(filePath)))
+    .sort((left, right) => path.basename(left).localeCompare(path.basename(right)));
+
+  for (const payloadManifestFile of payloadManifestFiles) {
+    await fs.copyFile(payloadManifestFile, path.resolve(resolvedOutputDir, path.basename(payloadManifestFile)));
+  }
+
+  const releaseVersions = new Set(
+    zipNames.map((zipName) => {
+      const match = zipName.match(RELEASE_ZIP_PATTERN);
+      return match?.[1] ?? null;
+    }),
+  );
+  releaseVersions.delete(null);
+  if (releaseVersions.size !== 1) {
+    throw new Error(`Release zips must all use the same version: ${zipNames.join(", ")}`);
+  }
+  const [releaseVersion] = releaseVersions;
+
   const checksumLines = [];
   for (const filePath of copiedFiles) {
     checksumLines.push(`${await sha256File(filePath)}  ${path.basename(filePath)}`);
@@ -82,7 +104,16 @@ export async function prepareReleaseAssets({ inputDir, outputDir } = {}) {
 
   const checksumPath = path.resolve(resolvedOutputDir, "SHA256SUMS.txt");
   await fs.writeFile(checksumPath, `${checksumLines.join("\n")}\n`);
-  return { outputDir: resolvedOutputDir, files: [...copiedFiles, checksumPath] };
+  const { outputPath: updateManifestPath } = await writeUpdateManifest({
+    releaseAssetDir: resolvedOutputDir,
+    version: releaseVersion,
+  });
+
+  await Promise.all(payloadManifestFiles.map((payloadManifestFile) =>
+    fs.rm(path.resolve(resolvedOutputDir, path.basename(payloadManifestFile)), { force: true })
+  ));
+
+  return { outputDir: resolvedOutputDir, files: [...copiedFiles, checksumPath, updateManifestPath] };
 }
 
 async function main() {

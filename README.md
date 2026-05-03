@@ -23,6 +23,7 @@ It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local t
 - Target a file size in decimal MB, or disable size targeting for constant-quality export.
 - Keep audio on/off, title metadata, recent export status, and output format in the app workflow.
 - Auto-suggest safe output names in the same folder and avoid overwriting existing `-N` exports.
+- Check for signed portable updates and prompt before installing them.
 - Save a preview frame as PNG.
 
 ## Who It Is For
@@ -40,6 +41,8 @@ Download the latest stable portable zip from [GitHub Releases](https://github.co
 - Checksums: `SHA256SUMS.txt`
 
 The portable builds bundle pinned FFmpeg sidecars, including `ffprobe`, so end users do not need to install FFmpeg separately for supported Windows and Linux releases.
+
+Updater-capable releases verify a signed update manifest before downloading future portable updates. The prompt offers `Update now`, `Remind me later`, and `Skip` for seven days.
 
 Windows builds are unsigned, so Windows may show SmartScreen or antivirus reputation warnings until the project has signing and reputation history. Verify the checksum before running downloaded binaries.
 
@@ -105,7 +108,7 @@ cd app
 npm run release:portable
 ```
 
-That command builds the portable folder, creates a versioned x64 zip such as `release/Video_For_Lazies-vX.Y.Z-win-x64.zip` or `release/Video_For_Lazies-vX.Y.Z-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted archive.
+That command builds the portable folder, creates a versioned x64 zip such as `release/Video_For_Lazies-vX.Y.Z-win-x64.zip` or `release/Video_For_Lazies-vX.Y.Z-linux-x64.zip`, writes `release/SHA256SUMS.txt`, writes the portable payload manifest used by the updater, and verifies the extracted archive.
 
 Release process details are in [`docs/release.md`](docs/release.md).
 

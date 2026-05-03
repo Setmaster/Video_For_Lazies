@@ -12,7 +12,7 @@ This app bundles FFmpeg for Windows x64 and Linux x64 release builds so end user
 - `npm run tauri build` and `npm run portable` trigger that staging automatically through Tauri's `beforeBuildCommand`.
 - The portable release format is a folder: `release/Video_For_Lazies/` plus `release/Video_For_Lazies/ffmpeg-sidecar/`.
 - The portable build also runs a Windows startup smoke (`app/scripts/windows-portable-smoke.ps1`) after packaging. It launches the portable exe, captures the app window, and fails the build if the rendered surface is overwhelmingly bright/white, which catches regressions like the accidental dev-surface/localhost build.
-- `npm run release:portable` packages a versioned zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted zip. Both platforms verify the bundled FFmpeg sidecar exposes `libx264` and can encode/probe a sample MP4. Windows additionally runs startup plus packaged interaction/export smoke, including a second tight-target 1080p MP4 smoke.
+- `npm run release:portable` packages a versioned zip such as `release/Video_For_Lazies-vX.Y.Z-win-x64.zip` or `release/Video_For_Lazies-vX.Y.Z-linux-x64.zip`, writes `release/SHA256SUMS.txt`, writes a payload manifest sidecar for the updater workflow, and verifies the extracted zip. Both platforms verify the bundled FFmpeg sidecar exposes `libx264` and can encode/probe a sample MP4. Windows additionally runs startup plus packaged interaction/export smoke, including a second tight-target 1080p MP4 smoke.
 
 ## Pinned Windows bundle
 

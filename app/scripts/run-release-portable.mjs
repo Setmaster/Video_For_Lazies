@@ -23,6 +23,11 @@ import {
   getPortableZipPath,
 } from "./portableRelease.mjs";
 import { getProjectVersion } from "./versioning.mjs";
+import {
+  copyPayloadManifestSidecar,
+  PAYLOAD_MANIFEST_FILE_NAME,
+  validatePayloadManifest,
+} from "./updateManifests.mjs";
 
 const __filename = url.fileURLToPath(import.meta.url);
 
@@ -227,6 +232,7 @@ async function assertPortableFile(portableDir, relativePath) {
 
 async function assertPortableLegalPayload(portableDir, { platform = process.platform } = {}) {
   const requiredFiles = [
+    PAYLOAD_MANIFEST_FILE_NAME,
     "README.md",
     "LICENSE.txt",
     "THIRD_PARTY_NOTICES.md",
@@ -257,12 +263,18 @@ async function assertPortableLegalPayload(portableDir, { platform = process.plat
 
 async function assertPortableExecutable(portableDir, { platform = process.platform } = {}) {
   await assertPortableFile(portableDir, getPortableExecutableName({ platform }));
+  await assertPortableFile(portableDir, platform === "win32" ? "vfl-update-helper.exe" : "vfl-update-helper");
 }
 
 async function verifyPortableArtifact(portableDir, label, { platform = process.platform } = {}) {
   console.log(`Verifying extracted ${label} artifact: ${portableDir}`);
   await assertPortableExecutable(portableDir, { platform });
   await assertPortableLegalPayload(portableDir, { platform });
+  await validatePayloadManifest({
+    portableDir,
+    version: await getProjectVersion(),
+    platform,
+  });
   await assertBundledLibx264(portableDir, { platform });
   await runBundledEncodeSmoke(portableDir, { platform });
 
@@ -319,6 +331,11 @@ async function main() {
 
   const zipPath = getPortableZipPath({ version });
   const checksumPath = getPortableChecksumPath();
+  const payloadSidecarPath = await copyPayloadManifestSidecar({
+    portableDir,
+    releaseDir: getPortableReleaseParentDir(),
+    version,
+  });
 
   await createZipArchive(portableDir, zipPath);
   await fs.writeFile(checksumPath, await buildChecksumLines([zipPath]));
@@ -342,6 +359,7 @@ async function main() {
 
   console.log(`Portable ${targetLabel} release artifacts ready:`);
   console.log(`- ${zipPath}`);
+  console.log(`- ${payloadSidecarPath}`);
   console.log(`- ${checksumPath}`);
   console.log(`Release directory: ${getPortableReleaseParentDir()}`);
 }

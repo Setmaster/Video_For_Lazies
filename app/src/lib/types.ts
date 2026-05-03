@@ -80,3 +80,34 @@ export interface AppSmokeStatus {
   expectedDurationS?: number | null;
   stageHistory?: string[] | null;
 }
+
+export interface UpdateNotes {
+  title: string;
+  summary: string;
+  url: string;
+}
+
+export interface UpdateArtifactInfo {
+  target: string;
+  fileName: string;
+  sizeBytes: number;
+  url: string;
+  sha256: string;
+}
+
+export interface UpdateCheckResponse {
+  status: "available" | "current" | "skipped";
+  currentVersion: string;
+  latestVersion?: string | null;
+  releaseUrl?: string | null;
+  notes?: UpdateNotes | null;
+  artifact?: UpdateArtifactInfo | null;
+  checkedAtMs: number;
+  reason?: string | null;
+}
+
+export interface UpdateApplyResponse {
+  status: "restarting";
+  version: string;
+  message: string;
+}

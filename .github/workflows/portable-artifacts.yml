@@ -141,6 +141,7 @@ jobs:
           name: Video_For_Lazies-v${{ steps.version.outputs.version }}-${{ matrix.target }}-${{ steps.version.outputs.short_sha }}
           path: |
             release/Video_For_Lazies-v${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+            release/Video_For_Lazies-v${{ steps.version.outputs.version }}-${{ matrix.target }}.payload-manifest.json
             release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
@@ -191,6 +192,13 @@ jobs:
 
       - name: Stage release assets
         run: node scripts/prepare-release-assets.mjs --input release/downloaded-artifacts --output release/release-assets
+        working-directory: app
+
+      - name: Sign update manifest
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.VFL_UPDATE_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.VFL_UPDATE_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node scripts/sign-update-manifest.mjs --release-assets release/release-assets
         working-directory: app
 
       - name: Generate release notes

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State, Window};
 
+pub mod updater;
 mod video;
 
 const SUPPORTED_PREVIEW_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v"];
@@ -450,6 +451,10 @@ pub fn run() {
             allow_preview_path,
             read_smoke_config,
             write_smoke_status,
+            updater::check_for_update,
+            updater::record_update_prompt_choice,
+            updater::prepare_and_apply_update,
+            updater::finalize_update_startup,
             start_encode,
             cancel_encode
         ])

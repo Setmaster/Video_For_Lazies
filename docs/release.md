@@ -15,6 +15,7 @@ Use SemVer for app versions: `MAJOR.MINOR.PATCH`, with optional prerelease suffi
 - Keep these metadata fields synchronized before tagging or building release artifacts:
   - `app/package.json`
   - `app/package-lock.json`
+  - `app/src/App.tsx` (`APP_VERSION`)
   - `app/src-tauri/Cargo.toml`
   - `app/src-tauri/Cargo.lock`
   - `app/src-tauri/tauri.conf.json`
@@ -63,7 +64,7 @@ The `Portable Release` GitHub Actions workflow builds verified x64 artifacts for
 - `linux-x64`
 - `win-x64`
 
-It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds both portable zips, creates release notes, stages a combined `SHA256SUMS.txt`, and creates a GitHub Release with the final assets. It defaults to a draft prerelease so the generated changelog and uploaded binaries can be reviewed before publishing.
+It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds both portable zips, creates release notes, stages a combined `SHA256SUMS.txt`, signs the updater manifest, and creates a GitHub Release with the final assets. It defaults to a draft prerelease so the generated changelog and uploaded binaries can be reviewed before publishing.
 
 Manual dispatch inputs:
 
@@ -85,7 +86,7 @@ Release notes follow this template:
 <categorized commits since previous release tag>
 
 ## Artifacts
-<portable zip assets and checksum file>
+<portable zip assets, checksum file, update manifest, and update manifest signature>
 
 ## Runtime Notes
 <Bundled FFmpeg sidecar notes>
@@ -101,7 +102,7 @@ Recommended manual draft protocol:
 3. Review commits since that tag with `git log --oneline <previous-tag>..HEAD`, or use `git log --oneline HEAD` for the first release.
 4. Write the curated `release_notes` input using the template above.
 5. Trigger `Portable Release` with `draft=true`.
-6. Review the draft release notes, Linux zip, Windows zip, and `SHA256SUMS.txt`.
+6. Review the draft release notes, Linux zip, Windows zip, `SHA256SUMS.txt`, `vfl-update-manifest-v1.json`, and `vfl-update-manifest-v1.json.sig`.
 7. Confirm the draft release is backed by the intended public `vX.Y.Z` tag.
 8. Confirm generated `SOURCE.md` in each zip names the intended release tag and source commit.
 9. Publish the draft only when the owner wants that release visible to the public.
@@ -113,7 +114,7 @@ cd app
 npm run release:portable
 ```
 
-The script builds `release/Video_For_Lazies/`, creates a versioned zip, writes `release/SHA256SUMS.txt`, extracts the zip, and verifies the payload.
+The script builds `release/Video_For_Lazies/`, creates a versioned zip, writes `release/SHA256SUMS.txt`, writes a platform payload manifest sidecar, extracts the zip, and verifies the payload.
 
 Linux artifact example:
 
@@ -127,7 +128,18 @@ Windows artifact example:
 release/Video_For_Lazies-vX.Y.Z-win-x64.zip
 ```
 
-GitHub release assets are intentionally zip-only for now: the Linux zip, the Windows zip, and the combined checksum file.
+GitHub release assets are the Linux zip, the Windows zip, the combined checksum file, the signed updater manifest, and the updater manifest signature. Payload manifest sidecars are intermediate workflow inputs and are intentionally not uploaded as separate release assets.
+
+## Updater Signing
+
+Portable update checks trust the signed `vfl-update-manifest-v1.json`, not the network transport alone. The manifest contains the release version, artifact URLs, zip SHA256 values, zip sizes, and payload manifest hashes. The app embeds the updater public key and rejects bad signatures before showing an update prompt.
+
+The release workflow expects these GitHub Actions secrets:
+
+- `VFL_UPDATE_SIGNING_PRIVATE_KEY`
+- `VFL_UPDATE_SIGNING_PRIVATE_KEY_PASSWORD`
+
+Do not commit the private key or password. Rotate the updater key with a dedicated compatibility plan, because already shipped apps can only trust public keys embedded in their binaries.
 
 ## Workflow Linting
 
@@ -140,6 +152,7 @@ actionlint -color
 Required portable payload on all platforms:
 
 - app executable
+- update helper executable
 - `README.md`
 - `LICENSE.txt`
 - `THIRD_PARTY_NOTICES.md`
