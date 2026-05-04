@@ -38,7 +38,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.1.1";
 
 type TrimFocusTarget = "preview" | "start" | "end";
 type TrimTimeline = {
@@ -193,6 +193,8 @@ function App() {
   const [updateNotice, setUpdateNotice] = useState<UpdateCheckResponse | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [manualUpdateBusy, setManualUpdateBusy] = useState(false);
+  const [manualUpdateStatus, setManualUpdateStatus] = useState<string | null>(null);
 
   const jobIdRef = useRef<number | null>(null);
   const formatRef = useRef<OutputFormat>(format);
@@ -1820,6 +1822,29 @@ function App() {
     }
   }
 
+  async function checkForUpdatesNow() {
+    if (manualUpdateBusy || updateBusy) return;
+
+    setManualUpdateBusy(true);
+    setManualUpdateStatus("Checking for updates...");
+    try {
+      const result = await invoke<UpdateCheckResponse>("check_for_update", { force: true });
+      if (result.status === "available") {
+        setUpdateNotice(result);
+        setUpdateStatus(null);
+        setManualUpdateStatus(`Video For Lazies ${result.latestVersion} is ready.`);
+      } else {
+        setUpdateNotice(null);
+        setUpdateStatus(null);
+        setManualUpdateStatus(result.reason ?? "Video For Lazies is up to date.");
+      }
+    } catch (error) {
+      setManualUpdateStatus(coerceErrorMessage(error, "Update check failed."));
+    } finally {
+      setManualUpdateBusy(false);
+    }
+  }
+
   async function applyUpdate() {
     if (updateBusy) return;
     setUpdateBusy(true);
@@ -2604,6 +2629,19 @@ function App() {
                     <div className="vfl-legal-row">
                       <div className="vfl-summary-label">Runtime</div>
                       <div className="vfl-summary-value">Windows portable builds include a pinned GPL FFmpeg sidecar with libx264.</div>
+                    </div>
+                    <div className="vfl-legal-row">
+                      <div className="vfl-summary-label">Updates</div>
+                      <div className="vfl-update-row-content">
+                        <button onClick={() => void checkForUpdatesNow()} disabled={manualUpdateBusy || updateBusy}>
+                          {manualUpdateBusy ? "Checking..." : "Check for updates"}
+                        </button>
+                        {manualUpdateStatus ? (
+                          <div className="vfl-update-inline-status" role="status" aria-live="polite">
+                            {manualUpdateStatus}
+                          </div>
+                        ) : null}
+                      </div>
                     </div>
                   </div>
                 </div>

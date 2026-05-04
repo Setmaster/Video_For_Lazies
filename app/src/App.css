@@ -752,6 +752,24 @@ button.danger:hover:enabled {
   background: rgba(0, 0, 0, 0.16);
 }
 
+.vfl-update-row-content {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.vfl-update-row-content button {
+  min-height: 34px;
+}
+
+.vfl-update-inline-status {
+  min-width: min(100%, 18rem);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.35;
+}
+
 /* ── stacks ───────────────────────────────────────────── */
 .vfl-stack-sm,
 .vfl-stack-md {
