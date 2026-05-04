@@ -38,7 +38,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.1.1";
+const APP_VERSION = "1.1.2";
 
 type TrimFocusTarget = "preview" | "start" | "end";
 type TrimTimeline = {

@@ -192,19 +192,7 @@ pub fn record_update_prompt_choice(
     let now = now_ms();
     let mut prefs = load_prefs(&app)?;
 
-    match choice {
-        PromptChoice::RemindLater => {
-            prefs.remind_later_version = Some(version.to_string());
-        }
-        PromptChoice::Skip7Days => {
-            prefs.suppress_prompts_until_ms = Some(now.saturating_add(SKIP_INTERVAL_MS));
-            prefs.remind_later_version = None;
-        }
-        PromptChoice::Dismiss => {
-            prefs.remind_later_version = None;
-        }
-    }
-
+    apply_prompt_choice(&mut prefs, choice, &version, now);
     save_prefs(&app, &prefs)
 }
 
@@ -351,11 +339,9 @@ fn check_for_update_inner(app: &AppHandle, force: bool) -> Result<UpdateCheckRes
     let latest = parse_semver(&manifest.version)?;
     let current = parse_semver(current_version())?;
 
-    prefs.last_checked_at_ms = Some(now);
-    set_highest_trusted_version(&mut prefs, &latest);
-    save_prefs(app, &prefs)?;
-
     if latest <= current {
+        record_update_check_result(&mut prefs, &latest, &current, now);
+        save_prefs(app, &prefs)?;
         return Ok(UpdateCheckResponse {
             status: "current".to_string(),
             current_version: current_version().to_string(),
@@ -374,6 +360,9 @@ fn check_for_update_inner(app: &AppHandle, force: bool) -> Result<UpdateCheckRes
         .get(target)
         .ok_or_else(|| "The update manifest does not include this platform.".to_string())?;
     validate_artifact(target, artifact)?;
+
+    record_update_check_result(&mut prefs, &latest, &current, now);
+    save_prefs(app, &prefs)?;
 
     Ok(UpdateCheckResponse {
         status: "available".to_string(),
@@ -404,6 +393,33 @@ fn skipped_response(now: u64, reason: String) -> UpdateCheckResponse {
         checked_at_ms: now,
         reason: Some(reason),
     }
+}
+
+fn apply_prompt_choice(prefs: &mut UpdatePrefs, choice: PromptChoice, version: &Version, now: u64) {
+    match choice {
+        PromptChoice::RemindLater | PromptChoice::Dismiss => {
+            prefs.remind_later_version = Some(version.to_string());
+        }
+        PromptChoice::Skip7Days => {
+            prefs.suppress_prompts_until_ms = Some(now.saturating_add(SKIP_INTERVAL_MS));
+            prefs.remind_later_version = None;
+        }
+    }
+}
+
+fn record_update_check_result(
+    prefs: &mut UpdatePrefs,
+    latest: &Version,
+    current: &Version,
+    now: u64,
+) {
+    prefs.last_checked_at_ms = Some(now);
+    if latest > current {
+        prefs.remind_later_version = Some(latest.to_string());
+    } else {
+        prefs.remind_later_version = None;
+    }
+    set_highest_trusted_version(prefs, latest);
 }
 
 fn fetch_verified_update_manifest() -> Result<VerifiedManifest, String> {
@@ -1531,6 +1547,64 @@ mod tests {
         assert!(validate_sha256(&"a".repeat(64), "hash").is_ok());
         assert!(validate_sha256(&"A".repeat(64), "hash").is_err());
         assert!(validate_sha256("abc", "hash").is_err());
+    }
+
+    #[test]
+    fn dismissing_update_prompt_behaves_like_remind_later() {
+        let mut prefs = UpdatePrefs::default();
+        let version = Version::parse("1.2.3").unwrap();
+
+        apply_prompt_choice(&mut prefs, PromptChoice::Dismiss, &version, 1234);
+
+        assert_eq!(prefs.remind_later_version.as_deref(), Some("1.2.3"));
+        assert_eq!(prefs.suppress_prompts_until_ms, None);
+    }
+
+    #[test]
+    fn skipping_update_prompt_clears_remind_later() {
+        let mut prefs = UpdatePrefs {
+            remind_later_version: Some("1.2.3".to_string()),
+            ..UpdatePrefs::default()
+        };
+        let version = Version::parse("1.2.3").unwrap();
+
+        apply_prompt_choice(&mut prefs, PromptChoice::Skip7Days, &version, 1234);
+
+        assert_eq!(prefs.remind_later_version, None);
+        assert_eq!(
+            prefs.suppress_prompts_until_ms,
+            Some(1234_u64.saturating_add(SKIP_INTERVAL_MS))
+        );
+    }
+
+    #[test]
+    fn available_update_check_records_next_launch_reminder() {
+        let mut prefs = UpdatePrefs::default();
+        let latest = Version::parse("1.2.3").unwrap();
+        let current = Version::parse("1.2.2").unwrap();
+
+        record_update_check_result(&mut prefs, &latest, &current, 5678);
+
+        assert_eq!(prefs.last_checked_at_ms, Some(5678));
+        assert_eq!(prefs.remind_later_version.as_deref(), Some("1.2.3"));
+        assert_eq!(prefs.highest_trusted_version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn current_update_check_clears_next_launch_reminder() {
+        let mut prefs = UpdatePrefs {
+            remind_later_version: Some("1.2.3".to_string()),
+            highest_trusted_version: Some("1.2.3".to_string()),
+            ..UpdatePrefs::default()
+        };
+        let latest = Version::parse("1.2.3").unwrap();
+        let current = Version::parse("1.2.3").unwrap();
+
+        record_update_check_result(&mut prefs, &latest, &current, 9012);
+
+        assert_eq!(prefs.last_checked_at_ms, Some(9012));
+        assert_eq!(prefs.remind_later_version, None);
+        assert_eq!(prefs.highest_trusted_version.as_deref(), Some("1.2.3"));
     }
 
     #[test]
