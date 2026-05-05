@@ -110,8 +110,18 @@ button {
 .vfl-header-badges {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 5px;
   max-width: 44rem;
+}
+
+.vfl-header-utilities {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
 }
 
 .vfl-header-badge {
@@ -126,6 +136,35 @@ button {
 
 .vfl-header-badge.subtle {
   color: var(--text-muted);
+}
+
+.vfl-about-button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  border-color: rgba(var(--accent), 0.24);
+  background: rgba(var(--accent), 0.08);
+  color: rgba(var(--accent), 0.95);
+}
+
+.vfl-about-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.vfl-about-button:hover:enabled {
+  transform: translateY(-1px);
+  border-color: rgba(var(--accent), 0.4);
+  background: rgba(var(--accent), 0.14);
 }
 
 .vfl-title {
@@ -189,6 +228,78 @@ button {
   flex-wrap: wrap;
   gap: 6px;
   justify-content: flex-end;
+}
+
+/* ── modal ────────────────────────────────────────────── */
+.vfl-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(7, 12, 20, 0.72);
+  backdrop-filter: blur(8px);
+}
+
+.vfl-about-modal {
+  width: min(520px, 100%);
+  max-height: min(650px, calc(100vh - 36px));
+  overflow: auto;
+  padding: 16px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-mid);
+  background:
+    linear-gradient(180deg, rgba(19, 30, 52, 0.96), rgba(10, 16, 28, 0.96)),
+    #0a101c;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.42);
+}
+
+.vfl-about-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.vfl-about-kicker {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.vfl-about-title {
+  color: #fff;
+  font-size: 18px;
+  font-weight: 750;
+}
+
+.vfl-modal-close {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 999px;
+}
+
+.vfl-modal-close svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.vfl-about-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 /* ── file cards (header) ──────────────────────────────── */

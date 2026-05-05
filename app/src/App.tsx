@@ -3,7 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
 import type {
   AppSmokeConfig,
@@ -38,7 +38,12 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.1.2";
+const APP_VERSION = "1.1.3";
+const APP_LINKS = {
+  github: "https://github.com/Setmaster/Video_For_Lazies",
+  releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
+  security: "https://github.com/Setmaster/Video_For_Lazies/security/advisories/new",
+} as const;
 
 type TrimFocusTarget = "preview" | "start" | "end";
 type TrimTimeline = {
@@ -195,6 +200,7 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [manualUpdateBusy, setManualUpdateBusy] = useState(false);
   const [manualUpdateStatus, setManualUpdateStatus] = useState<string | null>(null);
+  const [aboutOpen, setAboutOpen] = useState(false);
 
   const jobIdRef = useRef<number | null>(null);
   const formatRef = useRef<OutputFormat>(format);
@@ -287,6 +293,19 @@ function App() {
   useEffect(() => {
     activeTrimTargetRef.current = activeTrimTarget;
   }, [activeTrimTarget]);
+
+  useEffect(() => {
+    if (!aboutOpen) return;
+
+    function handleKeydown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setAboutOpen(false);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeydown);
+    return () => window.removeEventListener("keydown", handleKeydown);
+  }, [aboutOpen]);
 
   useEffect(() => {
     if (activeTrimTarget === "preview" || previewPlaying) {
@@ -1416,6 +1435,14 @@ function App() {
     }
   }
 
+  async function openExternalUrl(url: string) {
+    try {
+      await openUrl(url);
+    } catch (error) {
+      console.warn("Failed to open external URL:", error);
+    }
+  }
+
   async function saveCurrentFrame() {
     if (!inputPath || !previewReady || !probe) return;
     if (frameSaving || jobId !== null) return;
@@ -1884,6 +1911,63 @@ function App() {
           <div className="vfl-drop-overlay-card">Drop a video to open</div>
         </div>
       ) : null}
+      {aboutOpen ? (
+        <div className="vfl-modal-backdrop" role="presentation" onClick={() => setAboutOpen(false)}>
+          <div
+            className="vfl-about-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="vfl-about-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="vfl-about-head">
+              <div>
+                <div className="vfl-about-kicker">About & Legal</div>
+                <div className="vfl-about-title" id="vfl-about-title">Video For Lazies</div>
+              </div>
+              <button className="vfl-modal-close" type="button" aria-label="Close about dialog" onClick={() => setAboutOpen(false)}>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M7 7l10 10M17 7 7 17" />
+                </svg>
+              </button>
+            </div>
+            <div className="vfl-legal-list">
+              <div className="vfl-legal-row">
+                <div className="vfl-summary-label">App</div>
+                <div className="vfl-summary-value">Version {APP_VERSION}, GPL-3.0-or-later</div>
+              </div>
+              <div className="vfl-legal-row">
+                <div className="vfl-summary-label">Runtime</div>
+                <div className="vfl-summary-value">Portable builds include pinned GPL FFmpeg sidecars with libx264.</div>
+              </div>
+              <div className="vfl-legal-row">
+                <div className="vfl-summary-label">Updates</div>
+                <div className="vfl-update-row-content">
+                  <button onClick={() => void checkForUpdatesNow()} disabled={manualUpdateBusy || updateBusy}>
+                    {manualUpdateBusy ? "Checking..." : "Check for updates"}
+                  </button>
+                  {manualUpdateStatus ? (
+                    <div className="vfl-update-inline-status" role="status" aria-live="polite">
+                      {manualUpdateStatus}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+            <div className="vfl-about-links" aria-label="Project links">
+              <button type="button" onClick={() => void openExternalUrl(APP_LINKS.github)}>
+                GitHub
+              </button>
+              <button type="button" onClick={() => void openExternalUrl(APP_LINKS.releases)}>
+                Releases
+              </button>
+              <button type="button" onClick={() => void openExternalUrl(APP_LINKS.security)}>
+                Security
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <header className="vfl-header">
         {updateNotice ? (
           <div className="vfl-update-banner" role="status" aria-live="polite">
@@ -1913,15 +1997,30 @@ function App() {
             <div className="vfl-title-main">Video For Lazies</div>
             <div className="vfl-title-sub">Fast Windows-friendly FFmpeg exports without a giant editor UI.</div>
           </div>
-          <div className="vfl-header-badges">
-            <div className="vfl-header-badge">{sourceBadgeText}</div>
-            <div className="vfl-header-badge">{format.toUpperCase()} export</div>
-            {sizeLimitEnabled ? <div className="vfl-header-badge">{sizeLimitMb} MB target</div> : null}
-            {activeEditChips.length ? (
-              <div className="vfl-header-badge subtle">
-                {activeEditChips.length} active edit{activeEditChips.length === 1 ? "" : "s"}
-              </div>
-            ) : null}
+          <div className="vfl-header-utilities">
+            <div className="vfl-header-badges">
+              <div className="vfl-header-badge">{sourceBadgeText}</div>
+              <div className="vfl-header-badge">{format.toUpperCase()} export</div>
+              {sizeLimitEnabled ? <div className="vfl-header-badge">{sizeLimitMb} MB target</div> : null}
+              {activeEditChips.length ? (
+                <div className="vfl-header-badge subtle">
+                  {activeEditChips.length} active edit{activeEditChips.length === 1 ? "" : "s"}
+                </div>
+              ) : null}
+            </div>
+            <button
+              className="vfl-about-button"
+              type="button"
+              aria-label="About & updates"
+              title="About & updates"
+              onClick={() => setAboutOpen(true)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 11v6" />
+                <path d="M12 7h.01" />
+              </svg>
+            </button>
           </div>
         </div>
 
@@ -2616,33 +2715,6 @@ function App() {
                   <div className="vfl-field">
                     <label htmlFor="vfl-title-metadata">Title</label>
                     <input id="vfl-title-metadata" value={title} onChange={(e) => setTitle(e.currentTarget.value)} disabled={jobId !== null} />
-                  </div>
-                </div>
-
-                <div className="vfl-section">
-                  <div className="vfl-section-title">About & Legal</div>
-                  <div className="vfl-legal-list">
-                    <div className="vfl-legal-row">
-                      <div className="vfl-summary-label">App</div>
-                      <div className="vfl-summary-value">Video For Lazies {APP_VERSION}, GPL-3.0-or-later</div>
-                    </div>
-                    <div className="vfl-legal-row">
-                      <div className="vfl-summary-label">Runtime</div>
-                      <div className="vfl-summary-value">Windows portable builds include a pinned GPL FFmpeg sidecar with libx264.</div>
-                    </div>
-                    <div className="vfl-legal-row">
-                      <div className="vfl-summary-label">Updates</div>
-                      <div className="vfl-update-row-content">
-                        <button onClick={() => void checkForUpdatesNow()} disabled={manualUpdateBusy || updateBusy}>
-                          {manualUpdateBusy ? "Checking..." : "Check for updates"}
-                        </button>
-                        {manualUpdateStatus ? (
-                          <div className="vfl-update-inline-status" role="status" aria-live="polite">
-                            {manualUpdateStatus}
-                          </div>
-                        ) : null}
-                      </div>
-                    </div>
                   </div>
                 </div>
               </div>

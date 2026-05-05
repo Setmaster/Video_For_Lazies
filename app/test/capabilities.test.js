@@ -17,6 +17,8 @@ test("default capabilities expose only the needed dialog and opener permissions"
     "dialog:allow-open",
     "dialog:allow-save",
     "opener:allow-open-path",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
   ]);
   assert.equal(permissions.includes("dialog:default"), false);
   assert.equal(permissions.includes("opener:default"), false);
