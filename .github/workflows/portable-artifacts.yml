@@ -33,12 +33,14 @@ permissions:
   contents: read
 
 env:
+  CARGO_AUDIT_VERSION: "0.22.1"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   portable:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -56,24 +58,24 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            curl \
-            dbus-x11 \
-            file \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            patchelf \
-            pkg-config \
-            unzip \
-            wget \
-            xvfb \
-            xz-utils \
+        uses: ./.github/actions/setup-linux-tauri-deps
+        with:
+          packages: |
+            build-essential
+            curl
+            dbus-x11
+            file
+            libayatana-appindicator3-dev
+            librsvg2-dev
+            libssl-dev
+            libwebkit2gtk-4.1-dev
+            libxdo-dev
+            patchelf
+            pkg-config
+            unzip
+            wget
+            xvfb
+            xz-utils
             zip
 
       - name: Set up Node.js
@@ -111,7 +113,9 @@ jobs:
         working-directory: app
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: ./.github/actions/install-cargo-audit
+        with:
+          version: ${{ env.CARGO_AUDIT_VERSION }}
 
       - name: Test frontend utilities
         run: npm test
@@ -132,6 +136,7 @@ jobs:
         working-directory: app/src-tauri
 
       - name: Build portable zip
+        timeout-minutes: 45
         run: npm run release:portable
         working-directory: app
 
@@ -150,6 +155,7 @@ jobs:
     name: Create GitHub Release
     needs: portable
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

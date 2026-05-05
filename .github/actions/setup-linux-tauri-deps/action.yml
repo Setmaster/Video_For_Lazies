@@ -1,0 +1,64 @@
+name: Set up Linux Tauri dependencies
+description: Install Linux packages for Tauri builds with bounded retries.
+
+inputs:
+  packages:
+    description: Newline-separated apt packages to install.
+    required: true
+  attempts:
+    description: Number of attempts for apt update/install.
+    required: false
+    default: "3"
+  update-timeout-seconds:
+    description: Per-attempt timeout for apt-get update.
+    required: false
+    default: "300"
+  install-timeout-seconds:
+    description: Per-attempt timeout for apt-get install.
+    required: false
+    default: "900"
+
+runs:
+  using: composite
+  steps:
+    - name: Install apt packages
+      shell: bash
+      env:
+        APT_ATTEMPTS: ${{ inputs.attempts }}
+        APT_INSTALL_TIMEOUT_SECONDS: ${{ inputs.install-timeout-seconds }}
+        APT_UPDATE_TIMEOUT_SECONDS: ${{ inputs.update-timeout-seconds }}
+        LINUX_TAURI_PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+
+        retry() {
+          local attempts="$1"
+          local delay_seconds="$2"
+          local label="$3"
+          shift 3
+
+          local attempt=1
+          local exit_code=0
+          until "$@"; do
+            exit_code="$?"
+            if (( attempt >= attempts )); then
+              echo "::error::${label} failed after ${attempt} attempts with exit code ${exit_code}."
+              return "$exit_code"
+            fi
+            echo "::warning::${label} attempt ${attempt} failed with exit code ${exit_code}; retrying in ${delay_seconds}s."
+            sleep "$delay_seconds"
+            attempt=$((attempt + 1))
+          done
+        }
+
+        mapfile -t apt_packages < <(printf '%s\n' "$LINUX_TAURI_PACKAGES" | sed '/^[[:space:]]*$/d')
+        if (( ${#apt_packages[@]} == 0 )); then
+          echo "::error::No apt packages were provided."
+          exit 1
+        fi
+
+        retry "$APT_ATTEMPTS" 20 "apt-get update" \
+          sudo env DEBIAN_FRONTEND=noninteractive timeout "$APT_UPDATE_TIMEOUT_SECONDS" apt-get update
+        retry "$APT_ATTEMPTS" 20 "apt-get install" \
+          sudo env DEBIAN_FRONTEND=noninteractive timeout "$APT_INSTALL_TIMEOUT_SECONDS" \
+            apt-get install -y --no-install-recommends "${apt_packages[@]}"

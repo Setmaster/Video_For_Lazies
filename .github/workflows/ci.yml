@@ -9,12 +9,14 @@ permissions:
   contents: read
 
 env:
+  CARGO_AUDIT_VERSION: "0.22.1"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   workflow-lint:
     name: Lint workflows
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -33,19 +35,20 @@ jobs:
   test:
     name: Test and audit
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            patchelf \
+        uses: ./.github/actions/setup-linux-tauri-deps
+        with:
+          packages: |
+            libayatana-appindicator3-dev
+            librsvg2-dev
+            libssl-dev
+            libwebkit2gtk-4.1-dev
+            patchelf
             pkg-config
 
       - name: Set up Node.js
@@ -73,7 +76,9 @@ jobs:
         working-directory: app
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: ./.github/actions/install-cargo-audit
+        with:
+          version: ${{ env.CARGO_AUDIT_VERSION }}
 
       - name: Test frontend utilities
         run: npm test

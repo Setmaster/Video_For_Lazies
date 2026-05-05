@@ -1,0 +1,40 @@
+name: Install cargo-audit
+description: Install or restore a pinned cargo-audit binary.
+
+inputs:
+  version:
+    description: cargo-audit version to install.
+    required: false
+    default: "0.22.1"
+  install-timeout-seconds:
+    description: Timeout for cargo install when the cache misses.
+    required: false
+    default: "900"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache cargo-audit binary
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-audit
+        key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+
+    - name: Install cargo-audit
+      shell: bash
+      env:
+        CARGO_AUDIT_INSTALL_TIMEOUT_SECONDS: ${{ inputs.install-timeout-seconds }}
+        CARGO_AUDIT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        if command -v cargo-audit >/dev/null 2>&1; then
+          current_version="$(cargo audit --version | awk '{print $NF}')"
+          if [[ "$current_version" == "$CARGO_AUDIT_VERSION" ]]; then
+            echo "cargo-audit ${current_version} already available."
+            exit 0
+          fi
+        fi
+
+        timeout "$CARGO_AUDIT_INSTALL_TIMEOUT_SECONDS" \
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked

@@ -38,6 +38,27 @@ git push origin main v0.1.1
 
 For draft prereleases or release-candidate checks before approval, run the manual workflow from the development branch and leave the release as a draft.
 
+## Release Gate Policy
+
+For ordinary patch releases, the blocking gate is:
+
+1. Local checks pass on `dev`.
+2. CI passes on `dev` for the exact commit that will be released.
+3. `dev` fast-forwards into `main`.
+4. The manual `Portable Release` workflow passes on `main`.
+5. Published assets are downloaded and verified against `SHA256SUMS.txt`, the update manifest hashes, and any targeted runtime smoke needed for the change.
+
+The `Portable Release` workflow is the final release gate because it rebuilds and verifies both Windows x64 and Linux x64 portable artifacts before publishing. A duplicate `main` push CI run is useful branch-health signal, but it should not block an owner-approved stable release when all of these are true:
+
+- `dev` CI already passed for the same commit hash.
+- The merge to `main` was a fast-forward.
+- The `main` CI run is stalled in runner setup or dependency installation rather than failing a repo test.
+- The `Portable Release` workflow passes for that same `main` commit.
+
+If `main` CI fails in repo code, tests, lint, version checks, or audits, stop and fix it before release. If it stalls in setup, rerun it once and monitor it after the release gate rather than letting hosted-runner apt latency hold the release. Record the run outcome in the release notes or private release log.
+
+For updater changes, FFmpeg bundle changes, release-script changes, or major/minor releases, add the relevant dogfood step after the published asset verification. For UI-only patch releases, one targeted real-runtime smoke is enough when the changed surface is not already covered by packaged release smoke.
+
 ## Public Source Gate
 
 - Confirm `npm audit --audit-level=moderate` is clean.
