@@ -30,7 +30,7 @@ test("CI workflows use bounded reusable setup steps", async () => {
   assert.match(linuxSetupAction, /retry "\$APT_ATTEMPTS"/);
   assert.match(linuxSetupAction, /attempts:[\s\S]*default:\s*"1"/);
   assert.match(linuxSetupAction, /install-timeout-seconds:[\s\S]*default:\s*"1800"/);
-  assert.match(cargoAuditAction, /actions\/cache@v4/);
+  assert.match(cargoAuditAction, /actions\/cache@v5/);
   assert.match(cargoAuditAction, /cargo install cargo-audit --version "\$CARGO_AUDIT_VERSION" --locked/);
 });
 
