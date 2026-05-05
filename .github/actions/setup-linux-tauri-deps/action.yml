@@ -1,14 +1,14 @@
 name: Set up Linux Tauri dependencies
-description: Install Linux packages for Tauri builds with bounded retries.
+description: Install Linux packages for Tauri builds with bounded timeouts.
 
 inputs:
   packages:
     description: Newline-separated apt packages to install.
     required: true
   attempts:
-    description: Number of attempts for apt update/install.
+    description: Number of attempts for apt update/install. Keep install retries low because interrupted dpkg state is not reliably retryable.
     required: false
-    default: "3"
+    default: "1"
   update-timeout-seconds:
     description: Per-attempt timeout for apt-get update.
     required: false
@@ -16,7 +16,7 @@ inputs:
   install-timeout-seconds:
     description: Per-attempt timeout for apt-get install.
     required: false
-    default: "900"
+    default: "1800"
 
 runs:
   using: composite

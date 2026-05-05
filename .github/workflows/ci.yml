@@ -43,6 +43,7 @@ jobs:
       - name: Install Linux dependencies
         uses: ./.github/actions/setup-linux-tauri-deps
         with:
+          install-timeout-seconds: "1800"
           packages: |
             libayatana-appindicator3-dev
             librsvg2-dev
