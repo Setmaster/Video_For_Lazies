@@ -8,6 +8,7 @@ param(
   [int]$InputHeight = 360,
   [double]$InputRate = 30,
   [int]$InputVideoBitrateKbps = 900,
+  [ValidateSet("mp4", "webm", "mp3")][string]$OutputFormat = "mp4",
   [double]$SizeLimitMb = 0
 )
 
@@ -146,7 +147,7 @@ if (-not $ScreenshotPath) {
 $ScreenshotPath = [System.IO.Path]::GetFullPath($ScreenshotPath)
 
 $inputPath = Join-Path $SmokeRoot "smoke-input.webm"
-$outputPath = Join-Path $SmokeRoot "smoke-output.mp4"
+$outputPath = Join-Path $SmokeRoot ("smoke-output.{0}" -f $OutputFormat)
 $statusPath = Join-Path $SmokeRoot "smoke-status.json"
 
 Remove-Item $inputPath, $outputPath, $statusPath -Force -ErrorAction SilentlyContinue
@@ -179,7 +180,7 @@ $startInfo.UseShellExecute = $false
 $startInfo.EnvironmentVariables["VFL_SMOKE_INPUT"] = $inputPath
 $startInfo.EnvironmentVariables["VFL_SMOKE_OUTPUT"] = $outputPath
 $startInfo.EnvironmentVariables["VFL_SMOKE_STATUS"] = $statusPath
-$startInfo.EnvironmentVariables["VFL_SMOKE_FORMAT"] = "mp4"
+$startInfo.EnvironmentVariables["VFL_SMOKE_FORMAT"] = $OutputFormat
 $startInfo.EnvironmentVariables["VFL_SMOKE_SIZE_LIMIT_MB"] = $SizeLimitMb.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_START_S"] = "0"
 $startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_END_S"] = $TrimEndSeconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)

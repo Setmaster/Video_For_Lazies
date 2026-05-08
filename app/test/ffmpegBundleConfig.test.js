@@ -146,11 +146,16 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(raw, /output duration mismatch/);
   assert.match(raw, /\[double\]\$SizeLimitMb = 0/);
   assert.match(raw, /\[int\]\$InputWidth = 640/);
+  assert.match(raw, /\[ValidateSet\("mp4", "webm", "mp3"\)\]\[string\]\$OutputFormat = "mp4"/);
+  assert.match(raw, /VFL_SMOKE_FORMAT"\] = \$OutputFormat/);
   assert.match(bundleRaw, /variant: "win64-gpl-shared"/);
   assert.match(wrapperRaw, /-SizeLimitMb/);
   assert.match(wrapperRaw, /-InputWidth/);
+  assert.match(wrapperRaw, /-OutputFormat/);
+  assert.match(wrapperRaw, /outputFormat = "mp4"/);
   assert.match(releaseRaw, /assertBundledLibx264/);
   assert.match(releaseRaw, /runBundledEncodeSmoke/);
+  assert.match(releaseRaw, /runPortableExportSmoke\(\{ portableDir, outputFormat: "webm" \}\)/);
   assert.match(releaseRaw, /missing libx264/);
   assert.match(releaseRaw, /getFfmpegSourceArchiveNames/);
   assert.match(appRaw, /smokeStatusWriteRef/);

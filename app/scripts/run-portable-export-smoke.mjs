@@ -9,9 +9,18 @@ import { ffmpegSidecarResourceTarget, getPortableOutputDir } from "./ffmpegBundl
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const __filename = url.fileURLToPath(import.meta.url);
 const requiredSmokeStages = ["input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding", "success"];
+const supportedSmokeOutputFormats = new Set(["mp4", "webm", "mp3"]);
 
 function smokeNumber(value, fallback) {
   return value === undefined || value === null ? fallback : value;
+}
+
+function normalizeSmokeOutputFormat(value) {
+  const outputFormat = String(value || "mp4").toLowerCase();
+  if (!supportedSmokeOutputFormats.has(outputFormat)) {
+    throw new Error(`Unsupported portable export smoke format: ${value}`);
+  }
+  return outputFormat;
 }
 
 function sleep(ms) {
@@ -227,8 +236,10 @@ async function runLinuxPortableExportSmoke({
   inputHeight = 360,
   inputRate = 30,
   inputVideoBitrateKbps = 900,
+  outputFormat = "mp4",
   sizeLimitMb = 0,
 } = {}) {
+  outputFormat = normalizeSmokeOutputFormat(outputFormat);
   const { portableRoot, appPath, ffmpegPath, ffprobePath } = getLinuxPortablePaths(portableDir);
   for (const requiredPath of [appPath, ffmpegPath, ffprobePath]) {
     await assertRequiredFile(requiredPath);
@@ -236,7 +247,7 @@ async function runLinuxPortableExportSmoke({
 
   const smokeRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-portable-export-smoke-"));
   const inputPath = path.resolve(smokeRoot, "smoke-input.webm");
-  const outputPath = path.resolve(smokeRoot, "smoke-output.mp4");
+  const outputPath = path.resolve(smokeRoot, `smoke-output.${outputFormat}`);
   const statusPath = path.resolve(smokeRoot, "smoke-status.json");
   let child = null;
 
@@ -280,7 +291,7 @@ async function runLinuxPortableExportSmoke({
         VFL_SMOKE_INPUT: inputPath,
         VFL_SMOKE_OUTPUT: outputPath,
         VFL_SMOKE_STATUS: statusPath,
-        VFL_SMOKE_FORMAT: "mp4",
+        VFL_SMOKE_FORMAT: outputFormat,
         VFL_SMOKE_SIZE_LIMIT_MB: String(sizeLimitMb),
         VFL_SMOKE_TRIM_START_S: "0",
         VFL_SMOKE_TRIM_END_S: String(trimEndSeconds),
@@ -349,6 +360,7 @@ async function runPortableExportSmoke({
   inputHeight,
   inputRate,
   inputVideoBitrateKbps,
+  outputFormat,
   sizeLimitMb,
 } = {}) {
   if (process.platform === "linux") {
@@ -360,6 +372,7 @@ async function runPortableExportSmoke({
       inputHeight: smokeNumber(inputHeight, 360),
       inputRate: smokeNumber(inputRate, 30),
       inputVideoBitrateKbps: smokeNumber(inputVideoBitrateKbps, 900),
+      outputFormat,
       sizeLimitMb: smokeNumber(sizeLimitMb, 0),
     });
     return;
@@ -388,6 +401,7 @@ async function runPortableExportSmoke({
     ["-InputHeight", inputHeight],
     ["-InputRate", inputRate],
     ["-InputVideoBitrateKbps", inputVideoBitrateKbps],
+    ["-OutputFormat", outputFormat],
     ["-SizeLimitMb", sizeLimitMb],
   ];
 

@@ -280,6 +280,7 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
 
   if (platform === "linux") {
     await runPortableExportSmoke({ portableDir });
+    await runPortableExportSmoke({ portableDir, outputFormat: "webm" });
     await runPortableExportSmoke({
       portableDir,
       timeoutSeconds: 300,
@@ -299,6 +300,7 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
 
   await runPortableSmoke({ portableDir });
   await runPortableExportSmoke({ portableDir });
+  await runPortableExportSmoke({ portableDir, outputFormat: "webm" });
   await runPortableExportSmoke({
     portableDir,
     timeoutSeconds: 300,

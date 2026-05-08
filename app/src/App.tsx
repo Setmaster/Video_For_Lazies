@@ -24,6 +24,7 @@ import {
 } from "./lib/dropInput";
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
 import { dirname, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
+import { getActiveProgressUi } from "./lib/progress";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import "./App.css";
 
@@ -781,10 +782,14 @@ function App() {
 
   const lastExportSizeText = lastExport?.outputSizeBytes ? `${(lastExport.outputSizeBytes / 1_000_000).toFixed(2)} MB` : null;
   const lastExportDurationText = lastExport?.durationS ? formatClock(lastExport.durationS) : null;
+  const progressUi = getActiveProgressUi(progress, jobId !== null);
+  const displayedStatus = jobId !== null && progressUi.isFinalizing ? "Finalizing output..." : status;
 
   const footerKicker =
     jobId !== null
-      ? "Encoding now"
+      ? progressUi.isFinalizing
+        ? "Finalizing output"
+        : "Encoding now"
       : lastExport
         ? "Export complete"
         : inputPath
@@ -826,7 +831,7 @@ function App() {
   const exportReady = Boolean(inputPath && outputPath && probe);
   const planStatusText =
     jobId !== null
-      ? status
+      ? displayedStatus
       : !inputPath
         ? "Load a source video to unlock the export plan and composing tools."
         : !probe
@@ -2727,7 +2732,7 @@ function App() {
         <div className="vfl-footer-main">
           <div className="vfl-footer-copy">
             <div className="vfl-footer-kicker">{footerKicker}</div>
-            <div className="vfl-footer-status" role="status" aria-live="polite">{status}</div>
+            <div className="vfl-footer-status" role="status" aria-live="polite">{displayedStatus}</div>
             <div className="vfl-footer-meta">{footerMetaText}</div>
           </div>
           <div className="vfl-footer-actions">
@@ -2757,14 +2762,17 @@ function App() {
             aria-label="Encoding progress"
             aria-valuemin={0}
             aria-valuemax={100}
-            aria-valuenow={Math.round(progress * 100)}
+            aria-valuenow={progressUi.percent}
           >
             <div className="vfl-progress-meta">
-              <span>Progress</span>
-              <span>{Math.round(progress * 100)}%</span>
+              <span>{progressUi.label}</span>
+              <span>{progressUi.percent}%</span>
             </div>
             <div className="vfl-progress-bar">
-              <div className="vfl-progress-fill" style={{ width: `${Math.round(progress * 100)}%` }} />
+              <div
+                className={`vfl-progress-fill ${progressUi.isFinalizing ? "is-finalizing" : ""}`}
+                style={{ width: `${progressUi.percent}%` }}
+              />
             </div>
           </div>
         ) : null}

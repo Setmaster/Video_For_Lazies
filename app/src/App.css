@@ -934,9 +934,14 @@ button.danger:hover:enabled {
   box-shadow: 0 0 12px rgba(var(--accent), 0.3);
 }
 
+.vfl-progress-fill.is-finalizing {
+  animation: none;
+  background-size: 100% 100%;
+}
+
 @keyframes progress-shimmer {
-  0% { background-position: 0% 0; }
-  100% { background-position: 200% 0; }
+  0% { background-position: 200% 0; }
+  100% { background-position: 0% 0; }
 }
 
 /* ── status / muted ───────────────────────────────────── */
