@@ -21,6 +21,7 @@ It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local t
 - Resize by max edge, rotate, reverse, change playback speed, and adjust brightness, contrast, and saturation.
 - Export to `mp4`, `webm`, or `mp3`.
 - Target a file size in decimal MB, or disable size targeting for constant-quality export.
+- Override the video codec and no-limit audio bitrate when Auto is not the right fit.
 - Keep audio on/off, title metadata, recent export status, and output format in the app workflow.
 - Auto-suggest safe output names in the same folder and avoid overwriting existing `-N` exports.
 - Check for signed portable updates and prompt before installing them.
