@@ -1,7 +1,8 @@
-import type { OutputFormat } from "./types";
+import type { AdvancedEncodeSettings, OutputFormat } from "./types";
 
 export type PersistedSettings = {
   format?: OutputFormat;
+  advanced?: AdvancedEncodeSettings;
 };
 
 export function parsePersistedSettings(raw: string | null | undefined): PersistedSettings;

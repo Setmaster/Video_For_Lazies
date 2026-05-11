@@ -24,6 +24,7 @@ const FFMPEG_SIDECAR_DIR: &str = "ffmpeg-sidecar";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+const AUDIO_BITRATE_PRESETS_KBPS: &[u32] = &[96, 128, 192, 256, 320];
 
 fn command_no_window(bin: &str) -> Command {
     #[cfg(windows)]
@@ -80,6 +81,25 @@ pub enum OutputFormat {
     Mp3,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoCodecPreference {
+    Auto,
+    H264,
+    Mpeg4,
+    Vp9,
+    Vp8,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvancedEncodeSettings {
+    #[serde(default)]
+    pub video_codec: Option<VideoCodecPreference>,
+    #[serde(default)]
+    pub audio_bitrate_kbps: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeRequest {
@@ -89,6 +109,8 @@ pub struct EncodeRequest {
     pub title: Option<String>,
     pub size_limit_mb: f64,
     pub audio_enabled: bool,
+    #[serde(default)]
+    pub advanced: AdvancedEncodeSettings,
 
     pub trim: Option<Trim>,
     pub crop: Option<Crop>,
@@ -195,6 +217,24 @@ struct CodecSelection {
     video_codec: Option<VideoCodec>,
     audio_codec: Option<AudioCodec>,
     quality_mode: Option<QualityMode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoCodecCapability {
+    pub format: OutputFormat,
+    pub value: VideoCodecPreference,
+    pub label: &'static str,
+    pub ffmpeg_name: &'static str,
+    pub available: bool,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeCapabilities {
+    pub video_codecs: Vec<VideoCodecCapability>,
+    pub audio_bitrate_kbps: Vec<u32>,
 }
 
 fn trimmed_env_var(name: &str) -> Option<String> {
@@ -442,66 +482,207 @@ fn cached_encoder_names(ffmpeg_bin: &str) -> Result<HashSet<String>, String> {
     Ok(parsed)
 }
 
-fn select_codec_plan(format: OutputFormat, encoder_names: &HashSet<String>) -> CodecSelection {
-    match format {
-        OutputFormat::Mp4 => {
-            let video_codec = if encoder_names.contains("libx264") {
-                VideoCodec::LibX264
-            } else {
-                VideoCodec::Mpeg4
-            };
-            let quality_mode = if video_codec == VideoCodec::LibX264 {
-                QualityMode::Crf {
-                    crf: "23",
-                    preset: Some("medium"),
-                }
-            } else {
-                QualityMode::QScale { qscale: "5" }
-            };
-            CodecSelection {
-                video_codec: Some(video_codec),
-                audio_codec: Some(AudioCodec::Aac),
-                quality_mode: Some(quality_mode),
-            }
-        }
-        OutputFormat::Webm => {
-            let video_codec = if encoder_names.contains("libvpx-vp9") {
-                VideoCodec::LibVpxVp9
-            } else {
-                VideoCodec::LibVpx
-            };
-            let audio_codec = if encoder_names.contains("libopus") {
-                AudioCodec::LibOpus
-            } else {
-                AudioCodec::LibVorbis
-            };
-            let quality_mode = if video_codec == VideoCodec::LibVpxVp9 {
-                QualityMode::Cq {
-                    crf: "32",
-                    bitrate: "0",
-                }
-            } else {
-                QualityMode::Cq {
-                    crf: "10",
-                    bitrate: "1M",
-                }
-            };
-            CodecSelection {
-                video_codec: Some(video_codec),
-                audio_codec: Some(audio_codec),
-                quality_mode: Some(quality_mode),
-            }
-        }
-        OutputFormat::Mp3 => CodecSelection {
-            video_codec: None,
-            audio_codec: Some(if encoder_names.contains("libmp3lame") {
-                AudioCodec::LibMp3Lame
-            } else {
-                AudioCodec::Mp3
-            }),
-            quality_mode: None,
+fn quality_mode_for_codec(video_codec: VideoCodec) -> QualityMode {
+    match video_codec {
+        VideoCodec::LibX264 => QualityMode::Crf {
+            crf: "23",
+            preset: Some("medium"),
+        },
+        VideoCodec::Mpeg4 => QualityMode::QScale { qscale: "5" },
+        VideoCodec::LibVpxVp9 => QualityMode::Cq {
+            crf: "32",
+            bitrate: "0",
+        },
+        VideoCodec::LibVpx => QualityMode::Cq {
+            crf: "10",
+            bitrate: "1M",
         },
     }
+}
+
+fn codec_preference_for_codec(video_codec: VideoCodec) -> VideoCodecPreference {
+    match video_codec {
+        VideoCodec::LibX264 => VideoCodecPreference::H264,
+        VideoCodec::Mpeg4 => VideoCodecPreference::Mpeg4,
+        VideoCodec::LibVpxVp9 => VideoCodecPreference::Vp9,
+        VideoCodec::LibVpx => VideoCodecPreference::Vp8,
+    }
+}
+
+fn codec_label(preference: VideoCodecPreference) -> &'static str {
+    match preference {
+        VideoCodecPreference::Auto => "Auto",
+        VideoCodecPreference::H264 => "H.264",
+        VideoCodecPreference::Mpeg4 => "MPEG-4",
+        VideoCodecPreference::Vp9 => "VP9",
+        VideoCodecPreference::Vp8 => "VP8",
+    }
+}
+
+fn codec_ffmpeg_name(preference: VideoCodecPreference) -> Option<&'static str> {
+    match preference {
+        VideoCodecPreference::Auto => None,
+        VideoCodecPreference::H264 => Some("libx264"),
+        VideoCodecPreference::Mpeg4 => Some("mpeg4"),
+        VideoCodecPreference::Vp9 => Some("libvpx-vp9"),
+        VideoCodecPreference::Vp8 => Some("libvpx"),
+    }
+}
+
+fn auto_video_codec(format: OutputFormat, encoder_names: &HashSet<String>) -> Option<VideoCodec> {
+    match format {
+        OutputFormat::Mp4 => Some(if encoder_names.contains("libx264") {
+            VideoCodec::LibX264
+        } else {
+            VideoCodec::Mpeg4
+        }),
+        OutputFormat::Webm => Some(if encoder_names.contains("libvpx-vp9") {
+            VideoCodec::LibVpxVp9
+        } else {
+            VideoCodec::LibVpx
+        }),
+        OutputFormat::Mp3 => None,
+    }
+}
+
+fn audio_codec_for_format(
+    format: OutputFormat,
+    encoder_names: &HashSet<String>,
+) -> Option<AudioCodec> {
+    match format {
+        OutputFormat::Mp4 => Some(AudioCodec::Aac),
+        OutputFormat::Webm => Some(if encoder_names.contains("libopus") {
+            AudioCodec::LibOpus
+        } else {
+            AudioCodec::LibVorbis
+        }),
+        OutputFormat::Mp3 => Some(if encoder_names.contains("libmp3lame") {
+            AudioCodec::LibMp3Lame
+        } else {
+            AudioCodec::Mp3
+        }),
+    }
+}
+
+fn requested_video_codec(
+    format: OutputFormat,
+    preference: VideoCodecPreference,
+    encoder_names: &HashSet<String>,
+) -> Result<Option<VideoCodec>, String> {
+    let codec = match (format, preference) {
+        (_, VideoCodecPreference::Auto) | (OutputFormat::Mp3, _) => return Ok(None),
+        (OutputFormat::Mp4, VideoCodecPreference::H264) => VideoCodec::LibX264,
+        (OutputFormat::Mp4, VideoCodecPreference::Mpeg4) => VideoCodec::Mpeg4,
+        (OutputFormat::Webm, VideoCodecPreference::Vp9) => VideoCodec::LibVpxVp9,
+        (OutputFormat::Webm, VideoCodecPreference::Vp8) => VideoCodec::LibVpx,
+        (OutputFormat::Mp4, VideoCodecPreference::Vp9 | VideoCodecPreference::Vp8) => {
+            return Err("VP8/VP9 codecs are only valid for WebM output.".to_string());
+        }
+        (OutputFormat::Webm, VideoCodecPreference::H264 | VideoCodecPreference::Mpeg4) => {
+            return Err("H.264 and MPEG-4 codecs are only valid for MP4 output.".to_string());
+        }
+    };
+
+    let ffmpeg_name = codec.as_ffmpeg_name();
+    if !encoder_names.contains(ffmpeg_name) {
+        return Err(format!(
+            "The selected {} encoder ({ffmpeg_name}) is not available in this FFmpeg build.",
+            codec_label(preference)
+        ));
+    }
+
+    Ok(Some(codec))
+}
+
+fn select_codec_plan(
+    format: OutputFormat,
+    encoder_names: &HashSet<String>,
+    advanced: &AdvancedEncodeSettings,
+) -> Result<CodecSelection, String> {
+    match format {
+        OutputFormat::Mp4 | OutputFormat::Webm => {
+            let preference = advanced.video_codec.unwrap_or(VideoCodecPreference::Auto);
+            let video_codec = requested_video_codec(format, preference, encoder_names)?
+                .or_else(|| auto_video_codec(format, encoder_names))
+                .ok_or_else(|| "Missing video codec selection.".to_string())?;
+            Ok(CodecSelection {
+                video_codec: Some(video_codec),
+                audio_codec: audio_codec_for_format(format, encoder_names),
+                quality_mode: Some(quality_mode_for_codec(video_codec)),
+            })
+        }
+        OutputFormat::Mp3 => Ok(CodecSelection {
+            video_codec: None,
+            audio_codec: audio_codec_for_format(format, encoder_names),
+            quality_mode: None,
+        }),
+    }
+}
+
+fn video_codec_capabilities_for_format(
+    format: OutputFormat,
+    encoder_names: &HashSet<String>,
+) -> Vec<VideoCodecCapability> {
+    let default_preference =
+        auto_video_codec(format, encoder_names).map(codec_preference_for_codec);
+    let preferences: &[VideoCodecPreference] = match format {
+        OutputFormat::Mp4 => &[VideoCodecPreference::H264, VideoCodecPreference::Mpeg4],
+        OutputFormat::Webm => &[VideoCodecPreference::Vp9, VideoCodecPreference::Vp8],
+        OutputFormat::Mp3 => &[],
+    };
+
+    preferences
+        .iter()
+        .filter_map(|preference| {
+            let ffmpeg_name = codec_ffmpeg_name(*preference)?;
+            Some(VideoCodecCapability {
+                format,
+                value: *preference,
+                label: codec_label(*preference),
+                ffmpeg_name,
+                available: encoder_names.contains(ffmpeg_name),
+                is_default: default_preference == Some(*preference),
+            })
+        })
+        .collect()
+}
+
+pub fn encode_capabilities() -> Result<EncodeCapabilities, String> {
+    let ffmpeg_bin = default_ffmpeg();
+    let encoder_names = cached_encoder_names(&ffmpeg_bin)?;
+    let mut video_codecs = Vec::new();
+    video_codecs.extend(video_codec_capabilities_for_format(
+        OutputFormat::Mp4,
+        &encoder_names,
+    ));
+    video_codecs.extend(video_codec_capabilities_for_format(
+        OutputFormat::Webm,
+        &encoder_names,
+    ));
+
+    Ok(EncodeCapabilities {
+        video_codecs,
+        audio_bitrate_kbps: AUDIO_BITRATE_PRESETS_KBPS.to_vec(),
+    })
+}
+
+fn advanced_audio_bitrate_kbps(request: &EncodeRequest) -> Result<Option<u32>, String> {
+    let Some(kbps) = request.advanced.audio_bitrate_kbps else {
+        return Ok(None);
+    };
+
+    if !AUDIO_BITRATE_PRESETS_KBPS.contains(&kbps) {
+        return Err(format!(
+            "Audio bitrate must be one of: {} kbps.",
+            AUDIO_BITRATE_PRESETS_KBPS
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    Ok(Some(kbps))
 }
 
 fn output_extension(format: OutputFormat) -> &'static str {
@@ -1573,7 +1754,9 @@ pub fn run_encode_job(
 
     let ffmpeg_bin = default_ffmpeg();
     let probe = probe_video(input_path.to_string_lossy().to_string())?;
-    let codec_selection = select_codec_plan(request.format, &cached_encoder_names(&ffmpeg_bin)?);
+    let encoder_names = cached_encoder_names(&ffmpeg_bin)?;
+    let codec_selection = select_codec_plan(request.format, &encoder_names, &request.advanced)?;
+    let advanced_audio_bitrate_kbps = advanced_audio_bitrate_kbps(&request)?;
 
     let output_duration_s =
         estimate_output_duration_s(probe.duration_s, &request.trim, request.speed)?;
@@ -1625,6 +1808,9 @@ pub fn run_encode_job(
         if size_limit_enabled {
             let audio_kbps =
                 plan_audio_only_kbps(request.size_limit_mb, output_duration_s, 0.98, 32, 320)?;
+            args.push("-b:a".to_string());
+            args.push(format!("{audio_kbps}k"));
+        } else if let Some(audio_kbps) = advanced_audio_bitrate_kbps {
             args.push("-b:a".to_string());
             args.push(format!("{audio_kbps}k"));
         } else {
@@ -1831,11 +2017,12 @@ pub fn run_encode_job(
             args.extend(["-map", "0:a:0?"].into_iter().map(|s| s.to_string()));
             args.extend(["-c:a", audio_codec].into_iter().map(|s| s.to_string()));
             args.push("-b:a".to_string());
-            args.push(match request.format {
-                OutputFormat::Mp4 => "192k".to_string(),
-                OutputFormat::Webm => "128k".to_string(),
+            let audio_kbps = advanced_audio_bitrate_kbps.unwrap_or(match request.format {
+                OutputFormat::Mp4 => 192,
+                OutputFormat::Webm => 128,
                 OutputFormat::Mp3 => unreachable!(),
             });
+            args.push(format!("{audio_kbps}k"));
             if let Some(af) = &audio_filters {
                 args.push("-af".to_string());
                 args.push(af.clone());
@@ -2129,6 +2316,7 @@ mod tests {
             title: None,
             size_limit_mb: 8.0,
             audio_enabled: true,
+            advanced: AdvancedEncodeSettings::default(),
             trim: None,
             crop: None,
             reverse: false,
@@ -2316,7 +2504,12 @@ Encoders:
             "libopus".to_string(),
         ]);
 
-        let mp4_plan = select_codec_plan(OutputFormat::Mp4, &encoder_names);
+        let mp4_plan = select_codec_plan(
+            OutputFormat::Mp4,
+            &encoder_names,
+            &AdvancedEncodeSettings::default(),
+        )
+        .unwrap();
         assert_eq!(mp4_plan.video_codec, Some(VideoCodec::Mpeg4));
         assert_eq!(mp4_plan.audio_codec, Some(AudioCodec::Aac));
         assert_eq!(
@@ -2324,9 +2517,76 @@ Encoders:
             Some(QualityMode::QScale { qscale: "5" })
         );
 
-        let webm_plan = select_codec_plan(OutputFormat::Webm, &encoder_names);
+        let webm_plan = select_codec_plan(
+            OutputFormat::Webm,
+            &encoder_names,
+            &AdvancedEncodeSettings::default(),
+        )
+        .unwrap();
         assert_eq!(webm_plan.video_codec, Some(VideoCodec::LibVpxVp9));
         assert_eq!(webm_plan.audio_codec, Some(AudioCodec::LibOpus));
+    }
+
+    #[test]
+    fn select_codec_plan_honors_explicit_available_codec() {
+        let encoder_names = HashSet::from([
+            "libx264".to_string(),
+            "mpeg4".to_string(),
+            "aac".to_string(),
+            "libvpx-vp9".to_string(),
+            "libvpx".to_string(),
+            "libopus".to_string(),
+        ]);
+
+        let mp4_plan = select_codec_plan(
+            OutputFormat::Mp4,
+            &encoder_names,
+            &AdvancedEncodeSettings {
+                video_codec: Some(VideoCodecPreference::Mpeg4),
+                audio_bitrate_kbps: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp4_plan.video_codec, Some(VideoCodec::Mpeg4));
+
+        let webm_plan = select_codec_plan(
+            OutputFormat::Webm,
+            &encoder_names,
+            &AdvancedEncodeSettings {
+                video_codec: Some(VideoCodecPreference::Vp8),
+                audio_bitrate_kbps: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(webm_plan.video_codec, Some(VideoCodec::LibVpx));
+    }
+
+    #[test]
+    fn select_codec_plan_rejects_unavailable_explicit_codec() {
+        let encoder_names = HashSet::from(["mpeg4".to_string(), "aac".to_string()]);
+        let err = select_codec_plan(
+            OutputFormat::Mp4,
+            &encoder_names,
+            &AdvancedEncodeSettings {
+                video_codec: Some(VideoCodecPreference::H264),
+                audio_bitrate_kbps: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("libx264"));
+        assert!(err.contains("not available"));
+    }
+
+    #[test]
+    fn advanced_audio_bitrate_accepts_only_presets() {
+        let mut req = base_request();
+        req.advanced.audio_bitrate_kbps = Some(192);
+        assert_eq!(advanced_audio_bitrate_kbps(&req).unwrap(), Some(192));
+
+        req.advanced.audio_bitrate_kbps = Some(999);
+        let err = advanced_audio_bitrate_kbps(&req).unwrap_err();
+        assert!(err.contains("96, 128, 192, 256, 320"));
     }
 
     #[test]

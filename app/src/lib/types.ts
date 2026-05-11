@@ -1,4 +1,5 @@
 export type OutputFormat = "mp4" | "webm" | "mp3";
+export type VideoCodecPreference = "auto" | "h264" | "mpeg4" | "vp9" | "vp8";
 
 export interface VideoProbe {
   durationS: number;
@@ -32,6 +33,7 @@ export interface EncodeRequest {
   title?: string | null;
   sizeLimitMb: number;
   audioEnabled: boolean;
+  advanced?: AdvancedEncodeSettings | null;
 
   trim?: Trim | null;
   crop?: Crop | null;
@@ -40,6 +42,25 @@ export interface EncodeRequest {
   rotateDeg: number;
   maxEdgePx?: number | null;
   color?: ColorAdjust | null;
+}
+
+export interface AdvancedEncodeSettings {
+  videoCodec?: VideoCodecPreference | null;
+  audioBitrateKbps?: number | null;
+}
+
+export interface VideoCodecCapability {
+  format: OutputFormat;
+  value: VideoCodecPreference;
+  label: string;
+  ffmpegName: string;
+  available: boolean;
+  isDefault: boolean;
+}
+
+export interface EncodeCapabilities {
+  videoCodecs: VideoCodecCapability[];
+  audioBitrateKbps: number[];
 }
 
 export interface EncodeProgressPayload {

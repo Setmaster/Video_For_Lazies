@@ -292,6 +292,11 @@ fn suggest_output_path(input_path: String, format: video::OutputFormat) -> Resul
 }
 
 #[tauri::command]
+fn encode_capabilities() -> Result<video::EncodeCapabilities, String> {
+    video::encode_capabilities()
+}
+
+#[tauri::command]
 #[allow(non_snake_case)]
 fn extract_frame(inputPath: String, timeS: f64, outputPath: String) -> Result<(), String> {
     video::extract_frame(inputPath, timeS, outputPath)
@@ -447,6 +452,7 @@ pub fn run() {
             probe_video,
             detect_crop,
             suggest_output_path,
+            encode_capabilities,
             extract_frame,
             allow_preview_path,
             read_smoke_config,

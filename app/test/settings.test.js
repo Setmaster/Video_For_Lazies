@@ -17,13 +17,17 @@ test("parsePersistedSettings only restores the supported default format", () => 
   assert.deepEqual(
     parsePersistedSettings(JSON.stringify({
       format: "webm",
+      advanced: {
+        videoCodec: "vp9",
+        audioBitrateKbps: 192,
+      },
       sizeLimitMb: "50",
       trimStart: "12.5",
       trimEnd: "48",
       cropEnabled: true,
       brightness: "0.2",
     })),
-    { format: "webm" },
+    { format: "webm", advanced: { videoCodec: "vp9", audioBitrateKbps: 192 } },
   );
 });
 
@@ -31,12 +35,43 @@ test("parsePersistedSettings rejects unsupported formats", () => {
   assert.deepEqual(parsePersistedSettings(JSON.stringify({ format: "avi" })), {});
 });
 
+test("parsePersistedSettings rejects unsupported advanced settings", () => {
+  assert.deepEqual(
+    parsePersistedSettings(
+      JSON.stringify({
+        advanced: {
+          videoCodec: "prores",
+          audioBitrateKbps: 999,
+        },
+      }),
+    ),
+    {},
+  );
+});
+
 test("serializePersistedSettings only writes the supported default format", () => {
   assert.equal(
     serializePersistedSettings({
       format: "mp4",
+      advanced: {
+        videoCodec: "h264",
+        audioBitrateKbps: 256,
+      },
       trimStart: "5",
       sizeLimitMb: "25",
+    }),
+    JSON.stringify({ format: "mp4", advanced: { videoCodec: "h264", audioBitrateKbps: 256 } }),
+  );
+});
+
+test("serializePersistedSettings omits auto advanced defaults", () => {
+  assert.equal(
+    serializePersistedSettings({
+      format: "mp4",
+      advanced: {
+        videoCodec: "auto",
+        audioBitrateKbps: null,
+      },
     }),
     JSON.stringify({ format: "mp4" }),
   );

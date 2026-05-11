@@ -10,12 +10,14 @@ import type {
   AppSmokeStatus,
   Crop,
   ColorAdjust,
+  EncodeCapabilities,
   EncodeFinishedPayload,
   EncodeProgressPayload,
   EncodeRequest,
   OutputFormat,
   UpdateApplyResponse,
   UpdateCheckResponse,
+  VideoCodecPreference,
   VideoProbe,
 } from "./lib/types";
 import {
@@ -30,6 +32,20 @@ import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
 const SIZE_PRESETS_MB = [8, 10, 25, 50] as const;
+const AUDIO_BITRATE_PRESETS_KBPS = [96, 128, 192, 256, 320] as const;
+const VIDEO_CODEC_LABELS: Record<VideoCodecPreference, string> = {
+  auto: "Auto",
+  h264: "H.264",
+  mpeg4: "MPEG-4",
+  vp9: "VP9",
+  vp8: "VP8",
+};
+const VIDEO_CODEC_FFMPEG_NAMES: Partial<Record<VideoCodecPreference, string>> = {
+  h264: "libx264",
+  mpeg4: "mpeg4",
+  vp9: "libvpx-vp9",
+  vp8: "libvpx",
+};
 const MIN_WINDOW_WIDTH = 960;
 const MIN_WINDOW_HEIGHT = 720;
 const TRIM_MIN_GAP_S = 0.05;
@@ -46,6 +62,7 @@ const APP_LINKS = {
   security: "https://github.com/Setmaster/Video_For_Lazies/security/advisories/new",
 } as const;
 
+type ActiveTab = "general" | "composing" | "advanced";
 type TrimFocusTarget = "preview" | "start" | "end";
 type TrimTimeline = {
   start: number;
@@ -148,8 +165,20 @@ function blocksComposeShortcutTarget(target: EventTarget | null) {
   return !button.classList.contains("vfl-trim-timeline-grab") && !button.classList.contains("vfl-trim-timeline-value");
 }
 
+function isVideoCodecCompatible(format: OutputFormat, codec: VideoCodecPreference) {
+  if (codec === "auto") return true;
+  if (format === "mp4") return codec === "h264" || codec === "mpeg4";
+  if (format === "webm") return codec === "vp9" || codec === "vp8";
+  return false;
+}
+
+function formatVideoCodecLabel(codec: VideoCodecPreference) {
+  const ffmpegName = VIDEO_CODEC_FFMPEG_NAMES[codec];
+  return ffmpegName ? `${VIDEO_CODEC_LABELS[codec]} (${ffmpegName})` : VIDEO_CODEC_LABELS[codec];
+}
+
 function App() {
-  const [activeTab, setActiveTab] = useState<"composing" | "general">("general");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("general");
 
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
@@ -165,6 +194,10 @@ function App() {
   const [sizeLimitMb, setSizeLimitMb] = useState<string>(DEFAULT_SIZE_LIMIT_MB);
   const [maxEdgePx, setMaxEdgePx] = useState("");
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
+  const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
+  const [encodeCapabilities, setEncodeCapabilities] = useState<EncodeCapabilities | null>(null);
+  const [encodeCapabilitiesError, setEncodeCapabilitiesError] = useState<string | null>(null);
 
   const [trimStart, setTrimStart] = useState("0");
   const [trimEnd, setTrimEnd] = useState("");
@@ -426,6 +459,8 @@ function App() {
     try {
       const parsed = parsePersistedSettings(localStorage.getItem(SETTINGS_KEY));
       if (parsed.format) setFormat(parsed.format);
+      if (parsed.advanced?.videoCodec) setAdvancedVideoCodec(parsed.advanced.videoCodec);
+      if (parsed.advanced?.audioBitrateKbps) setAdvancedAudioBitrateKbps(String(parsed.advanced.audioBitrateKbps));
     } catch {
       // ignore
     } finally {
@@ -436,11 +471,20 @@ function App() {
   useEffect(() => {
     if (!settingsReady) return;
     try {
-      localStorage.setItem(SETTINGS_KEY, serializePersistedSettings({ format }));
+      localStorage.setItem(
+        SETTINGS_KEY,
+        serializePersistedSettings({
+          format,
+          advanced: {
+            videoCodec: advancedVideoCodec,
+            audioBitrateKbps: advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps),
+          },
+        }),
+      );
     } catch {
       // ignore
     }
-  }, [settingsReady, format]);
+  }, [settingsReady, format, advancedVideoCodec, advancedAudioBitrateKbps]);
 
   useEffect(() => {
     if (!settingsReady) return;
@@ -486,6 +530,8 @@ function App() {
     setSizeLimitMb(DEFAULT_SIZE_LIMIT_MB);
     setMaxEdgePx("");
     setAudioEnabled(true);
+    setAdvancedVideoCodec("auto");
+    setAdvancedAudioBitrateKbps("auto");
 
     setTrimStart("0");
     setTrimEnd("");
@@ -511,6 +557,33 @@ function App() {
   }, [format]);
 
   useEffect(() => {
+    if (isVideoCodecCompatible(format, advancedVideoCodec)) return;
+    setAdvancedVideoCodec("auto");
+  }, [format, advancedVideoCodec]);
+
+  useEffect(() => {
+    if (encodeCapabilities || encodeCapabilitiesError) return;
+    if (activeTab !== "advanced" && advancedVideoCodec === "auto") return;
+
+    let stop = false;
+    (async () => {
+      try {
+        const capabilities = await invoke<EncodeCapabilities>("encode_capabilities");
+        if (stop) return;
+        setEncodeCapabilities(capabilities);
+        setEncodeCapabilitiesError(null);
+      } catch (error) {
+        if (stop) return;
+        setEncodeCapabilitiesError(coerceErrorMessage(error, "Failed to read encoder capabilities."));
+      }
+    })();
+
+    return () => {
+      stop = true;
+    };
+  }, [activeTab, advancedVideoCodec, encodeCapabilities, encodeCapabilitiesError]);
+
+  useEffect(() => {
     if (!smokeConfig || smokeAppliedRef.current) return;
 
     smokeAppliedRef.current = true;
@@ -528,6 +601,8 @@ function App() {
     setSizeLimitMb(formatNumberInput(smokeConfig.sizeLimitMb));
     setMaxEdgePx("");
     setAudioEnabled(true);
+    setAdvancedVideoCodec("auto");
+    setAdvancedAudioBitrateKbps("auto");
     setTrimStart(formatNumberInput(smokeConfig.trimStartS));
     setTrimEnd(smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined ? "" : formatNumberInput(smokeConfig.trimEndS));
     setTrimDragSnapS("0");
@@ -553,6 +628,8 @@ function App() {
   useEffect(() => {
     setTrimDragSnapS((current) => normalizeTrimDragSnapInput(current, probe?.durationS ?? null));
   }, [probe?.durationS]);
+
+  const sizeLimitEnabled = sizeLimitMb.trim() !== "" && Number(sizeLimitMb) > 0;
 
   const plannedSummary = useMemo(() => {
     if (!probe) return null;
@@ -727,6 +804,49 @@ function App() {
     return `${shape} • ${formatClock(plannedSummary.durationS)} • ${bitrate}`;
   }, [plannedSummary]);
 
+  const advancedAudioBitrateValue = advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps);
+  const advancedAudioBitrateValid =
+    advancedAudioBitrateValue !== null &&
+    AUDIO_BITRATE_PRESETS_KBPS.includes(advancedAudioBitrateValue as (typeof AUDIO_BITRATE_PRESETS_KBPS)[number]);
+  const advancedAudioBitrateRequest = advancedAudioBitrateValid ? advancedAudioBitrateValue : null;
+  const advancedAudioApplies = !sizeLimitEnabled && advancedAudioBitrateRequest !== null;
+  const advancedCodecSummary =
+    format === "mp3"
+      ? "No video codec"
+      : advancedVideoCodec === "auto"
+        ? "Auto codec"
+        : formatVideoCodecLabel(advancedVideoCodec);
+  const advancedAudioSummary =
+    advancedAudioBitrateRequest === null
+      ? "Auto audio bitrate"
+      : sizeLimitEnabled
+        ? `${advancedAudioBitrateRequest} kbps when size target is off`
+        : `${advancedAudioBitrateRequest} kbps audio`;
+  const advancedOverrideCount = (advancedVideoCodec === "auto" ? 0 : 1) + (advancedAudioBitrateRequest === null ? 0 : 1);
+  const advancedPlanSummary = `${advancedCodecSummary} • ${advancedAudioSummary}`;
+  const videoCodecCapabilitiesForFormat = useMemo(
+    () => encodeCapabilities?.videoCodecs.filter((codec) => codec.format === format) ?? [],
+    [encodeCapabilities, format],
+  );
+  const selectedVideoCodecCapability =
+    advancedVideoCodec === "auto"
+      ? null
+      : videoCodecCapabilitiesForFormat.find((codec) => codec.value === advancedVideoCodec) ?? null;
+  const selectedVideoCodecUnavailable =
+    selectedVideoCodecCapability !== null && selectedVideoCodecCapability.available === false;
+  const fallbackVideoCodecOptions: VideoCodecPreference[] =
+    format === "mp4" ? ["h264", "mpeg4"] : format === "webm" ? ["vp9", "vp8"] : [];
+  const videoCodecOptions = videoCodecCapabilitiesForFormat.length
+    ? videoCodecCapabilitiesForFormat
+    : fallbackVideoCodecOptions.map((value) => ({
+        format,
+        value,
+        label: VIDEO_CODEC_LABELS[value],
+        ffmpegName: VIDEO_CODEC_FFMPEG_NAMES[value] ?? "",
+        available: true,
+        isDefault: value === fallbackVideoCodecOptions[0],
+      }));
+
   const activeEditChips = useMemo(() => {
     const chips: string[] = [];
 
@@ -760,6 +880,8 @@ function App() {
     if (maxEdgePx.trim() !== "") chips.push(`Max ${maxEdgePx.trim()} px`);
     if (title.trim()) chips.push("Custom title");
     if (format !== "mp3" && probe?.hasAudio && !audioEnabled) chips.push("Muted");
+    if (advancedVideoCodec !== "auto" && format !== "mp3") chips.push(VIDEO_CODEC_LABELS[advancedVideoCodec]);
+    if (advancedAudioBitrateRequest !== null) chips.push(`Audio ${advancedAudioBitrateRequest}k`);
 
     return chips;
   }, [
@@ -778,6 +900,8 @@ function App() {
     format,
     probe,
     audioEnabled,
+    advancedVideoCodec,
+    advancedAudioBitrateRequest,
   ]);
 
   const lastExportSizeText = lastExport?.outputSizeBytes ? `${(lastExport.outputSizeBytes / 1_000_000).toFixed(2)} MB` : null;
@@ -812,6 +936,9 @@ function App() {
       if (cropEnabled && cropSummary) return cropSummary;
       return trimSummary ?? planSummaryText ?? inputSummary;
     }
+    if (activeTab === "advanced") {
+      return advancedPlanSummary;
+    }
     return outputPath || planSummaryText || outputModeSummary;
   }, [
     jobId,
@@ -824,11 +951,12 @@ function App() {
     cropEnabled,
     cropSummary,
     trimSummary,
+    advancedPlanSummary,
     outputPath,
     outputModeSummary,
   ]);
 
-  const exportReady = Boolean(inputPath && outputPath && probe);
+  const exportReady = Boolean(inputPath && outputPath && probe && !selectedVideoCodecUnavailable);
   const planStatusText =
     jobId !== null
       ? displayedStatus
@@ -838,9 +966,11 @@ function App() {
           ? "Analyzing the source video so the export plan can be calculated."
           : !outputPath
             ? "Pick an output path to enable export."
+            : selectedVideoCodecUnavailable
+              ? "Choose an available codec before exporting."
             : lastExport
               ? "Last export completed. Review the output below or adjust the settings and export another variation."
-            : "Source, output path, and current settings are valid. Export is ready.";
+              : "Source, output path, and current settings are valid. Export is ready.";
 
   const planWarnings = useMemo(() => {
     const warnings: string[] = [];
@@ -869,8 +999,25 @@ function App() {
       warnings.push("MP3 export needs an input with an audio stream.");
     }
 
+    if (selectedVideoCodecUnavailable) {
+      warnings.push(`${VIDEO_CODEC_LABELS[advancedVideoCodec]} is not available in this FFmpeg build. Use Auto or another available codec.`);
+    }
+
+    if (sizeLimitEnabled && advancedAudioBitrateRequest !== null) {
+      warnings.push("Audio bitrate override is held for no-limit exports; size-targeted exports plan audio bitrate automatically.");
+    }
+
     return warnings;
-  }, [probe, plannedSummary, format, audioEnabled]);
+  }, [
+    probe,
+    plannedSummary,
+    format,
+    audioEnabled,
+    selectedVideoCodecUnavailable,
+    advancedVideoCodec,
+    sizeLimitEnabled,
+    advancedAudioBitrateRequest,
+  ]);
 
   function handleDroppedPaths(paths: string[]) {
     const action = resolveDroppedVideoAction({
@@ -1342,6 +1489,10 @@ function App() {
       title: title.trim() ? title.trim() : null,
       sizeLimitMb: size,
       audioEnabled: audioEnabled,
+      advanced: {
+        videoCodec: advancedVideoCodec,
+        audioBitrateKbps: advancedAudioBitrateRequest,
+      },
       trim,
       crop,
       reverse,
@@ -1378,7 +1529,7 @@ function App() {
     }
   }
 
-  async function startEncode(options?: { nextTab?: "general" | "composing" | null }): Promise<StartEncodeResult> {
+  async function startEncode(options?: { nextTab?: ActiveTab | null }): Promise<StartEncodeResult> {
     try {
       const request = buildRequest();
       pendingEncodeRef.current = {
@@ -1890,7 +2041,6 @@ function App() {
     }
   }
 
-  const sizeLimitEnabled = sizeLimitMb.trim() !== "" && Number(sizeLimitMb) > 0;
   const trimSelectionStyle =
     trimTimeline && previewDurationS > 0
       ? {
@@ -2007,6 +2157,7 @@ function App() {
               <div className="vfl-header-badge">{sourceBadgeText}</div>
               <div className="vfl-header-badge">{format.toUpperCase()} export</div>
               {sizeLimitEnabled ? <div className="vfl-header-badge">{sizeLimitMb} MB target</div> : null}
+              {advancedOverrideCount > 0 ? <div className="vfl-header-badge">Advanced {advancedOverrideCount}</div> : null}
               {activeEditChips.length ? (
                 <div className="vfl-header-badge subtle">
                   {activeEditChips.length} active edit{activeEditChips.length === 1 ? "" : "s"}
@@ -2089,6 +2240,16 @@ function App() {
               >
                 Composing
               </button>
+              <button
+                id="vfl-tab-advanced"
+                className={activeTab === "advanced" ? "active" : ""}
+                onClick={() => setActiveTab("advanced")}
+                role="tab"
+                aria-selected={activeTab === "advanced"}
+                aria-controls="vfl-tabpanel-advanced"
+              >
+                Advanced
+              </button>
             </div>
           </div>
           <div className="vfl-workspace-copy">
@@ -2096,6 +2257,8 @@ function App() {
             <div className="vfl-workspace-hint">
               {activeTab === "composing"
                 ? "Shape the clip, trim it, and adjust the frame."
+                : activeTab === "advanced"
+                  ? "Override codec and audio choices when Auto is not the right fit."
                 : "Finalize export settings, metadata, and output planning."}
             </div>
           </div>
@@ -2507,6 +2670,143 @@ function App() {
               </div>
             </div>
           </div>
+        ) : activeTab === "advanced" ? (
+          <div className="vfl-pane" id="vfl-tabpanel-advanced" role="tabpanel" aria-labelledby="vfl-tab-advanced">
+            <div className="vfl-grid vfl-grid-general">
+              <div className="vfl-stack-lg vfl-general-main">
+                <div className="vfl-section">
+                  <div className="vfl-section-title">Encoder controls</div>
+                  <div className="vfl-muted vfl-section-caption">
+                    Auto keeps the current export planner in charge; overrides apply only when a matching encoder is available.
+                  </div>
+                  <div className="vfl-stack-md">
+                    <div className="vfl-row2">
+                      <div className="vfl-field">
+                        <label htmlFor="vfl-video-codec">Video codec</label>
+                        <select
+                          id="vfl-video-codec"
+                          value={advancedVideoCodec}
+                          onChange={(e) => setAdvancedVideoCodec(e.currentTarget.value as VideoCodecPreference)}
+                          disabled={jobId !== null || format === "mp3"}
+                        >
+                          <option value="auto">
+                            Auto
+                            {videoCodecOptions.find((codec) => codec.isDefault)?.label
+                              ? ` (${videoCodecOptions.find((codec) => codec.isDefault)?.label})`
+                              : ""}
+                          </option>
+                          {videoCodecOptions.map((codec) => (
+                            <option key={`${codec.format}-${codec.value}`} value={codec.value} disabled={!codec.available}>
+                              {codec.label} ({codec.ffmpegName}){codec.available ? "" : " unavailable"}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="vfl-inline-hint">
+                          {format === "mp3"
+                            ? "MP3 exports are audio-only."
+                            : encodeCapabilities
+                              ? `${videoCodecOptions.filter((codec) => codec.available).length} available for ${format.toUpperCase()}.`
+                              : encodeCapabilitiesError
+                                ? "Capability check failed."
+                                : "Capability check runs when this tab opens."}
+                        </div>
+                      </div>
+                      <div className="vfl-field">
+                        <label htmlFor="vfl-audio-bitrate">Audio bitrate</label>
+                        <select
+                          id="vfl-audio-bitrate"
+                          value={advancedAudioBitrateKbps}
+                          onChange={(e) => setAdvancedAudioBitrateKbps(e.currentTarget.value)}
+                          disabled={jobId !== null || sizeLimitEnabled || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
+                        >
+                          <option value="auto">Auto</option>
+                          {AUDIO_BITRATE_PRESETS_KBPS.map((kbps) => (
+                            <option key={kbps} value={kbps}>
+                              {kbps} kbps
+                            </option>
+                          ))}
+                        </select>
+                        <div className="vfl-inline-hint">
+                          {sizeLimitEnabled
+                            ? "Size-targeted exports plan audio bitrate automatically."
+                            : advancedAudioApplies
+                              ? `${advancedAudioBitrateRequest} kbps will be requested.`
+                              : "Auto uses the current format default."}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="vfl-actions vfl-actions-secondary">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAdvancedVideoCodec("auto");
+                          setAdvancedAudioBitrateKbps("auto");
+                        }}
+                        disabled={jobId !== null || advancedOverrideCount === 0}
+                      >
+                        Reset advanced
+                      </button>
+                      {encodeCapabilitiesError ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEncodeCapabilities(null);
+                            setEncodeCapabilitiesError(null);
+                          }}
+                          disabled={jobId !== null}
+                        >
+                          Retry capability check
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {encodeCapabilitiesError ? <div className="vfl-error" role="alert">{encodeCapabilitiesError}</div> : null}
+                  </div>
+                </div>
+              </div>
+
+              <div className="vfl-stack-lg vfl-general-side">
+                <div className="vfl-section">
+                  <div className="vfl-section-title">Advanced plan</div>
+                  <div className="vfl-muted vfl-section-caption">
+                    Current encoder overrides and how they interact with the export plan.
+                  </div>
+                  <div className={`vfl-plan-hero ${advancedOverrideCount > 0 ? "is-ready" : ""}`}>
+                    <div className="vfl-plan-hero-kicker">{advancedOverrideCount > 0 ? "Overrides active" : "Auto mode"}</div>
+                    <div className="vfl-plan-hero-copy">{advancedPlanSummary}</div>
+                  </div>
+                  <div className="vfl-summary-list">
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Format</div>
+                      <div className="vfl-summary-value">{format.toUpperCase()}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Video codec</div>
+                      <div className="vfl-summary-value">{advancedCodecSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Audio bitrate</div>
+                      <div className="vfl-summary-value">{advancedAudioSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Size target</div>
+                      <div className="vfl-summary-value">{sizeLimitEnabled ? "Bitrate planned from target size" : "Quality mode with no size cap"}</div>
+                    </div>
+                  </div>
+                  {planWarnings.length ? (
+                    <div className="vfl-plan-warnings" role="status" aria-live="polite">
+                      {planWarnings.map((warning) => (
+                        <div key={warning} className="vfl-plan-warning">
+                          {warning}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          </div>
         ) : (
           <div className="vfl-pane" id="vfl-tabpanel-general" role="tabpanel" aria-labelledby="vfl-tab-general">
             <div className="vfl-grid vfl-grid-general">
@@ -2537,7 +2837,7 @@ function App() {
                           <div className="vfl-empty-step-index">2</div>
                           <div>
                             <div className="vfl-empty-step-title">Shape the export</div>
-                            <div className="vfl-empty-step-copy">Use General for format and size, then jump to Composing for trim, crop, speed, and color.</div>
+                            <div className="vfl-empty-step-copy">Use General for format and size, Advanced for encoder overrides, then Composing for trim, crop, speed, and color.</div>
                           </div>
                         </div>
                         <div className="vfl-empty-step">
@@ -2659,6 +2959,10 @@ function App() {
                       <div className="vfl-summary-value">{planSummaryText ?? "Pick a valid input and settings to calculate the plan."}</div>
                     </div>
                     <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Advanced</div>
+                      <div className="vfl-summary-value">{advancedPlanSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Active edits</div>
                       {activeEditChips.length ? (
                         <div className="vfl-chips vfl-chips-compact">
@@ -2749,7 +3053,7 @@ function App() {
                 Cancel
               </button>
             ) : (
-              <button className="primary vfl-export-button" onClick={() => void startEncode()} disabled={!inputPath || !outputPath || !probe}>
+              <button className="primary vfl-export-button" onClick={() => void startEncode()} disabled={!exportReady}>
                 Export
               </button>
             )}
