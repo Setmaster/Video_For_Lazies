@@ -20,6 +20,10 @@ test("parsePersistedSettings only restores the supported default format", () => 
       advanced: {
         videoCodec: "vp9",
         audioBitrateKbps: 192,
+        videoQuality: "higher",
+        encodeSpeed: "faster",
+        frameRateCapFps: 30,
+        audioChannels: "mono",
       },
       sizeLimitMb: "50",
       trimStart: "12.5",
@@ -27,7 +31,17 @@ test("parsePersistedSettings only restores the supported default format", () => 
       cropEnabled: true,
       brightness: "0.2",
     })),
-    { format: "webm", advanced: { videoCodec: "vp9", audioBitrateKbps: 192 } },
+    {
+      format: "webm",
+      advanced: {
+        videoCodec: "vp9",
+        audioBitrateKbps: 192,
+        videoQuality: "higher",
+        encodeSpeed: "faster",
+        frameRateCapFps: 30,
+        audioChannels: "mono",
+      },
+    },
   );
 });
 
@@ -42,6 +56,10 @@ test("parsePersistedSettings rejects unsupported advanced settings", () => {
         advanced: {
           videoCodec: "prores",
           audioBitrateKbps: 999,
+          videoQuality: "raw-crf",
+          encodeSpeed: "warp",
+          frameRateCapFps: 120,
+          audioChannels: "surround",
         },
       }),
     ),
@@ -56,11 +74,25 @@ test("serializePersistedSettings only writes the supported default format", () =
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: 256,
+        videoQuality: "balanced",
+        encodeSpeed: "smaller",
+        frameRateCapFps: 60,
+        audioChannels: "stereo",
       },
       trimStart: "5",
       sizeLimitMb: "25",
     }),
-    JSON.stringify({ format: "mp4", advanced: { videoCodec: "h264", audioBitrateKbps: 256 } }),
+    JSON.stringify({
+      format: "mp4",
+      advanced: {
+        videoCodec: "h264",
+        audioBitrateKbps: 256,
+        videoQuality: "balanced",
+        encodeSpeed: "smaller",
+        frameRateCapFps: 60,
+        audioChannels: "stereo",
+      },
+    }),
   );
 });
 
@@ -71,6 +103,10 @@ test("serializePersistedSettings omits auto advanced defaults", () => {
       advanced: {
         videoCodec: "auto",
         audioBitrateKbps: null,
+        videoQuality: "auto",
+        encodeSpeed: "auto",
+        frameRateCapFps: null,
+        audioChannels: "auto",
       },
     }),
     JSON.stringify({ format: "mp4" }),

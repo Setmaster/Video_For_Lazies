@@ -91,6 +91,32 @@ pub enum VideoCodecPreference {
     Vp8,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoQualityPreference {
+    Auto,
+    Smaller,
+    Balanced,
+    Higher,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EncodeSpeedPreference {
+    Auto,
+    Faster,
+    Balanced,
+    Smaller,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioChannelPreference {
+    Auto,
+    Stereo,
+    Mono,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AdvancedEncodeSettings {
@@ -98,6 +124,14 @@ pub struct AdvancedEncodeSettings {
     pub video_codec: Option<VideoCodecPreference>,
     #[serde(default)]
     pub audio_bitrate_kbps: Option<u32>,
+    #[serde(default)]
+    pub video_quality: Option<VideoQualityPreference>,
+    #[serde(default)]
+    pub encode_speed: Option<EncodeSpeedPreference>,
+    #[serde(default)]
+    pub frame_rate_cap_fps: Option<u32>,
+    #[serde(default)]
+    pub audio_channels: Option<AudioChannelPreference>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -482,21 +516,74 @@ fn cached_encoder_names(ffmpeg_bin: &str) -> Result<HashSet<String>, String> {
     Ok(parsed)
 }
 
-fn quality_mode_for_codec(video_codec: VideoCodec) -> QualityMode {
-    match video_codec {
-        VideoCodec::LibX264 => QualityMode::Crf {
+fn video_quality_preference(advanced: &AdvancedEncodeSettings) -> VideoQualityPreference {
+    advanced
+        .video_quality
+        .unwrap_or(VideoQualityPreference::Auto)
+}
+
+fn encode_speed_preference(advanced: &AdvancedEncodeSettings) -> EncodeSpeedPreference {
+    advanced.encode_speed.unwrap_or(EncodeSpeedPreference::Auto)
+}
+
+fn audio_channel_preference(advanced: &AdvancedEncodeSettings) -> AudioChannelPreference {
+    advanced
+        .audio_channels
+        .unwrap_or(AudioChannelPreference::Auto)
+}
+
+fn quality_mode_for_codec(
+    video_codec: VideoCodec,
+    preference: VideoQualityPreference,
+) -> QualityMode {
+    let preference = match preference {
+        VideoQualityPreference::Auto => VideoQualityPreference::Balanced,
+        other => other,
+    };
+
+    match (video_codec, preference) {
+        (VideoCodec::LibX264, VideoQualityPreference::Smaller) => QualityMode::Crf {
+            crf: "28",
+            preset: Some("medium"),
+        },
+        (VideoCodec::LibX264, VideoQualityPreference::Balanced) => QualityMode::Crf {
             crf: "23",
             preset: Some("medium"),
         },
-        VideoCodec::Mpeg4 => QualityMode::QScale { qscale: "5" },
-        VideoCodec::LibVpxVp9 => QualityMode::Cq {
+        (VideoCodec::LibX264, VideoQualityPreference::Higher) => QualityMode::Crf {
+            crf: "20",
+            preset: Some("medium"),
+        },
+        (VideoCodec::Mpeg4, VideoQualityPreference::Smaller) => QualityMode::QScale { qscale: "8" },
+        (VideoCodec::Mpeg4, VideoQualityPreference::Balanced) => {
+            QualityMode::QScale { qscale: "5" }
+        }
+        (VideoCodec::Mpeg4, VideoQualityPreference::Higher) => QualityMode::QScale { qscale: "3" },
+        (VideoCodec::LibVpxVp9, VideoQualityPreference::Smaller) => QualityMode::Cq {
+            crf: "38",
+            bitrate: "0",
+        },
+        (VideoCodec::LibVpxVp9, VideoQualityPreference::Balanced) => QualityMode::Cq {
             crf: "32",
             bitrate: "0",
         },
-        VideoCodec::LibVpx => QualityMode::Cq {
+        (VideoCodec::LibVpxVp9, VideoQualityPreference::Higher) => QualityMode::Cq {
+            crf: "28",
+            bitrate: "0",
+        },
+        (VideoCodec::LibVpx, VideoQualityPreference::Smaller) => QualityMode::Cq {
+            crf: "16",
+            bitrate: "800k",
+        },
+        (VideoCodec::LibVpx, VideoQualityPreference::Balanced) => QualityMode::Cq {
             crf: "10",
             bitrate: "1M",
         },
+        (VideoCodec::LibVpx, VideoQualityPreference::Higher) => QualityMode::Cq {
+            crf: "8",
+            bitrate: "1500k",
+        },
+        (_, VideoQualityPreference::Auto) => unreachable!(),
     }
 }
 
@@ -608,7 +695,10 @@ fn select_codec_plan(
             Ok(CodecSelection {
                 video_codec: Some(video_codec),
                 audio_codec: audio_codec_for_format(format, encoder_names),
-                quality_mode: Some(quality_mode_for_codec(video_codec)),
+                quality_mode: Some(quality_mode_for_codec(
+                    video_codec,
+                    video_quality_preference(advanced),
+                )),
             })
         }
         OutputFormat::Mp3 => Ok(CodecSelection {
@@ -683,6 +773,159 @@ fn advanced_audio_bitrate_kbps(request: &EncodeRequest) -> Result<Option<u32>, S
     }
 
     Ok(Some(kbps))
+}
+
+fn audio_channel_count(request: &EncodeRequest) -> Option<u8> {
+    match audio_channel_preference(&request.advanced) {
+        AudioChannelPreference::Auto => None,
+        AudioChannelPreference::Stereo => Some(2),
+        AudioChannelPreference::Mono => Some(1),
+    }
+}
+
+fn validate_frame_rate_cap_fps(cap_fps: u32) -> Result<u32, String> {
+    if (1..=240).contains(&cap_fps) {
+        Ok(cap_fps)
+    } else {
+        Err("Frame rate cap must be between 1 and 240 fps.".to_string())
+    }
+}
+
+fn requested_frame_rate_cap_fps(request: &EncodeRequest) -> Result<Option<u32>, String> {
+    request
+        .advanced
+        .frame_rate_cap_fps
+        .map(validate_frame_rate_cap_fps)
+        .transpose()
+}
+
+fn frame_rate_cap_filter_fps(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+) -> Result<Option<u32>, String> {
+    let Some(cap_fps) = requested_frame_rate_cap_fps(request)? else {
+        return Ok(None);
+    };
+    let Some(source_fps) = probe.frame_rate.filter(|fps| fps.is_finite() && *fps > 0.0) else {
+        return Ok(Some(cap_fps));
+    };
+
+    if source_fps > cap_fps as f64 + 0.01 {
+        Ok(Some(cap_fps))
+    } else {
+        Ok(None)
+    }
+}
+
+fn output_frame_rate_for_planning(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+) -> Result<Option<f64>, String> {
+    if let Some(cap_fps) = frame_rate_cap_filter_fps(request, probe)? {
+        Ok(Some(cap_fps as f64))
+    } else {
+        Ok(probe.frame_rate)
+    }
+}
+
+fn advanced_forces_reencode(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    size_limit_enabled: bool,
+) -> Result<bool, String> {
+    if matches!(request.format, OutputFormat::Mp3) {
+        return Ok(false);
+    }
+
+    let video_codec = request
+        .advanced
+        .video_codec
+        .unwrap_or(VideoCodecPreference::Auto);
+    if video_codec != VideoCodecPreference::Auto {
+        return Ok(true);
+    }
+
+    if !size_limit_enabled
+        && video_quality_preference(&request.advanced) != VideoQualityPreference::Auto
+    {
+        return Ok(true);
+    }
+
+    if encode_speed_preference(&request.advanced) != EncodeSpeedPreference::Auto {
+        return Ok(true);
+    }
+
+    if frame_rate_cap_filter_fps(request, probe)?.is_some() {
+        return Ok(true);
+    }
+
+    if request.audio_enabled && probe.has_audio {
+        if !size_limit_enabled && request.advanced.audio_bitrate_kbps.is_some() {
+            return Ok(true);
+        }
+        if audio_channel_count(request).is_some() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn encode_speed_args_for_codec(
+    video_codec: VideoCodec,
+    preference: EncodeSpeedPreference,
+) -> Vec<String> {
+    match (video_codec, preference) {
+        (_, EncodeSpeedPreference::Auto) => Vec::new(),
+        (VideoCodec::LibX264, EncodeSpeedPreference::Faster) => ["-preset", "faster"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        (VideoCodec::LibX264, EncodeSpeedPreference::Balanced) => ["-preset", "medium"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        (VideoCodec::LibX264, EncodeSpeedPreference::Smaller) => {
+            ["-preset", "slow"].into_iter().map(String::from).collect()
+        }
+        (VideoCodec::LibVpxVp9, EncodeSpeedPreference::Faster) => {
+            ["-deadline", "good", "-cpu-used", "5", "-row-mt", "1"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        (VideoCodec::LibVpxVp9, EncodeSpeedPreference::Balanced) => {
+            ["-deadline", "good", "-cpu-used", "3", "-row-mt", "1"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        (VideoCodec::LibVpxVp9, EncodeSpeedPreference::Smaller) => {
+            ["-deadline", "good", "-cpu-used", "1", "-row-mt", "1"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        (VideoCodec::LibVpx, EncodeSpeedPreference::Faster) => {
+            ["-deadline", "good", "-cpu-used", "4"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        (VideoCodec::LibVpx, EncodeSpeedPreference::Balanced) => {
+            ["-deadline", "good", "-cpu-used", "2"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        (VideoCodec::LibVpx, EncodeSpeedPreference::Smaller) => {
+            ["-deadline", "good", "-cpu-used", "1"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        (VideoCodec::Mpeg4, _) => Vec::new(),
+    }
 }
 
 fn output_extension(format: OutputFormat) -> &'static str {
@@ -1358,6 +1601,10 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         filters.push(format!("setpts=PTS/{:.9}", req.speed));
     }
 
+    if let Some(cap_fps) = frame_rate_cap_filter_fps(req, probe)? {
+        filters.push(format!("fps={cap_fps}"));
+    }
+
     Ok(if filters.is_empty() {
         None
     } else {
@@ -1666,11 +1913,12 @@ fn build_size_limited_encode_contract(
     include_audio: bool,
 ) -> Result<SizeLimitedEncodeContract, String> {
     let (planned_width, planned_height) = estimated_output_dimensions(request, probe);
+    let planned_frame_rate = output_frame_rate_for_planning(request, probe)?;
     let min_video_kbps = minimum_video_bitrate_kbps(
         selected_video_codec,
         planned_width,
         planned_height,
-        probe.frame_rate,
+        planned_frame_rate,
     );
     let plan = plan_bitrates(
         request.size_limit_mb,
@@ -1757,6 +2005,8 @@ pub fn run_encode_job(
     let encoder_names = cached_encoder_names(&ffmpeg_bin)?;
     let codec_selection = select_codec_plan(request.format, &encoder_names, &request.advanced)?;
     let advanced_audio_bitrate_kbps = advanced_audio_bitrate_kbps(&request)?;
+    let advanced_audio_channel_count = audio_channel_count(&request);
+    let advanced_force_reencode = advanced_forces_reencode(&request, &probe, size_limit_enabled)?;
 
     let output_duration_s =
         estimate_output_duration_s(probe.duration_s, &request.trim, request.speed)?;
@@ -1805,6 +2055,10 @@ pub fn run_encode_job(
 
         args.push("-c:a".to_string());
         args.push(audio_codec.to_string());
+        if let Some(channels) = advanced_audio_channel_count {
+            args.push("-ac".to_string());
+            args.push(channels.to_string());
+        }
         if size_limit_enabled {
             let audio_kbps =
                 plan_audio_only_kbps(request.size_limit_mb, output_duration_s, 0.98, 32, 320)?;
@@ -1880,7 +2134,7 @@ pub fn run_encode_job(
             input_size <= target_bytes || !request.audio_enabled
         } else {
             true
-        };
+        } && !advanced_force_reencode;
 
         if should_try_stream_copy {
             let mut args = vec![
@@ -1969,6 +2223,10 @@ pub fn run_encode_job(
         let quality_mode = codec_selection
             .quality_mode
             .ok_or_else(|| "Missing quality settings for export format.".to_string())?;
+        let selected_video_codec = codec_selection
+            .video_codec
+            .ok_or_else(|| "Missing video codec selection.".to_string())?;
+        let encode_speed_preference = encode_speed_preference(&request.advanced);
 
         let mut args = vec![
             "-y".to_string(),
@@ -1986,13 +2244,12 @@ pub fn run_encode_job(
             video_codec.to_string(),
         ];
 
-        // NOTE: This "no size target" path uses the codec plan defaults.
-        // If/when we expose advanced encoding knobs (CRF, preset, audio bitrate, etc),
-        // user-provided settings should override the defaults set below.
         match quality_mode {
             QualityMode::Crf { crf, preset } => {
                 args.extend(["-crf", crf].into_iter().map(|s| s.to_string()));
-                if let Some(preset) = preset {
+                if let Some(preset) = preset
+                    && encode_speed_preference == EncodeSpeedPreference::Auto
+                {
                     args.extend(["-preset", preset].into_iter().map(|s| s.to_string()));
                 }
             }
@@ -2007,6 +2264,10 @@ pub fn run_encode_job(
                 args.extend(["-q:v", qscale].into_iter().map(|s| s.to_string()));
             }
         }
+        args.extend(encode_speed_args_for_codec(
+            selected_video_codec,
+            encode_speed_preference,
+        ));
 
         if let Some(vf) = &video_filters {
             args.push("-vf".to_string());
@@ -2016,6 +2277,10 @@ pub fn run_encode_job(
         if include_audio && probe.has_audio && request.audio_enabled {
             args.extend(["-map", "0:a:0?"].into_iter().map(|s| s.to_string()));
             args.extend(["-c:a", audio_codec].into_iter().map(|s| s.to_string()));
+            if let Some(channels) = advanced_audio_channel_count {
+                args.push("-ac".to_string());
+                args.push(channels.to_string());
+            }
             args.push("-b:a".to_string());
             let audio_kbps = advanced_audio_bitrate_kbps.unwrap_or(match request.format {
                 OutputFormat::Mp4 => 192,
@@ -2102,6 +2367,7 @@ pub fn run_encode_job(
         .audio_codec
         .unwrap_or(AudioCodec::Aac)
         .as_ffmpeg_name();
+    let encode_speed_preference = encode_speed_preference(&request.advanced);
 
     let mut attempt: u32 = 0;
     let max_attempts: u32 = 3;
@@ -2139,6 +2405,10 @@ pub fn run_encode_job(
             passlog_str.clone(),
             "-an".to_string(),
         ];
+        pass1.extend(encode_speed_args_for_codec(
+            selected_video_codec,
+            encode_speed_preference,
+        ));
         if let Some(vf) = &video_filters {
             pass1.push("-vf".to_string());
             pass1.push(vf.clone());
@@ -2192,6 +2462,10 @@ pub fn run_encode_job(
             "-passlogfile".to_string(),
             passlog_str.clone(),
         ];
+        pass2.extend(encode_speed_args_for_codec(
+            selected_video_codec,
+            encode_speed_preference,
+        ));
 
         if let Some(vf) = &video_filters {
             pass2.push("-vf".to_string());
@@ -2201,6 +2475,10 @@ pub fn run_encode_job(
         if plan.include_audio && probe.has_audio && request.audio_enabled {
             pass2.extend(["-map", "0:a:0?"].into_iter().map(|s| s.to_string()));
             pass2.extend(["-c:a", audio_codec].into_iter().map(|s| s.to_string()));
+            if let Some(channels) = advanced_audio_channel_count {
+                pass2.push("-ac".to_string());
+                pass2.push(channels.to_string());
+            }
             pass2.push("-b:a".to_string());
             pass2.push(format!("{}k", plan.audio_bitrate_kbps.max(32)));
             if let Some(af) = &audio_filters {
@@ -2544,6 +2822,7 @@ Encoders:
             &AdvancedEncodeSettings {
                 video_codec: Some(VideoCodecPreference::Mpeg4),
                 audio_bitrate_kbps: None,
+                ..AdvancedEncodeSettings::default()
             },
         )
         .unwrap();
@@ -2555,6 +2834,7 @@ Encoders:
             &AdvancedEncodeSettings {
                 video_codec: Some(VideoCodecPreference::Vp8),
                 audio_bitrate_kbps: None,
+                ..AdvancedEncodeSettings::default()
             },
         )
         .unwrap();
@@ -2570,6 +2850,7 @@ Encoders:
             &AdvancedEncodeSettings {
                 video_codec: Some(VideoCodecPreference::H264),
                 audio_bitrate_kbps: None,
+                ..AdvancedEncodeSettings::default()
             },
         )
         .unwrap_err();
@@ -2587,6 +2868,103 @@ Encoders:
         req.advanced.audio_bitrate_kbps = Some(999);
         let err = advanced_audio_bitrate_kbps(&req).unwrap_err();
         assert!(err.contains("96, 128, 192, 256, 320"));
+    }
+
+    #[test]
+    fn advanced_overrides_force_reencode_when_they_affect_video_output() {
+        let probe = probe_10s_1920x1080_audio();
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+
+        assert!(!advanced_forces_reencode(&req, &probe, false).unwrap());
+
+        req.advanced.video_codec = Some(VideoCodecPreference::H264);
+        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+
+        req.advanced.video_codec = None;
+        req.advanced.audio_bitrate_kbps = Some(192);
+        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+
+        req.advanced.audio_bitrate_kbps = None;
+        req.advanced.video_quality = Some(VideoQualityPreference::Higher);
+        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+
+        req.advanced.video_quality = None;
+        req.advanced.encode_speed = Some(EncodeSpeedPreference::Faster);
+        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+
+        req.advanced.encode_speed = None;
+        req.advanced.frame_rate_cap_fps = Some(24);
+        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+
+        req.advanced.frame_rate_cap_fps = Some(60);
+        assert!(!advanced_forces_reencode(&req, &probe, false).unwrap());
+
+        req.advanced.frame_rate_cap_fps = None;
+        req.advanced.audio_channels = Some(AudioChannelPreference::Mono);
+        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+    }
+
+    #[test]
+    fn size_target_holds_no_size_only_quality_and_audio_bitrate_overrides() {
+        let probe = probe_10s_1920x1080_audio();
+        let mut req = base_request();
+        req.advanced.audio_bitrate_kbps = Some(192);
+        req.advanced.video_quality = Some(VideoQualityPreference::Higher);
+
+        assert!(!advanced_forces_reencode(&req, &probe, true).unwrap());
+
+        req.advanced.encode_speed = Some(EncodeSpeedPreference::Smaller);
+        assert!(advanced_forces_reencode(&req, &probe, true).unwrap());
+    }
+
+    #[test]
+    fn quality_preferences_map_per_codec() {
+        assert_eq!(
+            quality_mode_for_codec(VideoCodec::LibX264, VideoQualityPreference::Higher),
+            QualityMode::Crf {
+                crf: "20",
+                preset: Some("medium")
+            }
+        );
+        assert_eq!(
+            quality_mode_for_codec(VideoCodec::Mpeg4, VideoQualityPreference::Smaller),
+            QualityMode::QScale { qscale: "8" }
+        );
+        assert_eq!(
+            quality_mode_for_codec(VideoCodec::LibVpxVp9, VideoQualityPreference::Higher),
+            QualityMode::Cq {
+                crf: "28",
+                bitrate: "0"
+            }
+        );
+        assert_eq!(
+            quality_mode_for_codec(VideoCodec::LibVpx, VideoQualityPreference::Smaller),
+            QualityMode::Cq {
+                crf: "16",
+                bitrate: "800k"
+            }
+        );
+    }
+
+    #[test]
+    fn encode_speed_preferences_map_per_codec() {
+        assert_eq!(
+            encode_speed_args_for_codec(VideoCodec::LibX264, EncodeSpeedPreference::Smaller),
+            vec!["-preset", "slow"]
+        );
+        assert_eq!(
+            encode_speed_args_for_codec(VideoCodec::LibVpxVp9, EncodeSpeedPreference::Faster),
+            vec!["-deadline", "good", "-cpu-used", "5", "-row-mt", "1"]
+        );
+        assert_eq!(
+            encode_speed_args_for_codec(VideoCodec::LibVpx, EncodeSpeedPreference::Balanced),
+            vec!["-deadline", "good", "-cpu-used", "2"]
+        );
+        assert!(
+            encode_speed_args_for_codec(VideoCodec::Mpeg4, EncodeSpeedPreference::Faster)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2658,6 +3036,19 @@ Encoders:
             filters,
             "scale=w='if(gte(iw,ih),min(iw,720),-2)':h='if(gte(iw,ih),-2,min(ih,720))',eq=brightness=0.100000:contrast=1.200000:saturation=0.900000"
         );
+    }
+
+    #[test]
+    fn build_video_filters_applies_frame_rate_cap_only_when_source_is_higher() {
+        let mut req = base_request();
+        req.advanced.frame_rate_cap_fps = Some(24);
+
+        let probe = probe_10s_1920x1080_audio();
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(filters, "fps=24");
+
+        req.advanced.frame_rate_cap_fps = Some(60);
+        assert_eq!(build_video_filters(&req, &probe).unwrap(), None);
     }
 
     #[test]

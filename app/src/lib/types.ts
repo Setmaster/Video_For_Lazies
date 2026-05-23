@@ -1,10 +1,14 @@
 export type OutputFormat = "mp4" | "webm" | "mp3";
 export type VideoCodecPreference = "auto" | "h264" | "mpeg4" | "vp9" | "vp8";
+export type VideoQualityPreference = "auto" | "smaller" | "balanced" | "higher";
+export type EncodeSpeedPreference = "auto" | "faster" | "balanced" | "smaller";
+export type AudioChannelPreference = "auto" | "stereo" | "mono";
 
 export interface VideoProbe {
   durationS: number;
   width: number;
   height: number;
+  frameRate?: number | null;
   hasAudio: boolean;
 }
 
@@ -47,6 +51,10 @@ export interface EncodeRequest {
 export interface AdvancedEncodeSettings {
   videoCodec?: VideoCodecPreference | null;
   audioBitrateKbps?: number | null;
+  videoQuality?: VideoQualityPreference | null;
+  encodeSpeed?: EncodeSpeedPreference | null;
+  frameRateCapFps?: number | null;
+  audioChannels?: AudioChannelPreference | null;
 }
 
 export interface VideoCodecCapability {

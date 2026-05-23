@@ -8,8 +8,10 @@ import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./co
 import type {
   AppSmokeConfig,
   AppSmokeStatus,
+  AudioChannelPreference,
   Crop,
   ColorAdjust,
+  EncodeSpeedPreference,
   EncodeCapabilities,
   EncodeFinishedPayload,
   EncodeProgressPayload,
@@ -18,6 +20,7 @@ import type {
   UpdateApplyResponse,
   UpdateCheckResponse,
   VideoCodecPreference,
+  VideoQualityPreference,
   VideoProbe,
 } from "./lib/types";
 import {
@@ -33,6 +36,7 @@ import "./App.css";
 const SETTINGS_KEY = "vfl:settings:v1";
 const SIZE_PRESETS_MB = [8, 10, 25, 50] as const;
 const AUDIO_BITRATE_PRESETS_KBPS = [96, 128, 192, 256, 320] as const;
+const FRAME_RATE_CAP_PRESETS_FPS = [24, 30, 60] as const;
 const VIDEO_CODEC_LABELS: Record<VideoCodecPreference, string> = {
   auto: "Auto",
   h264: "H.264",
@@ -46,6 +50,23 @@ const VIDEO_CODEC_FFMPEG_NAMES: Partial<Record<VideoCodecPreference, string>> = 
   vp9: "libvpx-vp9",
   vp8: "libvpx",
 };
+const VIDEO_QUALITY_LABELS: Record<VideoQualityPreference, string> = {
+  auto: "Auto",
+  smaller: "Smaller file",
+  balanced: "Balanced",
+  higher: "Higher quality",
+};
+const ENCODE_SPEED_LABELS: Record<EncodeSpeedPreference, string> = {
+  auto: "Auto",
+  faster: "Faster",
+  balanced: "Balanced",
+  smaller: "Smaller file",
+};
+const AUDIO_CHANNEL_LABELS: Record<AudioChannelPreference, string> = {
+  auto: "Auto",
+  stereo: "Stereo",
+  mono: "Mono",
+};
 const MIN_WINDOW_WIDTH = 960;
 const MIN_WINDOW_HEIGHT = 720;
 const TRIM_MIN_GAP_S = 0.05;
@@ -55,7 +76,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.3.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -177,6 +198,17 @@ function formatVideoCodecLabel(codec: VideoCodecPreference) {
   return ffmpegName ? `${VIDEO_CODEC_LABELS[codec]} (${ffmpegName})` : VIDEO_CODEC_LABELS[codec];
 }
 
+function colorIsDefault(brightness: string, contrast: string, saturation: string) {
+  const brightnessNum = Number(brightness);
+  const contrastNum = Number(contrast);
+  const saturationNum = Number(saturation);
+  return !(
+    (Number.isFinite(brightnessNum) && Math.abs(brightnessNum) > 0.001) ||
+    (Number.isFinite(contrastNum) && Math.abs(contrastNum - 1) > 0.001) ||
+    (Number.isFinite(saturationNum) && Math.abs(saturationNum - 1) > 0.001)
+  );
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("general");
 
@@ -196,6 +228,10 @@ function App() {
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
   const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
+  const [advancedVideoQuality, setAdvancedVideoQuality] = useState<VideoQualityPreference>("auto");
+  const [advancedEncodeSpeed, setAdvancedEncodeSpeed] = useState<EncodeSpeedPreference>("auto");
+  const [advancedFrameRateCapFps, setAdvancedFrameRateCapFps] = useState("auto");
+  const [advancedAudioChannels, setAdvancedAudioChannels] = useState<AudioChannelPreference>("auto");
   const [encodeCapabilities, setEncodeCapabilities] = useState<EncodeCapabilities | null>(null);
   const [encodeCapabilitiesError, setEncodeCapabilitiesError] = useState<string | null>(null);
 
@@ -461,6 +497,10 @@ function App() {
       if (parsed.format) setFormat(parsed.format);
       if (parsed.advanced?.videoCodec) setAdvancedVideoCodec(parsed.advanced.videoCodec);
       if (parsed.advanced?.audioBitrateKbps) setAdvancedAudioBitrateKbps(String(parsed.advanced.audioBitrateKbps));
+      if (parsed.advanced?.videoQuality) setAdvancedVideoQuality(parsed.advanced.videoQuality);
+      if (parsed.advanced?.encodeSpeed) setAdvancedEncodeSpeed(parsed.advanced.encodeSpeed);
+      if (parsed.advanced?.frameRateCapFps) setAdvancedFrameRateCapFps(String(parsed.advanced.frameRateCapFps));
+      if (parsed.advanced?.audioChannels) setAdvancedAudioChannels(parsed.advanced.audioChannels);
     } catch {
       // ignore
     } finally {
@@ -478,13 +518,26 @@ function App() {
           advanced: {
             videoCodec: advancedVideoCodec,
             audioBitrateKbps: advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps),
+            videoQuality: advancedVideoQuality,
+            encodeSpeed: advancedEncodeSpeed,
+            frameRateCapFps: advancedFrameRateCapFps === "auto" ? null : Number(advancedFrameRateCapFps),
+            audioChannels: advancedAudioChannels,
           },
         }),
       );
     } catch {
       // ignore
     }
-  }, [settingsReady, format, advancedVideoCodec, advancedAudioBitrateKbps]);
+  }, [
+    settingsReady,
+    format,
+    advancedVideoCodec,
+    advancedAudioBitrateKbps,
+    advancedVideoQuality,
+    advancedEncodeSpeed,
+    advancedFrameRateCapFps,
+    advancedAudioChannels,
+  ]);
 
   useEffect(() => {
     if (!settingsReady) return;
@@ -532,6 +585,10 @@ function App() {
     setAudioEnabled(true);
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
+    setAdvancedVideoQuality("auto");
+    setAdvancedEncodeSpeed("auto");
+    setAdvancedFrameRateCapFps("auto");
+    setAdvancedAudioChannels("auto");
 
     setTrimStart("0");
     setTrimEnd("");
@@ -603,6 +660,10 @@ function App() {
     setAudioEnabled(true);
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
+    setAdvancedVideoQuality("auto");
+    setAdvancedEncodeSpeed("auto");
+    setAdvancedFrameRateCapFps("auto");
+    setAdvancedAudioChannels("auto");
     setTrimStart(formatNumberInput(smokeConfig.trimStartS));
     setTrimEnd(smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined ? "" : formatNumberInput(smokeConfig.trimEndS));
     setTrimDragSnapS("0");
@@ -809,21 +870,98 @@ function App() {
     advancedAudioBitrateValue !== null &&
     AUDIO_BITRATE_PRESETS_KBPS.includes(advancedAudioBitrateValue as (typeof AUDIO_BITRATE_PRESETS_KBPS)[number]);
   const advancedAudioBitrateRequest = advancedAudioBitrateValid ? advancedAudioBitrateValue : null;
+  const advancedFrameRateCapValue = advancedFrameRateCapFps === "auto" ? null : Number(advancedFrameRateCapFps);
+  const advancedFrameRateCapValid =
+    advancedFrameRateCapValue !== null &&
+    FRAME_RATE_CAP_PRESETS_FPS.includes(advancedFrameRateCapValue as (typeof FRAME_RATE_CAP_PRESETS_FPS)[number]);
+  const advancedFrameRateCapRequest = advancedFrameRateCapValid ? advancedFrameRateCapValue : null;
   const advancedAudioApplies = !sizeLimitEnabled && advancedAudioBitrateRequest !== null;
+  const sourceFrameRate = probe?.frameRate ?? null;
+  const frameRateCapApplies =
+    format !== "mp3" &&
+    advancedFrameRateCapRequest !== null &&
+    (sourceFrameRate === null || sourceFrameRate > advancedFrameRateCapRequest + 0.01);
+  const audioOverrideCanApply =
+    format === "mp3" ? Boolean(probe?.hasAudio) : audioEnabled && Boolean(probe?.hasAudio);
+  const advancedAudioChannelsApplies = advancedAudioChannels !== "auto" && audioOverrideCanApply;
+  const advancedVideoQualityApplies = format !== "mp3" && !sizeLimitEnabled && advancedVideoQuality !== "auto";
+  const advancedEncodeSpeedApplies = format !== "mp3" && advancedEncodeSpeed !== "auto";
   const advancedCodecSummary =
     format === "mp3"
       ? "No video codec"
       : advancedVideoCodec === "auto"
         ? "Auto codec"
         : formatVideoCodecLabel(advancedVideoCodec);
+  const advancedQualitySummary =
+    format === "mp3"
+      ? "No video quality"
+      : advancedVideoQuality === "auto"
+        ? sizeLimitEnabled
+          ? "Size target controls quality"
+          : "Auto quality"
+        : sizeLimitEnabled
+          ? `${VIDEO_QUALITY_LABELS[advancedVideoQuality]} when size target is off`
+          : VIDEO_QUALITY_LABELS[advancedVideoQuality];
+  const advancedSpeedSummary =
+    format === "mp3"
+      ? "No video speed"
+      : advancedEncodeSpeed === "auto"
+        ? "Auto encode speed"
+        : `${ENCODE_SPEED_LABELS[advancedEncodeSpeed]} encode`;
   const advancedAudioSummary =
     advancedAudioBitrateRequest === null
       ? "Auto audio bitrate"
       : sizeLimitEnabled
         ? `${advancedAudioBitrateRequest} kbps when size target is off`
         : `${advancedAudioBitrateRequest} kbps audio`;
-  const advancedOverrideCount = (advancedVideoCodec === "auto" ? 0 : 1) + (advancedAudioBitrateRequest === null ? 0 : 1);
-  const advancedPlanSummary = `${advancedCodecSummary} • ${advancedAudioSummary}`;
+  const advancedFrameRateSummary =
+    format === "mp3"
+      ? "No video frame rate"
+      : advancedFrameRateCapRequest === null
+        ? "Source frame rate"
+        : sourceFrameRate !== null && sourceFrameRate <= advancedFrameRateCapRequest + 0.01
+          ? `Cap ${advancedFrameRateCapRequest} fps, source is already lower`
+          : `Cap at ${advancedFrameRateCapRequest} fps`;
+  const advancedAudioChannelsSummary =
+    advancedAudioChannels === "auto"
+      ? "Auto audio channels"
+      : !audioOverrideCanApply
+        ? `${AUDIO_CHANNEL_LABELS[advancedAudioChannels]} when audio is included`
+        : `${AUDIO_CHANNEL_LABELS[advancedAudioChannels]} audio`;
+  const advancedOverrideCount =
+    (advancedVideoCodec === "auto" ? 0 : 1) +
+    (advancedAudioBitrateRequest === null ? 0 : 1) +
+    (advancedVideoQuality === "auto" ? 0 : 1) +
+    (advancedEncodeSpeed === "auto" ? 0 : 1) +
+    (advancedFrameRateCapRequest === null ? 0 : 1) +
+    (advancedAudioChannels === "auto" ? 0 : 1);
+  const hasVideoEditTransforms =
+    Boolean(trimSummary) ||
+    Boolean(cropEnabled && cropSummary && cropSummary !== "Full frame selected.") ||
+    reverse ||
+    rotateDeg !== 0 ||
+    (Number.isFinite(Number(speed)) && Math.abs(Number(speed) - 1) > 0.001) ||
+    maxEdgePx.trim() !== "" ||
+    !colorIsDefault(brightness, contrast, saturation);
+  const advancedForcesReencode =
+    format !== "mp3" &&
+    (advancedVideoCodec !== "auto" ||
+      advancedVideoQualityApplies ||
+      advancedEncodeSpeedApplies ||
+      frameRateCapApplies ||
+      advancedAudioApplies ||
+      advancedAudioChannelsApplies);
+  const encodeModeSummary =
+    format === "mp3"
+      ? "Audio-only re-encode"
+      : advancedForcesReencode
+        ? "Force re-encode because overrides are active"
+        : sizeLimitEnabled
+          ? "Re-encode for size target unless copy already fits"
+          : hasVideoEditTransforms
+            ? "Re-encode for edits"
+            : "Auto stream copy when safe";
+  const advancedPlanSummary = `${encodeModeSummary} • ${advancedCodecSummary}`;
   const videoCodecCapabilitiesForFormat = useMemo(
     () => encodeCapabilities?.videoCodecs.filter((codec) => codec.format === format) ?? [],
     [encodeCapabilities, format],
@@ -881,7 +1019,11 @@ function App() {
     if (title.trim()) chips.push("Custom title");
     if (format !== "mp3" && probe?.hasAudio && !audioEnabled) chips.push("Muted");
     if (advancedVideoCodec !== "auto" && format !== "mp3") chips.push(VIDEO_CODEC_LABELS[advancedVideoCodec]);
+    if (advancedVideoQuality !== "auto" && format !== "mp3") chips.push(VIDEO_QUALITY_LABELS[advancedVideoQuality]);
+    if (advancedEncodeSpeed !== "auto" && format !== "mp3") chips.push(`${ENCODE_SPEED_LABELS[advancedEncodeSpeed]} encode`);
+    if (advancedFrameRateCapRequest !== null && format !== "mp3") chips.push(`${advancedFrameRateCapRequest} fps cap`);
     if (advancedAudioBitrateRequest !== null) chips.push(`Audio ${advancedAudioBitrateRequest}k`);
+    if (advancedAudioChannels !== "auto") chips.push(AUDIO_CHANNEL_LABELS[advancedAudioChannels]);
 
     return chips;
   }, [
@@ -901,7 +1043,11 @@ function App() {
     probe,
     audioEnabled,
     advancedVideoCodec,
+    advancedVideoQuality,
+    advancedEncodeSpeed,
+    advancedFrameRateCapRequest,
     advancedAudioBitrateRequest,
+    advancedAudioChannels,
   ]);
 
   const lastExportSizeText = lastExport?.outputSizeBytes ? `${(lastExport.outputSizeBytes / 1_000_000).toFixed(2)} MB` : null;
@@ -1004,7 +1150,23 @@ function App() {
     }
 
     if (sizeLimitEnabled && advancedAudioBitrateRequest !== null) {
-      warnings.push("Audio bitrate override is held for no-limit exports; size-targeted exports plan audio bitrate automatically.");
+      warnings.push("Audio bitrate override is held until no-limit exports; size-targeted exports plan audio bitrate automatically.");
+    }
+
+    if (sizeLimitEnabled && advancedVideoQuality !== "auto") {
+      warnings.push("Quality override is held until no-limit exports; size-targeted exports use the bitrate planner.");
+    }
+
+    if (advancedEncodeSpeed !== "auto" && advancedVideoCodec === "mpeg4") {
+      warnings.push("The MPEG-4 fallback codec has no meaningful speed preset; this setting may not change that encoder.");
+    }
+
+    if (advancedFrameRateCapRequest !== null && sourceFrameRate !== null && sourceFrameRate <= advancedFrameRateCapRequest + 0.01) {
+      warnings.push(`Frame-rate cap is set to ${advancedFrameRateCapRequest} fps, but the source is already about ${sourceFrameRate.toFixed(1)} fps.`);
+    }
+
+    if (advancedAudioChannels !== "auto" && !audioOverrideCanApply) {
+      warnings.push("Audio channel override is waiting for an export with an included audio stream.");
     }
 
     return warnings;
@@ -1017,6 +1179,12 @@ function App() {
     advancedVideoCodec,
     sizeLimitEnabled,
     advancedAudioBitrateRequest,
+    advancedVideoQuality,
+    advancedEncodeSpeed,
+    advancedFrameRateCapRequest,
+    sourceFrameRate,
+    advancedAudioChannels,
+    audioOverrideCanApply,
   ]);
 
   function handleDroppedPaths(paths: string[]) {
@@ -1492,6 +1660,10 @@ function App() {
       advanced: {
         videoCodec: advancedVideoCodec,
         audioBitrateKbps: advancedAudioBitrateRequest,
+        videoQuality: advancedVideoQuality,
+        encodeSpeed: advancedEncodeSpeed,
+        frameRateCapFps: advancedFrameRateCapRequest,
+        audioChannels: advancedAudioChannels,
       },
       trim,
       crop,
@@ -1529,16 +1701,21 @@ function App() {
     }
   }
 
-  async function startEncode(options?: { nextTab?: ActiveTab | null }): Promise<StartEncodeResult> {
+  async function startEncode(options?: {
+    nextTab?: ActiveTab | null;
+    request?: EncodeRequest;
+    durationS?: number | null;
+    startingStatus?: string;
+  }): Promise<StartEncodeResult> {
     try {
-      const request = buildRequest();
+      const request = options?.request ?? buildRequest();
       pendingEncodeRef.current = {
         jobId: null,
         outputPath: request.outputPath,
-        durationS: plannedSummary?.durationS ?? null,
+        durationS: options?.durationS ?? plannedSummary?.durationS ?? null,
         format: request.format,
       };
-      setStatus("Starting…");
+      setStatus(options?.startingStatus ?? "Starting…");
       setProgress(0);
       const id = await invoke<number>("start_encode", { request });
       setJobId(id);
@@ -1557,6 +1734,48 @@ function App() {
       const msg = coerceErrorMessage(e, "Failed to start encode.");
       setStatus(msg);
       return { ok: false, message: msg };
+    }
+  }
+
+  async function exportSample() {
+    if (!inputPath || !probe || jobId !== null || selectedVideoCodecUnavailable) return;
+
+    try {
+      const request = buildRequest();
+      const extension = request.format;
+      const defaultPath = `${dirname(request.outputPath || inputPath)}${stem(request.outputPath || inputPath)}-sample.${extension}`;
+      const selected = await saveDialog({
+        title: "Save sample export as…",
+        defaultPath,
+        filters: [{ name: extension.toUpperCase(), extensions: [extension] }],
+      });
+      if (typeof selected !== "string") return;
+
+      const sourceStart = request.trim?.startS ?? 0;
+      const sourceEnd = request.trim?.endS ?? probe.durationS;
+      const availableDuration = Math.max(0.1, sourceEnd - sourceStart);
+      const sampleSourceDuration = Math.min(8, availableDuration);
+      const anchorTime = clamp(previewTimeRef.current || sourceStart, sourceStart, sourceEnd);
+      const latestStart = Math.max(sourceStart, sourceEnd - sampleSourceDuration);
+      const sampleStart = clamp(anchorTime - sampleSourceDuration / 2, sourceStart, latestStart);
+      const sampleEnd = Math.min(sourceEnd, sampleStart + sampleSourceDuration);
+      const outputSampleDuration = Math.max(0.1, (sampleEnd - sampleStart) / request.speed);
+
+      if (request.sizeLimitMb > 0 && plannedSummary?.durationS && plannedSummary.durationS > 0) {
+        request.sizeLimitMb = Math.max(0.1, request.sizeLimitMb * (outputSampleDuration / plannedSummary.durationS));
+      }
+
+      request.outputPath = selected;
+      request.trim = { startS: sampleStart, endS: sampleEnd };
+
+      await startEncode({
+        request,
+        durationS: outputSampleDuration,
+        nextTab: "general",
+        startingStatus: "Starting sample export…",
+      });
+    } catch (e) {
+      setStatus(coerceErrorMessage(e, "Failed to start sample export."));
     }
   }
 
@@ -2736,16 +2955,122 @@ function App() {
                       </div>
                     </div>
 
+                    <div className="vfl-row2">
+                      <div className="vfl-field">
+                        <label htmlFor="vfl-video-quality">Quality</label>
+                        <select
+                          id="vfl-video-quality"
+                          value={advancedVideoQuality}
+                          onChange={(e) => setAdvancedVideoQuality(e.currentTarget.value as VideoQualityPreference)}
+                          disabled={jobId !== null || format === "mp3"}
+                        >
+                          <option value="auto">Auto</option>
+                          <option value="smaller">Smaller file</option>
+                          <option value="balanced">Balanced</option>
+                          <option value="higher">Higher quality</option>
+                        </select>
+                        <div className="vfl-inline-hint">
+                          {format === "mp3"
+                            ? "MP3 exports are audio-only."
+                            : sizeLimitEnabled
+                              ? "Held while a size target is active."
+                              : advancedVideoQualityApplies
+                                ? `${VIDEO_QUALITY_LABELS[advancedVideoQuality]} will be requested.`
+                                : "Auto uses the current codec default."}
+                        </div>
+                      </div>
+                      <div className="vfl-field">
+                        <label htmlFor="vfl-encode-speed">Encode speed</label>
+                        <select
+                          id="vfl-encode-speed"
+                          value={advancedEncodeSpeed}
+                          onChange={(e) => setAdvancedEncodeSpeed(e.currentTarget.value as EncodeSpeedPreference)}
+                          disabled={jobId !== null || format === "mp3"}
+                        >
+                          <option value="auto">Auto</option>
+                          <option value="faster">Faster</option>
+                          <option value="balanced">Balanced</option>
+                          <option value="smaller">Smaller file</option>
+                        </select>
+                        <div className="vfl-inline-hint">
+                          {format === "mp3"
+                            ? "MP3 exports are audio-only."
+                            : advancedEncodeSpeedApplies
+                              ? `${ENCODE_SPEED_LABELS[advancedEncodeSpeed]} preset for re-encode paths.`
+                              : "Auto keeps the codec default speed."}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="vfl-row2">
+                      <div className="vfl-field">
+                        <label htmlFor="vfl-frame-rate-cap">Frame-rate cap</label>
+                        <select
+                          id="vfl-frame-rate-cap"
+                          value={advancedFrameRateCapFps}
+                          onChange={(e) => setAdvancedFrameRateCapFps(e.currentTarget.value)}
+                          disabled={jobId !== null || format === "mp3"}
+                        >
+                          <option value="auto">Auto</option>
+                          {FRAME_RATE_CAP_PRESETS_FPS.map((fps) => (
+                            <option key={fps} value={fps}>
+                              {fps} fps
+                            </option>
+                          ))}
+                        </select>
+                        <div className="vfl-inline-hint">
+                          {format === "mp3"
+                            ? "MP3 exports are audio-only."
+                            : advancedFrameRateCapRequest === null
+                              ? "Auto keeps the source frame rate."
+                              : frameRateCapApplies
+                                ? `Frames above ${advancedFrameRateCapRequest} fps will be reduced.`
+                                : "Source is already at or below the cap."}
+                        </div>
+                      </div>
+                      <div className="vfl-field">
+                        <label htmlFor="vfl-audio-channels">Audio channels</label>
+                        <select
+                          id="vfl-audio-channels"
+                          value={advancedAudioChannels}
+                          onChange={(e) => setAdvancedAudioChannels(e.currentTarget.value as AudioChannelPreference)}
+                          disabled={jobId !== null || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
+                        >
+                          <option value="auto">Auto</option>
+                          <option value="stereo">Stereo</option>
+                          <option value="mono">Mono</option>
+                        </select>
+                        <div className="vfl-inline-hint">
+                          {advancedAudioChannels === "auto"
+                            ? "Auto keeps the encoder default channel layout."
+                            : advancedAudioChannelsApplies
+                              ? `${AUDIO_CHANNEL_LABELS[advancedAudioChannels]} output will be requested.`
+                              : "Waiting for an export with included audio."}
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="vfl-actions vfl-actions-secondary">
                       <button
                         type="button"
                         onClick={() => {
                           setAdvancedVideoCodec("auto");
                           setAdvancedAudioBitrateKbps("auto");
+                          setAdvancedVideoQuality("auto");
+                          setAdvancedEncodeSpeed("auto");
+                          setAdvancedFrameRateCapFps("auto");
+                          setAdvancedAudioChannels("auto");
                         }}
                         disabled={jobId !== null || advancedOverrideCount === 0}
                       >
                         Reset advanced
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void exportSample()}
+                        disabled={!exportReady || jobId !== null}
+                      >
+                        Export sample
                       </button>
                       {encodeCapabilitiesError ? (
                         <button
@@ -2778,6 +3103,10 @@ function App() {
                   </div>
                   <div className="vfl-summary-list">
                     <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Encode mode</div>
+                      <div className="vfl-summary-value">{encodeModeSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Format</div>
                       <div className="vfl-summary-value">{format.toUpperCase()}</div>
                     </div>
@@ -2786,8 +3115,24 @@ function App() {
                       <div className="vfl-summary-value">{advancedCodecSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Quality</div>
+                      <div className="vfl-summary-value">{advancedQualitySummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Encode speed</div>
+                      <div className="vfl-summary-value">{advancedSpeedSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Frame rate</div>
+                      <div className="vfl-summary-value">{advancedFrameRateSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Audio bitrate</div>
                       <div className="vfl-summary-value">{advancedAudioSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Audio channels</div>
+                      <div className="vfl-summary-value">{advancedAudioChannelsSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Size target</div>
