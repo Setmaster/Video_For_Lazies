@@ -183,8 +183,8 @@ Required portable payload on all platforms:
 Additional required sidecar payload on Windows and Linux:
 
 - `ffmpeg-sidecar/` with FFmpeg binaries, FFmpeg license text, bundle notices, and source/provenance archives
-- `ffmpeg-sidecar/source/ffmpeg-75d37c499da2a9fd50e3ef5a69c7dd87cd96f62a.tar.gz`
-- `ffmpeg-sidecar/source/btbn-ffmpeg-builds-28ae7513e7b6477da5c9ba7edb07aa940d485fa2.tar.gz`
+- `ffmpeg-sidecar/source/ffmpeg-b21e00eda5b16c9d76ff97f029051d7be8f95d10.tar.gz`
+- `ffmpeg-sidecar/source/btbn-ffmpeg-builds-6e66d4d1e81f75b5f34dc2a369cc341e12edc531.tar.gz`
 - `ffmpeg-sidecar/source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
 Linux sidecar-specific payload also includes root `ffmpeg` and `ffprobe` wrapper scripts, `bin/ffmpeg`, `bin/ffprobe`, and the required shared libraries in `ffmpeg-sidecar/lib/`.
