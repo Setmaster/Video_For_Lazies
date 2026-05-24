@@ -16,6 +16,7 @@ import type {
   EncodeFinishedPayload,
   EncodeProgressPayload,
   EncodeRequest,
+  ExportDiagnostics,
   OutputFormat,
   UpdateApplyResponse,
   UpdateCheckResponse,
@@ -26,11 +27,13 @@ import type {
 import {
   bindWindowFileDrop,
   resolveDroppedVideoAction,
+  SUPPORTED_INPUT_EXTENSIONS,
 } from "./lib/dropInput";
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
-import { dirname, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
+import { basename, dirname, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
 import { getActiveProgressUi } from "./lib/progress";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
+import { EXPORT_RECIPES, findMatchingExportRecipe, type ExportRecipe } from "./lib/exportRecipes";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
@@ -76,7 +79,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -107,7 +110,27 @@ type LastExportResult = {
   durationS: number | null;
   format: OutputFormat;
   message: string | null;
+  diagnostics: ExportDiagnostics | null;
   completedAtMs: number;
+};
+type ExportQueueItemStatus = "queued" | "running" | "done" | "failed";
+type ExportQueueItem = {
+  id: number;
+  inputPath: string;
+  outputPath: string;
+  format: OutputFormat;
+  durationS: number | null;
+  request: EncodeRequest;
+  status: ExportQueueItemStatus;
+  message: string | null;
+  outputSizeBytes: number | null;
+};
+
+const QUEUE_STATUS_LABELS: Record<ExportQueueItemStatus, string> = {
+  queued: "Queued",
+  running: "Running",
+  done: "Done",
+  failed: "Failed",
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -139,6 +162,19 @@ function rangeFillStyle(value: number, min: number, max: number): CSSProperties 
 
 function formatNumberInput(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/\.?0+$/, "");
+}
+
+function formatByteSize(bytes: number | null | undefined) {
+  if (!bytes || !Number.isFinite(bytes) || bytes <= 0) return "n/a";
+  return `${(bytes / 1_000_000).toFixed(2)} MB`;
+}
+
+function cloneEncodeRequest(request: EncodeRequest): EncodeRequest {
+  return JSON.parse(JSON.stringify(request)) as EncodeRequest;
+}
+
+function hasTauriRuntime() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 function coerceErrorMessage(error: unknown, fallback: string) {
@@ -265,6 +301,9 @@ function App() {
   const [smokeConfig, setSmokeConfig] = useState<AppSmokeConfig | null>(null);
   const [previewMediaReady, setPreviewMediaReady] = useState(false);
   const [lastExport, setLastExport] = useState<LastExportResult | null>(null);
+  const [exportQueue, setExportQueue] = useState<ExportQueueItem[]>([]);
+  const [queueRunning, setQueueRunning] = useState(false);
+  const [queueActiveItemId, setQueueActiveItemId] = useState<number | null>(null);
   const [updateNotice, setUpdateNotice] = useState<UpdateCheckResponse | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
@@ -278,6 +317,10 @@ function App() {
   const cropperRef = useRef<VideoCropperHandle | null>(null);
   const trimTimelineTrackRef = useRef<HTMLDivElement | null>(null);
   const trimDragCleanupRef = useRef<(() => void) | null>(null);
+  const exportQueueRef = useRef<ExportQueueItem[]>([]);
+  const queueRunningRef = useRef(false);
+  const queueActiveItemIdRef = useRef<number | null>(null);
+  const queueIdRef = useRef(1);
   const smokeConfigRef = useRef<AppSmokeConfig | null>(null);
   const smokeStageRef = useRef<string | null>(null);
   const smokeStageHistoryRef = useRef<string[]>([]);
@@ -298,6 +341,7 @@ function App() {
     outputPath: string;
     durationS: number | null;
     format: OutputFormat;
+    queueItemId: number | null;
   } | null>(null);
 
   async function reportSmokeStatus(stage: string, extra: Omit<AppSmokeStatus, "stage"> = {}) {
@@ -353,6 +397,18 @@ function App() {
   }, [outputAuto]);
 
   useEffect(() => {
+    exportQueueRef.current = exportQueue;
+  }, [exportQueue]);
+
+  useEffect(() => {
+    queueRunningRef.current = queueRunning;
+  }, [queueRunning]);
+
+  useEffect(() => {
+    queueActiveItemIdRef.current = queueActiveItemId;
+  }, [queueActiveItemId]);
+
+  useEffect(() => {
     smokeConfigRef.current = smokeConfig;
   }, [smokeConfig]);
 
@@ -384,6 +440,8 @@ function App() {
   }, [activeTrimTarget, previewPlaying, previewTimeS]);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
+
     let stop = false;
 
     void (async () => {
@@ -417,7 +475,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const currentWindow = getCurrentWindow();
+    let currentWindow: ReturnType<typeof getCurrentWindow>;
+    try {
+      currentWindow = getCurrentWindow();
+    } catch {
+      return;
+    }
     let disposed = false;
     let resizeGuard = false;
     let unlistenResize: (() => void) | null = null;
@@ -541,6 +604,7 @@ function App() {
 
   useEffect(() => {
     if (!settingsReady) return;
+    if (!hasTauriRuntime()) return;
 
     let stop = false;
     (async () => {
@@ -606,6 +670,26 @@ function App() {
     setBrightness("0");
     setContrast("1");
     setSaturation("1");
+  }
+
+  function applyExportRecipe(recipe: ExportRecipe) {
+    const recipeSettings = recipe.settings;
+    const recipeAdvanced = recipeSettings.advanced;
+
+    setFormat(recipeSettings.format);
+    setSizeLimitMb(recipeSettings.sizeLimitMb);
+    setMaxEdgePx(recipeSettings.maxEdgePx);
+    setAudioEnabled(recipeSettings.format === "mp3" ? true : recipeSettings.audioEnabled);
+    setAdvancedVideoCodec(recipeAdvanced.videoCodec);
+    setAdvancedAudioBitrateKbps(recipeAdvanced.audioBitrateKbps === null ? "auto" : String(recipeAdvanced.audioBitrateKbps));
+    setAdvancedVideoQuality(recipeAdvanced.videoQuality);
+    setAdvancedEncodeSpeed(recipeAdvanced.encodeSpeed);
+    setAdvancedFrameRateCapFps(recipeAdvanced.frameRateCapFps === null ? "auto" : String(recipeAdvanced.frameRateCapFps));
+    setAdvancedAudioChannels(recipeAdvanced.audioChannels);
+    setOutputAuto(true);
+    setOutputPath("");
+    setOutputSuggestNonce((n) => n + 1);
+    setStatus(`Applied ${recipe.label}.`);
   }
 
   useEffect(() => {
@@ -962,6 +1046,35 @@ function App() {
             ? "Re-encode for edits"
             : "Auto stream copy when safe";
   const advancedPlanSummary = `${encodeModeSummary} • ${advancedCodecSummary}`;
+  const currentRecipeSettings = useMemo(
+    () => ({
+      format,
+      sizeLimitMb,
+      maxEdgePx,
+      audioEnabled,
+      advanced: {
+        videoCodec: advancedVideoCodec,
+        audioBitrateKbps: advancedAudioBitrateRequest,
+        videoQuality: advancedVideoQuality,
+        encodeSpeed: advancedEncodeSpeed,
+        frameRateCapFps: advancedFrameRateCapRequest,
+        audioChannels: advancedAudioChannels,
+      },
+    }),
+    [
+      format,
+      sizeLimitMb,
+      maxEdgePx,
+      audioEnabled,
+      advancedVideoCodec,
+      advancedAudioBitrateRequest,
+      advancedVideoQuality,
+      advancedEncodeSpeed,
+      advancedFrameRateCapRequest,
+      advancedAudioChannels,
+    ],
+  );
+  const matchingRecipe = useMemo(() => findMatchingExportRecipe(currentRecipeSettings), [currentRecipeSettings]);
   const videoCodecCapabilitiesForFormat = useMemo(
     () => encodeCapabilities?.videoCodecs.filter((codec) => codec.format === format) ?? [],
     [encodeCapabilities, format],
@@ -1103,6 +1216,15 @@ function App() {
   ]);
 
   const exportReady = Boolean(inputPath && outputPath && probe && !selectedVideoCodecUnavailable);
+  const queueCounts = useMemo(
+    () => ({
+      queued: exportQueue.filter((item) => item.status === "queued").length,
+      running: exportQueue.filter((item) => item.status === "running").length,
+      done: exportQueue.filter((item) => item.status === "done").length,
+      failed: exportQueue.filter((item) => item.status === "failed").length,
+    }),
+    [exportQueue],
+  );
   const planStatusText =
     jobId !== null
       ? displayedStatus
@@ -1244,6 +1366,8 @@ function App() {
   }, [format, outputAuto, inputPath]);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
+
     const cleanupWindowDrop = bindWindowFileDrop(window, {
       isDropAllowed: () => jobIdRef.current === null,
       onDragActiveChange: setDragActive,
@@ -1285,6 +1409,8 @@ function App() {
   }, [inputPath, previewReady]);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
+
     let stop = false;
     async function run() {
       if (!inputPath) {
@@ -1483,6 +1609,8 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
+
     let unlistenProgress: (() => void) | null = null;
     let unlistenFinished: (() => void) | null = null;
 
@@ -1493,7 +1621,9 @@ function App() {
       unlistenFinished = await listen<EncodeFinishedPayload>("encode-finished", (event) => {
         const p = event.payload;
         const pendingEncode = pendingEncodeRef.current;
+        const completedQueueItemId = pendingEncode?.queueItemId ?? null;
         setJobId(null);
+        jobIdRef.current = null;
         setProgress(0);
 
         if (smokeJobIdRef.current === p.jobId) {
@@ -1515,8 +1645,22 @@ function App() {
         }
 
         if (!p.ok) {
+          if (completedQueueItemId !== null) {
+            updateExportQueue((items) =>
+              items.map((item) =>
+                item.id === completedQueueItemId
+                  ? { ...item, status: "failed", message: p.message || "Encode failed.", outputSizeBytes: null }
+                  : item,
+              ),
+            );
+            queueActiveItemIdRef.current = null;
+            setQueueActiveItemId(null);
+          }
           pendingEncodeRef.current = null;
           setStatus(p.message || "Encode failed.");
+          if (completedQueueItemId !== null && queueRunningRef.current) {
+            window.setTimeout(() => void startNextQueuedItem(), 0);
+          }
           return;
         }
 
@@ -1532,11 +1676,31 @@ function App() {
           durationS: pendingEncode?.durationS ?? plannedSummary?.durationS ?? null,
           format: pendingEncode?.format ?? formatRef.current,
           message: p.message ?? null,
+          diagnostics: p.diagnostics ?? null,
           completedAtMs: Date.now(),
         });
+        if (completedQueueItemId !== null) {
+          updateExportQueue((items) =>
+            items.map((item) =>
+              item.id === completedQueueItemId
+                ? {
+                    ...item,
+                    status: "done",
+                    message: p.message ?? null,
+                    outputSizeBytes: p.outputSizeBytes ?? null,
+                  }
+                : item,
+            ),
+          );
+          queueActiveItemIdRef.current = null;
+          setQueueActiveItemId(null);
+        }
         pendingEncodeRef.current = null;
         if (outputAutoRef.current) {
           setOutputSuggestNonce((n) => n + 1);
+        }
+        if (completedQueueItemId !== null && queueRunningRef.current) {
+          window.setTimeout(() => void startNextQueuedItem(), 0);
         }
       });
     })();
@@ -1616,6 +1780,40 @@ function App() {
     return v;
   }
 
+  function buildAdvancedSettings() {
+    return {
+      videoCodec: advancedVideoCodec,
+      audioBitrateKbps: advancedAudioBitrateRequest,
+      videoQuality: advancedVideoQuality,
+      encodeSpeed: advancedEncodeSpeed,
+      frameRateCapFps: advancedFrameRateCapRequest,
+      audioChannels: advancedAudioChannels,
+    };
+  }
+
+  function buildSettingsOnlyRequest(nextInputPath: string, nextOutputPath: string): EncodeRequest {
+    const size = parseNum("Size limit (MB)", sizeLimitMb, { min: 0 });
+    if (size !== 0 && size < 0.1) throw new Error("Size limit must be >= 0.1 MB (or 0/empty to disable).");
+    const maxEdge = maxEdgePx.trim() === "" ? null : parseIntNum("Max edge (px)", maxEdgePx, { min: 16, max: 32768 });
+
+    return {
+      inputPath: nextInputPath,
+      outputPath: nextOutputPath,
+      format,
+      title: null,
+      sizeLimitMb: size,
+      audioEnabled: format === "mp3" ? true : audioEnabled,
+      advanced: buildAdvancedSettings(),
+      trim: null,
+      crop: null,
+      reverse: false,
+      speed: 1,
+      rotateDeg: 0,
+      maxEdgePx: maxEdge,
+      color: null,
+    };
+  }
+
   function buildRequest(): EncodeRequest {
     if (!inputPath) throw new Error("Pick an input file first.");
     if (!outputPath) throw new Error("Pick an output path first.");
@@ -1657,14 +1855,7 @@ function App() {
       title: title.trim() ? title.trim() : null,
       sizeLimitMb: size,
       audioEnabled: audioEnabled,
-      advanced: {
-        videoCodec: advancedVideoCodec,
-        audioBitrateKbps: advancedAudioBitrateRequest,
-        videoQuality: advancedVideoQuality,
-        encodeSpeed: advancedEncodeSpeed,
-        frameRateCapFps: advancedFrameRateCapRequest,
-        audioChannels: advancedAudioChannels,
-      },
+      advanced: buildAdvancedSettings(),
       trim,
       crop,
       reverse,
@@ -1673,6 +1864,151 @@ function App() {
       maxEdgePx: maxEdge,
       color,
     };
+  }
+
+  function updateExportQueue(updater: (items: ExportQueueItem[]) => ExportQueueItem[]) {
+    const next = updater(exportQueueRef.current);
+    exportQueueRef.current = next;
+    setExportQueue(next);
+    return next;
+  }
+
+  function createQueueItem(request: EncodeRequest, durationS: number | null): ExportQueueItem {
+    const id = queueIdRef.current;
+    queueIdRef.current += 1;
+    return {
+      id,
+      inputPath: request.inputPath,
+      outputPath: request.outputPath,
+      format: request.format,
+      durationS,
+      request: cloneEncodeRequest(request),
+      status: "queued",
+      message: null,
+      outputSizeBytes: null,
+    };
+  }
+
+  function enqueueItems(items: ExportQueueItem[]) {
+    if (!items.length) return;
+    updateExportQueue((current) => [...current, ...items]);
+    const label = items.length === 1 ? basename(items[0].inputPath) : `${items.length} files`;
+    setStatus(`Queued ${label}.`);
+  }
+
+  async function suggestedOutputForInput(nextInputPath: string, nextFormat: OutputFormat) {
+    try {
+      return await invoke<string>("suggest_output_path", { inputPath: nextInputPath, format: nextFormat });
+    } catch {
+      return suggestOutputPath(nextInputPath, nextFormat);
+    }
+  }
+
+  async function addCurrentPlanToQueue() {
+    if (!exportReady) return;
+    try {
+      const request = buildRequest();
+      enqueueItems([createQueueItem(request, plannedSummary?.durationS ?? null)]);
+    } catch (e) {
+      setStatus(coerceErrorMessage(e, "Failed to queue current export."));
+    }
+  }
+
+  async function addFilesToQueue() {
+    if (jobId !== null) return;
+    try {
+      const selected = await openDialog({
+        multiple: true,
+        directory: false,
+        title: "Add files to export queue",
+        filters: [{ name: "Video", extensions: SUPPORTED_INPUT_EXTENSIONS }],
+      });
+      const picked = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+      const paths = [...new Set(picked)].filter(Boolean);
+      if (!paths.length) return;
+
+      const items: ExportQueueItem[] = [];
+      for (const nextInputPath of paths) {
+        const nextOutputPath = await suggestedOutputForInput(nextInputPath, format);
+        const request = buildSettingsOnlyRequest(nextInputPath, nextOutputPath);
+        items.push(createQueueItem(request, null));
+      }
+      enqueueItems(items);
+    } catch (e) {
+      setStatus(coerceErrorMessage(e, "Failed to add files to the queue."));
+    }
+  }
+
+  function removeQueueItem(id: number) {
+    updateExportQueue((items) => items.filter((item) => item.id !== id || item.status === "running"));
+  }
+
+  function clearCompletedQueueItems() {
+    updateExportQueue((items) => items.filter((item) => item.status === "queued" || item.status === "running"));
+  }
+
+  function stopQueueAfterCurrent() {
+    queueRunningRef.current = false;
+    setQueueRunning(false);
+    setStatus(jobIdRef.current === null ? "Queue stopped." : "Queue will stop after the current export.");
+  }
+
+  async function startNextQueuedItem() {
+    if (!queueRunningRef.current || jobIdRef.current !== null) return;
+
+    const nextItem = exportQueueRef.current.find((item) => item.status === "queued");
+    if (!nextItem) {
+      queueRunningRef.current = false;
+      setQueueRunning(false);
+      queueActiveItemIdRef.current = null;
+      setQueueActiveItemId(null);
+      setStatus("Queue complete.");
+      return;
+    }
+
+    queueActiveItemIdRef.current = nextItem.id;
+    setQueueActiveItemId(nextItem.id);
+    updateExportQueue((items) =>
+      items.map((item) =>
+        item.id === nextItem.id
+          ? { ...item, status: "running", message: null, outputSizeBytes: null }
+          : item,
+      ),
+    );
+
+    const queuedCount = exportQueueRef.current.filter((item) => item.status === "queued").length + 1;
+    const result = await startEncode({
+      request: cloneEncodeRequest(nextItem.request),
+      durationS: nextItem.durationS,
+      nextTab: "general",
+      startingStatus: `Starting queued export (${queuedCount} remaining)…`,
+      queueItemId: nextItem.id,
+    });
+
+    if (!result.ok) {
+      updateExportQueue((items) =>
+        items.map((item) =>
+          item.id === nextItem.id
+            ? { ...item, status: "failed", message: result.message, outputSizeBytes: null }
+            : item,
+        ),
+      );
+      queueActiveItemIdRef.current = null;
+      setQueueActiveItemId(null);
+      window.setTimeout(() => void startNextQueuedItem(), 0);
+    }
+  }
+
+  function runQueue() {
+    if (jobId !== null || queueRunningRef.current) return;
+    const hasQueuedItems = exportQueueRef.current.some((item) => item.status === "queued");
+    if (!hasQueuedItems) {
+      setStatus("Queue is empty.");
+      return;
+    }
+    queueRunningRef.current = true;
+    setQueueRunning(true);
+    void startNextQueuedItem();
   }
 
   async function autoDetectCrop() {
@@ -1706,6 +2042,7 @@ function App() {
     request?: EncodeRequest;
     durationS?: number | null;
     startingStatus?: string;
+    queueItemId?: number | null;
   }): Promise<StartEncodeResult> {
     try {
       const request = options?.request ?? buildRequest();
@@ -1714,11 +2051,13 @@ function App() {
         outputPath: request.outputPath,
         durationS: options?.durationS ?? plannedSummary?.durationS ?? null,
         format: request.format,
+        queueItemId: options?.queueItemId ?? null,
       };
       setStatus(options?.startingStatus ?? "Starting…");
       setProgress(0);
       const id = await invoke<number>("start_encode", { request });
       setJobId(id);
+      jobIdRef.current = id;
       setStatus("Encoding…");
       smokeJobIdRef.current = id;
       if (pendingEncodeRef.current) {
@@ -1781,7 +2120,13 @@ function App() {
 
   async function cancelEncode() {
     if (jobId === null) return;
-    setStatus("Canceling…");
+    if (queueActiveItemIdRef.current !== null) {
+      queueRunningRef.current = false;
+      setQueueRunning(false);
+      setStatus("Canceling queued export…");
+    } else {
+      setStatus("Canceling…");
+    }
     try {
       await invoke("cancel_encode", { jobId });
     } catch {
@@ -3198,6 +3543,32 @@ function App() {
                 ) : null}
 
                 <div className="vfl-section">
+                  <div className="vfl-section-title">Recipes</div>
+                  <div className="vfl-muted vfl-section-caption">
+                    Apply a complete starting point, then adjust any setting before exporting.
+                  </div>
+                  <div className="vfl-recipe-grid">
+                    {EXPORT_RECIPES.map((recipe) => {
+                      const isActive = matchingRecipe?.id === recipe.id;
+                      const isDisabled = jobId !== null || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
+                      return (
+                        <button
+                          key={recipe.id}
+                          type="button"
+                          className={`vfl-recipe-option ${isActive ? "active" : ""}`}
+                          onClick={() => applyExportRecipe(recipe)}
+                          disabled={isDisabled}
+                          aria-pressed={isActive}
+                        >
+                          <span className="vfl-recipe-option-title">{recipe.label}</span>
+                          <span className="vfl-recipe-option-copy">{recipe.description}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="vfl-section">
                   <div className="vfl-section-title">Export settings</div>
                   <div className="vfl-muted vfl-section-caption">
                     Choose the output format, target size, resize limit, and audio behavior.
@@ -3278,6 +3649,64 @@ function App() {
                     </div>
                   </div>
                 </div>
+
+                <div className="vfl-section">
+                  <div className="vfl-section-title">Queue</div>
+                  <div className="vfl-muted vfl-section-caption">
+                    Add exports as snapshots and run them one after another with no parallel FFmpeg jobs.
+                  </div>
+                  <div className="vfl-actions vfl-actions-wrap vfl-queue-actions">
+                    <button type="button" onClick={() => void addCurrentPlanToQueue()} disabled={!exportReady || jobId !== null}>
+                      Add current plan
+                    </button>
+                    <button type="button" onClick={() => void addFilesToQueue()} disabled={jobId !== null}>
+                      Add files
+                    </button>
+                    <button type="button" className="primary" onClick={runQueue} disabled={jobId !== null || queueRunning || queueCounts.queued === 0}>
+                      Run queue
+                    </button>
+                    <button type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
+                      Stop after current
+                    </button>
+                    <button type="button" onClick={clearCompletedQueueItems} disabled={queueCounts.done + queueCounts.failed === 0}>
+                      Clear finished
+                    </button>
+                  </div>
+                  <div className="vfl-queue-counts" aria-live="polite">
+                    <span>{queueCounts.queued} queued</span>
+                    <span>{queueCounts.running} running</span>
+                    <span>{queueCounts.done} done</span>
+                    <span>{queueCounts.failed} failed</span>
+                  </div>
+                  {exportQueue.length ? (
+                    <div className="vfl-queue-list">
+                      {exportQueue.map((item) => (
+                        <div key={item.id} className={`vfl-queue-item ${item.status} ${queueActiveItemId === item.id ? "active" : ""}`}>
+                          <div className="vfl-queue-item-main">
+                            <div className="vfl-queue-item-title">{basename(item.inputPath)}</div>
+                            <div className="vfl-queue-item-meta">
+                              {item.format.toUpperCase()} {"->"} {basename(item.outputPath)}
+                              {item.outputSizeBytes ? ` • ${formatByteSize(item.outputSizeBytes)}` : ""}
+                            </div>
+                            {item.message ? <div className="vfl-queue-item-message">{item.message}</div> : null}
+                          </div>
+                          <div className="vfl-queue-item-actions">
+                            <span className={`vfl-chip ${item.status === "running" || item.status === "done" ? "active" : ""}`}>
+                              {QUEUE_STATUS_LABELS[item.status]}
+                            </span>
+                            <button type="button" onClick={() => removeQueueItem(item.id)} disabled={item.status === "running"}>
+                              Remove
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="vfl-inline-hint">
+                      Use Add files for a same-settings batch, or Add current plan to queue the loaded file with its current edits.
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="vfl-stack-lg vfl-general-side">
@@ -3302,6 +3731,10 @@ function App() {
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Planned</div>
                       <div className="vfl-summary-value">{planSummaryText ?? "Pick a valid input and settings to calculate the plan."}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Recipe</div>
+                      <div className="vfl-summary-value">{matchingRecipe ? matchingRecipe.label : "Custom settings"}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Advanced</div>
@@ -3346,6 +3779,52 @@ function App() {
                       </div>
                       {lastExport.message ? <div className="vfl-export-result-note">{lastExport.message}</div> : null}
                       <div className="vfl-export-result-path">{lastExport.outputPath}</div>
+                      {lastExport.diagnostics ? (
+                        <details className="vfl-export-diagnostics">
+                          <summary>Export details</summary>
+                          <div className="vfl-diagnostic-grid">
+                            <div>
+                              <span>Mode</span>
+                              <strong>{lastExport.diagnostics.mode}</strong>
+                            </div>
+                            <div>
+                              <span>Video</span>
+                              <strong>{lastExport.diagnostics.videoCodec ?? "none"}</strong>
+                            </div>
+                            <div>
+                              <span>Audio</span>
+                              <strong>{lastExport.diagnostics.audioCodec ?? "none"}</strong>
+                            </div>
+                            <div>
+                              <span>Passes</span>
+                              <strong>
+                                {lastExport.diagnostics.passes}
+                                {lastExport.diagnostics.attempts > 1 ? `, ${lastExport.diagnostics.attempts} attempts` : ""}
+                              </strong>
+                            </div>
+                            <div>
+                              <span>Video bitrate</span>
+                              <strong>{lastExport.diagnostics.videoBitrateKbps ? `${lastExport.diagnostics.videoBitrateKbps} kbps` : "auto"}</strong>
+                            </div>
+                            <div>
+                              <span>Audio bitrate</span>
+                              <strong>{lastExport.diagnostics.audioBitrateKbps ? `${lastExport.diagnostics.audioBitrateKbps} kbps` : "auto"}</strong>
+                            </div>
+                            <div>
+                              <span>Target</span>
+                              <strong>{formatByteSize(lastExport.diagnostics.requestedSizeBytes)}</strong>
+                            </div>
+                            <div>
+                              <span>Actual</span>
+                              <strong>{formatByteSize(lastExport.diagnostics.actualSizeBytes)}</strong>
+                            </div>
+                          </div>
+                          {lastExport.diagnostics.audioRemovedForSizeTarget ? (
+                            <div className="vfl-export-result-note">Audio was removed to fit the requested size target.</div>
+                          ) : null}
+                          <pre className="vfl-command-preview">{lastExport.diagnostics.commandPreview}</pre>
+                        </details>
+                      ) : null}
                       <div className="vfl-actions vfl-actions-secondary">
                         <button onClick={() => void openOutputFile(lastExport.outputPath)}>Open file</button>
                         <button onClick={() => void openOutputFolder()}>Open folder</button>

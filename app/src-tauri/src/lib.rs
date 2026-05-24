@@ -400,6 +400,7 @@ fn start_encode(
                     output_path: None,
                     output_size_bytes: None,
                     message: Some(err),
+                    diagnostics: None,
                 },
             ),
         };

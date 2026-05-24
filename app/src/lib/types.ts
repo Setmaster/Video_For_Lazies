@@ -85,6 +85,21 @@ export interface EncodeFinishedPayload {
   outputPath?: string | null;
   outputSizeBytes?: number | null;
   message?: string | null;
+  diagnostics?: ExportDiagnostics | null;
+}
+
+export interface ExportDiagnostics {
+  mode: string;
+  videoCodec?: string | null;
+  audioCodec?: string | null;
+  videoBitrateKbps?: number | null;
+  audioBitrateKbps?: number | null;
+  requestedSizeBytes?: number | null;
+  actualSizeBytes?: number | null;
+  passes: number;
+  attempts: number;
+  audioRemovedForSizeTarget: boolean;
+  commandPreview: string;
 }
 
 export interface AppSmokeConfig {

@@ -20,8 +20,11 @@ It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local t
 - Crop by drawing over the preview, optionally with aspect lock or auto-detect crop.
 - Resize by max edge, rotate, reverse, change playback speed, and adjust brightness, contrast, and saturation.
 - Export to `mp4`, `webm`, or `mp3`.
+- Apply built-in recipes for quick sharing, size-limited uploads, archive-quality MP4, smaller WebM, and audio-only MP3.
+- Queue several export snapshots and run them sequentially with one FFmpeg job at a time.
 - Target a file size in decimal MB, or disable size targeting for constant-quality export.
 - Override codec, quality, encode speed, frame-rate cap, audio bitrate, and audio channels when Auto is not the right fit.
+- Expand the last export details to inspect the effective encode mode, selected codecs, bitrates, size target, actual size, and a redacted FFmpeg command preview.
 - Keep audio on/off, title metadata, recent export status, and output format in the app workflow.
 - Auto-suggest safe output names in the same folder and avoid overwriting existing `-N` exports.
 - Check for signed portable updates and prompt before installing them.
@@ -117,6 +120,7 @@ Release process details are in [`docs/release.md`](docs/release.md).
 
 - Size targets use decimal MB: `1 MB = 1,000,000 bytes`.
 - Set size limit to `0`, or leave it empty, to disable size targeting.
+- Queue items are snapshots. Changing settings after adding an item does not rewrite that queued export.
 - Bundled MP4 export uses H.264 when the staged FFmpeg sidecar exposes `libx264`.
 - If the active FFmpeg build does not expose `libx264`, MP4 export falls back to `mpeg4`.
 - Process media files you trust. Video For Lazies runs FFmpeg locally as your user, so hostile media exercises the active FFmpeg build.

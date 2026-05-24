@@ -173,6 +173,23 @@ pub struct EncodeFinishedPayload {
     pub output_path: Option<String>,
     pub output_size_bytes: Option<u64>,
     pub message: Option<String>,
+    pub diagnostics: Option<ExportDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportDiagnostics {
+    pub mode: String,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub video_bitrate_kbps: Option<u32>,
+    pub audio_bitrate_kbps: Option<u32>,
+    pub requested_size_bytes: Option<u64>,
+    pub actual_size_bytes: Option<u64>,
+    pub passes: u8,
+    pub attempts: u32,
+    pub audio_removed_for_size_target: bool,
+    pub command_preview: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1883,6 +1900,39 @@ fn run_ffmpeg_with_progress(
     Ok(())
 }
 
+fn shell_preview_arg(arg: &str) -> String {
+    if arg.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '-' | '_' | '.' | ':' | '/' | '=' | '+' | ',' | '?')
+    }) {
+        return arg.to_string();
+    }
+
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn ffmpeg_command_preview(args: &[String], replacements: &[(&str, &str)]) -> String {
+    let preview_args = args
+        .iter()
+        .map(|arg| {
+            let mut next = arg.clone();
+            if next.starts_with("title=") {
+                next = "title=<title>".to_string();
+            } else {
+                for (needle, replacement) in replacements {
+                    if !needle.is_empty() {
+                        next = next.replace(needle, replacement);
+                    }
+                }
+            }
+            shell_preview_arg(&next)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!("ffmpeg {preview_args}")
+}
+
 fn map_mpeg4_size_limit_error(
     format: OutputFormat,
     codec: VideoCodec,
@@ -1991,6 +2041,7 @@ pub fn run_encode_job(
     if size_limit_enabled && request.size_limit_mb < 0.1 {
         return Err("Size limit must be >= 0.1 MB (or 0 to disable).".to_string());
     }
+    let target_bytes = (request.size_limit_mb * MB_BYTES as f64) as u64;
 
     let output_path = validate_output_path(
         &input_path,
@@ -2059,18 +2110,21 @@ pub fn run_encode_job(
             args.push("-ac".to_string());
             args.push(channels.to_string());
         }
-        if size_limit_enabled {
+        let selected_audio_bitrate_kbps = if size_limit_enabled {
             let audio_kbps =
                 plan_audio_only_kbps(request.size_limit_mb, output_duration_s, 0.98, 32, 320)?;
             args.push("-b:a".to_string());
             args.push(format!("{audio_kbps}k"));
+            Some(audio_kbps)
         } else if let Some(audio_kbps) = advanced_audio_bitrate_kbps {
             args.push("-b:a".to_string());
             args.push(format!("{audio_kbps}k"));
+            Some(audio_kbps)
         } else {
             args.push("-q:a".to_string());
             args.push("2".to_string());
-        }
+            None
+        };
 
         if let Some(title) = request
             .title
@@ -2084,6 +2138,9 @@ pub fn run_encode_job(
 
         let temp_path = temp_output_path(&output_path, job_id, "mp3")?;
         args.push(temp_path.to_string_lossy().to_string());
+        let temp_str = temp_path.to_string_lossy().to_string();
+        let command_preview =
+            ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
         if let Err(error) = run_ffmpeg_with_progress(
             window,
@@ -2111,10 +2168,21 @@ pub fn run_encode_job(
             output_path: Some(output_path.to_string_lossy().to_string()),
             output_size_bytes: Some(out_size),
             message: None,
+            diagnostics: Some(ExportDiagnostics {
+                mode: "Audio-only encode".to_string(),
+                video_codec: None,
+                audio_codec: Some(audio_codec.to_string()),
+                video_bitrate_kbps: None,
+                audio_bitrate_kbps: selected_audio_bitrate_kbps,
+                requested_size_bytes: size_limit_enabled.then_some(target_bytes),
+                actual_size_bytes: Some(out_size),
+                passes: 1,
+                attempts: 1,
+                audio_removed_for_size_target: false,
+                command_preview,
+            }),
         });
     }
-
-    let target_bytes = (request.size_limit_mb * MB_BYTES as f64) as u64;
 
     // Fast path: no-op transforms (avoid inflating already-small files).
     let no_op_transforms = request.trim.is_none()
@@ -2179,6 +2247,9 @@ pub fn run_encode_job(
 
             let temp_path = temp_output_path(&output_path, job_id, "copy")?;
             args.push(temp_path.to_string_lossy().to_string());
+            let temp_str = temp_path.to_string_lossy().to_string();
+            let command_preview =
+                ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
             if run_ffmpeg_with_progress(
                 window,
@@ -2204,6 +2275,26 @@ pub fn run_encode_job(
                         output_path: Some(output_path.to_string_lossy().to_string()),
                         output_size_bytes: Some(out_size),
                         message: None,
+                        diagnostics: Some(ExportDiagnostics {
+                            mode: "Stream copy".to_string(),
+                            video_codec: Some("copy".to_string()),
+                            audio_codec: Some(
+                                if request.audio_enabled && probe.has_audio {
+                                    "copy"
+                                } else {
+                                    "none"
+                                }
+                                .to_string(),
+                            ),
+                            video_bitrate_kbps: None,
+                            audio_bitrate_kbps: None,
+                            requested_size_bytes: size_limit_enabled.then_some(target_bytes),
+                            actual_size_bytes: Some(out_size),
+                            passes: 1,
+                            attempts: 1,
+                            audio_removed_for_size_target: false,
+                            command_preview,
+                        }),
                     });
                 }
             }
@@ -2227,6 +2318,7 @@ pub fn run_encode_job(
             .video_codec
             .ok_or_else(|| "Missing video codec selection.".to_string())?;
         let encode_speed_preference = encode_speed_preference(&request.advanced);
+        let mut selected_audio_bitrate_kbps: Option<u32> = None;
 
         let mut args = vec![
             "-y".to_string(),
@@ -2287,6 +2379,7 @@ pub fn run_encode_job(
                 OutputFormat::Webm => 128,
                 OutputFormat::Mp3 => unreachable!(),
             });
+            selected_audio_bitrate_kbps = Some(audio_kbps);
             args.push(format!("{audio_kbps}k"));
             if let Some(af) = &audio_filters {
                 args.push("-af".to_string());
@@ -2316,6 +2409,9 @@ pub fn run_encode_job(
 
         let temp_path = temp_output_path(&output_path, job_id, "encode")?;
         args.push(temp_path.to_string_lossy().to_string());
+        let temp_str = temp_path.to_string_lossy().to_string();
+        let command_preview =
+            ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
         if let Err(error) = run_ffmpeg_with_progress(
             window,
@@ -2343,6 +2439,26 @@ pub fn run_encode_job(
             output_path: Some(output_path.to_string_lossy().to_string()),
             output_size_bytes: Some(out_size),
             message: None,
+            diagnostics: Some(ExportDiagnostics {
+                mode: "Video re-encode".to_string(),
+                video_codec: Some(video_codec.to_string()),
+                audio_codec: Some(
+                    if include_audio && probe.has_audio && request.audio_enabled {
+                        audio_codec
+                    } else {
+                        "none"
+                    }
+                    .to_string(),
+                ),
+                video_bitrate_kbps: None,
+                audio_bitrate_kbps: selected_audio_bitrate_kbps,
+                requested_size_bytes: None,
+                actual_size_bytes: Some(out_size),
+                passes: 1,
+                attempts: 1,
+                audio_removed_for_size_target: false,
+                command_preview,
+            }),
         });
     }
 
@@ -2472,7 +2588,14 @@ pub fn run_encode_job(
             pass2.push(vf.clone());
         }
 
-        if plan.include_audio && probe.has_audio && request.audio_enabled {
+        let pass2_audio_bitrate_kbps =
+            if plan.include_audio && probe.has_audio && request.audio_enabled {
+                Some(plan.audio_bitrate_kbps.max(32))
+            } else {
+                None
+            };
+
+        if pass2_audio_bitrate_kbps.is_some() {
             pass2.extend(["-map", "0:a:0?"].into_iter().map(|s| s.to_string()));
             pass2.extend(["-c:a", audio_codec].into_iter().map(|s| s.to_string()));
             if let Some(channels) = advanced_audio_channel_count {
@@ -2480,7 +2603,7 @@ pub fn run_encode_job(
                 pass2.push(channels.to_string());
             }
             pass2.push("-b:a".to_string());
-            pass2.push(format!("{}k", plan.audio_bitrate_kbps.max(32)));
+            pass2.push(format!("{}k", pass2_audio_bitrate_kbps.unwrap_or(32)));
             if let Some(af) = &audio_filters {
                 pass2.push("-af".to_string());
                 pass2.push(af.clone());
@@ -2509,6 +2632,15 @@ pub fn run_encode_job(
 
         let temp_output = temp_output_path(&output_path, job_id, &format!("pass2-{attempt}"))?;
         pass2.push(temp_output.to_string_lossy().to_string());
+        let temp_output_str = temp_output.to_string_lossy().to_string();
+        let command_preview = ffmpeg_command_preview(
+            &pass2,
+            &[
+                (&input_str, "<input>"),
+                (&temp_output_str, "<output>"),
+                (&passlog_str, "<passlog>"),
+            ],
+        );
 
         if let Err(error) = run_ffmpeg_with_progress(
             window,
@@ -2554,6 +2686,24 @@ pub fn run_encode_job(
                     min_video_kbps,
                     audio_removed_for_size_target,
                 ),
+                diagnostics: Some(ExportDiagnostics {
+                    mode: "Size-targeted two-pass encode".to_string(),
+                    video_codec: Some(video_codec.to_string()),
+                    audio_codec: Some(
+                        pass2_audio_bitrate_kbps
+                            .map(|_| audio_codec)
+                            .unwrap_or("none")
+                            .to_string(),
+                    ),
+                    video_bitrate_kbps: Some(plan.video_bitrate_kbps.max(min_video_kbps)),
+                    audio_bitrate_kbps: pass2_audio_bitrate_kbps,
+                    requested_size_bytes: Some(target_bytes),
+                    actual_size_bytes: Some(out_size),
+                    passes: 2,
+                    attempts: attempt,
+                    audio_removed_for_size_target,
+                    command_preview,
+                }),
             });
         }
 
@@ -2575,6 +2725,24 @@ pub fn run_encode_job(
                     min_video_kbps,
                     audio_removed_for_size_target,
                 ),
+                diagnostics: Some(ExportDiagnostics {
+                    mode: "Size-targeted two-pass encode".to_string(),
+                    video_codec: Some(video_codec.to_string()),
+                    audio_codec: Some(
+                        pass2_audio_bitrate_kbps
+                            .map(|_| audio_codec)
+                            .unwrap_or("none")
+                            .to_string(),
+                    ),
+                    video_bitrate_kbps: Some(plan.video_bitrate_kbps.max(min_video_kbps)),
+                    audio_bitrate_kbps: pass2_audio_bitrate_kbps,
+                    requested_size_bytes: Some(target_bytes),
+                    actual_size_bytes: Some(out_size),
+                    passes: 2,
+                    attempts: attempt,
+                    audio_removed_for_size_target,
+                    command_preview,
+                }),
             });
         }
         let _ = fs::remove_file(&temp_output);
@@ -2651,6 +2819,35 @@ mod tests {
         assert!(suggested.ends_with("myvideo-4.mp4"), "{suggested}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffmpeg_command_preview_redacts_local_paths_and_metadata_title() {
+        let args = vec![
+            "-i".to_string(),
+            "/tmp/source secret/input.mp4".to_string(),
+            "-metadata".to_string(),
+            "title=Private clip".to_string(),
+            "-passlogfile".to_string(),
+            "/tmp/source secret/passlog".to_string(),
+            "/tmp/source secret/output.mp4".to_string(),
+        ];
+
+        let preview = ffmpeg_command_preview(
+            &args,
+            &[
+                ("/tmp/source secret/input.mp4", "<input>"),
+                ("/tmp/source secret/output.mp4", "<output>"),
+                ("/tmp/source secret/passlog", "<passlog>"),
+            ],
+        );
+
+        assert!(preview.contains("<input>"));
+        assert!(preview.contains("<output>"));
+        assert!(preview.contains("<passlog>"));
+        assert!(preview.contains("title=<title>"));
+        assert!(!preview.contains("/tmp/source secret"));
+        assert!(!preview.contains("Private clip"));
     }
 
     #[test]

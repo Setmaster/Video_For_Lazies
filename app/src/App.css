@@ -763,6 +763,133 @@ button.danger:hover:enabled {
   margin-top: 0;
 }
 
+/* ── recipes ──────────────────────────────────────────── */
+.vfl-recipe-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.vfl-recipe-option {
+  display: grid;
+  gap: 5px;
+  min-height: 84px;
+  padding: 11px 12px;
+  text-align: left;
+  align-content: start;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.vfl-recipe-option.active {
+  border-color: rgba(var(--accent), 0.5);
+  background:
+    linear-gradient(180deg, rgba(var(--accent), 0.12), rgba(var(--accent), 0.04)),
+    rgba(0, 0, 0, 0.18);
+  color: rgba(var(--accent), 0.95);
+}
+
+.vfl-recipe-option-title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.vfl-recipe-option-copy {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+/* ── export queue ─────────────────────────────────────── */
+.vfl-queue-actions {
+  margin-top: 12px;
+}
+
+.vfl-queue-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.vfl-queue-counts span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(0, 0, 0, 0.14);
+}
+
+.vfl-queue-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.vfl-queue-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.vfl-queue-item.active,
+.vfl-queue-item.running {
+  border-color: rgba(var(--accent), 0.4);
+  background:
+    linear-gradient(180deg, rgba(var(--accent), 0.1), rgba(var(--accent), 0.03)),
+    rgba(0, 0, 0, 0.16);
+}
+
+.vfl-queue-item.failed {
+  border-color: rgba(244, 63, 94, 0.34);
+}
+
+.vfl-queue-item-main {
+  min-width: 0;
+}
+
+.vfl-queue-item-title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vfl-queue-item-meta,
+.vfl-queue-item-message {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.vfl-queue-item-message {
+  color: #f9df91;
+}
+
+.vfl-queue-item-actions {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.vfl-queue-item-actions button {
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
 /* ── checkboxes ───────────────────────────────────────── */
 .vfl-check {
   display: flex;
@@ -1443,6 +1570,65 @@ button.danger:hover:enabled {
   color: var(--text-primary);
   font-size: 12px;
   word-break: break-word;
+}
+
+.vfl-export-diagnostics {
+  display: grid;
+  gap: 9px;
+}
+
+.vfl-export-diagnostics summary {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.vfl-diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.vfl-diagnostic-grid > div {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.vfl-diagnostic-grid span {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.vfl-diagnostic-grid strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 650;
+  word-break: break-word;
+}
+
+.vfl-command-preview {
+  max-height: 9rem;
+  margin: 8px 0 0;
+  padding: 9px 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--text-secondary);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .vfl-slider-field {
