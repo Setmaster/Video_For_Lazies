@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { EXPORT_RECIPES, findExportRecipe, findMatchingExportRecipe } from "../src/lib/exportRecipes.mjs";
+import {
+  EXPORT_RECIPES,
+  findExportRecipe,
+  findMatchingExportRecipe,
+  normalizeRecipeResizeSettings,
+} from "../src/lib/exportRecipes.mjs";
 
 test("built-in export recipes cover the supported output formats", () => {
   const formats = new Set(EXPORT_RECIPES.map((recipe) => recipe.settings.format));
@@ -26,4 +31,34 @@ test("recipe matching treats edited settings as custom", () => {
   };
 
   assert.equal(findMatchingExportRecipe(changed), null);
+});
+
+test("recipe matching treats edited resize settings as custom", () => {
+  const recipe = findExportRecipe("quick-share");
+  const changed = {
+    ...recipe.settings,
+    resize: {
+      ...recipe.settings.resize,
+      mode: "custom",
+      widthPx: "1280",
+      heightPx: "720",
+    },
+  };
+
+  assert.equal(findMatchingExportRecipe(changed), null);
+});
+
+test("normalizeRecipeResizeSettings migrates legacy max edge snapshots", () => {
+  assert.deepEqual(
+    normalizeRecipeResizeSettings({
+      maxEdgePx: "720",
+    }),
+    {
+      mode: "maxEdge",
+      maxEdgePx: "720",
+      widthPx: "",
+      heightPx: "",
+      lockAspect: true,
+    },
+  );
 });

@@ -134,6 +134,28 @@ pub struct AdvancedEncodeSettings {
     pub audio_channels: Option<AudioChannelPreference>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResizeMode {
+    #[default]
+    Source,
+    MaxEdge,
+    Custom,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeSettings {
+    #[serde(default)]
+    pub mode: ResizeMode,
+    #[serde(default)]
+    pub max_edge_px: Option<u32>,
+    #[serde(default)]
+    pub width_px: Option<u32>,
+    #[serde(default)]
+    pub height_px: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeRequest {
@@ -151,6 +173,9 @@ pub struct EncodeRequest {
     pub reverse: bool,
     pub speed: f64,
     pub rotate_deg: u16,
+    #[serde(default)]
+    pub resize: Option<ResizeSettings>,
+    #[serde(default)]
     pub max_edge_px: Option<u32>,
     pub color: Option<ColorAdjust>,
 }
@@ -962,7 +987,64 @@ fn even_at_least_two(value: u32) -> u32 {
     even.max(2)
 }
 
-fn estimated_output_dimensions(req: &EncodeRequest, probe: &VideoProbe) -> (u32, u32) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizePlan {
+    Source,
+    MaxEdge(u32),
+    Custom { width_px: u32, height_px: u32 },
+}
+
+fn validate_output_dimension_px(label: &str, value: u32) -> Result<u32, String> {
+    if value < 16 {
+        return Err(format!("{label} must be >= 16 px."));
+    }
+    if value > 32768 {
+        return Err(format!("{label} must be <= 32768 px."));
+    }
+    Ok(value)
+}
+
+fn requested_resize(req: &EncodeRequest) -> Result<ResizePlan, String> {
+    let Some(resize) = &req.resize else {
+        return match req.max_edge_px {
+            Some(max_edge_px) => Ok(ResizePlan::MaxEdge(validate_output_dimension_px(
+                "Max edge",
+                max_edge_px,
+            )?)),
+            None => Ok(ResizePlan::Source),
+        };
+    };
+
+    match resize.mode {
+        ResizeMode::Source => Ok(ResizePlan::Source),
+        ResizeMode::MaxEdge => {
+            let max_edge_px = resize.max_edge_px.or(req.max_edge_px).ok_or_else(|| {
+                "Max edge must be set when output dimensions use Max edge mode.".to_string()
+            })?;
+            Ok(ResizePlan::MaxEdge(validate_output_dimension_px(
+                "Max edge",
+                max_edge_px,
+            )?))
+        }
+        ResizeMode::Custom => {
+            let width_px = resize.width_px.ok_or_else(|| {
+                "Output width must be set when output dimensions use Custom mode.".to_string()
+            })?;
+            let height_px = resize.height_px.ok_or_else(|| {
+                "Output height must be set when output dimensions use Custom mode.".to_string()
+            })?;
+            Ok(ResizePlan::Custom {
+                width_px: validate_output_dimension_px("Output width", width_px)?,
+                height_px: validate_output_dimension_px("Output height", height_px)?,
+            })
+        }
+    }
+}
+
+fn estimated_output_dimensions(
+    req: &EncodeRequest,
+    probe: &VideoProbe,
+) -> Result<(u32, u32), String> {
     let mut width = probe.width.max(2);
     let mut height = probe.height.max(2);
 
@@ -976,24 +1058,34 @@ fn estimated_output_dimensions(req: &EncodeRequest, probe: &VideoProbe) -> (u32,
         _ => {}
     }
 
-    if let Some(max_edge_px) = req.max_edge_px {
-        let long_edge = width.max(height);
-        if max_edge_px >= 16 && long_edge > max_edge_px {
-            if width >= height {
-                let scaled_height =
-                    (((height as f64) * (max_edge_px as f64)) / (width as f64)).round() as u32;
-                width = even_at_least_two(max_edge_px);
-                height = even_at_least_two(scaled_height);
-            } else {
-                let scaled_width =
-                    (((width as f64) * (max_edge_px as f64)) / (height as f64)).round() as u32;
-                width = even_at_least_two(scaled_width);
-                height = even_at_least_two(max_edge_px);
+    match requested_resize(req)? {
+        ResizePlan::Source => {}
+        ResizePlan::MaxEdge(max_edge_px) => {
+            let long_edge = width.max(height);
+            if long_edge > max_edge_px {
+                if width >= height {
+                    let scaled_height =
+                        (((height as f64) * (max_edge_px as f64)) / (width as f64)).round() as u32;
+                    width = even_at_least_two(max_edge_px);
+                    height = even_at_least_two(scaled_height);
+                } else {
+                    let scaled_width =
+                        (((width as f64) * (max_edge_px as f64)) / (height as f64)).round() as u32;
+                    width = even_at_least_two(scaled_width);
+                    height = even_at_least_two(max_edge_px);
+                }
             }
+        }
+        ResizePlan::Custom {
+            width_px,
+            height_px,
+        } => {
+            width = even_at_least_two(width_px);
+            height = even_at_least_two(height_px);
         }
     }
 
-    (width, height)
+    Ok((width, height))
 }
 
 fn minimum_video_bitrate_kbps(
@@ -1530,12 +1622,20 @@ fn color_is_noop(color: &Option<ColorAdjust>) -> bool {
         && (c.saturation - 1.0).abs() <= 1e-9
 }
 
-fn scale_filter(max_edge_px: u32) -> String {
+fn max_edge_scale_filter(max_edge_px: u32) -> String {
     // Keep aspect ratio, never upscale, and keep dimensions divisible by 2.
     // Use quotes inside the filter string so commas inside expressions are not treated as filter separators.
     format!(
         "scale=w='if(gte(iw,ih),min(iw,{m}),-2)':h='if(gte(iw,ih),-2,min(ih,{m}))'",
         m = max_edge_px
+    )
+}
+
+fn custom_scale_filter(width_px: u32, height_px: u32) -> String {
+    format!(
+        "scale=w={}:h={}",
+        even_at_least_two(width_px),
+        even_at_least_two(height_px)
     )
 }
 
@@ -1582,11 +1682,13 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         }
     }
 
-    if let Some(max_edge_px) = req.max_edge_px {
-        if max_edge_px < 16 {
-            return Err("Max edge must be >= 16 px.".to_string());
-        }
-        filters.push(scale_filter(max_edge_px));
+    match requested_resize(req)? {
+        ResizePlan::Source => {}
+        ResizePlan::MaxEdge(max_edge_px) => filters.push(max_edge_scale_filter(max_edge_px)),
+        ResizePlan::Custom {
+            width_px,
+            height_px,
+        } => filters.push(custom_scale_filter(width_px, height_px)),
     }
 
     if let Some(c) = &req.color {
@@ -1947,7 +2049,7 @@ fn map_mpeg4_size_limit_error(
             || lowered.contains("bitrate too low for this video with these parameters")
         {
             return format!(
-                "The bundled MP4 fallback codec cannot encode {width}x{height} video within a {target_size_mb:.2} MB size target. Try a larger size limit, lower Max edge, reduce crop, or export as WebM."
+                "The bundled MP4 fallback codec cannot encode {width}x{height} video within a {target_size_mb:.2} MB size target. Try a larger size limit, smaller output dimensions, reduce crop, or export as WebM."
             );
         }
     }
@@ -1962,7 +2064,7 @@ fn build_size_limited_encode_contract(
     output_duration_s: f64,
     include_audio: bool,
 ) -> Result<SizeLimitedEncodeContract, String> {
-    let (planned_width, planned_height) = estimated_output_dimensions(request, probe);
+    let (planned_width, planned_height) = estimated_output_dimensions(request, probe)?;
     let planned_frame_rate = output_frame_rate_for_planning(request, probe)?;
     let min_video_kbps = minimum_video_bitrate_kbps(
         selected_video_codec,
@@ -2001,7 +2103,7 @@ fn size_limited_completion_message(
 
     if !met_target {
         if selected_video_codec == VideoCodec::Mpeg4 && video_bitrate_kbps <= min_video_kbps {
-            messages.push("Still above size limit. The bundled MP4 fallback codec cannot go lower at this resolution. Try a larger size limit, WebM, or reduce Max edge.");
+            messages.push("Still above size limit. The bundled MP4 fallback codec cannot go lower at this resolution. Try a larger size limit, WebM, or smaller output dimensions.");
         } else {
             messages.push("Still above size limit.");
         }
@@ -2190,7 +2292,7 @@ pub fn run_encode_job(
         && !request.reverse
         && request.rotate_deg == 0
         && (request.speed - 1.0).abs() <= 1e-9
-        && request.max_edge_px.is_none()
+        && matches!(requested_resize(&request)?, ResizePlan::Source)
         && color_is_noop(&request.color);
 
     if no_op_transforms {
@@ -2768,6 +2870,7 @@ mod tests {
             reverse: false,
             speed: 1.0,
             rotate_deg: 0,
+            resize: None,
             max_edge_px: None,
             color: None,
         }
@@ -3236,6 +3339,21 @@ Encoders:
     }
 
     #[test]
+    fn build_video_filters_includes_custom_resize() {
+        let mut req = base_request();
+        req.resize = Some(ResizeSettings {
+            mode: ResizeMode::Custom,
+            max_edge_px: None,
+            width_px: Some(801),
+            height_px: Some(451),
+        });
+
+        let probe = probe_10s_1920x1080_audio();
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(filters, "scale=w=800:h=450");
+    }
+
+    #[test]
     fn build_video_filters_applies_frame_rate_cap_only_when_source_is_higher() {
         let mut req = base_request();
         req.advanced.frame_rate_cap_fps = Some(24);
@@ -3399,8 +3517,24 @@ Encoders:
         req.rotate_deg = 90;
         req.max_edge_px = Some(720);
 
-        let (width, height) = estimated_output_dimensions(&req, &probe_10s_1920x1080_audio());
+        let (width, height) =
+            estimated_output_dimensions(&req, &probe_10s_1920x1080_audio()).unwrap();
         assert_eq!((width, height), (576, 720));
+    }
+
+    #[test]
+    fn estimated_output_dimensions_follow_custom_resize() {
+        let mut req = base_request();
+        req.resize = Some(ResizeSettings {
+            mode: ResizeMode::Custom,
+            max_edge_px: None,
+            width_px: Some(853),
+            height_px: Some(481),
+        });
+
+        let (width, height) =
+            estimated_output_dimensions(&req, &probe_10s_1920x1080_audio()).unwrap();
+        assert_eq!((width, height), (852, 480));
     }
 
     #[test]

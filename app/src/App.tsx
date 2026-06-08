@@ -18,6 +18,7 @@ import type {
   EncodeRequest,
   ExportDiagnostics,
   OutputFormat,
+  ResizeMode,
   UpdateApplyResponse,
   UpdateCheckResponse,
   VideoCodecPreference,
@@ -33,11 +34,13 @@ import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
 import { basename, dirname, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
 import { getActiveProgressUi } from "./lib/progress";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
-import { EXPORT_RECIPES, findMatchingExportRecipe, type ExportRecipe } from "./lib/exportRecipes";
+import { EXPORT_RECIPES, findMatchingExportRecipe, normalizeRecipeResizeSettings, type ExportRecipe } from "./lib/exportRecipes";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
 const SIZE_PRESETS_MB = [8, 10, 25, 50] as const;
+const OUTPUT_DIMENSION_MIN_PX = 16;
+const OUTPUT_DIMENSION_MAX_PX = 32768;
 const AUDIO_BITRATE_PRESETS_KBPS = [96, 128, 192, 256, 320] as const;
 const FRAME_RATE_CAP_PRESETS_FPS = [24, 30, 60] as const;
 const VIDEO_CODEC_LABELS: Record<VideoCodecPreference, string> = {
@@ -79,7 +82,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.5.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -245,6 +248,66 @@ function colorIsDefault(brightness: string, contrast: string, saturation: string
   );
 }
 
+function evenPixel(value: number) {
+  if (!Number.isFinite(value)) return 2;
+  return Math.max(2, Math.floor(value / 2) * 2);
+}
+
+function dimensionsAfterShape(
+  probe: VideoProbe,
+  cropEnabled: boolean,
+  cropRect: NormalizedRect,
+  rotateDeg: number,
+) {
+  let width = probe.width;
+  let height = probe.height;
+
+  if (cropEnabled) {
+    const cropPx = {
+      x: Math.round(cropRect.x * probe.width),
+      y: Math.round(cropRect.y * probe.height),
+      width: Math.round(cropRect.w * probe.width),
+      height: Math.round(cropRect.h * probe.height),
+    };
+    const isFull =
+      cropPx.x <= 1 && cropPx.y <= 1 && cropPx.width >= probe.width - 2 && cropPx.height >= probe.height - 2;
+    if (!isFull) {
+      width = evenPixel(cropPx.width);
+      height = evenPixel(cropPx.height);
+    }
+  }
+
+  if (rotateDeg === 90 || rotateDeg === 270) {
+    const tmp = width;
+    width = height;
+    height = tmp;
+  }
+
+  return { width, height };
+}
+
+function fitMaxEdgeDimensions(width: number, height: number, maxEdge: number) {
+  const longEdge = Math.max(width, height);
+  if (!Number.isFinite(maxEdge) || maxEdge < OUTPUT_DIMENSION_MIN_PX || longEdge <= maxEdge) {
+    return { width, height };
+  }
+
+  const scale = maxEdge / longEdge;
+  return {
+    width: evenPixel(Math.floor(width * scale)),
+    height: evenPixel(Math.floor(height * scale)),
+  };
+}
+
+function parseDimensionDraft(raw: string) {
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function formatDimensionDraft(value: number) {
+  return String(evenPixel(Math.round(value)));
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("general");
 
@@ -260,7 +323,11 @@ function App() {
   const [format, setFormat] = useState<OutputFormat>(DEFAULT_OUTPUT_FORMAT);
   const [title, setTitle] = useState("");
   const [sizeLimitMb, setSizeLimitMb] = useState<string>(DEFAULT_SIZE_LIMIT_MB);
+  const [resizeMode, setResizeMode] = useState<ResizeMode>("source");
   const [maxEdgePx, setMaxEdgePx] = useState("");
+  const [customWidthPx, setCustomWidthPx] = useState("");
+  const [customHeightPx, setCustomHeightPx] = useState("");
+  const [outputAspectLocked, setOutputAspectLocked] = useState(true);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
   const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
@@ -645,7 +712,11 @@ function App() {
     setFormat(DEFAULT_OUTPUT_FORMAT);
     setTitle("");
     setSizeLimitMb(DEFAULT_SIZE_LIMIT_MB);
+    setResizeMode("source");
     setMaxEdgePx("");
+    setCustomWidthPx("");
+    setCustomHeightPx("");
+    setOutputAspectLocked(true);
     setAudioEnabled(true);
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
@@ -675,10 +746,15 @@ function App() {
   function applyExportRecipe(recipe: ExportRecipe) {
     const recipeSettings = recipe.settings;
     const recipeAdvanced = recipeSettings.advanced;
+    const recipeResize = normalizeRecipeResizeSettings(recipeSettings);
 
     setFormat(recipeSettings.format);
     setSizeLimitMb(recipeSettings.sizeLimitMb);
-    setMaxEdgePx(recipeSettings.maxEdgePx);
+    setResizeMode(recipeResize.mode);
+    setMaxEdgePx(recipeResize.maxEdgePx);
+    setCustomWidthPx(recipeResize.widthPx);
+    setCustomHeightPx(recipeResize.heightPx);
+    setOutputAspectLocked(recipeResize.lockAspect);
     setAudioEnabled(recipeSettings.format === "mp3" ? true : recipeSettings.audioEnabled);
     setAdvancedVideoCodec(recipeAdvanced.videoCodec);
     setAdvancedAudioBitrateKbps(recipeAdvanced.audioBitrateKbps === null ? "auto" : String(recipeAdvanced.audioBitrateKbps));
@@ -740,7 +816,11 @@ function App() {
     setFormat(smokeConfig.format);
     setTitle("");
     setSizeLimitMb(formatNumberInput(smokeConfig.sizeLimitMb));
-    setMaxEdgePx("");
+    setResizeMode(smokeConfig.resizeMode ?? "source");
+    setMaxEdgePx(smokeConfig.resizeMaxEdgePx === null || smokeConfig.resizeMaxEdgePx === undefined ? "" : formatNumberInput(smokeConfig.resizeMaxEdgePx));
+    setCustomWidthPx(smokeConfig.resizeWidthPx === null || smokeConfig.resizeWidthPx === undefined ? "" : formatNumberInput(smokeConfig.resizeWidthPx));
+    setCustomHeightPx(smokeConfig.resizeHeightPx === null || smokeConfig.resizeHeightPx === undefined ? "" : formatNumberInput(smokeConfig.resizeHeightPx));
+    setOutputAspectLocked(true);
     setAudioEnabled(true);
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
@@ -775,6 +855,10 @@ function App() {
   }, [probe?.durationS]);
 
   const sizeLimitEnabled = sizeLimitMb.trim() !== "" && Number(sizeLimitMb) > 0;
+  const shapedVideoDimensions = useMemo(() => {
+    if (!probe) return null;
+    return dimensionsAfterShape(probe, cropEnabled, cropRect, rotateDeg);
+  }, [probe, cropEnabled, cropRect, rotateDeg]);
 
   const plannedSummary = useMemo(() => {
     if (!probe) return null;
@@ -804,40 +888,36 @@ function App() {
       return { durationS, totalKbps, sizeLimitEnabled, w: null as number | null, h: null as number | null };
     }
 
-    const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2);
+    if (!shapedVideoDimensions) return null;
 
-    let w = probe.width;
-    let h = probe.height;
+    let w = shapedVideoDimensions.width;
+    let h = shapedVideoDimensions.height;
 
-    if (cropEnabled) {
-      const cropPx = {
-        x: Math.round(cropRect.x * probe.width),
-        y: Math.round(cropRect.y * probe.height),
-        width: Math.round(cropRect.w * probe.width),
-        height: Math.round(cropRect.h * probe.height),
-      };
-      const isFull =
-        cropPx.x <= 1 && cropPx.y <= 1 && cropPx.width >= probe.width - 2 && cropPx.height >= probe.height - 2;
-      if (!isFull) {
-        w = even(cropPx.width);
-        h = even(cropPx.height);
+    if (resizeMode === "maxEdge") {
+      const maxEdge = maxEdgePx.trim() === "" ? null : Number(maxEdgePx);
+      if (maxEdge === null || !Number.isFinite(maxEdge) || maxEdge < OUTPUT_DIMENSION_MIN_PX || maxEdge > OUTPUT_DIMENSION_MAX_PX) {
+        return null;
       }
-    }
-
-    if (rotateDeg === 90 || rotateDeg === 270) {
-      const tmp = w;
-      w = h;
-      h = tmp;
-    }
-
-    const maxEdge = maxEdgePx.trim() === "" ? null : Number(maxEdgePx);
-    if (maxEdge !== null && Number.isFinite(maxEdge) && maxEdge >= 16) {
-      const longEdge = Math.max(w, h);
-      if (longEdge > maxEdge) {
-        const scale = maxEdge / longEdge;
-        w = even(Math.floor(w * scale));
-        h = even(Math.floor(h * scale));
+      const resized = fitMaxEdgeDimensions(w, h, maxEdge);
+      w = resized.width;
+      h = resized.height;
+    } else if (resizeMode === "custom") {
+      const customWidth = customWidthPx.trim() === "" ? null : Number(customWidthPx);
+      const customHeight = customHeightPx.trim() === "" ? null : Number(customHeightPx);
+      if (
+        customWidth === null ||
+        customHeight === null ||
+        !Number.isFinite(customWidth) ||
+        !Number.isFinite(customHeight) ||
+        customWidth < OUTPUT_DIMENSION_MIN_PX ||
+        customHeight < OUTPUT_DIMENSION_MIN_PX ||
+        customWidth > OUTPUT_DIMENSION_MAX_PX ||
+        customHeight > OUTPUT_DIMENSION_MAX_PX
+      ) {
+        return null;
       }
+      w = evenPixel(customWidth);
+      h = evenPixel(customHeight);
     }
 
     return { durationS, totalKbps, sizeLimitEnabled, w, h };
@@ -848,10 +928,11 @@ function App() {
     trimStart,
     trimEnd,
     format,
-    cropEnabled,
-    cropRect,
-    rotateDeg,
+    shapedVideoDimensions,
+    resizeMode,
     maxEdgePx,
+    customWidthPx,
+    customHeightPx,
   ]);
 
   const previewDurationS = probe?.durationS ?? 0;
@@ -948,6 +1029,25 @@ function App() {
     const bitrate = plannedSummary.totalKbps !== null ? `~${plannedSummary.totalKbps} kbps` : "no size limit";
     return `${shape} • ${formatClock(plannedSummary.durationS)} • ${bitrate}`;
   }, [plannedSummary]);
+  const outputDimensionsSummary = useMemo(() => {
+    if (format === "mp3") return "No video dimensions for MP3 output";
+    if (resizeMode === "source") {
+      return shapedVideoDimensions
+        ? `Original ${shapedVideoDimensions.width}x${shapedVideoDimensions.height}`
+        : "Original source dimensions";
+    }
+    if (resizeMode === "maxEdge") {
+      const maxEdge = maxEdgePx.trim();
+      return maxEdge ? `Max edge ${maxEdge} px` : "Set a max edge";
+    }
+    const width = customWidthPx.trim();
+    const height = customHeightPx.trim();
+    const widthNum = Number(width);
+    const heightNum = Number(height);
+    return width && height && Number.isFinite(widthNum) && Number.isFinite(heightNum)
+      ? `Custom ${evenPixel(widthNum)}x${evenPixel(heightNum)}`
+      : "Set custom width and height";
+  }, [format, resizeMode, shapedVideoDimensions, maxEdgePx, customWidthPx, customHeightPx]);
 
   const advancedAudioBitrateValue = advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps);
   const advancedAudioBitrateValid =
@@ -1025,7 +1125,7 @@ function App() {
     reverse ||
     rotateDeg !== 0 ||
     (Number.isFinite(Number(speed)) && Math.abs(Number(speed) - 1) > 0.001) ||
-    maxEdgePx.trim() !== "" ||
+    (format !== "mp3" && resizeMode !== "source") ||
     !colorIsDefault(brightness, contrast, saturation);
   const advancedForcesReencode =
     format !== "mp3" &&
@@ -1050,7 +1150,13 @@ function App() {
     () => ({
       format,
       sizeLimitMb,
-      maxEdgePx,
+      resize: {
+        mode: resizeMode,
+        maxEdgePx,
+        widthPx: customWidthPx,
+        heightPx: customHeightPx,
+        lockAspect: outputAspectLocked,
+      },
       audioEnabled,
       advanced: {
         videoCodec: advancedVideoCodec,
@@ -1064,7 +1170,11 @@ function App() {
     [
       format,
       sizeLimitMb,
+      resizeMode,
       maxEdgePx,
+      customWidthPx,
+      customHeightPx,
+      outputAspectLocked,
       audioEnabled,
       advancedVideoCodec,
       advancedAudioBitrateRequest,
@@ -1128,7 +1238,10 @@ function App() {
       chips.push("Color");
     }
 
-    if (maxEdgePx.trim() !== "") chips.push(`Max ${maxEdgePx.trim()} px`);
+    if (format !== "mp3" && resizeMode === "maxEdge" && maxEdgePx.trim() !== "") chips.push(`Max ${maxEdgePx.trim()} px`);
+    if (format !== "mp3" && resizeMode === "custom" && customWidthPx.trim() !== "" && customHeightPx.trim() !== "") {
+      chips.push(`${customWidthPx.trim()}x${customHeightPx.trim()}`);
+    }
     if (title.trim()) chips.push("Custom title");
     if (format !== "mp3" && probe?.hasAudio && !audioEnabled) chips.push("Muted");
     if (advancedVideoCodec !== "auto" && format !== "mp3") chips.push(VIDEO_CODEC_LABELS[advancedVideoCodec]);
@@ -1150,7 +1263,10 @@ function App() {
     brightness,
     contrast,
     saturation,
+    resizeMode,
     maxEdgePx,
+    customWidthPx,
+    customHeightPx,
     title,
     format,
     probe,
@@ -1247,7 +1363,7 @@ function App() {
     if (plannedSummary.sizeLimitEnabled) {
       warnings.push("Size targets are best effort; tight budgets can reduce quality, remove audio, or finish above target.");
       if (plannedSummary.totalKbps !== null && plannedSummary.totalKbps < 160 && format !== "mp3") {
-        warnings.push("This target leaves a very low bitrate for video. Lower Max edge, trim shorter, or raise the size limit.");
+        warnings.push("This target leaves a very low bitrate for video. Lower output dimensions, trim shorter, or raise the size limit.");
       }
       if (format !== "mp3" && probe.hasAudio && audioEnabled && plannedSummary.totalKbps !== null && plannedSummary.totalKbps < 82) {
         warnings.push("This target is too tight to keep audio; export may remove it to prioritize a playable video.");
@@ -1259,7 +1375,7 @@ function App() {
         plannedSummary.w * plannedSummary.h >= 1280 * 720 &&
         plannedSummary.totalKbps < 700
       ) {
-        warnings.push("The current resolution is high for this bitrate. A smaller Max edge will usually behave better.");
+        warnings.push("The current resolution is high for this bitrate. Smaller output dimensions will usually behave better.");
       }
     }
 
@@ -1780,6 +1896,121 @@ function App() {
     return v;
   }
 
+  function currentOutputAspectRatio() {
+    if (shapedVideoDimensions && shapedVideoDimensions.height > 0) {
+      return shapedVideoDimensions.width / shapedVideoDimensions.height;
+    }
+
+    const width = parseDimensionDraft(customWidthPx);
+    const height = parseDimensionDraft(customHeightPx);
+    if (width !== null && height !== null && height > 0) return width / height;
+
+    return 16 / 9;
+  }
+
+  function seedCustomDimensions() {
+    if (!shapedVideoDimensions) return;
+    setCustomWidthPx((current) => current || String(evenPixel(shapedVideoDimensions.width)));
+    setCustomHeightPx((current) => current || String(evenPixel(shapedVideoDimensions.height)));
+  }
+
+  function handleResizeModeChange(nextMode: ResizeMode) {
+    setResizeMode(nextMode);
+    if (nextMode === "maxEdge") {
+      setMaxEdgePx((current) => current || "720");
+    } else if (nextMode === "custom") {
+      seedCustomDimensions();
+    }
+  }
+
+  function handleCustomWidthChange(raw: string) {
+    setCustomWidthPx(raw);
+    if (!outputAspectLocked) return;
+
+    const width = parseDimensionDraft(raw);
+    if (width === null) return;
+
+    const ratio = currentOutputAspectRatio();
+    setCustomHeightPx(formatDimensionDraft(width / ratio));
+  }
+
+  function handleCustomHeightChange(raw: string) {
+    setCustomHeightPx(raw);
+    if (!outputAspectLocked) return;
+
+    const height = parseDimensionDraft(raw);
+    if (height === null) return;
+
+    const ratio = currentOutputAspectRatio();
+    setCustomWidthPx(formatDimensionDraft(height * ratio));
+  }
+
+  function handleOutputAspectLockChange(nextLocked: boolean) {
+    setOutputAspectLocked(nextLocked);
+    if (!nextLocked || resizeMode !== "custom") return;
+
+    const width = parseDimensionDraft(customWidthPx);
+    const ratio = currentOutputAspectRatio();
+    if (width !== null) {
+      setCustomHeightPx(formatDimensionDraft(width / ratio));
+      return;
+    }
+
+    const height = parseDimensionDraft(customHeightPx);
+    if (height !== null) {
+      setCustomWidthPx(formatDimensionDraft(height * ratio));
+    }
+  }
+
+  function buildResizeRequest() {
+    if (format === "mp3" || resizeMode === "source") {
+      return {
+        resize: {
+          mode: "source" as ResizeMode,
+          maxEdgePx: null,
+          widthPx: null,
+          heightPx: null,
+        },
+        legacyMaxEdgePx: null as number | null,
+      };
+    }
+
+    if (resizeMode === "maxEdge") {
+      const maxEdge = parseIntNum("Max edge (px)", maxEdgePx, {
+        min: OUTPUT_DIMENSION_MIN_PX,
+        max: OUTPUT_DIMENSION_MAX_PX,
+      });
+      return {
+        resize: {
+          mode: "maxEdge" as ResizeMode,
+          maxEdgePx: maxEdge,
+          widthPx: null,
+          heightPx: null,
+        },
+        legacyMaxEdgePx: maxEdge,
+      };
+    }
+
+    const widthPx = parseIntNum("Output width (px)", customWidthPx, {
+      min: OUTPUT_DIMENSION_MIN_PX,
+      max: OUTPUT_DIMENSION_MAX_PX,
+    });
+    const heightPx = parseIntNum("Output height (px)", customHeightPx, {
+      min: OUTPUT_DIMENSION_MIN_PX,
+      max: OUTPUT_DIMENSION_MAX_PX,
+    });
+
+    return {
+      resize: {
+        mode: "custom" as ResizeMode,
+        maxEdgePx: null,
+        widthPx,
+        heightPx,
+      },
+      legacyMaxEdgePx: null as number | null,
+    };
+  }
+
   function buildAdvancedSettings() {
     return {
       videoCodec: advancedVideoCodec,
@@ -1794,7 +2025,7 @@ function App() {
   function buildSettingsOnlyRequest(nextInputPath: string, nextOutputPath: string): EncodeRequest {
     const size = parseNum("Size limit (MB)", sizeLimitMb, { min: 0 });
     if (size !== 0 && size < 0.1) throw new Error("Size limit must be >= 0.1 MB (or 0/empty to disable).");
-    const maxEdge = maxEdgePx.trim() === "" ? null : parseIntNum("Max edge (px)", maxEdgePx, { min: 16, max: 32768 });
+    const resizeRequest = buildResizeRequest();
 
     return {
       inputPath: nextInputPath,
@@ -1809,7 +2040,8 @@ function App() {
       reverse: false,
       speed: 1,
       rotateDeg: 0,
-      maxEdgePx: maxEdge,
+      resize: resizeRequest.resize,
+      maxEdgePx: resizeRequest.legacyMaxEdgePx,
       color: null,
     };
   }
@@ -1823,7 +2055,7 @@ function App() {
     const size = parseNum("Size limit (MB)", sizeLimitMb, { min: 0 });
     if (size !== 0 && size < 0.1) throw new Error("Size limit must be >= 0.1 MB (or 0/empty to disable).");
     const s = parseNum("Speed", speed, { min: 0.05, max: 16 });
-    const maxEdge = maxEdgePx.trim() === "" ? null : parseIntNum("Max edge (px)", maxEdgePx, { min: 16, max: 32768 });
+    const resizeRequest = buildResizeRequest();
 
     const b = brightness.trim() === "" ? 0 : parseNum("Brightness", brightness, { min: -1, max: 1 });
     const c = contrast.trim() === "" ? 1 : parseNum("Contrast", contrast, { min: 0, max: 2 });
@@ -1861,7 +2093,8 @@ function App() {
       reverse,
       speed: s,
       rotateDeg,
-      maxEdgePx: maxEdge,
+      resize: resizeRequest.resize,
+      maxEdgePx: resizeRequest.legacyMaxEdgePx,
       color,
     };
   }
@@ -3571,7 +3804,7 @@ function App() {
                 <div className="vfl-section">
                   <div className="vfl-section-title">Export settings</div>
                   <div className="vfl-muted vfl-section-caption">
-                    Choose the output format, target size, resize limit, and audio behavior.
+                    Choose the output format, target size, dimensions, and audio behavior.
                   </div>
                   <div className="vfl-stack-md">
                     <div className="vfl-row2">
@@ -3634,17 +3867,96 @@ function App() {
                           })}
                         </div>
                       </div>
-                      <div className="vfl-field">
-                        <label htmlFor="vfl-max-edge">Max edge (px)</label>
-                        <input
-                          id="vfl-max-edge"
-                          value={maxEdgePx}
-                          onChange={(e) => setMaxEdgePx(e.currentTarget.value)}
-                          disabled={jobId !== null}
-                          placeholder="(optional)"
-                          inputMode="numeric"
-                        />
-                        <div className="vfl-inline-hint">Scales down the long edge, keeps aspect ratio, never upscales.</div>
+                      <div className="vfl-field vfl-output-dimensions-field">
+                        <div className="vfl-field-label">Output dimensions</div>
+                        <div className="vfl-segmented" role="group" aria-label="Output dimensions">
+                          <button
+                            type="button"
+                            className={resizeMode === "source" ? "active" : ""}
+                            onClick={() => handleResizeModeChange("source")}
+                            disabled={jobId !== null || format === "mp3"}
+                            aria-pressed={resizeMode === "source"}
+                          >
+                            Original
+                          </button>
+                          <button
+                            type="button"
+                            className={resizeMode === "maxEdge" ? "active" : ""}
+                            onClick={() => handleResizeModeChange("maxEdge")}
+                            disabled={jobId !== null || format === "mp3"}
+                            aria-pressed={resizeMode === "maxEdge"}
+                          >
+                            Max edge
+                          </button>
+                          <button
+                            type="button"
+                            className={resizeMode === "custom" ? "active" : ""}
+                            onClick={() => handleResizeModeChange("custom")}
+                            disabled={jobId !== null || format === "mp3"}
+                            aria-pressed={resizeMode === "custom"}
+                          >
+                            Custom
+                          </button>
+                        </div>
+
+                        <div className="vfl-output-dimensions-panel">
+                          {format === "mp3" ? (
+                            <div className="vfl-inline-hint">MP3 exports audio only.</div>
+                          ) : resizeMode === "source" ? (
+                            <div className="vfl-inline-hint">Keeps the shaped source size.</div>
+                          ) : resizeMode === "maxEdge" ? (
+                            <>
+                              <label htmlFor="vfl-max-edge">Max edge (px)</label>
+                              <input
+                                id="vfl-max-edge"
+                                value={maxEdgePx}
+                                onChange={(e) => setMaxEdgePx(e.currentTarget.value)}
+                                disabled={jobId !== null}
+                                placeholder="720"
+                                inputMode="numeric"
+                              />
+                              <div className="vfl-inline-hint">Scales down the long edge, keeps aspect ratio, never upscales.</div>
+                            </>
+                          ) : (
+                            <>
+                              <div className="vfl-dimensions-grid">
+                                <div>
+                                  <label htmlFor="vfl-output-width">Width (px)</label>
+                                  <input
+                                    id="vfl-output-width"
+                                    value={customWidthPx}
+                                    onChange={(e) => handleCustomWidthChange(e.currentTarget.value)}
+                                    disabled={jobId !== null}
+                                    placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.width) : "1280"}
+                                    inputMode="numeric"
+                                  />
+                                </div>
+                                <div>
+                                  <label htmlFor="vfl-output-height">Height (px)</label>
+                                  <input
+                                    id="vfl-output-height"
+                                    value={customHeightPx}
+                                    onChange={(e) => handleCustomHeightChange(e.currentTarget.value)}
+                                    disabled={jobId !== null}
+                                    placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.height) : "720"}
+                                    inputMode="numeric"
+                                  />
+                                </div>
+                              </div>
+                              <label className="vfl-check vfl-check-card vfl-dimension-lock">
+                                <input
+                                  type="checkbox"
+                                  checked={outputAspectLocked}
+                                  onChange={(e) => handleOutputAspectLockChange(e.currentTarget.checked)}
+                                  disabled={jobId !== null}
+                                />
+                                <span>Lock aspect ratio</span>
+                              </label>
+                              <div className="vfl-inline-hint">Odd values are snapped down to even pixels for encoder compatibility.</div>
+                            </>
+                          )}
+                        </div>
+                        <div className="vfl-inline-hint">{outputDimensionsSummary}</div>
                       </div>
                     </div>
                   </div>
@@ -3727,6 +4039,10 @@ function App() {
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Output</div>
                       <div className="vfl-summary-value">{outputPath || outputModeSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Dimensions</div>
+                      <div className="vfl-summary-value">{outputDimensionsSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Planned</div>

@@ -238,6 +238,10 @@ async function runLinuxPortableExportSmoke({
   inputVideoBitrateKbps = 900,
   outputFormat = "mp4",
   sizeLimitMb = 0,
+  resizeMode,
+  resizeMaxEdgePx,
+  resizeWidthPx,
+  resizeHeightPx,
 } = {}) {
   outputFormat = normalizeSmokeOutputFormat(outputFormat);
   const { portableRoot, appPath, ffmpegPath, ffprobePath } = getLinuxPortablePaths(portableDir);
@@ -296,6 +300,10 @@ async function runLinuxPortableExportSmoke({
         VFL_SMOKE_TRIM_START_S: "0",
         VFL_SMOKE_TRIM_END_S: String(trimEndSeconds),
         VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS: "1",
+        ...(resizeMode ? { VFL_SMOKE_RESIZE_MODE: String(resizeMode) } : {}),
+        ...(resizeMaxEdgePx === undefined || resizeMaxEdgePx === null ? {} : { VFL_SMOKE_RESIZE_MAX_EDGE_PX: String(resizeMaxEdgePx) }),
+        ...(resizeWidthPx === undefined || resizeWidthPx === null ? {} : { VFL_SMOKE_RESIZE_WIDTH_PX: String(resizeWidthPx) }),
+        ...(resizeHeightPx === undefined || resizeHeightPx === null ? {} : { VFL_SMOKE_RESIZE_HEIGHT_PX: String(resizeHeightPx) }),
       },
       stdio: "ignore",
     });
@@ -334,6 +342,14 @@ async function runLinuxPortableExportSmoke({
     if (!Number.isFinite(outputDurationS)) {
       throw new Error("Portable export smoke wrote an output file with an invalid duration.");
     }
+    if (resizeMode === "custom") {
+      const videoStream = Array.isArray(ffprobe?.streams) ? ffprobe.streams.find((stream) => stream.codec_type === "video") : null;
+      const expectedWidth = Math.max(2, Math.floor(Number(resizeWidthPx) / 2) * 2);
+      const expectedHeight = Math.max(2, Math.floor(Number(resizeHeightPx) / 2) * 2);
+      if (!videoStream || videoStream.width !== expectedWidth || videoStream.height !== expectedHeight) {
+        throw new Error(`Portable export smoke output dimensions mismatch. expected=${expectedWidth}x${expectedHeight} actual=${videoStream?.width ?? "none"}x${videoStream?.height ?? "none"}`);
+      }
+    }
 
     const { trimStartS, trimEndS, expectedDurationS } = parseStatusTrimMetrics(status);
     if (trimEndS <= trimStartS) {
@@ -362,6 +378,10 @@ async function runPortableExportSmoke({
   inputVideoBitrateKbps,
   outputFormat,
   sizeLimitMb,
+  resizeMode,
+  resizeMaxEdgePx,
+  resizeWidthPx,
+  resizeHeightPx,
 } = {}) {
   if (process.platform === "linux") {
     await runLinuxPortableExportSmoke({
@@ -374,6 +394,10 @@ async function runPortableExportSmoke({
       inputVideoBitrateKbps: smokeNumber(inputVideoBitrateKbps, 900),
       outputFormat,
       sizeLimitMb: smokeNumber(sizeLimitMb, 0),
+      resizeMode,
+      resizeMaxEdgePx,
+      resizeWidthPx,
+      resizeHeightPx,
     });
     return;
   }
@@ -403,6 +427,10 @@ async function runPortableExportSmoke({
     ["-InputVideoBitrateKbps", inputVideoBitrateKbps],
     ["-OutputFormat", outputFormat],
     ["-SizeLimitMb", sizeLimitMb],
+    ["-ResizeMode", resizeMode],
+    ["-ResizeMaxEdgePx", resizeMaxEdgePx],
+    ["-ResizeWidthPx", resizeWidthPx],
+    ["-ResizeHeightPx", resizeHeightPx],
   ];
 
   for (const [flag, value] of optionalArgs) {

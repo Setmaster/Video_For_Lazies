@@ -33,6 +33,10 @@ struct AppSmokeConfig {
     size_limit_mb: f64,
     trim_start_s: f64,
     trim_end_s: Option<f64>,
+    resize_mode: Option<video::ResizeMode>,
+    resize_max_edge_px: Option<u32>,
+    resize_width_px: Option<u32>,
+    resize_height_px: Option<u32>,
     skip_preview_interactions: bool,
 }
 
@@ -89,6 +93,15 @@ fn parse_smoke_output_format(raw: &str) -> Result<video::OutputFormat, String> {
     }
 }
 
+fn parse_smoke_resize_mode(raw: &str) -> Result<video::ResizeMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "source" | "original" => Ok(video::ResizeMode::Source),
+        "maxedge" | "max-edge" | "max_edge" => Ok(video::ResizeMode::MaxEdge),
+        "custom" => Ok(video::ResizeMode::Custom),
+        _ => Err("VFL_SMOKE_RESIZE_MODE must be one of: source, maxEdge, custom.".to_string()),
+    }
+}
+
 fn parse_smoke_bool(env: &HashMap<String, String>, key: &str) -> Result<bool, String> {
     let Some(raw) = env.get(key) else {
         return Ok(false);
@@ -99,6 +112,24 @@ fn parse_smoke_bool(env: &HashMap<String, String>, key: &str) -> Result<bool, St
         "1" | "true" | "yes" | "on" => Ok(true),
         _ => Err(format!("{key} must be a boolean value.")),
     }
+}
+
+fn parse_smoke_u32(
+    env: &HashMap<String, String>,
+    key: &str,
+    default: Option<u32>,
+) -> Result<Option<u32>, String> {
+    let Some(raw) = env.get(key).map(|value| value.trim()) else {
+        return Ok(default);
+    };
+    if raw.is_empty() {
+        return Ok(default);
+    }
+
+    let value = raw
+        .parse::<u32>()
+        .map_err(|_| format!("{key} must be an integer."))?;
+    Ok(Some(value))
 }
 
 fn validate_smoke_status_path(raw: &str) -> Result<String, String> {
@@ -161,6 +192,13 @@ fn parse_smoke_config_from_env(
     let trim_start_s = parse_smoke_f64(env, "VFL_SMOKE_TRIM_START_S", Some(0.0))?
         .ok_or_else(|| "VFL_SMOKE_TRIM_START_S parsing failed.".to_string())?;
     let trim_end_s = parse_smoke_f64(env, "VFL_SMOKE_TRIM_END_S", None)?;
+    let resize_mode = env
+        .get("VFL_SMOKE_RESIZE_MODE")
+        .map(|raw| parse_smoke_resize_mode(raw))
+        .transpose()?;
+    let resize_max_edge_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_MAX_EDGE_PX", None)?;
+    let resize_width_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_WIDTH_PX", None)?;
+    let resize_height_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_HEIGHT_PX", None)?;
     let skip_preview_interactions = parse_smoke_bool(env, "VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS")?;
 
     if size_limit_mb < 0.0 {
@@ -179,6 +217,19 @@ fn parse_smoke_config_from_env(
             );
         }
     }
+    if matches!(resize_mode, Some(video::ResizeMode::MaxEdge)) && resize_max_edge_px.is_none() {
+        return Err(
+            "VFL_SMOKE_RESIZE_MAX_EDGE_PX is required for maxEdge smoke resize mode.".to_string(),
+        );
+    }
+    if matches!(resize_mode, Some(video::ResizeMode::Custom))
+        && (resize_width_px.is_none() || resize_height_px.is_none())
+    {
+        return Err(
+            "VFL_SMOKE_RESIZE_WIDTH_PX and VFL_SMOKE_RESIZE_HEIGHT_PX are required for custom smoke resize mode."
+                .to_string(),
+        );
+    }
 
     Ok(Some(AppSmokeConfig {
         input_path: input_path.to_string(),
@@ -188,6 +239,10 @@ fn parse_smoke_config_from_env(
         size_limit_mb,
         trim_start_s,
         trim_end_s,
+        resize_mode,
+        resize_max_edge_px,
+        resize_width_px,
+        resize_height_px,
         skip_preview_interactions,
     }))
 }
@@ -475,7 +530,7 @@ mod tests {
         AppSmokeConfig, AppSmokeStatus, is_supported_preview_path, merge_smoke_optional_fields,
         merge_smoke_stage_history, parse_smoke_config_from_env,
     };
-    use crate::video::OutputFormat;
+    use crate::video::{OutputFormat, ResizeMode};
     use std::collections::HashMap;
     use std::fs;
 
@@ -531,6 +586,10 @@ mod tests {
                 size_limit_mb: 0.0,
                 trim_start_s: 0.0,
                 trim_end_s: None,
+                resize_mode: None,
+                resize_max_edge_px: None,
+                resize_width_px: None,
+                resize_height_px: None,
                 skip_preview_interactions: false,
             })
         );
@@ -547,6 +606,9 @@ mod tests {
             ("VFL_SMOKE_SIZE_LIMIT_MB", "12.5"),
             ("VFL_SMOKE_TRIM_START_S", "0.25"),
             ("VFL_SMOKE_TRIM_END_S", "1.5"),
+            ("VFL_SMOKE_RESIZE_MODE", "custom"),
+            ("VFL_SMOKE_RESIZE_WIDTH_PX", "320"),
+            ("VFL_SMOKE_RESIZE_HEIGHT_PX", "180"),
             ("VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS", "true"),
         ]);
 
@@ -560,9 +622,28 @@ mod tests {
                 size_limit_mb: 12.5,
                 trim_start_s: 0.25,
                 trim_end_s: Some(1.5),
+                resize_mode: Some(ResizeMode::Custom),
+                resize_max_edge_px: None,
+                resize_width_px: Some(320),
+                resize_height_px: Some(180),
                 skip_preview_interactions: true,
             })
         );
+    }
+
+    #[test]
+    fn parse_smoke_config_rejects_incomplete_resize_settings() {
+        let status_path = temp_smoke_status_path("bad-resize");
+        let env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.webm"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_RESIZE_MODE", "custom"),
+            ("VFL_SMOKE_RESIZE_WIDTH_PX", "320"),
+        ]);
+
+        let err = parse_smoke_config_from_env(&env).unwrap_err();
+        assert!(err.contains("VFL_SMOKE_RESIZE_HEIGHT_PX"));
     }
 
     #[test]

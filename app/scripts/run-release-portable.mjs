@@ -283,6 +283,12 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
     await runPortableExportSmoke({ portableDir, outputFormat: "webm" });
     await runPortableExportSmoke({
       portableDir,
+      resizeMode: "custom",
+      resizeWidthPx: 320,
+      resizeHeightPx: 180,
+    });
+    await runPortableExportSmoke({
+      portableDir,
       timeoutSeconds: 300,
       inputWidth: 1920,
       inputHeight: 1080,
@@ -301,6 +307,12 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
   await runPortableSmoke({ portableDir });
   await runPortableExportSmoke({ portableDir });
   await runPortableExportSmoke({ portableDir, outputFormat: "webm" });
+  await runPortableExportSmoke({
+    portableDir,
+    resizeMode: "custom",
+    resizeWidthPx: 320,
+    resizeHeightPx: 180,
+  });
   await runPortableExportSmoke({
     portableDir,
     timeoutSeconds: 300,

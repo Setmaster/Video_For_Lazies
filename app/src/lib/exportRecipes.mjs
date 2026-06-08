@@ -6,7 +6,13 @@ export const EXPORT_RECIPES = [
     settings: {
       format: "mp4",
       sizeLimitMb: "",
-      maxEdgePx: "720",
+      resize: {
+        mode: "maxEdge",
+        maxEdgePx: "720",
+        widthPx: "",
+        heightPx: "",
+        lockAspect: true,
+      },
       audioEnabled: true,
       advanced: {
         videoCodec: "h264",
@@ -25,7 +31,13 @@ export const EXPORT_RECIPES = [
     settings: {
       format: "mp4",
       sizeLimitMb: "25",
-      maxEdgePx: "720",
+      resize: {
+        mode: "maxEdge",
+        maxEdgePx: "720",
+        widthPx: "",
+        heightPx: "",
+        lockAspect: true,
+      },
       audioEnabled: true,
       advanced: {
         videoCodec: "h264",
@@ -44,7 +56,13 @@ export const EXPORT_RECIPES = [
     settings: {
       format: "mp4",
       sizeLimitMb: "10",
-      maxEdgePx: "540",
+      resize: {
+        mode: "maxEdge",
+        maxEdgePx: "540",
+        widthPx: "",
+        heightPx: "",
+        lockAspect: true,
+      },
       audioEnabled: true,
       advanced: {
         videoCodec: "h264",
@@ -63,7 +81,13 @@ export const EXPORT_RECIPES = [
     settings: {
       format: "mp4",
       sizeLimitMb: "",
-      maxEdgePx: "",
+      resize: {
+        mode: "source",
+        maxEdgePx: "",
+        widthPx: "",
+        heightPx: "",
+        lockAspect: true,
+      },
       audioEnabled: true,
       advanced: {
         videoCodec: "h264",
@@ -82,7 +106,13 @@ export const EXPORT_RECIPES = [
     settings: {
       format: "webm",
       sizeLimitMb: "25",
-      maxEdgePx: "720",
+      resize: {
+        mode: "maxEdge",
+        maxEdgePx: "720",
+        widthPx: "",
+        heightPx: "",
+        lockAspect: true,
+      },
       audioEnabled: true,
       advanced: {
         videoCodec: "vp9",
@@ -101,7 +131,13 @@ export const EXPORT_RECIPES = [
     settings: {
       format: "mp3",
       sizeLimitMb: "",
-      maxEdgePx: "",
+      resize: {
+        mode: "source",
+        maxEdgePx: "",
+        widthPx: "",
+        heightPx: "",
+        lockAspect: true,
+      },
       audioEnabled: true,
       advanced: {
         videoCodec: "auto",
@@ -123,6 +159,25 @@ function normalizeTextSetting(value) {
   return String(value ?? "").trim();
 }
 
+function normalizeResizeMode(value, legacyMaxEdgePx) {
+  if (value === "source" || value === "maxEdge" || value === "custom") return value;
+  return legacyMaxEdgePx ? "maxEdge" : "source";
+}
+
+export function normalizeRecipeResizeSettings(settings) {
+  const legacyMaxEdgePx = normalizeTextSetting(settings?.maxEdgePx);
+  const raw = settings?.resize && typeof settings.resize === "object" ? settings.resize : {};
+  const mode = normalizeResizeMode(raw.mode, legacyMaxEdgePx);
+
+  return {
+    mode,
+    maxEdgePx: normalizeTextSetting(raw.maxEdgePx ?? legacyMaxEdgePx),
+    widthPx: normalizeTextSetting(raw.widthPx),
+    heightPx: normalizeTextSetting(raw.heightPx),
+    lockAspect: raw.lockAspect !== false,
+  };
+}
+
 function normalizeAdvancedNumber(value) {
   if (value === null || value === undefined || value === "auto" || value === "") return null;
   const parsed = Number(value);
@@ -135,11 +190,22 @@ export function recipeMatchesSettings(recipe, settings) {
   const recipeSettings = recipe.settings;
   const recipeAdvanced = recipeSettings.advanced ?? {};
   const currentAdvanced = settings.advanced ?? {};
+  const recipeResize = normalizeRecipeResizeSettings(recipeSettings);
+  const currentResize = normalizeRecipeResizeSettings(settings);
+
+  const resizeMatches =
+    recipeResize.mode === currentResize.mode &&
+    (recipeResize.mode === "source" ||
+      (recipeResize.mode === "maxEdge" && recipeResize.maxEdgePx === currentResize.maxEdgePx) ||
+      (recipeResize.mode === "custom" &&
+        recipeResize.widthPx === currentResize.widthPx &&
+        recipeResize.heightPx === currentResize.heightPx &&
+        Boolean(recipeResize.lockAspect) === Boolean(currentResize.lockAspect)));
 
   return (
     settings.format === recipeSettings.format &&
     normalizeTextSetting(settings.sizeLimitMb) === normalizeTextSetting(recipeSettings.sizeLimitMb) &&
-    normalizeTextSetting(settings.maxEdgePx) === normalizeTextSetting(recipeSettings.maxEdgePx) &&
+    resizeMatches &&
     Boolean(settings.audioEnabled) === Boolean(recipeSettings.audioEnabled) &&
     (currentAdvanced.videoCodec ?? "auto") === (recipeAdvanced.videoCodec ?? "auto") &&
     normalizeAdvancedNumber(currentAdvanced.audioBitrateKbps) === normalizeAdvancedNumber(recipeAdvanced.audioBitrateKbps) &&

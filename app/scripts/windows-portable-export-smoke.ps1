@@ -9,7 +9,11 @@ param(
   [double]$InputRate = 30,
   [int]$InputVideoBitrateKbps = 900,
   [ValidateSet("mp4", "webm", "mp3")][string]$OutputFormat = "mp4",
-  [double]$SizeLimitMb = 0
+  [double]$SizeLimitMb = 0,
+  [ValidateSet("source", "maxEdge", "custom")][string]$ResizeMode,
+  [int]$ResizeMaxEdgePx,
+  [int]$ResizeWidthPx,
+  [int]$ResizeHeightPx
 )
 
 Set-StrictMode -Version Latest
@@ -184,6 +188,18 @@ $startInfo.EnvironmentVariables["VFL_SMOKE_FORMAT"] = $OutputFormat
 $startInfo.EnvironmentVariables["VFL_SMOKE_SIZE_LIMIT_MB"] = $SizeLimitMb.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_START_S"] = "0"
 $startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_END_S"] = $TrimEndSeconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+if ($ResizeMode) {
+  $startInfo.EnvironmentVariables["VFL_SMOKE_RESIZE_MODE"] = $ResizeMode
+}
+if ($ResizeMaxEdgePx -gt 0) {
+  $startInfo.EnvironmentVariables["VFL_SMOKE_RESIZE_MAX_EDGE_PX"] = $ResizeMaxEdgePx.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
+if ($ResizeWidthPx -gt 0) {
+  $startInfo.EnvironmentVariables["VFL_SMOKE_RESIZE_WIDTH_PX"] = $ResizeWidthPx.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
+if ($ResizeHeightPx -gt 0) {
+  $startInfo.EnvironmentVariables["VFL_SMOKE_RESIZE_HEIGHT_PX"] = $ResizeHeightPx.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
 
 $process = [System.Diagnostics.Process]::Start($startInfo)
 if (-not $process) {
@@ -266,6 +282,16 @@ try {
 
   $ffprobe = $ffprobeJson | ConvertFrom-Json
   $outputDurationS = [double]::Parse($ffprobe.format.duration, [System.Globalization.CultureInfo]::InvariantCulture)
+  if ($ResizeMode -eq "custom") {
+    $videoStream = @($ffprobe.streams | Where-Object { $_.codec_type -eq "video" } | Select-Object -First 1)
+    $expectedWidth = [Math]::Max(2, [Math]::Floor($ResizeWidthPx / 2) * 2)
+    $expectedHeight = [Math]::Max(2, [Math]::Floor($ResizeHeightPx / 2) * 2)
+    if (-not $videoStream -or $videoStream.width -ne $expectedWidth -or $videoStream.height -ne $expectedHeight) {
+      $actualWidth = if ($videoStream) { $videoStream.width } else { "none" }
+      $actualHeight = if ($videoStream) { $videoStream.height } else { "none" }
+      throw ("Portable export smoke output dimensions mismatch. expected={0}x{1} actual={2}x{3}" -f $expectedWidth, $expectedHeight, $actualWidth, $actualHeight)
+    }
+  }
   $trimStartS = $null
   $trimEndS = $null
   $expectedDurationS = $null

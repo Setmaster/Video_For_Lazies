@@ -3,6 +3,7 @@ export type VideoCodecPreference = "auto" | "h264" | "mpeg4" | "vp9" | "vp8";
 export type VideoQualityPreference = "auto" | "smaller" | "balanced" | "higher";
 export type EncodeSpeedPreference = "auto" | "faster" | "balanced" | "smaller";
 export type AudioChannelPreference = "auto" | "stereo" | "mono";
+export type ResizeMode = "source" | "maxEdge" | "custom";
 
 export interface VideoProbe {
   durationS: number;
@@ -30,6 +31,13 @@ export interface ColorAdjust {
   saturation: number;
 }
 
+export interface ResizeSettings {
+  mode: ResizeMode;
+  maxEdgePx?: number | null;
+  widthPx?: number | null;
+  heightPx?: number | null;
+}
+
 export interface EncodeRequest {
   inputPath: string;
   outputPath: string;
@@ -44,6 +52,7 @@ export interface EncodeRequest {
   reverse: boolean;
   speed: number;
   rotateDeg: number;
+  resize?: ResizeSettings | null;
   maxEdgePx?: number | null;
   color?: ColorAdjust | null;
 }
@@ -110,6 +119,10 @@ export interface AppSmokeConfig {
   sizeLimitMb: number;
   trimStartS: number;
   trimEndS?: number | null;
+  resizeMode?: ResizeMode | null;
+  resizeMaxEdgePx?: number | null;
+  resizeWidthPx?: number | null;
+  resizeHeightPx?: number | null;
   skipPreviewInteractions?: boolean | null;
 }
 
