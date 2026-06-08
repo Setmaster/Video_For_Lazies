@@ -17,8 +17,8 @@ test("portable source notice describes app and FFmpeg source artifacts without l
   assert.match(notice, /Repository: https:\/\/github\.com\/Setmaster\/Video_For_Lazies/);
   assert.match(notice, /Release tag: `v0\.1\.0`/);
   assert.match(notice, /Source commit: `abc1234def`/);
-  assert.match(notice, /ffmpeg-sidecar\/source\/ffmpeg-b21e00eda5/);
-  assert.match(notice, /btbn-ffmpeg-builds-6e66d4d1/);
+  assert.match(notice, /ffmpeg-sidecar\/source\/ffmpeg-e4c7fbf6c0/);
+  assert.match(notice, /btbn-ffmpeg-builds-97ef373e/);
   assert.match(notice, /x264-0480cb05/);
   assert.doesNotMatch(notice, /\/home\//);
   assert.doesNotMatch(notice, /C:\\Users\\/);
