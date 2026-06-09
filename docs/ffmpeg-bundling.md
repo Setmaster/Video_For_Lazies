@@ -18,25 +18,25 @@ This app bundles FFmpeg for Windows x64 and Linux x64 release builds so end user
 
 - Provider: BtbN FFmpeg Builds
 - Variant: `win64-gpl-shared`
-- BtbN release tag: `autobuild-2026-05-22-15-11`
+- BtbN release tag: `autobuild-2026-06-08-14-24`
 - Binary archive:
-  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-05-22-15-11/ffmpeg-n8.1.1-8-gb21e00eda5-win64-gpl-shared-8.1.zip`
+  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-08-14-24/ffmpeg-n8.1.1-11-ge4c7fbf6c0-win64-gpl-shared-8.1.zip`
 - Binary archive SHA256:
-  `b691c0525c0fbe1bda64b3da470d0c2bdc4b485cfb72cae3d88c030f4116c9a0`
+  `b11fdf2ed53372f334a7732883cdbe9814cd730450672d58fa56c47111526580`
 - FFmpeg version string from the bundle:
-  `n8.1.1-8-gb21e00eda5-20260522`
+  `n8.1.1-11-ge4c7fbf6c0-20260608`
 
 ## Pinned Linux bundle
 
 - Provider: BtbN FFmpeg Builds
 - Variant: `linux64-gpl-shared`
-- BtbN release tag: `autobuild-2026-05-22-15-11`
+- BtbN release tag: `autobuild-2026-06-08-14-24`
 - Binary archive:
-  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-05-22-15-11/ffmpeg-n8.1.1-8-gb21e00eda5-linux64-gpl-shared-8.1.tar.xz`
+  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-08-14-24/ffmpeg-n8.1.1-11-ge4c7fbf6c0-linux64-gpl-shared-8.1.tar.xz`
 - Binary archive SHA256:
-  `3c75729401fbe1a1f7e1ee62e09ba7b895418489a2017e2ac6e9db7ccfc5f815`
+  `30b0ca389e7d0e34b4ca1acb5fe38d57fbc2542d690a8c5b06c72bdac0a234d1`
 - FFmpeg version string from the bundle:
-  `n8.1.1-8-gb21e00eda5-20260522`
+  `n8.1.1-11-ge4c7fbf6c0-20260608`
 
 Note:
 
@@ -49,20 +49,20 @@ Note:
 - Upstream mirror:
   `https://github.com/FFmpeg/FFmpeg`
 - Exact source archive:
-  `https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/b21e00eda5b16c9d76ff97f029051d7be8f95d10`
+  `https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/e4c7fbf6c0a922297d4df7288d7aea665af15e24`
 - Source archive SHA256:
-  `ffef396c7a19b8e99c58e762d315e0fdcb21bc69778bebd42e9b2a919486c8be`
+  `c4cb2356bef3c6d46a00098f42380a071475a44052933b499af6d7d4d7e6d520`
 
 ### BtbN build recipe snapshot
 
 - Upstream repository:
   `https://github.com/BtbN/FFmpeg-Builds`
 - Exact build recipe archive:
-  `https://github.com/BtbN/FFmpeg-Builds/archive/6e66d4d1e81f75b5f34dc2a369cc341e12edc531.tar.gz`
+  `https://github.com/BtbN/FFmpeg-Builds/archive/97ef373e17b7c9de46e980de0a26698237f09a83.tar.gz`
 - Build recipe archive SHA256:
-  `239a76c068e5a148d691a9b29b1b93498164a8df79578bf684a41e2eb28ac4cb`
+  `0fc9bae62374dee03991cff5dacf192b3d9af4b36e16294bb70f7d66c7c22be8`
 - Build recipe commit:
-  `6e66d4d1e81f75b5f34dc2a369cc341e12edc531`
+  `97ef373e17b7c9de46e980de0a26698237f09a83`
 
 ### x264 source snapshot
 
@@ -82,8 +82,8 @@ The staged Windows sidecar includes:
 - required shared FFmpeg DLLs from the pinned archive
 - upstream `LICENSE.txt`
 - `FFMPEG_BUNDLE_NOTICES.txt`
-- `source/ffmpeg-b21e00eda5b16c9d76ff97f029051d7be8f95d10.tar.gz`
-- `source/btbn-ffmpeg-builds-6e66d4d1e81f75b5f34dc2a369cc341e12edc531.tar.gz`
+- `source/ffmpeg-e4c7fbf6c0a922297d4df7288d7aea665af15e24.tar.gz`
+- `source/btbn-ffmpeg-builds-97ef373e17b7c9de46e980de0a26698237f09a83.tar.gz`
 - `source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
 The staged Linux sidecar includes:
@@ -94,8 +94,8 @@ The staged Linux sidecar includes:
 - required shared FFmpeg libraries under `lib/`
 - upstream `LICENSE.txt`
 - `FFMPEG_BUNDLE_NOTICES.txt`
-- `source/ffmpeg-b21e00eda5b16c9d76ff97f029051d7be8f95d10.tar.gz`
-- `source/btbn-ffmpeg-builds-6e66d4d1e81f75b5f34dc2a369cc341e12edc531.tar.gz`
+- `source/ffmpeg-e4c7fbf6c0a922297d4df7288d7aea665af15e24.tar.gz`
+- `source/btbn-ffmpeg-builds-97ef373e17b7c9de46e980de0a26698237f09a83.tar.gz`
 - `source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
 The Linux root wrapper scripts set `LD_LIBRARY_PATH` to the bundled `ffmpeg-sidecar/lib/` directory before executing `bin/ffmpeg` or `bin/ffprobe`. The app still launches `ffmpeg-sidecar/ffmpeg` and `ffmpeg-sidecar/ffprobe`, so the runtime lookup contract stays the same across Windows and Linux.
