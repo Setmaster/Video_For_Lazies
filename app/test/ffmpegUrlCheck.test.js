@@ -48,3 +48,23 @@ test("checkUrl reports failures including thrown fetch errors", async () => {
   assert.equal(refused.ok, false);
   assert.match(refused.error, /ECONNREFUSED/);
 });
+
+test("checkUrl treats method-quirk statuses as reachable and retries transient failures", async () => {
+  // GitLab archive endpoints answer probes with 406/416 while the asset exists.
+  const quirky = await checkUrl("https://example.com/gitlab-archive", {
+    fetchImpl: async () => ({ ok: false, status: 406 }),
+  });
+  assert.equal(quirky.ok, true);
+
+  let calls = 0;
+  const flaky = await checkUrl("https://example.com/flaky", {
+    attempts: 2,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls <= 2) throw new Error("ECONNRESET");
+      return { ok: true, status: 200 };
+    },
+  });
+  assert.equal(flaky.ok, true);
+  assert.equal(flaky.status, 200);
+});

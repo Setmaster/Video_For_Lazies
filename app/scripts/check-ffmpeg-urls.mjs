@@ -26,24 +26,30 @@ export const PINNED_BUNDLE_URLS = Object.freeze([
   ]),
 ]);
 
-export async function checkUrl(url, { timeoutMs = 30_000, fetchImpl = fetch } = {}) {
-  // HEAD first; some hosts reject HEAD, so fall back to a one-byte ranged GET.
+// On-the-fly archive endpoints (GitLab) can answer probe methods with
+// 405/406/416 even though the asset exists; only treat statuses that mean
+// "missing" as failures. A deleted asset answers 404.
+const METHOD_QUIRK_STATUSES = new Set([405, 406, 416]);
+
+export async function checkUrl(url, { timeoutMs = 30_000, fetchImpl = fetch, attempts = 2 } = {}) {
   let last = { url, ok: false, status: null, error: "not attempted" };
-  for (const init of [
-    { method: "HEAD", redirect: "follow" },
-    { method: "GET", redirect: "follow", headers: { range: "bytes=0-0" } },
-  ]) {
-    try {
-      const response = await fetchImpl(url, {
-        ...init,
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (response.ok || response.status === 206) {
-        return { url, ok: true, status: response.status };
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    for (const init of [
+      { method: "HEAD", redirect: "follow" },
+      { method: "GET", redirect: "follow", headers: { range: "bytes=0-0" } },
+    ]) {
+      try {
+        const response = await fetchImpl(url, {
+          ...init,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (response.ok || response.status === 206 || METHOD_QUIRK_STATUSES.has(response.status)) {
+          return { url, ok: true, status: response.status };
+        }
+        last = { url, ok: false, status: response.status, error: null };
+      } catch (error) {
+        last = { url, ok: false, status: null, error: String(error) };
       }
-      last = { url, ok: false, status: response.status, error: null };
-    } catch (error) {
-      last = { url, ok: false, status: null, error: String(error) };
     }
   }
   return last;
