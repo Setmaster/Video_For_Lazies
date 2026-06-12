@@ -166,6 +166,8 @@ pub struct EncodeRequest {
     pub size_limit_mb: f64,
     pub audio_enabled: bool,
     #[serde(default)]
+    pub normalize_audio: bool,
+    #[serde(default)]
     pub advanced: AdvancedEncodeSettings,
 
     pub trim: Option<Trim>,
@@ -400,18 +402,46 @@ fn run_command_output_with_timeout(
         }
     })?;
 
+    // Drain both pipes while polling; a child that fills an unread pipe buffer
+    // blocks forever and would be misreported as a timeout.
+    fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+        reader: Option<R>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        reader.map(|mut r| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = r.read_to_end(&mut buf);
+                buf
+            })
+        })
+    }
+    let mut stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let mut stderr_reader = spawn_pipe_reader(child.stderr.take());
+    let join_pipe = |handle: &mut Option<std::thread::JoinHandle<Vec<u8>>>| {
+        handle
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+    };
+
     let started_at = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| format!("Failed to collect {action} output: {e}"));
+            Ok(Some(status)) => {
+                let stdout = join_pipe(&mut stdout_reader);
+                let stderr = join_pipe(&mut stderr_reader);
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if started_at.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_pipe(&mut stdout_reader);
+                    let _ = join_pipe(&mut stderr_reader);
                     return Err(format!(
                         "{action} timed out after {} seconds.",
                         timeout.as_secs()
@@ -841,6 +871,14 @@ fn requested_frame_rate_cap_fps(request: &EncodeRequest) -> Result<Option<u32>, 
         .transpose()
 }
 
+fn effective_speed(request: &EncodeRequest) -> f64 {
+    if request.speed.is_finite() && request.speed > 0.0 {
+        request.speed
+    } else {
+        1.0
+    }
+}
+
 fn frame_rate_cap_filter_fps(
     request: &EncodeRequest,
     probe: &VideoProbe,
@@ -852,7 +890,8 @@ fn frame_rate_cap_filter_fps(
         return Ok(Some(cap_fps));
     };
 
-    if source_fps > cap_fps as f64 + 0.01 {
+    // setpts speed-up multiplies the effective frame rate before the cap applies.
+    if source_fps * effective_speed(request) > cap_fps as f64 + 0.01 {
         Ok(Some(cap_fps))
     } else {
         Ok(None)
@@ -866,7 +905,7 @@ fn output_frame_rate_for_planning(
     if let Some(cap_fps) = frame_rate_cap_filter_fps(request, probe)? {
         Ok(Some(cap_fps as f64))
     } else {
-        Ok(probe.frame_rate)
+        Ok(probe.frame_rate.map(|fps| fps * effective_speed(request)))
     }
 }
 
@@ -902,6 +941,9 @@ fn advanced_forces_reencode(
     }
 
     if request.audio_enabled && probe.has_audio {
+        if request.normalize_audio {
+            return Ok(true);
+        }
         if !size_limit_enabled && request.advanced.audio_bitrate_kbps.is_some() {
             return Ok(true);
         }
@@ -1085,7 +1127,9 @@ fn estimated_output_dimensions(
         }
     }
 
-    Ok((width, height))
+    // The filter chain forces even output for every path, so the plan should
+    // match even for untouched odd-dimension sources.
+    Ok((even_at_least_two(width), even_at_least_two(height)))
 }
 
 fn minimum_video_bitrate_kbps(
@@ -1129,6 +1173,7 @@ fn split_sequence_stem(stem: &str) -> (String, u32) {
 pub fn suggest_output_path_unique(
     input_path: String,
     format: OutputFormat,
+    taken_paths: &[String],
 ) -> Result<String, String> {
     let input_path = PathBuf::from(input_path.trim());
     let stem = input_path
@@ -1142,13 +1187,17 @@ pub fn suggest_output_path_unique(
     let parent = input_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new(""));
+    // Paths claimed by not-yet-written outputs (queued export snapshots), which
+    // an on-disk existence check alone cannot see.
+    let taken: HashSet<&str> = taken_paths.iter().map(|p| p.as_str()).collect();
 
     let max_tries = 10_000u32;
     for i in start_n..start_n.saturating_add(max_tries) {
         let file = format!("{base}-{i}.{ext}");
         let candidate = parent.join(file);
-        if !candidate.exists() {
-            return Ok(candidate.to_string_lossy().to_string());
+        let candidate_str = candidate.to_string_lossy().to_string();
+        if !candidate.exists() && !taken.contains(candidate_str.as_str()) {
+            return Ok(candidate_str);
         }
     }
 
@@ -1177,15 +1226,17 @@ pub fn extract_frame(input_path: String, time_s: f64, output_path: String) -> Re
     let ffmpeg_bin = default_ffmpeg();
 
     let mut cmd = command_no_window(&ffmpeg_bin);
+    // Input-side seeking: output-side -ss decodes the whole stream up to the
+    // timestamp and times out on long sources.
     cmd.arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-nostdin")
-        .arg("-i")
-        .arg(input_path.as_os_str())
         .arg("-ss")
         .arg(format!("{time_s:.3}"))
+        .arg("-i")
+        .arg(input_path.as_os_str())
         .arg("-frames:v")
         .arg("1")
         .arg("-an")
@@ -1230,6 +1281,17 @@ struct FFProbeFormat {
 }
 
 #[derive(Debug, Deserialize)]
+struct FFProbeSideData {
+    side_data_type: Option<String>,
+    rotation: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FFProbeStreamTags {
+    rotate: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct FFProbeStream {
     codec_type: Option<String>,
     duration: Option<String>,
@@ -1237,6 +1299,50 @@ struct FFProbeStream {
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
+    #[serde(default)]
+    side_data_list: Vec<FFProbeSideData>,
+    tags: Option<FFProbeStreamTags>,
+}
+
+fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Display rotation in degrees (0/90/180/270), from the display matrix side
+/// data or the legacy rotate tag. Rotations off the 90-degree grid return 0
+/// because ffmpeg's autorotation ignores them too.
+fn stream_rotation_deg(stream: &FFProbeStream) -> u32 {
+    let raw = stream
+        .side_data_list
+        .iter()
+        .filter(|sd| {
+            sd.side_data_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("Display Matrix"))
+        })
+        .find_map(|sd| sd.rotation.as_ref().and_then(json_number_to_f64))
+        .or_else(|| {
+            stream
+                .tags
+                .as_ref()
+                .and_then(|t| t.rotate.as_deref())
+                .and_then(|r| r.trim().parse::<f64>().ok())
+        });
+    let Some(raw) = raw else {
+        return 0;
+    };
+    if !raw.is_finite() {
+        return 0;
+    }
+    let nearest = (raw / 90.0).round() * 90.0;
+    if (raw - nearest).abs() > 2.0 {
+        return 0;
+    }
+    (((nearest as i64 % 360) + 360) % 360) as u32
 }
 
 fn parse_ffprobe_rate(rate: Option<&str>) -> Option<f64> {
@@ -1271,7 +1377,7 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     let ffprobe_bin = default_ffprobe();
     let mut cmd = command_no_window(&ffprobe_bin);
     cmd.arg("-v")
-        .arg("quiet")
+        .arg("error")
         .arg("-print_format")
         .arg("json")
         .arg("-show_streams")
@@ -1292,8 +1398,12 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_probe_output(&stdout)
+}
+
+fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
     let parsed: FFProbeOutput =
-        serde_json::from_str(&stdout).map_err(|e| format!("ffprobe returned invalid JSON: {e}"))?;
+        serde_json::from_str(stdout).map_err(|e| format!("ffprobe returned invalid JSON: {e}"))?;
 
     let has_audio = parsed
         .streams
@@ -1334,6 +1444,11 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
         {
             width = w;
             height = h;
+            // The webview preview, ffmpeg autorotation, and cropdetect all work
+            // in display space, so report display-oriented dimensions.
+            if matches!(stream_rotation_deg(stream), 90 | 270) {
+                std::mem::swap(&mut width, &mut height);
+            }
             frame_rate = parse_ffprobe_rate(stream.avg_frame_rate.as_deref())
                 .or_else(|| parse_ffprobe_rate(stream.r_frame_rate.as_deref()));
             break;
@@ -1623,11 +1738,13 @@ fn color_is_noop(color: &Option<ColorAdjust>) -> bool {
 }
 
 fn max_edge_scale_filter(max_edge_px: u32) -> String {
-    // Keep aspect ratio, never upscale, and keep dimensions divisible by 2.
+    // Keep aspect ratio, never upscale, and keep dimensions divisible by 2: the
+    // explicit edge needs trunc()/2*2 because min(iw, m) is odd for odd sources
+    // or odd caps, and yuv420p encoders reject odd dimensions.
     // Use quotes inside the filter string so commas inside expressions are not treated as filter separators.
     format!(
-        "scale=w='if(gte(iw,ih),min(iw,{m}),-2)':h='if(gte(iw,ih),-2,min(ih,{m}))'",
-        m = max_edge_px
+        "scale=w='if(gte(iw,ih),trunc(min(iw,{m})/2)*2,-2)':h='if(gte(iw,ih),-2,trunc(min(ih,{m})/2)*2)'",
+        m = even_at_least_two(max_edge_px)
     )
 }
 
@@ -1682,13 +1799,23 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         }
     }
 
-    match requested_resize(req)? {
+    let resize_plan = requested_resize(req)?;
+    match resize_plan {
         ResizePlan::Source => {}
         ResizePlan::MaxEdge(max_edge_px) => filters.push(max_edge_scale_filter(max_edge_px)),
         ResizePlan::Custom {
             width_px,
             height_px,
         } => filters.push(custom_scale_filter(width_px, height_px)),
+    }
+
+    // Crop and the scale filters already guarantee even output; an untouched
+    // odd-dimension source would otherwise fail yuv420p encoders.
+    if req.crop.is_none()
+        && resize_plan == ResizePlan::Source
+        && (probe.width % 2 == 1 || probe.height % 2 == 1)
+    {
+        filters.push("crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2".to_string());
     }
 
     if let Some(c) = &req.color {
@@ -1746,6 +1873,12 @@ fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         }
         filters.push(format!("atrim=start={start}:end={end}"));
         filters.push("asetpts=PTS-STARTPTS".to_string());
+    }
+
+    if req.normalize_audio {
+        // loudnorm internally upsamples to 192 kHz; bring the rate back down.
+        filters.push("loudnorm=I=-16:TP=-1.5:LRA=11".to_string());
+        filters.push("aresample=48000".to_string());
     }
 
     if req.reverse {
@@ -2864,6 +2997,7 @@ mod tests {
             title: None,
             size_limit_mb: 8.0,
             audio_enabled: true,
+            normalize_audio: false,
             advanced: AdvancedEncodeSettings::default(),
             trim: None,
             crop: None,
@@ -2917,9 +3051,19 @@ mod tests {
         fs::write(dir.join("myvideo-3.mp4"), b"out").unwrap();
 
         let suggested =
-            suggest_output_path_unique(input.to_string_lossy().to_string(), OutputFormat::Mp4)
+            suggest_output_path_unique(input.to_string_lossy().to_string(), OutputFormat::Mp4, &[])
                 .unwrap();
         assert!(suggested.ends_with("myvideo-4.mp4"), "{suggested}");
+
+        // Queue snapshots claim paths that do not exist on disk yet.
+        let taken = vec![suggested];
+        let next = suggest_output_path_unique(
+            input.to_string_lossy().to_string(),
+            OutputFormat::Mp4,
+            &taken,
+        )
+        .unwrap();
+        assert!(next.ends_with("myvideo-5.mp4"), "{next}");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3334,7 +3478,57 @@ Encoders:
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "scale=w='if(gte(iw,ih),min(iw,720),-2)':h='if(gte(iw,ih),-2,min(ih,720))',eq=brightness=0.100000:contrast=1.200000:saturation=0.900000"
+            "scale=w='if(gte(iw,ih),trunc(min(iw,720)/2)*2,-2)':h='if(gte(iw,ih),-2,trunc(min(ih,720)/2)*2)',eq=brightness=0.100000:contrast=1.200000:saturation=0.900000"
+        );
+    }
+
+    #[test]
+    fn max_edge_scale_filter_evens_odd_caps() {
+        assert!(max_edge_scale_filter(719).contains("min(iw,718)"));
+        assert!(max_edge_scale_filter(720).contains("min(iw,720)"));
+    }
+
+    #[test]
+    fn build_video_filters_evens_untouched_odd_sources() {
+        let req = {
+            let mut req = base_request();
+            req.advanced.video_quality = Some(VideoQualityPreference::Higher);
+            req
+        };
+        let probe = VideoProbe {
+            duration_s: 10.0,
+            width: 853,
+            height: 480,
+            frame_rate: Some(30.0),
+            has_audio: true,
+        };
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(filters, "crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2");
+
+        // Crop and scale paths already guarantee even output, so no extra crop.
+        let mut scaled = base_request();
+        scaled.max_edge_px = Some(720);
+        let filters = build_video_filters(&scaled, &probe).unwrap().unwrap();
+        assert!(!filters.contains("crop="));
+    }
+
+    #[test]
+    fn frame_rate_cap_accounts_for_speed_multiplier() {
+        let probe = probe_10s_1920x1080_audio();
+        let mut req = base_request();
+        req.advanced.frame_rate_cap_fps = Some(30);
+
+        assert_eq!(frame_rate_cap_filter_fps(&req, &probe).unwrap(), None);
+
+        req.speed = 2.0;
+        assert_eq!(frame_rate_cap_filter_fps(&req, &probe).unwrap(), Some(30));
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(filters, "setpts=PTS/2.000000000,fps=30");
+
+        req.advanced.frame_rate_cap_fps = None;
+        assert_eq!(
+            output_frame_rate_for_planning(&req, &probe).unwrap(),
+            Some(60.0)
         );
     }
 
@@ -3382,6 +3576,101 @@ Encoders:
             filters,
             "atrim=start=1:end=5,asetpts=PTS-STARTPTS,areverse,atempo=2.0,atempo=2.000000"
         );
+    }
+
+    #[test]
+    fn build_audio_filters_inserts_loudnorm_after_trim() {
+        let mut req = base_request();
+        req.normalize_audio = true;
+        req.trim = Some(Trim {
+            start_s: 1.0,
+            end_s: Some(5.0),
+        });
+
+        let probe = probe_10s_1920x1080_audio();
+        let filters = build_audio_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(
+            filters,
+            "atrim=start=1:end=5,asetpts=PTS-STARTPTS,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"
+        );
+
+        let silent_probe = VideoProbe {
+            has_audio: false,
+            ..probe_10s_1920x1080_audio()
+        };
+        assert_eq!(build_audio_filters(&req, &silent_probe).unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_audio_forces_reencode() {
+        let probe = probe_10s_1920x1080_audio();
+        let mut req = base_request();
+        req.normalize_audio = true;
+        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+        assert!(advanced_forces_reencode(&req, &probe, true).unwrap());
+
+        req.audio_enabled = false;
+        assert!(!advanced_forces_reencode(&req, &probe, false).unwrap());
+    }
+
+    #[test]
+    fn parse_probe_output_swaps_dimensions_for_display_rotation() {
+        let json = r#"{
+            "format": {"duration": "12.5"},
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "avg_frame_rate": "30/1",
+                    "side_data_list": [
+                        {"side_data_type": "Display Matrix", "rotation": -90}
+                    ]
+                },
+                {"codec_type": "audio"}
+            ]
+        }"#;
+        let probe = parse_probe_output(json).unwrap();
+        assert_eq!((probe.width, probe.height), (1080, 1920));
+        assert!(probe.has_audio);
+        assert!((probe.duration_s - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_probe_output_handles_legacy_rotate_tag_and_180() {
+        let rotated_tag = r#"{
+            "format": {"duration": "5"},
+            "streams": [
+                {"codec_type": "video", "width": 640, "height": 480,
+                 "avg_frame_rate": "30/1", "tags": {"rotate": "90"}}
+            ]
+        }"#;
+        let probe = parse_probe_output(rotated_tag).unwrap();
+        assert_eq!((probe.width, probe.height), (480, 640));
+
+        let upside_down = r#"{
+            "format": {"duration": "5"},
+            "streams": [
+                {"codec_type": "video", "width": 640, "height": 480,
+                 "avg_frame_rate": "30/1",
+                 "side_data_list": [
+                    {"side_data_type": "Display Matrix", "rotation": 180}
+                 ]}
+            ]
+        }"#;
+        let probe = parse_probe_output(upside_down).unwrap();
+        assert_eq!((probe.width, probe.height), (640, 480));
+
+        let no_rotation = r#"{
+            "format": {"duration": "5"},
+            "streams": [
+                {"codec_type": "video", "width": 640, "height": 480,
+                 "avg_frame_rate": "30/1"}
+            ]
+        }"#;
+        let probe = parse_probe_output(no_rotation).unwrap();
+        assert_eq!((probe.width, probe.height), (640, 480));
+        assert!(!probe.has_audio);
     }
 
     #[test]

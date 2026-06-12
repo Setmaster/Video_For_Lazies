@@ -24,6 +24,7 @@ It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local t
 - Queue several export snapshots and run them sequentially with one FFmpeg job at a time.
 - Target a file size in decimal MB, or disable size targeting for constant-quality export.
 - Override codec, quality, encode speed, frame-rate cap, audio bitrate, and audio channels when Auto is not the right fit.
+- Normalize quiet or uneven speech loudness, which helps screen recordings.
 - Expand the last export details to inspect the effective encode mode, selected codecs, bitrates, size target, actual size, and a redacted FFmpeg command preview.
 - Keep audio on/off, title metadata, recent export status, and output format in the app workflow.
 - Auto-suggest safe output names in the same folder and avoid overwriting existing `-N` exports.

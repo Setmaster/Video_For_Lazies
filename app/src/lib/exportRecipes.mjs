@@ -25,12 +25,12 @@ export const EXPORT_RECIPES = [
     },
   },
   {
-    id: "discord-25mb",
-    label: "Discord 25 MB",
-    description: "MP4, 720p, size-targeted for common upload limits.",
+    id: "discord-10mb",
+    label: "Discord 10 MB",
+    description: "MP4, 720p, sized for Discord's 10 MB free upload limit.",
     settings: {
       format: "mp4",
-      sizeLimitMb: "25",
+      sizeLimitMb: "10",
       resize: {
         mode: "maxEdge",
         maxEdgePx: "720",
@@ -41,9 +41,9 @@ export const EXPORT_RECIPES = [
       audioEnabled: true,
       advanced: {
         videoCodec: "h264",
-        audioBitrateKbps: null,
+        audioBitrateKbps: 96,
         videoQuality: "auto",
-        encodeSpeed: "balanced",
+        encodeSpeed: "smaller",
         frameRateCapFps: 30,
         audioChannels: "auto",
       },
@@ -69,6 +69,31 @@ export const EXPORT_RECIPES = [
         audioBitrateKbps: null,
         videoQuality: "auto",
         encodeSpeed: "balanced",
+        frameRateCapFps: 30,
+        audioChannels: "mono",
+      },
+    },
+  },
+  {
+    id: "forum-4mb",
+    label: "Forum 4 MB",
+    description: "MP4, 540p, tight 4 MB cap for forum attachment limits.",
+    settings: {
+      format: "mp4",
+      sizeLimitMb: "4",
+      resize: {
+        mode: "maxEdge",
+        maxEdgePx: "540",
+        widthPx: "",
+        heightPx: "",
+        lockAspect: true,
+      },
+      audioEnabled: true,
+      advanced: {
+        videoCodec: "h264",
+        audioBitrateKbps: 96,
+        videoQuality: "auto",
+        encodeSpeed: "smaller",
         frameRateCapFps: 30,
         audioChannels: "mono",
       },
@@ -207,6 +232,7 @@ export function recipeMatchesSettings(recipe, settings) {
     normalizeTextSetting(settings.sizeLimitMb) === normalizeTextSetting(recipeSettings.sizeLimitMb) &&
     resizeMatches &&
     Boolean(settings.audioEnabled) === Boolean(recipeSettings.audioEnabled) &&
+    Boolean(settings.normalizeAudio) === Boolean(recipeSettings.normalizeAudio) &&
     (currentAdvanced.videoCodec ?? "auto") === (recipeAdvanced.videoCodec ?? "auto") &&
     normalizeAdvancedNumber(currentAdvanced.audioBitrateKbps) === normalizeAdvancedNumber(recipeAdvanced.audioBitrateKbps) &&
     (currentAdvanced.videoQuality ?? "auto") === (recipeAdvanced.videoQuality ?? "auto") &&

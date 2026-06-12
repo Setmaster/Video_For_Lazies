@@ -18,9 +18,35 @@ test("built-in export recipes cover the supported output formats", () => {
 });
 
 test("findMatchingExportRecipe matches a full recipe settings snapshot", () => {
-  const recipe = findExportRecipe("discord-25mb");
+  const recipe = findExportRecipe("discord-10mb");
 
-  assert.equal(findMatchingExportRecipe(recipe.settings)?.id, "discord-25mb");
+  assert.equal(findMatchingExportRecipe(recipe.settings)?.id, "discord-10mb");
+});
+
+test("discord recipe targets the current 10 MB free upload limit", () => {
+  const recipe = findExportRecipe("discord-10mb");
+
+  assert.equal(recipe.settings.sizeLimitMb, "10");
+  assert.equal(findExportRecipe("discord-25mb"), null);
+});
+
+test("forum recipe caps exports at 4 MB", () => {
+  const recipe = findExportRecipe("forum-4mb");
+
+  assert.equal(recipe.label, "Forum 4 MB");
+  assert.equal(recipe.settings.sizeLimitMb, "4");
+  assert.equal(recipe.settings.format, "mp4");
+  assert.equal(findMatchingExportRecipe(recipe.settings)?.id, "forum-4mb");
+});
+
+test("normalize-audio edits break recipe matching", () => {
+  const recipe = findExportRecipe("quick-share");
+  const changed = {
+    ...recipe.settings,
+    normalizeAudio: true,
+  };
+
+  assert.equal(findMatchingExportRecipe(changed), null);
 });
 
 test("recipe matching treats edited settings as custom", () => {

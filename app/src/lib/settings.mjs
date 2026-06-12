@@ -17,6 +17,9 @@ export function parsePersistedSettings(raw) {
     if (VALID_FORMATS.has(parsed.format)) {
       next.format = parsed.format;
     }
+    if (parsed.normalizeAudio === true) {
+      next.normalizeAudio = true;
+    }
     if (parsed.advanced && typeof parsed.advanced === "object") {
       const advanced = {};
       if (VALID_VIDEO_CODECS.has(parsed.advanced.videoCodec) && parsed.advanced.videoCodec !== "auto") {
@@ -51,6 +54,9 @@ export function serializePersistedSettings(settings) {
   const next = {};
   if (VALID_FORMATS.has(settings?.format)) {
     next.format = settings.format;
+  }
+  if (settings?.normalizeAudio === true) {
+    next.normalizeAudio = true;
   }
   const advanced = {};
   if (VALID_VIDEO_CODECS.has(settings?.advanced?.videoCodec) && settings.advanced.videoCodec !== "auto") {

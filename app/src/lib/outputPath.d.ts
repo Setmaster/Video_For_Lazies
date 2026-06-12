@@ -7,4 +7,5 @@ export function extname(p: string): string;
 export function stem(p: string): string;
 export function replaceExtension(p: string, newExt: string): string;
 export function suggestOutputPath(inputPath: string, formatExt: string): string;
+export function ensureUniqueOutputPath(candidate: string, takenPaths: Iterable<string> | null | undefined): string;
 

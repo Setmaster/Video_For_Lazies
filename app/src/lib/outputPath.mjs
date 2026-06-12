@@ -56,3 +56,23 @@ export function suggestOutputPath(inputPath, formatExt) {
   const ext = formatExt.startsWith(".") ? formatExt.slice(1) : formatExt;
   return `${dir}${nextStem}.${ext}`;
 }
+
+export function ensureUniqueOutputPath(candidate, takenPaths) {
+  // Disk existence is the backend's job; this guards against paths already
+  // claimed by queued export snapshots that have not been written yet.
+  const taken = new Set();
+  for (const path of takenPaths ?? []) {
+    if (typeof path === "string" && path) taken.add(path);
+  }
+
+  let next = candidate;
+  let guard = 0;
+  while (taken.has(next) && guard < 10_000) {
+    const { dir } = splitPath(next);
+    const bumpedStem = incrementSuffixNumber(stem(next));
+    const ext = extname(next);
+    next = `${dir}${bumpedStem}${ext ? `.${ext}` : ""}`;
+    guard += 1;
+  }
+  return next;
+}

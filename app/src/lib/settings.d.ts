@@ -2,6 +2,7 @@ import type { AdvancedEncodeSettings, OutputFormat } from "./types";
 
 export type PersistedSettings = {
   format?: OutputFormat;
+  normalizeAudio?: boolean;
   advanced?: AdvancedEncodeSettings;
 };
 

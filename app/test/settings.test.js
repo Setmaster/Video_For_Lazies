@@ -112,3 +112,20 @@ test("serializePersistedSettings omits auto advanced defaults", () => {
     JSON.stringify({ format: "mp4" }),
   );
 });
+
+test("normalizeAudio persists only when enabled and ignores garbage", () => {
+  assert.equal(
+    serializePersistedSettings({ format: "mp4", normalizeAudio: true }),
+    JSON.stringify({ format: "mp4", normalizeAudio: true }),
+  );
+  assert.equal(
+    serializePersistedSettings({ format: "mp4", normalizeAudio: false }),
+    JSON.stringify({ format: "mp4" }),
+  );
+
+  assert.deepEqual(parsePersistedSettings(JSON.stringify({ normalizeAudio: true })), {
+    normalizeAudio: true,
+  });
+  assert.deepEqual(parsePersistedSettings(JSON.stringify({ normalizeAudio: "yes" })), {});
+  assert.deepEqual(parsePersistedSettings(JSON.stringify({ normalizeAudio: 1 })), {});
+});

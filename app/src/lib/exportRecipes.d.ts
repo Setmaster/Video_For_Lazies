@@ -21,6 +21,7 @@ export type ExportRecipeSettings = {
   resize: ExportRecipeResizeSettings;
   maxEdgePx?: string;
   audioEnabled: boolean;
+  normalizeAudio?: boolean;
   advanced: {
     videoCodec: VideoCodecPreference;
     audioBitrateKbps: number | null;

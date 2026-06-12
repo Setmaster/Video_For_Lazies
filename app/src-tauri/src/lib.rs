@@ -66,6 +66,21 @@ impl JobManager {
     fn alloc_job_id(&self) -> u64 {
         self.next_job_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    fn kill_active_job(&self) {
+        let Ok(guard) = self.current.lock() else {
+            return;
+        };
+        let Some(handle) = guard.as_ref() else {
+            return;
+        };
+        handle.cancel.store(true, Ordering::Relaxed);
+        if let Ok(mut child_guard) = handle.child.lock()
+            && let Some(child) = child_guard.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }
 }
 
 fn parse_smoke_f64(
@@ -342,8 +357,12 @@ fn detect_crop(path: String) -> Result<Option<video::Crop>, String> {
 }
 
 #[tauri::command]
-fn suggest_output_path(input_path: String, format: video::OutputFormat) -> Result<String, String> {
-    video::suggest_output_path_unique(input_path, format)
+fn suggest_output_path(
+    input_path: String,
+    format: video::OutputFormat,
+    taken_paths: Option<Vec<String>>,
+) -> Result<String, String> {
+    video::suggest_output_path_unique(input_path, format, &taken_paths.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -504,6 +523,15 @@ pub fn run() {
         .manage(JobManager::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // Destroyed (not CloseRequested) so the frontend close-confirm can still
+        // prevent the close; once the window is really gone, no ffmpeg child may
+        // outlive the app.
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let manager: State<'_, JobManager> = window.app_handle().state();
+                manager.kill_active_job();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             probe_video,
             detect_crop,

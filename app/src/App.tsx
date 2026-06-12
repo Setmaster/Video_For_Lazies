@@ -2,7 +2,7 @@ import { useEffect, useEffectEvent, useMemo, useRef, useState, type CSSPropertie
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
 import type {
@@ -31,14 +31,20 @@ import {
   SUPPORTED_INPUT_EXTENSIONS,
 } from "./lib/dropInput";
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
-import { basename, dirname, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
+import { basename, dirname, ensureUniqueOutputPath, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
 import { getActiveProgressUi } from "./lib/progress";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import { EXPORT_RECIPES, findMatchingExportRecipe, normalizeRecipeResizeSettings, type ExportRecipe } from "./lib/exportRecipes";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
-const SIZE_PRESETS_MB = [8, 10, 25, 50] as const;
+const SIZE_PRESETS_MB = [4, 10, 25, 50] as const;
+const SIZE_PRESET_HINTS: Record<number, string> = {
+  4: "Common forum attachment cap",
+  10: "Discord free upload limit",
+  25: "Gmail attachment limit",
+  50: "Discord Nitro Basic / level 2 server boost",
+};
 const OUTPUT_DIMENSION_MIN_PX = 16;
 const OUTPUT_DIMENSION_MAX_PX = 32768;
 const AUDIO_BITRATE_PRESETS_KBPS = [96, 128, 192, 256, 320] as const;
@@ -82,7 +88,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.6.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -329,6 +335,7 @@ function App() {
   const [customHeightPx, setCustomHeightPx] = useState("");
   const [outputAspectLocked, setOutputAspectLocked] = useState(true);
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [normalizeAudio, setNormalizeAudio] = useState(false);
   const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
   const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
   const [advancedVideoQuality, setAdvancedVideoQuality] = useState<VideoQualityPreference>("auto");
@@ -379,6 +386,9 @@ function App() {
   const [aboutOpen, setAboutOpen] = useState(false);
 
   const jobIdRef = useRef<number | null>(null);
+  const inputPathRef = useRef("");
+  const audioEnabledRef = useRef(true);
+  const autoMutedRef = useRef(false);
   const formatRef = useRef<OutputFormat>(format);
   const outputAutoRef = useRef<boolean>(outputAuto);
   const cropperRef = useRef<VideoCropperHandle | null>(null);
@@ -607,8 +617,50 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const handle = await getCurrentWindow().onCloseRequested(async (event) => {
+          const queuedCount = exportQueueRef.current.filter((item) => item.status === "queued").length;
+          const encoding = jobIdRef.current !== null;
+          if (!encoding && queuedCount === 0) return;
+
+          const queuedText = `${queuedCount} queued export${queuedCount === 1 ? "" : "s"}`;
+          const summary = encoding
+            ? queuedCount > 0
+              ? `An export is still running and ${queuedText} have not started.`
+              : "An export is still running."
+            : `${queuedText} have not started.`;
+          const ok = await confirmDialog(`${summary} Close anyway?`, {
+            title: "Video For Lazies",
+            kind: "warning",
+          });
+          if (!ok) event.preventDefault();
+        });
+        if (cancelled) handle();
+        else unlisten = handle;
+      } catch {
+        // Not running inside a Tauri window.
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
     previewPlayingRef.current = previewPlaying;
   }, [previewPlaying]);
+
+  useEffect(() => {
+    inputPathRef.current = inputPath;
+  }, [inputPath]);
+
+  useEffect(() => {
+    audioEnabledRef.current = audioEnabled;
+  }, [audioEnabled]);
 
   useEffect(() => {
     setPreviewTimeS(0);
@@ -625,6 +677,7 @@ function App() {
     try {
       const parsed = parsePersistedSettings(localStorage.getItem(SETTINGS_KEY));
       if (parsed.format) setFormat(parsed.format);
+      if (parsed.normalizeAudio) setNormalizeAudio(true);
       if (parsed.advanced?.videoCodec) setAdvancedVideoCodec(parsed.advanced.videoCodec);
       if (parsed.advanced?.audioBitrateKbps) setAdvancedAudioBitrateKbps(String(parsed.advanced.audioBitrateKbps));
       if (parsed.advanced?.videoQuality) setAdvancedVideoQuality(parsed.advanced.videoQuality);
@@ -645,6 +698,7 @@ function App() {
         SETTINGS_KEY,
         serializePersistedSettings({
           format,
+          normalizeAudio,
           advanced: {
             videoCodec: advancedVideoCodec,
             audioBitrateKbps: advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps),
@@ -661,6 +715,7 @@ function App() {
   }, [
     settingsReady,
     format,
+    normalizeAudio,
     advancedVideoCodec,
     advancedAudioBitrateKbps,
     advancedVideoQuality,
@@ -718,6 +773,8 @@ function App() {
     setCustomHeightPx("");
     setOutputAspectLocked(true);
     setAudioEnabled(true);
+    setNormalizeAudio(false);
+    autoMutedRef.current = false;
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
     setAdvancedVideoQuality("auto");
@@ -755,7 +812,12 @@ function App() {
     setCustomWidthPx(recipeResize.widthPx);
     setCustomHeightPx(recipeResize.heightPx);
     setOutputAspectLocked(recipeResize.lockAspect);
-    setAudioEnabled(recipeSettings.format === "mp3" ? true : recipeSettings.audioEnabled);
+    setAudioEnabled(
+      recipeSettings.format === "mp3"
+        ? true
+        : recipeSettings.audioEnabled && (probe ? probe.hasAudio : true),
+    );
+    setNormalizeAudio(Boolean(recipeSettings.normalizeAudio));
     setAdvancedVideoCodec(recipeAdvanced.videoCodec);
     setAdvancedAudioBitrateKbps(recipeAdvanced.audioBitrateKbps === null ? "auto" : String(recipeAdvanced.audioBitrateKbps));
     setAdvancedVideoQuality(recipeAdvanced.videoQuality);
@@ -822,6 +884,8 @@ function App() {
     setCustomHeightPx(smokeConfig.resizeHeightPx === null || smokeConfig.resizeHeightPx === undefined ? "" : formatNumberInput(smokeConfig.resizeHeightPx));
     setOutputAspectLocked(true);
     setAudioEnabled(true);
+    setNormalizeAudio(false);
+    autoMutedRef.current = false;
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
     setAdvancedVideoQuality("auto");
@@ -875,10 +939,12 @@ function App() {
     const endRaw = trimEnd.trim() === "" ? null : Number(trimEnd);
     if (endRaw !== null && (!Number.isFinite(endRaw) || endRaw < 0)) return null;
 
-    const endS = (endRaw ?? probe.durationS) as number;
-    if (endS <= startRaw) return null;
+    // Mirror the request clamping so size planning never budgets beyond the clip.
+    const startS = Math.min(startRaw, probe.durationS);
+    const endS = Math.min(endRaw ?? probe.durationS, probe.durationS);
+    if (endS <= startS) return null;
 
-    const durationS = Math.max(0.001, (endS - startRaw) / speedNum);
+    const durationS = Math.max(0.001, (endS - startS) / speedNum);
     const sizeLimitEnabled = sizeMb > 0;
     const totalKbps = sizeLimitEnabled
       ? Math.max(1, Math.floor((sizeMb * 1_000_000 * 8 * 0.95) / durationS / 1000))
@@ -1068,6 +1134,7 @@ function App() {
   const audioOverrideCanApply =
     format === "mp3" ? Boolean(probe?.hasAudio) : audioEnabled && Boolean(probe?.hasAudio);
   const advancedAudioChannelsApplies = advancedAudioChannels !== "auto" && audioOverrideCanApply;
+  const normalizeAudioApplies = normalizeAudio && audioOverrideCanApply;
   const advancedVideoQualityApplies = format !== "mp3" && !sizeLimitEnabled && advancedVideoQuality !== "auto";
   const advancedEncodeSpeedApplies = format !== "mp3" && advancedEncodeSpeed !== "auto";
   const advancedCodecSummary =
@@ -1118,7 +1185,8 @@ function App() {
     (advancedVideoQuality === "auto" ? 0 : 1) +
     (advancedEncodeSpeed === "auto" ? 0 : 1) +
     (advancedFrameRateCapRequest === null ? 0 : 1) +
-    (advancedAudioChannels === "auto" ? 0 : 1);
+    (advancedAudioChannels === "auto" ? 0 : 1) +
+    (normalizeAudio ? 1 : 0);
   const hasVideoEditTransforms =
     Boolean(trimSummary) ||
     Boolean(cropEnabled && cropSummary && cropSummary !== "Full frame selected.") ||
@@ -1134,7 +1202,8 @@ function App() {
       advancedEncodeSpeedApplies ||
       frameRateCapApplies ||
       advancedAudioApplies ||
-      advancedAudioChannelsApplies);
+      advancedAudioChannelsApplies ||
+      normalizeAudioApplies);
   const encodeModeSummary =
     format === "mp3"
       ? "Audio-only re-encode"
@@ -1158,6 +1227,7 @@ function App() {
         lockAspect: outputAspectLocked,
       },
       audioEnabled,
+      normalizeAudio,
       advanced: {
         videoCodec: advancedVideoCodec,
         audioBitrateKbps: advancedAudioBitrateRequest,
@@ -1176,6 +1246,7 @@ function App() {
       customHeightPx,
       outputAspectLocked,
       audioEnabled,
+      normalizeAudio,
       advancedVideoCodec,
       advancedAudioBitrateRequest,
       advancedVideoQuality,
@@ -1250,6 +1321,7 @@ function App() {
     if (advancedFrameRateCapRequest !== null && format !== "mp3") chips.push(`${advancedFrameRateCapRequest} fps cap`);
     if (advancedAudioBitrateRequest !== null) chips.push(`Audio ${advancedAudioBitrateRequest}k`);
     if (advancedAudioChannels !== "auto") chips.push(AUDIO_CHANNEL_LABELS[advancedAudioChannels]);
+    if (normalizeAudioApplies) chips.push("Normalized audio");
 
     return chips;
   }, [
@@ -1277,6 +1349,7 @@ function App() {
     advancedFrameRateCapRequest,
     advancedAudioBitrateRequest,
     advancedAudioChannels,
+    normalizeAudioApplies,
   ]);
 
   const lastExportSizeText = lastExport?.outputSizeBytes ? `${(lastExport.outputSizeBytes / 1_000_000).toFixed(2)} MB` : null;
@@ -1457,13 +1530,14 @@ function App() {
       }
       if (!outputAuto) return;
 
+      const takenPaths = exportQueueRef.current.map((item) => item.request.outputPath);
       try {
-        const suggested = await invoke<string>("suggest_output_path", { inputPath, format });
+        const suggested = await invoke<string>("suggest_output_path", { inputPath, format, takenPaths });
         if (stop) return;
         setOutputPath(suggested);
       } catch {
         if (stop) return;
-        setOutputPath(suggestOutputPath(inputPath, format));
+        setOutputPath(ensureUniqueOutputPath(suggestOutputPath(inputPath, format), takenPaths));
       }
     }
     run();
@@ -1595,7 +1669,15 @@ function App() {
         const p = await invoke<VideoProbe>("probe_video", { path: inputPath });
         if (stop) return;
         setProbe(p);
-        if (!p.hasAudio) setAudioEnabled(false);
+        if (!p.hasAudio) {
+          // Remember that the mute was automatic so the next input with audio
+          // does not silently inherit it.
+          if (audioEnabledRef.current) autoMutedRef.current = true;
+          setAudioEnabled(false);
+        } else if (autoMutedRef.current) {
+          autoMutedRef.current = false;
+          setAudioEnabled(true);
+        }
         if (!p.hasAudio && formatRef.current === "mp3") {
           setFormat("mp4");
         }
@@ -2034,6 +2116,7 @@ function App() {
       title: null,
       sizeLimitMb: size,
       audioEnabled: format === "mp3" ? true : audioEnabled,
+      normalizeAudio,
       advanced: buildAdvancedSettings(),
       trim: null,
       crop: null,
@@ -2062,8 +2145,14 @@ function App() {
     const sat = saturation.trim() === "" ? 1 : parseNum("Saturation", saturation, { min: 0, max: 3 });
     const color: ColorAdjust | null = b !== 0 || c !== 1 || sat !== 1 ? { brightness: b, contrast: c, saturation: sat } : null;
 
-    const startS = trimStart.trim() === "" ? 0 : parseNum("Trim start (s)", trimStart, { min: 0 });
-    const endS = trimEnd.trim() === "" ? null : parseNum("Trim end (s)", trimEnd, { min: 0 });
+    const startRaw = trimStart.trim() === "" ? 0 : parseNum("Trim start (s)", trimStart, { min: 0 });
+    const endRaw = trimEnd.trim() === "" ? null : parseNum("Trim end (s)", trimEnd, { min: 0 });
+    // Clamp to the probed clip so typed values past the end cannot skew the
+    // backend's size planning.
+    const startS = Math.min(startRaw, probe.durationS);
+    if (startS >= probe.durationS) throw new Error("Trim start (s) is past the end of the clip.");
+    const endS = endRaw === null || endRaw >= probe.durationS ? null : endRaw;
+    if (endS !== null && endS <= startS) throw new Error("Trim end (s) must be greater than trim start.");
     const trim = startS > 0 || endS !== null ? { startS, endS } : null;
 
     const cropPx = cropEnabled
@@ -2087,6 +2176,7 @@ function App() {
       title: title.trim() ? title.trim() : null,
       sizeLimitMb: size,
       audioEnabled: audioEnabled,
+      normalizeAudio,
       advanced: buildAdvancedSettings(),
       trim,
       crop,
@@ -2129,11 +2219,19 @@ function App() {
     setStatus(`Queued ${label}.`);
   }
 
-  async function suggestedOutputForInput(nextInputPath: string, nextFormat: OutputFormat) {
+  function queuedOutputPaths(): string[] {
+    return exportQueueRef.current.map((item) => item.request.outputPath);
+  }
+
+  async function suggestedOutputForInput(nextInputPath: string, nextFormat: OutputFormat, takenPaths: string[]) {
     try {
-      return await invoke<string>("suggest_output_path", { inputPath: nextInputPath, format: nextFormat });
+      return await invoke<string>("suggest_output_path", {
+        inputPath: nextInputPath,
+        format: nextFormat,
+        takenPaths,
+      });
     } catch {
-      return suggestOutputPath(nextInputPath, nextFormat);
+      return ensureUniqueOutputPath(suggestOutputPath(nextInputPath, nextFormat), takenPaths);
     }
   }
 
@@ -2141,7 +2239,15 @@ function App() {
     if (!exportReady) return;
     try {
       const request = buildRequest();
-      enqueueItems([createQueueItem(request, plannedSummary?.durationS ?? null)]);
+      // Earlier queue snapshots may already claim this suggested path even
+      // though nothing exists on disk yet.
+      const outputPath = ensureUniqueOutputPath(request.outputPath, queuedOutputPaths());
+      enqueueItems([
+        createQueueItem(
+          outputPath === request.outputPath ? request : { ...request, outputPath },
+          plannedSummary?.durationS ?? null,
+        ),
+      ]);
     } catch (e) {
       setStatus(coerceErrorMessage(e, "Failed to queue current export."));
     }
@@ -2161,8 +2267,10 @@ function App() {
       if (!paths.length) return;
 
       const items: ExportQueueItem[] = [];
+      const takenPaths = queuedOutputPaths();
       for (const nextInputPath of paths) {
-        const nextOutputPath = await suggestedOutputForInput(nextInputPath, format);
+        const nextOutputPath = await suggestedOutputForInput(nextInputPath, format, takenPaths);
+        takenPaths.push(nextOutputPath);
         const request = buildSettingsOnlyRequest(nextInputPath, nextOutputPath);
         items.push(createQueueItem(request, null));
       }
@@ -2246,10 +2354,14 @@ function App() {
 
   async function autoDetectCrop() {
     if (!inputPath || !probe) return;
+    const requestedPath = inputPath;
     setCropDetectHint(null);
     setCropDetecting(true);
     try {
       const crop = await invoke<Crop | null>("detect_crop", { path: inputPath });
+      // A slow detection must not apply the old video's crop to a newly
+      // loaded input.
+      if (inputPathRef.current !== requestedPath) return;
       if (!crop) {
         setCropDetectHint("No crop detected.");
         return;
@@ -2263,6 +2375,7 @@ function App() {
       setCropEnabled(true);
       setCropDetectHint(`Detected ${crop.width}x${crop.height} @ ${crop.x},${crop.y}.`);
     } catch (e) {
+      if (inputPathRef.current !== requestedPath) return;
       const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "Crop detection failed.";
       setCropDetectHint(msg);
     } finally {
@@ -3628,6 +3741,28 @@ function App() {
                       </div>
                     </div>
 
+                    <div className="vfl-row2">
+                      <div className="vfl-field">
+                        <div className="vfl-field-label">Audio cleanup</div>
+                        <label className="vfl-check vfl-check-card">
+                          <input
+                            type="checkbox"
+                            checked={normalizeAudio}
+                            onChange={(e) => setNormalizeAudio(e.currentTarget.checked)}
+                            disabled={jobId !== null || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
+                          />
+                          <span>Normalize speech</span>
+                        </label>
+                        <div className="vfl-inline-hint">
+                          {normalizeAudio
+                            ? normalizeAudioApplies
+                              ? "Evens out quiet or uneven voice loudness. Forces a re-encode."
+                              : "Waiting for an export with included audio."
+                            : "Evens out quiet or uneven voice loudness in screen recordings."}
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="vfl-actions vfl-actions-secondary">
                       <button
                         type="button"
@@ -3638,6 +3773,7 @@ function App() {
                           setAdvancedEncodeSpeed("auto");
                           setAdvancedFrameRateCapFps("auto");
                           setAdvancedAudioChannels("auto");
+                          setNormalizeAudio(false);
                         }}
                         disabled={jobId !== null || advancedOverrideCount === 0}
                       >
@@ -3824,7 +3960,10 @@ function App() {
                           <input
                             type="checkbox"
                             checked={audioEnabled}
-                            onChange={(e) => setAudioEnabled(e.currentTarget.checked)}
+                            onChange={(e) => {
+                              autoMutedRef.current = false;
+                              setAudioEnabled(e.currentTarget.checked);
+                            }}
                             disabled={jobId !== null || format === "mp3" || !probe?.hasAudio}
                           />
                           <span>{format === "mp3" ? "Always enabled for mp3 export" : "Include audio in the export"}</span>
@@ -3860,6 +3999,7 @@ function App() {
                                 className={`vfl-preset-chip ${active ? "active" : ""}`}
                                 onClick={() => setSizeLimitMb(String(v))}
                                 disabled={jobId !== null}
+                                title={SIZE_PRESET_HINTS[v]}
                               >
                                 {v} MB
                               </button>
