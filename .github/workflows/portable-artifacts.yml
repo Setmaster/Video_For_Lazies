@@ -109,6 +109,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         working-directory: app
 
+      - name: Check pinned FFmpeg bundle URLs
+        run: node scripts/check-ffmpeg-urls.mjs
+        working-directory: app
+
       - name: Audit npm dependencies
         run: npm audit --audit-level=moderate
         working-directory: app
@@ -151,6 +155,38 @@ jobs:
             release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
+
+      - name: Collect failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const os = require("node:os");
+            const path = require("node:path");
+            const dest = path.join(process.env.RUNNER_TEMP, "vfl-failure-diagnostics");
+            fs.mkdirSync(dest, { recursive: true });
+            for (const root of new Set([os.tmpdir(), process.env.RUNNER_TEMP])) {
+              if (!root || !fs.existsSync(root)) continue;
+              for (const entry of fs.readdirSync(root)) {
+                if (!entry.startsWith("vfl-")) continue;
+                const from = path.join(root, entry);
+                if (from === dest) continue;
+                try {
+                  fs.cpSync(from, path.join(dest, entry), { recursive: true });
+                } catch {}
+              }
+            }
+          '
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-diagnostics-${{ matrix.target }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/vfl-failure-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
 
   release:
     name: Create GitHub Release
@@ -206,6 +242,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.VFL_UPDATE_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.VFL_UPDATE_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: node scripts/sign-update-manifest.mjs --release-assets release/release-assets
+        working-directory: app
+
+      - name: Verify update manifest signature against embedded public keys
+        run: node scripts/verify-update-manifest.mjs --release-assets release/release-assets
         working-directory: app
 
       - name: Generate release notes

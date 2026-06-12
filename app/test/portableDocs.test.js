@@ -112,3 +112,40 @@ test("checked-in FFmpeg bundling doc matches pinned bundle config", () => {
     assert.match(doc, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
 });
+
+test("public docs carry no stale FFmpeg pin identifiers", () => {
+  // The v1.5.0 zips shipped with a provenance doc describing the previous pin
+  // because only current-value presence was checked; reject any pin-shaped
+  // string that is not part of the current bundle config.
+  const currentValues = new Set();
+  for (const bundle of [FFMPEG_BUNDLE.windowsX64, FFMPEG_BUNDLE.linuxX64]) {
+    currentValues.add(bundle.releaseTag);
+    currentValues.add(bundle.sourceCommit);
+    currentValues.add(bundle.buildScriptsCommit);
+    currentValues.add(bundle.x264Commit);
+    currentValues.add(bundle.assetSha256);
+    currentValues.add(bundle.sourceSha256);
+    currentValues.add(bundle.buildScriptsSha256);
+    currentValues.add(bundle.x264Sha256);
+    currentValues.add(bundle.versionString);
+  }
+  for (const docPath of ["docs/ffmpeg-bundling.md", "docs/release.md"]) {
+    const doc = fs.readFileSync(path.resolve(repoRoot, docPath), "utf8");
+
+    for (const match of doc.matchAll(/autobuild-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}/g)) {
+      assert.ok(currentValues.has(match[0]), `${docPath} mentions stale release tag ${match[0]}`);
+    }
+    for (const match of doc.matchAll(/\b[0-9a-f]{40}\b/g)) {
+      assert.ok(currentValues.has(match[0]), `${docPath} mentions stale pin hash ${match[0]}`);
+    }
+    for (const match of doc.matchAll(/\b[0-9a-f]{64}\b/g)) {
+      assert.ok(currentValues.has(match[0]), `${docPath} mentions stale sha256 ${match[0]}`);
+    }
+    for (const match of doc.matchAll(/\bn\d+\.\d+(?:\.\d+)?-\d+-g[0-9a-f]+(?:-\d+)?\b/g)) {
+      assert.ok(
+        [...currentValues].some((value) => value.includes(match[0]) || match[0].includes(value)),
+        `${docPath} mentions stale FFmpeg version string ${match[0]}`,
+      );
+    }
+  }
+});
