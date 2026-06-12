@@ -67,23 +67,14 @@ cargo test
 
 ## Features (current)
 
+- Workbench layout: the video preview, scrubber, and trim controls are always visible on the left; all settings live in a fixed-width rail of collapsible cards on the right (Source & destination, Recipes, Export settings, Crop, Transform & color, Advanced, Current plan, Queue).
 - Drag and drop a video anywhere onto the window to set it as input.
-- Output path is auto-suggested in the same folder by incrementing a `-N` suffix, skips existing `-N` outputs to avoid overwrites, and changing the export format updates the output extension.
-- Export format and recent export status are remembered between launches (input/output paths are not persisted).
-- Quick size presets (8/10/25/50 MB), direct trim in/out handles under the preview, selected-boundary fine nudges plus compose shortcuts (`Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `[` and `]`), a `Current plan` summary card with plan status and last-export details, bottom-bar export/open actions, and a `Save frame (PNG)` button beside the live preview controls.
-- Composing:
-  - Trim
-  - Crop (drag-select with optional aspect lock, plus auto-detect crop)
-  - Reverse
-  - Playback speed
-  - Rotate
-  - Color adjustments (brightness, contrast, saturation)
-- General:
-  - Output format (`mp4`, `webm`, `mp3`)
-  - Size limit (MB, optional)
-  - Max edge (resize)
-  - Audio on/off
-  - Title metadata
+- Output path is auto-suggested in the same folder by incrementing a `-N` suffix, skips existing `-N` outputs and queued snapshots to avoid overwrites, and changing the export format updates the output extension.
+- Export format, normalize-speech, strip-metadata, and advanced overrides are remembered between launches (input/output paths are not persisted).
+- Quick size presets (4/10/25/50 MB), direct trim in/out handles under the preview, selected-boundary fine nudges plus compose shortcuts (`Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `[` and `]`), a `Current plan` card with plan status and last-export details, bottom-bar export/open actions plus queue position, and a `Save frame (PNG)` button beside the live preview controls.
+- Preview and shaping: trim, crop (drag-select with optional aspect lock, plus auto-detect), reverse, playback speed, rotate, and color adjustments (brightness, contrast, saturation).
+- Export settings: output format (`mp4`, `webm`, `mp3`), size limit (MB, optional), output dimensions (Original / Max edge / Custom with aspect lock), audio on/off, title metadata, and a strip-location-metadata privacy toggle (on by default).
+- Advanced: codec/quality/encode-speed/frame-rate-cap/audio overrides, speech normalization, and sample exports with a selectable 5/10/30 s window plus an extrapolated full-size estimate.
 
 ## FFmpeg runtime notes
 

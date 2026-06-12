@@ -25,6 +25,8 @@ It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local t
 - Target a file size in decimal MB, or disable size targeting for constant-quality export.
 - Override codec, quality, encode speed, frame-rate cap, audio bitrate, and audio channels when Auto is not the right fit.
 - Normalize quiet or uneven speech loudness, which helps screen recordings.
+- Strip GPS and capture metadata from exports by default, with a visible privacy toggle.
+- Keep the preview, trim, and crop always in view: settings live in a compact rail of collapsible cards beside the video.
 - Expand the last export details to inspect the effective encode mode, selected codecs, bitrates, size target, actual size, and a redacted FFmpeg command preview.
 - Keep audio on/off, title metadata, recent export status, and output format in the app workflow.
 - Auto-suggest safe output names in the same folder and avoid overwriting existing `-N` exports.

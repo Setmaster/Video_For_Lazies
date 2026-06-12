@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
@@ -95,7 +95,42 @@ const APP_LINKS = {
   security: "https://github.com/Setmaster/Video_For_Lazies/security/advisories/new",
 } as const;
 
-type ActiveTab = "general" | "composing" | "advanced";
+type RailCardKey = "source" | "recipes" | "output" | "crop" | "transform" | "advanced" | "plan" | "queue";
+const DEFAULT_OPEN_CARDS: Record<RailCardKey, boolean> = {
+  source: true,
+  recipes: true,
+  output: true,
+  crop: false,
+  transform: false,
+  advanced: false,
+  plan: true,
+  queue: false,
+};
+const SAMPLE_DURATION_CHOICES_S = [5, 10, 30] as const;
+
+type RailCardProps = {
+  title: string;
+  summary?: string | null;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+};
+
+function RailCard({ title, summary, open, onToggle, children }: RailCardProps) {
+  return (
+    <section className={`vfl-card ${open ? "is-open" : ""}`}>
+      <button type="button" className="vfl-card-head" aria-expanded={open} onClick={onToggle}>
+        <span className="vfl-card-title">{title}</span>
+        {summary ? <span className="vfl-card-summary">{summary}</span> : null}
+        <svg className="vfl-card-chevron" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        </svg>
+      </button>
+      {open ? <div className="vfl-card-body">{children}</div> : null}
+    </section>
+  );
+}
+
 type TrimFocusTarget = "preview" | "start" | "end";
 type TrimTimeline = {
   start: number;
@@ -315,7 +350,17 @@ function formatDimensionDraft(value: number) {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>("general");
+  const [openCards, setOpenCards] = useState<Record<RailCardKey, boolean>>(DEFAULT_OPEN_CARDS);
+  const [sampleDurationS, setSampleDurationS] = useState<number>(10);
+  const [sampleEstimate, setSampleEstimate] = useState<{
+    sampleBytes: number;
+    estimateBytes: number | null;
+  } | null>(null);
+  const [stripMetadata, setStripMetadata] = useState(true);
+
+  function toggleCard(key: RailCardKey) {
+    setOpenCards((cards) => ({ ...cards, [key]: !cards[key] }));
+  }
 
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
@@ -419,6 +464,7 @@ function App() {
     durationS: number | null;
     format: OutputFormat;
     queueItemId: number | null;
+    sample: { outputDurationS: number; fullDurationS: number | null } | null;
   } | null>(null);
 
   async function reportSmokeStatus(stage: string, extra: Omit<AppSmokeStatus, "stage"> = {}) {
@@ -678,6 +724,7 @@ function App() {
       const parsed = parsePersistedSettings(localStorage.getItem(SETTINGS_KEY));
       if (parsed.format) setFormat(parsed.format);
       if (parsed.normalizeAudio) setNormalizeAudio(true);
+      if (parsed.stripMetadata === false) setStripMetadata(false);
       if (parsed.advanced?.videoCodec) setAdvancedVideoCodec(parsed.advanced.videoCodec);
       if (parsed.advanced?.audioBitrateKbps) setAdvancedAudioBitrateKbps(String(parsed.advanced.audioBitrateKbps));
       if (parsed.advanced?.videoQuality) setAdvancedVideoQuality(parsed.advanced.videoQuality);
@@ -699,6 +746,7 @@ function App() {
         serializePersistedSettings({
           format,
           normalizeAudio,
+          stripMetadata,
           advanced: {
             videoCodec: advancedVideoCodec,
             audioBitrateKbps: advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps),
@@ -716,6 +764,7 @@ function App() {
     settingsReady,
     format,
     normalizeAudio,
+    stripMetadata,
     advancedVideoCodec,
     advancedAudioBitrateKbps,
     advancedVideoQuality,
@@ -759,7 +808,6 @@ function App() {
 
     if (nextFormat !== formatRef.current) setFormat(nextFormat);
     setInputPath(path);
-    setActiveTab("general");
     setStatus("Probing…");
   }
 
@@ -774,6 +822,9 @@ function App() {
     setOutputAspectLocked(true);
     setAudioEnabled(true);
     setNormalizeAudio(false);
+    setStripMetadata(true);
+    setSampleDurationS(10);
+    setSampleEstimate(null);
     autoMutedRef.current = false;
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
@@ -842,7 +893,7 @@ function App() {
 
   useEffect(() => {
     if (encodeCapabilities || encodeCapabilitiesError) return;
-    if (activeTab !== "advanced" && advancedVideoCodec === "auto") return;
+    if (!openCards.advanced && advancedVideoCodec === "auto") return;
 
     let stop = false;
     (async () => {
@@ -860,7 +911,7 @@ function App() {
     return () => {
       stop = true;
     };
-  }, [activeTab, advancedVideoCodec, encodeCapabilities, encodeCapabilitiesError]);
+  }, [openCards.advanced, advancedVideoCodec, encodeCapabilities, encodeCapabilitiesError]);
 
   useEffect(() => {
     if (!smokeConfig || smokeAppliedRef.current) return;
@@ -906,7 +957,6 @@ function App() {
     setBrightness("0");
     setContrast("1");
     setSaturation("1");
-    setActiveTab("composing");
     setStatus("Smoke: preparing packaged interaction check…");
     void reportSmokeStatus("input-applied", {
       message: `Smoke input staged through the shared drop path: ${smokeConfig.inputPath}`,
@@ -1380,13 +1430,6 @@ function App() {
       ].filter(Boolean);
       return parts.join(" • ");
     }
-    if (activeTab === "composing") {
-      if (cropEnabled && cropSummary) return cropSummary;
-      return trimSummary ?? planSummaryText ?? inputSummary;
-    }
-    if (activeTab === "advanced") {
-      return advancedPlanSummary;
-    }
     return outputPath || planSummaryText || outputModeSummary;
   }, [
     jobId,
@@ -1395,11 +1438,6 @@ function App() {
     lastExportSizeText,
     planSummaryText,
     inputSummary,
-    activeTab,
-    cropEnabled,
-    cropSummary,
-    trimSummary,
-    advancedPlanSummary,
     outputPath,
     outputModeSummary,
   ]);
@@ -1786,7 +1824,7 @@ function App() {
         trimEndS: smokeMetrics?.trimEndS ?? null,
         expectedDurationS: smokeMetrics?.expectedDurationS ?? null,
       });
-      const result = await startEncode({ nextTab: "general" });
+      const result = await startEncode();
       if (!result.ok) {
         await reportSmokeFailure(`Packaged app smoke encode failed to start: ${result.message}`);
         return;
@@ -1860,6 +1898,17 @@ function App() {
             window.setTimeout(() => void startNextQueuedItem(), 0);
           }
           return;
+        }
+
+        if (pendingEncode?.sample && p.outputSizeBytes) {
+          const { outputDurationS, fullDurationS } = pendingEncode.sample;
+          setSampleEstimate({
+            sampleBytes: p.outputSizeBytes,
+            estimateBytes:
+              fullDurationS && outputDurationS > 0
+                ? Math.round((p.outputSizeBytes * fullDurationS) / outputDurationS)
+                : null,
+          });
         }
 
         const sizeMb = p.outputSizeBytes ? p.outputSizeBytes / 1_000_000 : null;
@@ -2117,6 +2166,7 @@ function App() {
       sizeLimitMb: size,
       audioEnabled: format === "mp3" ? true : audioEnabled,
       normalizeAudio,
+      stripMetadata,
       advanced: buildAdvancedSettings(),
       trim: null,
       crop: null,
@@ -2177,6 +2227,7 @@ function App() {
       sizeLimitMb: size,
       audioEnabled: audioEnabled,
       normalizeAudio,
+      stripMetadata,
       advanced: buildAdvancedSettings(),
       trim,
       crop,
@@ -2321,7 +2372,6 @@ function App() {
     const result = await startEncode({
       request: cloneEncodeRequest(nextItem.request),
       durationS: nextItem.durationS,
-      nextTab: "general",
       startingStatus: `Starting queued export (${queuedCount} remaining)…`,
       queueItemId: nextItem.id,
     });
@@ -2384,11 +2434,11 @@ function App() {
   }
 
   async function startEncode(options?: {
-    nextTab?: ActiveTab | null;
     request?: EncodeRequest;
     durationS?: number | null;
     startingStatus?: string;
     queueItemId?: number | null;
+    sample?: { outputDurationS: number; fullDurationS: number | null } | null;
   }): Promise<StartEncodeResult> {
     try {
       const request = options?.request ?? buildRequest();
@@ -2398,6 +2448,7 @@ function App() {
         durationS: options?.durationS ?? plannedSummary?.durationS ?? null,
         format: request.format,
         queueItemId: options?.queueItemId ?? null,
+        sample: options?.sample ?? null,
       };
       setStatus(options?.startingStatus ?? "Starting…");
       setProgress(0);
@@ -2408,10 +2459,6 @@ function App() {
       smokeJobIdRef.current = id;
       if (pendingEncodeRef.current) {
         pendingEncodeRef.current.jobId = id;
-      }
-      const nextTab = options?.nextTab === undefined ? "general" : options.nextTab;
-      if (nextTab) {
-        setActiveTab(nextTab);
       }
       return { ok: true, jobId: id };
     } catch (e) {
@@ -2439,25 +2486,27 @@ function App() {
       const sourceStart = request.trim?.startS ?? 0;
       const sourceEnd = request.trim?.endS ?? probe.durationS;
       const availableDuration = Math.max(0.1, sourceEnd - sourceStart);
-      const sampleSourceDuration = Math.min(8, availableDuration);
+      const sampleSourceDuration = Math.min(sampleDurationS, availableDuration);
       const anchorTime = clamp(previewTimeRef.current || sourceStart, sourceStart, sourceEnd);
       const latestStart = Math.max(sourceStart, sourceEnd - sampleSourceDuration);
       const sampleStart = clamp(anchorTime - sampleSourceDuration / 2, sourceStart, latestStart);
       const sampleEnd = Math.min(sourceEnd, sampleStart + sampleSourceDuration);
       const outputSampleDuration = Math.max(0.1, (sampleEnd - sampleStart) / request.speed);
+      const fullOutputDuration = plannedSummary?.durationS ?? null;
 
-      if (request.sizeLimitMb > 0 && plannedSummary?.durationS && plannedSummary.durationS > 0) {
-        request.sizeLimitMb = Math.max(0.1, request.sizeLimitMb * (outputSampleDuration / plannedSummary.durationS));
+      if (request.sizeLimitMb > 0 && fullOutputDuration && fullOutputDuration > 0) {
+        request.sizeLimitMb = Math.max(0.1, request.sizeLimitMb * (outputSampleDuration / fullOutputDuration));
       }
 
       request.outputPath = selected;
       request.trim = { startS: sampleStart, endS: sampleEnd };
 
+      setSampleEstimate(null);
       await startEncode({
         request,
         durationS: outputSampleDuration,
-        nextTab: "general",
         startingStatus: "Starting sample export…",
+        sample: { outputDurationS: outputSampleDuration, fullDurationS: fullOutputDuration },
       });
     } catch (e) {
       setStatus(coerceErrorMessage(e, "Failed to start sample export."));
@@ -2480,15 +2529,20 @@ function App() {
     }
   }
 
-  async function openOutputFolder() {
-    const p = lastExport?.outputPath || outputPath || inputPath;
-    if (!p) return;
+  async function openFolderFor(path: string) {
+    if (!path) return;
     try {
-      const dir = dirname(p);
-      await openPath(dir || p);
+      const dir = dirname(path);
+      await openPath(dir || path);
     } catch {
       // ignore
     }
+  }
+
+  async function openOutputFolder() {
+    const p = lastExport?.outputPath || outputPath || inputPath;
+    if (!p) return;
+    await openFolderFor(p);
   }
 
   async function openOutputFile(pathToOpen?: string) {
@@ -2724,7 +2778,7 @@ function App() {
   }
 
   const handleComposeShortcutKeydown = useEffectEvent((event: KeyboardEvent) => {
-    if (activeTab !== "composing" || !inputPath) return;
+    if (!inputPath || aboutOpen) return;
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
     if (blocksComposeShortcutTarget(event.target)) return;
 
@@ -3090,94 +3144,11 @@ function App() {
           </div>
         </div>
 
-        <div className="vfl-file-row">
-          <div className="vfl-file-card">
-            <div className="vfl-field">
-              <label htmlFor="vfl-input-path">Input</label>
-              <input id="vfl-input-path" value={inputPath} placeholder="Pick a video…" readOnly />
-              <div className="vfl-file-actions">
-                <button className={!inputPath ? "primary" : ""} onClick={pickInput} disabled={jobId !== null}>
-                  Browse…
-                </button>
-              </div>
-              <div className="vfl-inline-hint">Drag and drop works anywhere in the window.</div>
-            </div>
-          </div>
-
-          <div className="vfl-file-card">
-            <div className="vfl-field">
-              <label htmlFor="vfl-output-path">Output</label>
-              <input id="vfl-output-path" value={outputPath} placeholder="Pick an output path…" readOnly />
-              <div className="vfl-file-actions">
-                <button className={!outputPath ? "primary" : ""} onClick={pickOutput} disabled={!inputPath || jobId !== null}>
-                  Save as…
-                </button>
-                <button onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || jobId !== null}>
-                  Open folder
-                </button>
-              </div>
-              <div className="vfl-inline-hint">
-                {outputAuto ? "Auto-suggested beside the input file. Change it any time." : "Custom output path selected."}
-              </div>
-            </div>
-          </div>
-        </div>
-        {probeError ? <div className="vfl-error" role="alert">{probeError}</div> : null}
       </header>
 
-      <div className="vfl-body">
-        <div className="vfl-workspace-bar">
-          <div className="vfl-tabs-shell">
-            <div className="vfl-tabs" role="tablist" aria-label="Workspace tabs">
-              <button
-                id="vfl-tab-general"
-                className={activeTab === "general" ? "active" : ""}
-                onClick={() => setActiveTab("general")}
-                role="tab"
-                aria-selected={activeTab === "general"}
-                aria-controls="vfl-tabpanel-general"
-              >
-                General
-              </button>
-              <button
-                id="vfl-tab-composing"
-                className={activeTab === "composing" ? "active" : ""}
-                onClick={() => setActiveTab("composing")}
-                disabled={!inputPath}
-                role="tab"
-                aria-selected={activeTab === "composing"}
-                aria-controls="vfl-tabpanel-composing"
-              >
-                Composing
-              </button>
-              <button
-                id="vfl-tab-advanced"
-                className={activeTab === "advanced" ? "active" : ""}
-                onClick={() => setActiveTab("advanced")}
-                role="tab"
-                aria-selected={activeTab === "advanced"}
-                aria-controls="vfl-tabpanel-advanced"
-              >
-                Advanced
-              </button>
-            </div>
-          </div>
-          <div className="vfl-workspace-copy">
-            <div className="vfl-workspace-kicker">{footerKicker}</div>
-            <div className="vfl-workspace-hint">
-              {activeTab === "composing"
-                ? "Shape the clip, trim it, and adjust the frame."
-                : activeTab === "advanced"
-                  ? "Override codec and audio choices when Auto is not the right fit."
-                : "Finalize export settings, metadata, and output planning."}
-            </div>
-          </div>
-        </div>
-
-        {activeTab === "composing" ? (
-          <div className="vfl-pane" id="vfl-tabpanel-composing" role="tabpanel" aria-labelledby="vfl-tab-composing">
-            <div className="vfl-grid vfl-grid-composing">
-              <div className="vfl-section vfl-preview-section">
+      <div className="vfl-split">
+        <section className="vfl-pane-left">
+              <div className="vfl-preview-section">
                 <div className="vfl-preview-head">
                   <div>
                     <div className="vfl-section-title">Preview, trim & crop</div>
@@ -3306,8 +3277,7 @@ function App() {
                         </div>
                       </div>
 
-                      <div className="vfl-preview-side vfl-stack-md">
-                        <div className="vfl-side-block vfl-stack-sm">
+                      <div className="vfl-side-block vfl-trim-block vfl-stack-sm">
                           <div className="vfl-subsection-title">Trim</div>
                           <div className="vfl-row2">
                             <div className="vfl-field">
@@ -3389,85 +3359,373 @@ function App() {
                             </button>
                           </div>
                           {trimSummary ? <div className="vfl-inline-hint">{trimSummary}</div> : null}
-                        </div>
-
-                        <div className="vfl-side-block vfl-stack-sm">
-                          <div className="vfl-subsection-title">Crop</div>
-                          <label className="vfl-check">
-                            <input
-                              type="checkbox"
-                              checked={cropEnabled}
-                              onChange={(e) => setCropEnabled(e.currentTarget.checked)}
-                              disabled={jobId !== null || !probe}
-                            />
-                            Enable crop
-                          </label>
-                          <div className="vfl-row2 vfl-row2-compact">
-                            <label className="vfl-check">
-                              <input
-                                type="checkbox"
-                                checked={aspectLocked}
-                                onChange={(e) => setAspectLocked(e.currentTarget.checked)}
-                                disabled={jobId !== null || !cropEnabled}
-                              />
-                              Lock aspect
-                            </label>
-                            <div className="vfl-field">
-                              <label htmlFor="vfl-aspect-preset">Aspect preset</label>
-                              <select
-                                id="vfl-aspect-preset"
-                                value={aspectPreset}
-                                onChange={(e) => setAspectPreset(e.currentTarget.value as typeof aspectPreset)}
-                                disabled={jobId !== null || !cropEnabled || !aspectLocked}
-                              >
-                                <option value="free">Free</option>
-                                <option value="1:1">1:1</option>
-                                <option value="16:9">16:9</option>
-                                <option value="9:16">9:16</option>
-                                <option value="4:3">4:3</option>
-                                <option value="3:4">3:4</option>
-                              </select>
-                            </div>
-                          </div>
-                          <div className="vfl-actions vfl-actions-wrap">
-                            <button
-                              onClick={autoDetectCrop}
-                              disabled={jobId !== null || !probe || !inputPath || cropDetecting}
-                              title="Detect black bars and suggest a crop"
-                            >
-                              {cropDetecting ? "Detecting…" : "Auto detect crop"}
-                            </button>
-                            <button
-                              onClick={() => {
-                                setCropRect({ x: 0, y: 0, w: 1, h: 1 });
-                                setCropDetectHint(null);
-                              }}
-                              disabled={jobId !== null || !probe}
-                              title="Reset crop selection"
-                            >
-                              Reset crop
-                            </button>
-                          </div>
-                          <div className="vfl-inline-hint">
-                            {cropEnabled ? "Drag directly on the preview to adjust the crop box." : "Enable crop to draw directly on the preview."}
-                          </div>
-                          {cropDetectHint ? <div className="vfl-inline-hint">{cropDetectHint}</div> : null}
-                          {cropEnabled && cropSummary ? <div className="vfl-inline-hint">Current crop: {cropSummary}</div> : null}
-                        </div>
                       </div>
                     </div>
                   )
                 ) : (
-                  <div className="vfl-muted">Pick an input file to preview, trim, and crop.</div>
+                  <div className="vfl-empty-state">
+                    <div className="vfl-empty-copy">
+                      <div className="vfl-section-title">Start with a source video</div>
+                      <div className="vfl-muted vfl-section-caption">
+                        Drop a file anywhere in the window or browse for one. Once a source is loaded, the preview, trim,
+                        and crop tools live here.
+                      </div>
+                      <div className="vfl-actions">
+                        <button className="primary" onClick={pickInput} disabled={jobId !== null}>
+                          Browse…
+                        </button>
+                      </div>
+                    </div>
+                    <div className="vfl-empty-steps" aria-label="Getting started">
+                      <div className="vfl-empty-step">
+                        <div className="vfl-empty-step-index">1</div>
+                        <div>
+                          <div className="vfl-empty-step-title">Load a source</div>
+                          <div className="vfl-empty-step-copy">Point the app at a clip, then let it probe the resolution, duration, and audio track.</div>
+                        </div>
+                      </div>
+                      <div className="vfl-empty-step">
+                        <div className="vfl-empty-step-index">2</div>
+                        <div>
+                          <div className="vfl-empty-step-title">Shape the export</div>
+                          <div className="vfl-empty-step-copy">Pick a recipe or adjust format, size, and encoder settings in the panel on the right.</div>
+                        </div>
+                      </div>
+                      <div className="vfl-empty-step">
+                        <div className="vfl-empty-step-index">3</div>
+                        <div>
+                          <div className="vfl-empty-step-title">Export from the plan</div>
+                          <div className="vfl-empty-step-copy">Check the Current plan card, then use the bottom bar to export once the output path is ready.</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 )}
               </div>
+        </section>
 
-              <div className="vfl-composing-secondary">
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Transform</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    Adjust playback speed, rotate the frame, or reverse the clip without leaving the main flow.
-                  </div>
+        <aside className="vfl-rail">
+          {probeError ? <div className="vfl-error" role="alert">{probeError}</div> : null}
+          <RailCard
+            title="Source & destination"
+            summary={inputPath ? basename(inputPath) : "No source"}
+            open={openCards.source}
+            onToggle={() => toggleCard("source")}
+          >
+            <div className="vfl-field">
+              <label htmlFor="vfl-input-path">Input</label>
+              <input id="vfl-input-path" value={inputPath} placeholder="Pick a video…" readOnly />
+              <div className="vfl-file-actions">
+                <button className={!inputPath ? "primary" : ""} onClick={pickInput} disabled={jobId !== null}>
+                  Browse…
+                </button>
+              </div>
+              <div className="vfl-inline-hint">Drag and drop works anywhere in the window.</div>
+            </div>
+            <div className="vfl-field">
+              <label htmlFor="vfl-output-path">Output</label>
+              <input id="vfl-output-path" value={outputPath} placeholder="Pick an output path…" readOnly />
+              <div className="vfl-file-actions">
+                <button className={!outputPath ? "primary" : ""} onClick={pickOutput} disabled={!inputPath || jobId !== null}>
+                  Save as…
+                </button>
+                <button onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || jobId !== null}>
+                  Open folder
+                </button>
+              </div>
+              <div className="vfl-inline-hint">
+                {outputAuto ? "Auto-suggested beside the input file. Change it any time." : "Custom output path selected."}
+              </div>
+            </div>
+          </RailCard>
+
+          <RailCard
+            title="Recipes"
+            summary={matchingRecipe ? matchingRecipe.label : "Custom settings"}
+            open={openCards.recipes}
+            onToggle={() => toggleCard("recipes")}
+          >
+            <div className="vfl-muted vfl-section-caption">
+              Apply a complete starting point, then adjust any setting before exporting.
+            </div>
+            <div className="vfl-recipe-grid">
+              {EXPORT_RECIPES.map((recipe) => {
+                const isActive = matchingRecipe?.id === recipe.id;
+                const isDisabled = jobId !== null || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
+                return (
+                  <button
+                    key={recipe.id}
+                    type="button"
+                    className={`vfl-recipe-option ${isActive ? "active" : ""}`}
+                    onClick={() => applyExportRecipe(recipe)}
+                    disabled={isDisabled}
+                    aria-pressed={isActive}
+                  >
+                    <span className="vfl-recipe-option-title">{recipe.label}</span>
+                    <span className="vfl-recipe-option-copy">{recipe.description}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </RailCard>
+
+          <RailCard
+            title="Export settings"
+            summary={`${format.toUpperCase()}${sizeLimitEnabled ? ` • ${sizeLimitMb} MB` : ""}`}
+            open={openCards.output}
+            onToggle={() => toggleCard("output")}
+          >
+            <div className="vfl-stack-md">
+              <div className="vfl-field">
+                <label htmlFor="vfl-format">Format</label>
+                <select id="vfl-format" value={format} onChange={(e) => setFormat(e.currentTarget.value as OutputFormat)} disabled={jobId !== null}>
+                  <option value="mp4">mp4</option>
+                  <option value="webm">webm</option>
+                  <option value="mp3" disabled={probe !== null && !probe.hasAudio}>
+                    mp3
+                  </option>
+                </select>
+              </div>
+              <div className="vfl-field">
+                <div className="vfl-field-label">Audio</div>
+                <label className="vfl-check vfl-check-card">
+                  <input
+                    type="checkbox"
+                    checked={audioEnabled}
+                    onChange={(e) => {
+                      autoMutedRef.current = false;
+                      setAudioEnabled(e.currentTarget.checked);
+                    }}
+                    disabled={jobId !== null || format === "mp3" || !probe?.hasAudio}
+                  />
+                  <span>{format === "mp3" ? "Always enabled for mp3 export" : "Include audio in the export"}</span>
+                </label>
+              </div>
+              <div className="vfl-field">
+                <label htmlFor="vfl-size-limit">Size limit (MB)</label>
+                <input
+                  id="vfl-size-limit"
+                  value={sizeLimitMb}
+                  onChange={(e) => setSizeLimitMb(e.currentTarget.value)}
+                  disabled={jobId !== null}
+                  placeholder="0 or empty = no limit"
+                />
+                <div className="vfl-chips" aria-label="Size presets">
+                  <button
+                    type="button"
+                    className={`vfl-preset-chip ${Number(sizeLimitMb) === 0 ? "active" : ""}`}
+                    onClick={() => setSizeLimitMb("")}
+                    disabled={jobId !== null}
+                  >
+                    No limit
+                  </button>
+                  {SIZE_PRESETS_MB.map((v) => {
+                    const active = Number(sizeLimitMb) === v;
+                    return (
+                      <button
+                        key={v}
+                        type="button"
+                        className={`vfl-preset-chip ${active ? "active" : ""}`}
+                        onClick={() => setSizeLimitMb(String(v))}
+                        disabled={jobId !== null}
+                        title={SIZE_PRESET_HINTS[v]}
+                      >
+                        {v} MB
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="vfl-field vfl-output-dimensions-field">
+                <div className="vfl-field-label">Output dimensions</div>
+                <div className="vfl-segmented" role="group" aria-label="Output dimensions">
+                  <button
+                    type="button"
+                    className={resizeMode === "source" ? "active" : ""}
+                    onClick={() => handleResizeModeChange("source")}
+                    disabled={jobId !== null || format === "mp3"}
+                    aria-pressed={resizeMode === "source"}
+                  >
+                    Original
+                  </button>
+                  <button
+                    type="button"
+                    className={resizeMode === "maxEdge" ? "active" : ""}
+                    onClick={() => handleResizeModeChange("maxEdge")}
+                    disabled={jobId !== null || format === "mp3"}
+                    aria-pressed={resizeMode === "maxEdge"}
+                  >
+                    Max edge
+                  </button>
+                  <button
+                    type="button"
+                    className={resizeMode === "custom" ? "active" : ""}
+                    onClick={() => handleResizeModeChange("custom")}
+                    disabled={jobId !== null || format === "mp3"}
+                    aria-pressed={resizeMode === "custom"}
+                  >
+                    Custom
+                  </button>
+                </div>
+
+                <div className="vfl-output-dimensions-panel">
+                  {format === "mp3" ? (
+                    <div className="vfl-inline-hint">MP3 exports audio only.</div>
+                  ) : resizeMode === "source" ? (
+                    <div className="vfl-inline-hint">Keeps the shaped source size.</div>
+                  ) : resizeMode === "maxEdge" ? (
+                    <>
+                      <label htmlFor="vfl-max-edge">Max edge (px)</label>
+                      <input
+                        id="vfl-max-edge"
+                        value={maxEdgePx}
+                        onChange={(e) => setMaxEdgePx(e.currentTarget.value)}
+                        disabled={jobId !== null}
+                        placeholder="720"
+                        inputMode="numeric"
+                      />
+                      <div className="vfl-inline-hint">Scales down the long edge, keeps aspect ratio, never upscales.</div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="vfl-dimensions-grid">
+                        <div>
+                          <label htmlFor="vfl-output-width">Width (px)</label>
+                          <input
+                            id="vfl-output-width"
+                            value={customWidthPx}
+                            onChange={(e) => handleCustomWidthChange(e.currentTarget.value)}
+                            disabled={jobId !== null}
+                            placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.width) : "1280"}
+                            inputMode="numeric"
+                          />
+                        </div>
+                        <div>
+                          <label htmlFor="vfl-output-height">Height (px)</label>
+                          <input
+                            id="vfl-output-height"
+                            value={customHeightPx}
+                            onChange={(e) => handleCustomHeightChange(e.currentTarget.value)}
+                            disabled={jobId !== null}
+                            placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.height) : "720"}
+                            inputMode="numeric"
+                          />
+                        </div>
+                      </div>
+                      <label className="vfl-check vfl-check-card vfl-dimension-lock">
+                        <input
+                          type="checkbox"
+                          checked={outputAspectLocked}
+                          onChange={(e) => handleOutputAspectLockChange(e.currentTarget.checked)}
+                          disabled={jobId !== null}
+                        />
+                        <span>Lock aspect ratio</span>
+                      </label>
+                      <div className="vfl-inline-hint">Odd values are snapped down to even pixels for encoder compatibility.</div>
+                    </>
+                  )}
+                </div>
+                <div className="vfl-inline-hint">{outputDimensionsSummary}</div>
+              </div>
+              <div className="vfl-field">
+                <label htmlFor="vfl-title-metadata">Title metadata</label>
+                <input id="vfl-title-metadata" value={title} onChange={(e) => setTitle(e.currentTarget.value)} disabled={jobId !== null} />
+              </div>
+              <div className="vfl-field">
+                <div className="vfl-field-label">Privacy</div>
+                <label className="vfl-check vfl-check-card">
+                  <input
+                    type="checkbox"
+                    checked={stripMetadata}
+                    onChange={(e) => setStripMetadata(e.currentTarget.checked)}
+                    disabled={jobId !== null}
+                  />
+                  <span>Strip location metadata</span>
+                </label>
+                <div className="vfl-inline-hint">
+                  {stripMetadata
+                    ? "GPS and capture metadata from the source are removed from exports."
+                    : "Source metadata, including GPS location when present, is copied into exports."}
+                </div>
+              </div>
+            </div>
+          </RailCard>
+
+          <RailCard
+            title="Crop"
+            summary={cropEnabled && cropSummary ? cropSummary : "Off"}
+            open={openCards.crop}
+            onToggle={() => toggleCard("crop")}
+          >
+            <label className="vfl-check">
+              <input
+                type="checkbox"
+                checked={cropEnabled}
+                onChange={(e) => setCropEnabled(e.currentTarget.checked)}
+                disabled={jobId !== null || !probe}
+              />
+              Enable crop
+            </label>
+            <div className="vfl-row2 vfl-row2-compact">
+              <label className="vfl-check">
+                <input
+                  type="checkbox"
+                  checked={aspectLocked}
+                  onChange={(e) => setAspectLocked(e.currentTarget.checked)}
+                  disabled={jobId !== null || !cropEnabled}
+                />
+                Lock aspect
+              </label>
+              <div className="vfl-field">
+                <label htmlFor="vfl-aspect-preset">Aspect preset</label>
+                <select
+                  id="vfl-aspect-preset"
+                  value={aspectPreset}
+                  onChange={(e) => setAspectPreset(e.currentTarget.value as typeof aspectPreset)}
+                  disabled={jobId !== null || !cropEnabled || !aspectLocked}
+                >
+                  <option value="free">Free</option>
+                  <option value="1:1">1:1</option>
+                  <option value="16:9">16:9</option>
+                  <option value="9:16">9:16</option>
+                  <option value="4:3">4:3</option>
+                  <option value="3:4">3:4</option>
+                </select>
+              </div>
+            </div>
+            <div className="vfl-actions vfl-actions-wrap">
+              <button
+                onClick={autoDetectCrop}
+                disabled={jobId !== null || !probe || !inputPath || cropDetecting}
+                title="Detect black bars and suggest a crop"
+              >
+                {cropDetecting ? "Detecting…" : "Auto detect crop"}
+              </button>
+              <button
+                onClick={() => {
+                  setCropRect({ x: 0, y: 0, w: 1, h: 1 });
+                  setCropDetectHint(null);
+                }}
+                disabled={jobId !== null || !probe}
+                title="Reset crop selection"
+              >
+                Reset crop
+              </button>
+            </div>
+            <div className="vfl-inline-hint">
+              {cropEnabled ? "Drag directly on the preview to adjust the crop box." : "Enable crop to draw directly on the preview."}
+            </div>
+            {cropDetectHint ? <div className="vfl-inline-hint">{cropDetectHint}</div> : null}
+            {cropEnabled && cropSummary ? <div className="vfl-inline-hint">Current crop: {cropSummary}</div> : null}
+          </RailCard>
+
+          <RailCard
+            title="Transform & color"
+            summary={activeEditChips.filter((chip) => chip !== "Trim" && chip !== "Crop").length ? "Edits active" : "Defaults"}
+            open={openCards.transform}
+            onToggle={() => toggleCard("transform")}
+          >
+                  <div className="vfl-subsection-title">Transform</div>
                   <div className="vfl-stack-md">
                     <div className="vfl-row2">
                       <div className="vfl-field">
@@ -3499,13 +3757,8 @@ function App() {
                       Reverse (video + audio)
                     </label>
                   </div>
-                </div>
 
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Color</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    Make quick brightness, contrast, and saturation changes if the export needs a simple correction.
-                  </div>
+                  <div className="vfl-subsection-title">Color</div>
                   <div className="vfl-stack-md">
                     <div className="vfl-row2">
                       <div className="vfl-field vfl-slider-field">
@@ -3576,16 +3829,14 @@ function App() {
                       </button>
                     </div>
                   </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        ) : activeTab === "advanced" ? (
-          <div className="vfl-pane" id="vfl-tabpanel-advanced" role="tabpanel" aria-labelledby="vfl-tab-advanced">
-            <div className="vfl-grid vfl-grid-general">
-              <div className="vfl-stack-lg vfl-general-main">
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Encoder controls</div>
+          </RailCard>
+
+          <RailCard
+            title="Advanced"
+            summary={advancedOverrideCount > 0 ? `${advancedOverrideCount} override${advancedOverrideCount === 1 ? "" : "s"}` : "Auto"}
+            open={openCards.advanced}
+            onToggle={() => toggleCard("advanced")}
+          >
                   <div className="vfl-muted vfl-section-caption">
                     Auto keeps the current export planner in charge; overrides apply only when a matching encoder is available.
                   </div>
@@ -3763,6 +4014,40 @@ function App() {
                       </div>
                     </div>
 
+                    <div className="vfl-field">
+                      <div className="vfl-field-label">Sample preview</div>
+                      <div className="vfl-control-row">
+                        <div className="vfl-segmented" role="group" aria-label="Sample duration">
+                          {SAMPLE_DURATION_CHOICES_S.map((seconds) => (
+                            <button
+                              key={seconds}
+                              type="button"
+                              className={sampleDurationS === seconds ? "active" : ""}
+                              onClick={() => setSampleDurationS(seconds)}
+                              disabled={jobId !== null}
+                              aria-pressed={sampleDurationS === seconds}
+                            >
+                              {seconds} s
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void exportSample()}
+                          disabled={!exportReady || jobId !== null}
+                        >
+                          Export sample
+                        </button>
+                      </div>
+                      <div className="vfl-inline-hint">
+                        {sampleEstimate
+                          ? `Sample ${formatByteSize(sampleEstimate.sampleBytes)}${
+                              sampleEstimate.estimateBytes ? ` -> full export ~ ${formatByteSize(sampleEstimate.estimateBytes)}` : ""
+                            }`
+                          : "Encodes a short slice around the preview position with the current settings."}
+                      </div>
+                    </div>
+
                     <div className="vfl-actions vfl-actions-secondary">
                       <button
                         type="button"
@@ -3778,13 +4063,6 @@ function App() {
                         disabled={jobId !== null || advancedOverrideCount === 0}
                       >
                         Reset advanced
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void exportSample()}
-                        disabled={!exportReady || jobId !== null}
-                      >
-                        Export sample
                       </button>
                       {encodeCapabilitiesError ? (
                         <button
@@ -3802,15 +4080,8 @@ function App() {
 
                     {encodeCapabilitiesError ? <div className="vfl-error" role="alert">{encodeCapabilitiesError}</div> : null}
                   </div>
-                </div>
-              </div>
 
-              <div className="vfl-stack-lg vfl-general-side">
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Advanced plan</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    Current encoder overrides and how they interact with the export plan.
-                  </div>
+                  <div className="vfl-subsection-title">Advanced plan</div>
                   <div className={`vfl-plan-hero ${advancedOverrideCount > 0 ? "is-ready" : ""}`}>
                     <div className="vfl-plan-hero-kicker">{advancedOverrideCount > 0 ? "Overrides active" : "Auto mode"}</div>
                     <div className="vfl-plan-hero-copy">{advancedPlanSummary}</div>
@@ -3862,311 +4133,14 @@ function App() {
                       ))}
                     </div>
                   ) : null}
-                </div>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="vfl-pane" id="vfl-tabpanel-general" role="tabpanel" aria-labelledby="vfl-tab-general">
-            <div className="vfl-grid vfl-grid-general">
-              <div className="vfl-stack-lg vfl-general-main">
-                {!inputPath ? (
-                  <div className="vfl-section vfl-empty-state">
-                    <div className="vfl-empty-layout">
-                      <div className="vfl-empty-copy">
-                        <div className="vfl-section-title">Start with a source video</div>
-                        <div className="vfl-muted vfl-section-caption">
-                          Use the input card above or drop a file anywhere in the window. Once a source is loaded, the export plan and composing tools unlock here.
-                        </div>
-                        <div className="vfl-actions">
-                          <button className="primary" onClick={pickInput} disabled={jobId !== null}>
-                            Browse…
-                          </button>
-                        </div>
-                      </div>
-                      <div className="vfl-empty-steps" aria-label="Getting started">
-                        <div className="vfl-empty-step">
-                          <div className="vfl-empty-step-index">1</div>
-                          <div>
-                            <div className="vfl-empty-step-title">Load a source</div>
-                            <div className="vfl-empty-step-copy">Point the app at a clip, then let it probe the resolution, duration, and audio track.</div>
-                          </div>
-                        </div>
-                        <div className="vfl-empty-step">
-                          <div className="vfl-empty-step-index">2</div>
-                          <div>
-                            <div className="vfl-empty-step-title">Shape the export</div>
-                            <div className="vfl-empty-step-copy">Use General for format and size, Advanced for encoder overrides, then Composing for trim, crop, speed, and color.</div>
-                          </div>
-                        </div>
-                        <div className="vfl-empty-step">
-                          <div className="vfl-empty-step-index">3</div>
-                          <div>
-                            <div className="vfl-empty-step-title">Export from the plan</div>
-                            <div className="vfl-empty-step-copy">Fine-tune the plan in the tabs above, then use the bottom bar to export once the output path is ready.</div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ) : null}
+          </RailCard>
 
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Recipes</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    Apply a complete starting point, then adjust any setting before exporting.
-                  </div>
-                  <div className="vfl-recipe-grid">
-                    {EXPORT_RECIPES.map((recipe) => {
-                      const isActive = matchingRecipe?.id === recipe.id;
-                      const isDisabled = jobId !== null || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
-                      return (
-                        <button
-                          key={recipe.id}
-                          type="button"
-                          className={`vfl-recipe-option ${isActive ? "active" : ""}`}
-                          onClick={() => applyExportRecipe(recipe)}
-                          disabled={isDisabled}
-                          aria-pressed={isActive}
-                        >
-                          <span className="vfl-recipe-option-title">{recipe.label}</span>
-                          <span className="vfl-recipe-option-copy">{recipe.description}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Export settings</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    Choose the output format, target size, dimensions, and audio behavior.
-                  </div>
-                  <div className="vfl-stack-md">
-                    <div className="vfl-row2">
-                      <div className="vfl-field">
-                        <label htmlFor="vfl-format">Format</label>
-                        <select id="vfl-format" value={format} onChange={(e) => setFormat(e.currentTarget.value as OutputFormat)} disabled={jobId !== null}>
-                          <option value="mp4">mp4</option>
-                          <option value="webm">webm</option>
-                          <option value="mp3" disabled={probe !== null && !probe.hasAudio}>
-                            mp3
-                          </option>
-                        </select>
-                      </div>
-                      <div className="vfl-field">
-                        <div className="vfl-field-label">Audio</div>
-                        <label className="vfl-check vfl-check-card">
-                          <input
-                            type="checkbox"
-                            checked={audioEnabled}
-                            onChange={(e) => {
-                              autoMutedRef.current = false;
-                              setAudioEnabled(e.currentTarget.checked);
-                            }}
-                            disabled={jobId !== null || format === "mp3" || !probe?.hasAudio}
-                          />
-                          <span>{format === "mp3" ? "Always enabled for mp3 export" : "Include audio in the export"}</span>
-                        </label>
-                      </div>
-                    </div>
-
-                    <div className="vfl-row2">
-                      <div className="vfl-field">
-                        <label htmlFor="vfl-size-limit">Size limit (MB)</label>
-                        <input
-                          id="vfl-size-limit"
-                          value={sizeLimitMb}
-                          onChange={(e) => setSizeLimitMb(e.currentTarget.value)}
-                          disabled={jobId !== null}
-                          placeholder="0 or empty = no limit"
-                        />
-                        <div className="vfl-chips" aria-label="Size presets">
-                          <button
-                            type="button"
-                            className={`vfl-preset-chip ${Number(sizeLimitMb) === 0 ? "active" : ""}`}
-                            onClick={() => setSizeLimitMb("")}
-                            disabled={jobId !== null}
-                          >
-                            No limit
-                          </button>
-                          {SIZE_PRESETS_MB.map((v) => {
-                            const active = Number(sizeLimitMb) === v;
-                            return (
-                              <button
-                                key={v}
-                                type="button"
-                                className={`vfl-preset-chip ${active ? "active" : ""}`}
-                                onClick={() => setSizeLimitMb(String(v))}
-                                disabled={jobId !== null}
-                                title={SIZE_PRESET_HINTS[v]}
-                              >
-                                {v} MB
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-                      <div className="vfl-field vfl-output-dimensions-field">
-                        <div className="vfl-field-label">Output dimensions</div>
-                        <div className="vfl-segmented" role="group" aria-label="Output dimensions">
-                          <button
-                            type="button"
-                            className={resizeMode === "source" ? "active" : ""}
-                            onClick={() => handleResizeModeChange("source")}
-                            disabled={jobId !== null || format === "mp3"}
-                            aria-pressed={resizeMode === "source"}
-                          >
-                            Original
-                          </button>
-                          <button
-                            type="button"
-                            className={resizeMode === "maxEdge" ? "active" : ""}
-                            onClick={() => handleResizeModeChange("maxEdge")}
-                            disabled={jobId !== null || format === "mp3"}
-                            aria-pressed={resizeMode === "maxEdge"}
-                          >
-                            Max edge
-                          </button>
-                          <button
-                            type="button"
-                            className={resizeMode === "custom" ? "active" : ""}
-                            onClick={() => handleResizeModeChange("custom")}
-                            disabled={jobId !== null || format === "mp3"}
-                            aria-pressed={resizeMode === "custom"}
-                          >
-                            Custom
-                          </button>
-                        </div>
-
-                        <div className="vfl-output-dimensions-panel">
-                          {format === "mp3" ? (
-                            <div className="vfl-inline-hint">MP3 exports audio only.</div>
-                          ) : resizeMode === "source" ? (
-                            <div className="vfl-inline-hint">Keeps the shaped source size.</div>
-                          ) : resizeMode === "maxEdge" ? (
-                            <>
-                              <label htmlFor="vfl-max-edge">Max edge (px)</label>
-                              <input
-                                id="vfl-max-edge"
-                                value={maxEdgePx}
-                                onChange={(e) => setMaxEdgePx(e.currentTarget.value)}
-                                disabled={jobId !== null}
-                                placeholder="720"
-                                inputMode="numeric"
-                              />
-                              <div className="vfl-inline-hint">Scales down the long edge, keeps aspect ratio, never upscales.</div>
-                            </>
-                          ) : (
-                            <>
-                              <div className="vfl-dimensions-grid">
-                                <div>
-                                  <label htmlFor="vfl-output-width">Width (px)</label>
-                                  <input
-                                    id="vfl-output-width"
-                                    value={customWidthPx}
-                                    onChange={(e) => handleCustomWidthChange(e.currentTarget.value)}
-                                    disabled={jobId !== null}
-                                    placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.width) : "1280"}
-                                    inputMode="numeric"
-                                  />
-                                </div>
-                                <div>
-                                  <label htmlFor="vfl-output-height">Height (px)</label>
-                                  <input
-                                    id="vfl-output-height"
-                                    value={customHeightPx}
-                                    onChange={(e) => handleCustomHeightChange(e.currentTarget.value)}
-                                    disabled={jobId !== null}
-                                    placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.height) : "720"}
-                                    inputMode="numeric"
-                                  />
-                                </div>
-                              </div>
-                              <label className="vfl-check vfl-check-card vfl-dimension-lock">
-                                <input
-                                  type="checkbox"
-                                  checked={outputAspectLocked}
-                                  onChange={(e) => handleOutputAspectLockChange(e.currentTarget.checked)}
-                                  disabled={jobId !== null}
-                                />
-                                <span>Lock aspect ratio</span>
-                              </label>
-                              <div className="vfl-inline-hint">Odd values are snapped down to even pixels for encoder compatibility.</div>
-                            </>
-                          )}
-                        </div>
-                        <div className="vfl-inline-hint">{outputDimensionsSummary}</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Queue</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    Add exports as snapshots and run them one after another with no parallel FFmpeg jobs.
-                  </div>
-                  <div className="vfl-actions vfl-actions-wrap vfl-queue-actions">
-                    <button type="button" onClick={() => void addCurrentPlanToQueue()} disabled={!exportReady || jobId !== null}>
-                      Add current plan
-                    </button>
-                    <button type="button" onClick={() => void addFilesToQueue()} disabled={jobId !== null}>
-                      Add files
-                    </button>
-                    <button type="button" className="primary" onClick={runQueue} disabled={jobId !== null || queueRunning || queueCounts.queued === 0}>
-                      Run queue
-                    </button>
-                    <button type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
-                      Stop after current
-                    </button>
-                    <button type="button" onClick={clearCompletedQueueItems} disabled={queueCounts.done + queueCounts.failed === 0}>
-                      Clear finished
-                    </button>
-                  </div>
-                  <div className="vfl-queue-counts" aria-live="polite">
-                    <span>{queueCounts.queued} queued</span>
-                    <span>{queueCounts.running} running</span>
-                    <span>{queueCounts.done} done</span>
-                    <span>{queueCounts.failed} failed</span>
-                  </div>
-                  {exportQueue.length ? (
-                    <div className="vfl-queue-list">
-                      {exportQueue.map((item) => (
-                        <div key={item.id} className={`vfl-queue-item ${item.status} ${queueActiveItemId === item.id ? "active" : ""}`}>
-                          <div className="vfl-queue-item-main">
-                            <div className="vfl-queue-item-title">{basename(item.inputPath)}</div>
-                            <div className="vfl-queue-item-meta">
-                              {item.format.toUpperCase()} {"->"} {basename(item.outputPath)}
-                              {item.outputSizeBytes ? ` • ${formatByteSize(item.outputSizeBytes)}` : ""}
-                            </div>
-                            {item.message ? <div className="vfl-queue-item-message">{item.message}</div> : null}
-                          </div>
-                          <div className="vfl-queue-item-actions">
-                            <span className={`vfl-chip ${item.status === "running" || item.status === "done" ? "active" : ""}`}>
-                              {QUEUE_STATUS_LABELS[item.status]}
-                            </span>
-                            <button type="button" onClick={() => removeQueueItem(item.id)} disabled={item.status === "running"}>
-                              Remove
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="vfl-inline-hint">
-                      Use Add files for a same-settings batch, or Add current plan to queue the loaded file with its current edits.
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="vfl-stack-lg vfl-general-side">
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Current plan</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    A quick read on the source file and what the current settings will produce.
-                  </div>
+          <RailCard
+            title="Current plan"
+            summary={jobId !== null ? "Encoding now" : exportReady ? "Ready" : "Waiting"}
+            open={openCards.plan}
+            onToggle={() => toggleCard("plan")}
+          >
                   <div className={`vfl-plan-hero ${exportReady ? "is-ready" : ""} ${jobId !== null ? "is-busy" : ""} ${lastExport ? "is-done" : ""}`}>
                     <div className="vfl-plan-hero-kicker">{jobId !== null ? "Encoding now" : footerKicker}</div>
                     <div className="vfl-plan-hero-copy">{planStatusText}</div>
@@ -4294,22 +4268,81 @@ function App() {
                       </button>
                     </div>
                   </div>
-                </div>
+          </RailCard>
 
-                <div className="vfl-section">
-                  <div className="vfl-section-title">Metadata</div>
-                  <div className="vfl-muted vfl-section-caption">
-                    Optional fields that get written into supported output formats after the main export settings are settled.
-                  </div>
-                  <div className="vfl-field">
-                    <label htmlFor="vfl-title-metadata">Title</label>
-                    <input id="vfl-title-metadata" value={title} onChange={(e) => setTitle(e.currentTarget.value)} disabled={jobId !== null} />
-                  </div>
-                </div>
-              </div>
+          <RailCard
+            title="Queue"
+            summary={
+              exportQueue.length
+                ? queueActiveItemId !== null
+                  ? `Item ${queueCounts.done + queueCounts.failed + 1} of ${exportQueue.length}`
+                  : `${queueCounts.queued} queued`
+                : "Empty"
+            }
+            open={openCards.queue}
+            onToggle={() => toggleCard("queue")}
+          >
+            <div className="vfl-muted vfl-section-caption">
+              Add exports as snapshots and run them one after another with no parallel FFmpeg jobs.
             </div>
-          </div>
-        )}
+            <div className="vfl-actions vfl-actions-wrap vfl-queue-actions">
+              <button type="button" onClick={() => void addCurrentPlanToQueue()} disabled={!exportReady || jobId !== null}>
+                Add current plan
+              </button>
+              <button type="button" onClick={() => void addFilesToQueue()} disabled={jobId !== null}>
+                Add files
+              </button>
+              <button type="button" className="primary" onClick={runQueue} disabled={jobId !== null || queueRunning || queueCounts.queued === 0}>
+                Run queue
+              </button>
+              <button type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
+                Stop after current
+              </button>
+              <button type="button" onClick={clearCompletedQueueItems} disabled={queueCounts.done + queueCounts.failed === 0}>
+                Clear finished
+              </button>
+            </div>
+            <div className="vfl-queue-counts" aria-live="polite">
+              <span>{queueCounts.queued} queued</span>
+              <span>{queueCounts.running} running</span>
+              <span>{queueCounts.done} done</span>
+              <span>{queueCounts.failed} failed</span>
+            </div>
+            {exportQueue.length ? (
+              <div className="vfl-queue-list">
+                {exportQueue.map((item) => (
+                  <div key={item.id} className={`vfl-queue-item ${item.status} ${queueActiveItemId === item.id ? "active" : ""}`}>
+                    <div className="vfl-queue-item-main">
+                      <div className="vfl-queue-item-title">{basename(item.inputPath)}</div>
+                      <div className="vfl-queue-item-meta">
+                        {item.format.toUpperCase()} {"->"} {basename(item.outputPath)}
+                        {item.outputSizeBytes ? ` • ${formatByteSize(item.outputSizeBytes)}` : ""}
+                      </div>
+                      {item.message ? <div className="vfl-queue-item-message">{item.message}</div> : null}
+                    </div>
+                    <div className="vfl-queue-item-actions">
+                      <span className={`vfl-chip ${item.status === "running" || item.status === "done" ? "active" : ""}`}>
+                        {QUEUE_STATUS_LABELS[item.status]}
+                      </span>
+                      {item.status === "done" ? (
+                        <button type="button" onClick={() => void openFolderFor(item.outputPath)}>
+                          Open folder
+                        </button>
+                      ) : null}
+                      <button type="button" onClick={() => removeQueueItem(item.id)} disabled={item.status === "running"}>
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="vfl-inline-hint">
+                Use Add files for a same-settings batch, or Add current plan to queue the loaded file with its current edits.
+              </div>
+            )}
+          </RailCard>
+        </aside>
       </div>
 
       <footer className={`vfl-footer ${jobId !== null ? "is-active" : "is-idle"}`}>
@@ -4339,6 +4372,11 @@ function App() {
             )}
           </div>
         </div>
+        {queueActiveItemId !== null && exportQueue.length ? (
+          <div className="vfl-footer-queue" aria-live="polite">
+            Queue: item {queueCounts.done + queueCounts.failed + 1} of {exportQueue.length}
+          </div>
+        ) : null}
         {jobId !== null ? (
           <div
             className="vfl-progress"

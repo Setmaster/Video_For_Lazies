@@ -40,9 +40,12 @@ test("progress inputs clamp to the supported display range", () => {
   assert.equal(clampProgress(Number.NaN), 0);
 });
 
-test("progress shimmer moves left to right and stops while finalizing", async () => {
+test("finalizing progress is visually distinct without a looping animation", async () => {
   const css = await fs.readFile(path.resolve(repoRoot, "app/src/App.css"), "utf8");
 
-  assert.match(css, /\.vfl-progress-fill\.is-finalizing\s*{[\s\S]*animation:\s*none;[\s\S]*}/);
-  assert.match(css, /@keyframes progress-shimmer\s*{[\s\S]*0%\s*{\s*background-position:\s*200%\s+0;\s*}[\s\S]*100%\s*{\s*background-position:\s*0%\s+0;\s*}[\s\S]*}/);
+  // Workbench theme: the fill is a static gradient (no infinite shimmer), and
+  // the finalizing phase switches to its own color so 99% reads differently.
+  assert.match(css, /\.vfl-progress-fill\s*{[\s\S]*?background:[\s\S]*?}/);
+  assert.match(css, /\.vfl-progress-fill\.is-finalizing\s*{[\s\S]*?background:[\s\S]*?}/);
+  assert.doesNotMatch(css, /animation:[^;]*infinite/);
 });

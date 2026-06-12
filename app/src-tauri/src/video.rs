@@ -168,6 +168,8 @@ pub struct EncodeRequest {
     #[serde(default)]
     pub normalize_audio: bool,
     #[serde(default)]
+    pub strip_metadata: bool,
+    #[serde(default)]
     pub advanced: AdvancedEncodeSettings,
 
     pub trim: Option<Trim>,
@@ -507,6 +509,24 @@ fn validate_output_path(
     }
 
     Ok(destination_path)
+}
+
+fn push_metadata_args(args: &mut Vec<String>, request: &EncodeRequest) {
+    if request.strip_metadata {
+        // Drop source global metadata (GPS location, capture info) before the
+        // explicit title, so the title survives the strip.
+        args.push("-map_metadata".to_string());
+        args.push("-1".to_string());
+    }
+    if let Some(title) = request
+        .title
+        .as_deref()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+    {
+        args.push("-metadata".to_string());
+        args.push(format!("title={title}"));
+    }
 }
 
 fn temp_output_path(output_path: &Path, job_id: u64, label: &str) -> Result<PathBuf, String> {
@@ -2361,15 +2381,7 @@ pub fn run_encode_job(
             None
         };
 
-        if let Some(title) = request
-            .title
-            .as_deref()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-        {
-            args.push("-metadata".to_string());
-            args.push(format!("title={title}"));
-        }
+        push_metadata_args(&mut args, &request);
 
         let temp_path = temp_output_path(&output_path, job_id, "mp3")?;
         args.push(temp_path.to_string_lossy().to_string());
@@ -2624,15 +2636,7 @@ pub fn run_encode_job(
             args.push("-an".to_string());
         }
 
-        if let Some(title) = request
-            .title
-            .as_deref()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-        {
-            args.push("-metadata".to_string());
-            args.push(format!("title={title}"));
-        }
+        push_metadata_args(&mut args, &request);
 
         if matches!(request.format, OutputFormat::Mp4) {
             args.extend(
@@ -2847,15 +2851,7 @@ pub fn run_encode_job(
             pass2.push("-an".to_string());
         }
 
-        if let Some(title) = request
-            .title
-            .as_deref()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-        {
-            pass2.push("-metadata".to_string());
-            pass2.push(format!("title={title}"));
-        }
+        push_metadata_args(&mut pass2, &request);
 
         if matches!(request.format, OutputFormat::Mp4) {
             pass2.extend(
@@ -2998,6 +2994,7 @@ mod tests {
             size_limit_mb: 8.0,
             audio_enabled: true,
             normalize_audio: false,
+            strip_metadata: false,
             advanced: AdvancedEncodeSettings::default(),
             trim: None,
             crop: None,
@@ -3599,6 +3596,25 @@ Encoders:
             ..probe_10s_1920x1080_audio()
         };
         assert_eq!(build_audio_filters(&req, &silent_probe).unwrap(), None);
+    }
+
+    #[test]
+    fn metadata_args_strip_before_title() {
+        let mut req = base_request();
+        req.title = Some("  Beach day  ".to_string());
+        req.strip_metadata = true;
+        let mut args = Vec::new();
+        push_metadata_args(&mut args, &req);
+        assert_eq!(
+            args,
+            vec!["-map_metadata", "-1", "-metadata", "title=Beach day"]
+        );
+
+        req.strip_metadata = false;
+        req.title = None;
+        let mut args = Vec::new();
+        push_metadata_args(&mut args, &req);
+        assert!(args.is_empty());
     }
 
     #[test]

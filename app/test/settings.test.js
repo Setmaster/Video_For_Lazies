@@ -113,6 +113,23 @@ test("serializePersistedSettings omits auto advanced defaults", () => {
   );
 });
 
+test("stripMetadata persists only the opt-out and ignores garbage", () => {
+  assert.equal(
+    serializePersistedSettings({ format: "mp4", stripMetadata: false }),
+    JSON.stringify({ format: "mp4", stripMetadata: false }),
+  );
+  assert.equal(
+    serializePersistedSettings({ format: "mp4", stripMetadata: true }),
+    JSON.stringify({ format: "mp4" }),
+  );
+
+  assert.deepEqual(parsePersistedSettings(JSON.stringify({ stripMetadata: false })), {
+    stripMetadata: false,
+  });
+  assert.deepEqual(parsePersistedSettings(JSON.stringify({ stripMetadata: true })), {});
+  assert.deepEqual(parsePersistedSettings(JSON.stringify({ stripMetadata: "no" })), {});
+});
+
 test("normalizeAudio persists only when enabled and ignores garbage", () => {
   assert.equal(
     serializePersistedSettings({ format: "mp4", normalizeAudio: true }),

@@ -46,6 +46,7 @@ export interface EncodeRequest {
   sizeLimitMb: number;
   audioEnabled: boolean;
   normalizeAudio: boolean;
+  stripMetadata: boolean;
   advanced?: AdvancedEncodeSettings | null;
 
   trim?: Trim | null;
