@@ -6,7 +6,7 @@ import url from "node:url";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
-test("default capabilities expose only the needed dialog and opener permissions", async () => {
+test("default capabilities expose only the needed window, dialog, and opener permissions", async () => {
   const capabilitiesPath = path.resolve(__dirname, "../src-tauri/capabilities/default.json");
   const raw = await fs.readFile(capabilitiesPath, "utf8");
   const json = JSON.parse(raw);
@@ -14,14 +14,25 @@ test("default capabilities expose only the needed dialog and opener permissions"
 
   assert.deepEqual(permissions, [
     "core:default",
+    // core:window:default is getters-only. The JS onCloseRequested listener
+    // takes over the close flow in tauri v2 and finishes it with destroy();
+    // without allow-destroy the title bar X silently does nothing.
+    "core:window:allow-destroy",
+    // The min-window-size enforcement in App.tsx calls these setters.
+    "core:window:allow-set-size",
+    "core:window:allow-set-min-size",
+    "core:window:allow-set-size-constraints",
     "dialog:allow-open",
     "dialog:allow-save",
+    // Close-confirm prompt while an export is running or queued.
+    "dialog:allow-confirm",
     "opener:allow-open-path",
     "opener:allow-open-url",
     "opener:allow-default-urls",
   ]);
   assert.equal(permissions.includes("dialog:default"), false);
   assert.equal(permissions.includes("opener:default"), false);
+  assert.equal(permissions.includes("core:window:allow-close"), false);
 });
 
 test("tauri config enables asset protocol for previews", async () => {

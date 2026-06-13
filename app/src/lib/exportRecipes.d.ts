@@ -32,12 +32,26 @@ export type ExportRecipeSettings = {
   };
 };
 
-export type ExportRecipe = {
-  id: string;
-  label: string;
-  description: string;
-  settings: ExportRecipeSettings;
-};
+export type PartialExportRecipeSettings = Partial<
+  Pick<ExportRecipeSettings, "format" | "sizeLimitMb" | "audioEnabled" | "normalizeAudio">
+>;
+
+export type ExportRecipe =
+  | {
+      id: string;
+      label: string;
+      description: string;
+      partial?: false;
+      settings: ExportRecipeSettings;
+    }
+  | {
+      id: string;
+      label: string;
+      description: string;
+      // Partial recipes only set (and only match) the settings they list.
+      partial: true;
+      settings: PartialExportRecipeSettings;
+    };
 
 export const EXPORT_RECIPES: ExportRecipe[];
 

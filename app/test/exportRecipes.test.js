@@ -30,13 +30,27 @@ test("discord recipe targets the current 10 MB free upload limit", () => {
   assert.equal(findExportRecipe("discord-25mb"), null);
 });
 
-test("forum recipe caps exports at 4 MB", () => {
+test("forum recipe only caps size at 4 MB and drops audio", () => {
   const recipe = findExportRecipe("forum-4mb");
 
   assert.equal(recipe.label, "Forum 4 MB");
-  assert.equal(recipe.settings.sizeLimitMb, "4");
-  assert.equal(recipe.settings.format, "mp4");
-  assert.equal(findMatchingExportRecipe(recipe.settings)?.id, "forum-4mb");
+  assert.equal(recipe.partial, true);
+  // The partial recipe must not touch anything beyond these two settings.
+  assert.deepEqual(recipe.settings, { sizeLimitMb: "4", audioEnabled: false });
+});
+
+test("partial forum recipe matches any settings with a 4 MB cap and audio off", () => {
+  const base = findExportRecipe("quick-share").settings;
+
+  const forumFromQuickShare = { ...base, sizeLimitMb: "4", audioEnabled: false };
+  assert.equal(findMatchingExportRecipe(forumFromQuickShare)?.id, "forum-4mb");
+
+  const archive = findExportRecipe("archive-quality").settings;
+  const forumFromArchive = { ...archive, sizeLimitMb: "4", audioEnabled: false };
+  assert.equal(findMatchingExportRecipe(forumFromArchive)?.id, "forum-4mb");
+
+  assert.equal(findMatchingExportRecipe({ ...base, sizeLimitMb: "4" }), null);
+  assert.equal(findMatchingExportRecipe({ ...base, audioEnabled: false }), null);
 });
 
 test("normalize-audio edits break recipe matching", () => {

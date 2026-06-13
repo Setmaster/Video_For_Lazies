@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type PointerEvent } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 
 export type NormalizedRect = { x: number; y: number; w: number; h: number };
 export type VideoCropperHandle = {
@@ -208,6 +208,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   frameAspectRatio?: number;
   cropEnabled: boolean;
   disabled?: boolean;
+  colorFilter?: string | null;
   onTimeUpdate?: (t: number) => void;
   onPlaybackChange?: (playing: boolean) => void;
   onSourceReadyChange?: (ready: boolean) => void;
@@ -219,6 +220,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   frameAspectRatio,
   cropEnabled,
   disabled,
+  colorFilter,
   onTimeUpdate,
   onPlaybackChange,
   onSourceReadyChange,
@@ -571,15 +573,30 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     } as const;
   };
 
+  const safeFrameAspectRatio =
+    Number.isFinite(frameAspectRatio) && frameAspectRatio && frameAspectRatio > 0 ? frameAspectRatio : undefined;
+
   return (
     <div
       className="vfl-cropper"
-      style={{
-        aspectRatio: Number.isFinite(frameAspectRatio) && frameAspectRatio && frameAspectRatio > 0 ? frameAspectRatio : undefined,
-      }}
+      style={
+        {
+          aspectRatio: safeFrameAspectRatio,
+          // Lets the stage hug the video: width is capped by the wrap's
+          // height (cqh) times this ratio, mirroring object-fit: contain.
+          "--frame-ar": safeFrameAspectRatio,
+        } as CSSProperties
+      }
     >
       <div className="vfl-cropper-stage" ref={containerRef}>
-        <video className="vfl-video" ref={videoRef} src={src} preload="auto" playsInline />
+        <video
+          className="vfl-video"
+          ref={videoRef}
+          src={src}
+          style={colorFilter ? { filter: colorFilter } : undefined}
+          preload="auto"
+          playsInline
+        />
         {cropEnabled ? (
           <div
             className="vfl-overlay"

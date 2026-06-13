@@ -519,6 +519,10 @@ fn cancel_encode(state: State<'_, JobManager>, jobId: u64) -> Result<(), String>
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::args().any(|arg| arg == updater::ELEVATED_UPDATE_ARG) {
+        updater::set_elevated_update_run(true);
+    }
+
     tauri::Builder::default()
         .manage(JobManager::new())
         .plugin(tauri_plugin_dialog::init())
@@ -545,6 +549,7 @@ pub fn run() {
             updater::record_update_prompt_choice,
             updater::prepare_and_apply_update,
             updater::finalize_update_startup,
+            updater::elevated_update_pending,
             start_encode,
             cancel_encode
         ])

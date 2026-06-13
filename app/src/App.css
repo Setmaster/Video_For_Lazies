@@ -630,53 +630,31 @@ button:focus-visible {
   gap: 8px;
 }
 
-.vfl-preview-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  flex: 0 0 auto;
-}
-
-.vfl-preview-head .vfl-section-caption {
-  margin-bottom: 0;
-}
-
-.vfl-preview-meta {
-  color: var(--text-muted);
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
 .vfl-preview-layout {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 9px;
 }
 
-.vfl-preview-main {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
+/* The wrap absorbs all leftover pane space; the stage inside sizes like
+   object-fit: contain against it (width- or height-bound, never capped),
+   so the video keeps a breathing margin instead of touching the pane. */
 .vfl-cropper-wrap {
   flex: 1 1 auto;
   min-height: 140px;
   display: flex;
   align-items: center;
   justify-content: center;
+  container-type: size;
 }
 
 .vfl-cropper {
   position: relative;
-  width: 100%;
-  height: 100%;
+  width: min(100%, calc(100cqh * var(--frame-ar, 1.7778)));
+  max-height: 100%;
+  aspect-ratio: var(--frame-ar, 1.7778);
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--border);
@@ -728,28 +706,37 @@ button:focus-visible {
   pointer-events: none;
 }
 
-.vfl-preview-controls {
+.vfl-transport-row {
   flex: 0 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.vfl-preview-buttons {
   display: flex;
   gap: 6px;
   align-items: center;
   flex-wrap: wrap;
 }
 
-.vfl-preview-time {
+.vfl-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 9px;
+}
+
+.vfl-icon-button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.vfl-transport-time {
+  margin-left: auto;
   color: var(--text-secondary);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
-}
-
-.vfl-preview-tools {
-  flex-wrap: wrap;
+  white-space: nowrap;
 }
 
 /* ---------- range inputs ---------- */
@@ -808,25 +795,25 @@ input[type="range"]:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- trim timeline ---------- */
-.vfl-trim-timeline {
-  display: grid;
+/* ---------- merged trim block (track + fields in one slim card) ---------- */
+.vfl-trim-block {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
   gap: 7px;
-  padding: 9px 11px;
+  padding: 9px 11px 8px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
-  background: var(--inset);
+  background: var(--panel);
 }
 
-.vfl-trim-timeline-head,
-.vfl-trim-timeline-values {
+.vfl-trim-head {
   display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
-.vfl-trim-timeline-label {
+.vfl-trim-label {
   color: var(--text-secondary);
   font-size: 10.5px;
   font-weight: 700;
@@ -834,26 +821,63 @@ input[type="range"]:focus-visible {
   text-transform: uppercase;
 }
 
-.vfl-trim-timeline-summary,
-.vfl-trim-timeline-values {
+.vfl-trim-range-summary {
   color: var(--text-secondary);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
 }
 
-.vfl-trim-timeline-value {
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-variant-numeric: inherit;
+.vfl-trim-kept-chip {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 5px;
+  border: 1px solid rgba(var(--accent), 0.4);
+  background: rgba(var(--accent), 0.12);
+  color: var(--accent-strong);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
-.vfl-trim-timeline-value.active {
-  color: var(--accent-strong);
-  text-decoration: underline;
-  text-underline-offset: 0.22em;
+.vfl-trim-row {
+  display: flex;
+  align-items: center;
+  gap: 6px 10px;
+  flex-wrap: wrap;
+}
+
+.vfl-trim-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vfl-trim-field label {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.vfl-trim-field input {
+  width: 64px;
+  padding: 4px 7px;
+  font-variant-numeric: tabular-nums;
+}
+
+.vfl-trim-field button,
+.vfl-trim-reset {
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.vfl-trim-reset {
+  margin-left: auto;
+}
+
+.vfl-kbd-hint {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.4;
 }
 
 .vfl-trim-timeline-track {
@@ -928,19 +952,6 @@ input[type="range"]:focus-visible {
   box-shadow:
     0 0 0 2px rgba(10, 14, 20, 0.45),
     0 0 0 5px rgba(var(--accent), 0.3);
-}
-
-/* ---------- trim fields block (left pane) ---------- */
-.vfl-side-block {
-  flex: 0 0 auto;
-  padding: 10px 12px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--panel);
-}
-
-.vfl-trim-block .vfl-subsection-title {
-  margin-top: 0;
 }
 
 /* ---------- empty state (left pane) ---------- */
@@ -1389,6 +1400,17 @@ input[type="range"]:focus-visible {
   justify-content: center;
   padding: 24px;
   background: rgba(8, 12, 18, 0.66);
+}
+
+.vfl-elevated-update-card {
+  width: min(420px, 100%);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .vfl-about-modal {

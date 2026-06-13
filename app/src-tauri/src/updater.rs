@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -34,6 +35,25 @@ const DEFAULT_SIGNATURE_SUFFIX: &str = ".sig";
 const UPDATE_PUBLIC_KEYS: &[&str] = &[
     "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ3ODU2M0VEQUIwRkNEQTYKUldTbXpRK3I3V09GMTdIUnBHaDlkMzBEN0FRYnJyTUVEa2FRN0Q0Ylh4RDMxT09hYy9vR3hEd2IK",
 ];
+
+/// CLI flag passed to the elevated relaunch so the new instance knows it
+/// should immediately resume the update instead of waiting for the user.
+pub const ELEVATED_UPDATE_ARG: &str = "--apply-update-elevated";
+
+static ELEVATED_UPDATE_RUN: AtomicBool = AtomicBool::new(false);
+
+pub fn set_elevated_update_run(value: bool) {
+    ELEVATED_UPDATE_RUN.store(value, AtomicOrdering::Relaxed);
+}
+
+fn elevated_update_run() -> bool {
+    ELEVATED_UPDATE_RUN.load(AtomicOrdering::Relaxed)
+}
+
+#[tauri::command]
+pub fn elevated_update_pending() -> bool {
+    elevated_update_run()
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +141,11 @@ struct UpdateApplyPlan {
     parent_pid: u32,
     executable_name: String,
     helper_name: String,
+    // True when the staging instance ran elevated: the helper inherits that
+    // token, so it must relaunch the updated app through the shell to drop
+    // back to the user's normal privileges. Old plans omit the field.
+    #[serde(default)]
+    relaunch_via_shell: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -205,6 +230,10 @@ pub fn prepare_and_apply_update(app: AppHandle) -> Result<UpdateApplyResponse, S
             .unwrap_or_else(|| "No update is available.".to_string()));
     }
 
+    if !install_dir_writable(&install_dir()?) {
+        return elevate_for_update(&app, &check);
+    }
+
     let manifest_bundle = fetch_verified_update_manifest()?;
     let manifest = manifest_bundle.manifest;
     let target = current_target()?;
@@ -232,6 +261,113 @@ pub fn prepare_and_apply_update(app: AppHandle) -> Result<UpdateApplyResponse, S
         message: "The update is ready. Video For Lazies will restart to finish installing it."
             .to_string(),
     })
+}
+
+/// True when the app can create and delete files in its own install folder.
+/// Probes the real update-state directory so the answer matches what staging
+/// is about to do.
+fn install_dir_writable(install_dir: &Path) -> bool {
+    let probe_dir = install_dir.join(UPDATE_STATE_DIR);
+    if fs::create_dir_all(&probe_dir).is_err() {
+        return false;
+    }
+    let probe_path = probe_dir.join(format!(".write-probe-{}", std::process::id()));
+    match fs::write(&probe_path, b"vfl-write-probe") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe_path);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn elevate_for_update(
+    app: &AppHandle,
+    check: &UpdateCheckResponse,
+) -> Result<UpdateApplyResponse, String> {
+    if elevated_update_run() {
+        return Err(
+            "The app folder is still not writable even with administrator permission. \
+             Move the app to a writable folder and update again."
+                .to_string(),
+        );
+    }
+
+    relaunch_self_elevated_for_update()?;
+
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        handle.exit(0);
+    });
+
+    Ok(UpdateApplyResponse {
+        status: "elevating".to_string(),
+        version: check.latest_version.clone().unwrap_or_default(),
+        message:
+            "Video For Lazies will restart with administrator permission to install the update."
+                .to_string(),
+    })
+}
+
+#[cfg(not(windows))]
+fn elevate_for_update(
+    _app: &AppHandle,
+    _check: &UpdateCheckResponse,
+) -> Result<UpdateApplyResponse, String> {
+    Err(
+        "The app folder is not writable, so the update cannot be installed. \
+         Move the app to a writable folder and update again."
+            .to_string(),
+    )
+}
+
+/// Relaunches this executable with the elevated-update flag through
+/// `Start-Process -Verb RunAs`, which triggers the Windows UAC prompt.
+/// Returns an error when Windows declines (the user cancelled the prompt).
+#[cfg(windows)]
+fn relaunch_self_elevated_for_update() -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to locate the app executable: {e}"))?;
+    let install_dir = install_dir()?;
+    let command_text = format!(
+        "Start-Process -FilePath {} -ArgumentList '{}' -WorkingDirectory {} -Verb RunAs",
+        powershell_quote(&exe.to_string_lossy()),
+        ELEVATED_UPDATE_ARG,
+        powershell_quote(&install_dir.to_string_lossy()),
+    );
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(&command_text);
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+
+    let status = command
+        .status()
+        .map_err(|e| format!("Failed to request administrator permission: {e}"))?;
+    if !status.success() {
+        return Err(
+            "Windows did not grant administrator permission, so the update was not installed."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// PowerShell single-quoted literal: only embedded single quotes need
+/// escaping (doubled), everything else is taken verbatim.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "''"))
 }
 
 #[tauri::command]
@@ -638,6 +774,7 @@ fn stage_update(
         parent_pid: std::process::id(),
         executable_name: main_executable_name()?.to_string(),
         helper_name: helper_executable_name()?.to_string(),
+        relaunch_via_shell: elevated_update_run(),
     };
     validate_apply_plan(&plan)?;
 
@@ -880,6 +1017,22 @@ fn restore_backup(
 
 fn launch_updated_app(plan: &UpdateApplyPlan) -> Result<(), String> {
     let executable = plan.install_dir.join(&plan.executable_name);
+
+    #[cfg(windows)]
+    if plan.relaunch_via_shell {
+        // This helper inherited the elevated token from the staging instance.
+        // explorer.exe always runs with the user's normal token, so launching
+        // through it drops the elevation for the updated app (otherwise the
+        // relaunched app could not receive drag and drop from Explorer).
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("explorer.exe");
+        command.arg(&executable).creation_flags(0x08000000);
+        command
+            .spawn()
+            .map_err(|e| format!("Failed to relaunch Video For Lazies: {e}"))?;
+        return Ok(());
+    }
+
     let mut command = Command::new(executable);
     command.current_dir(&plan.install_dir);
     #[cfg(windows)]
@@ -1550,6 +1703,50 @@ mod tests {
     }
 
     #[test]
+    fn apply_plans_without_relaunch_flag_default_to_direct_relaunch() {
+        // Plans written by pre-1.7 versions omit relaunchViaShell entirely.
+        let raw = r#"{
+            "schema": "com.setmaster.video-for-lazies.apply-plan.v1",
+            "updateId": "legacy",
+            "fromVersion": "1.6.0",
+            "toVersion": "1.7.0",
+            "target": "windows-x64",
+            "installDir": "C:/apps/vfl",
+            "stageDir": "C:/apps/vfl/.vfl-updates/staged/legacy",
+            "backupDir": "C:/apps/vfl/.vfl-updates/backups/legacy",
+            "parentPid": 0,
+            "executableName": "Video_For_Lazies.exe",
+            "helperName": "vfl-update-helper.exe"
+        }"#;
+        let plan: UpdateApplyPlan = serde_json::from_str(raw).unwrap();
+        assert!(!plan.relaunch_via_shell);
+    }
+
+    #[test]
+    fn powershell_quote_escapes_embedded_single_quotes() {
+        assert_eq!(powershell_quote(r"C:\Apps\VFL"), r"'C:\Apps\VFL'");
+        assert_eq!(
+            powershell_quote(r"C:\User's Files\VFL"),
+            r"'C:\User''s Files\VFL'"
+        );
+    }
+
+    #[test]
+    fn install_dir_writable_reflects_filesystem_access() {
+        let dir = std::env::temp_dir().join(format!(
+            "vfl_updater_write_probe_test_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(install_dir_writable(&dir));
+        // The probe must not leave artifacts behind besides the state dir.
+        let state_dir = dir.join(UPDATE_STATE_DIR);
+        assert!(state_dir.exists());
+        assert_eq!(fs::read_dir(&state_dir).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn dismissing_update_prompt_behaves_like_remind_later() {
         let mut prefs = UpdatePrefs::default();
         let version = Version::parse("1.2.3").unwrap();
@@ -1670,6 +1867,7 @@ mod tests {
             parent_pid: 0,
             executable_name: main_executable_name().unwrap().to_string(),
             helper_name: helper_executable_name().unwrap().to_string(),
+            relaunch_via_shell: false,
         };
         let plan_path = apply_plan_path(&plan);
         fs::create_dir_all(plan_path.parent().unwrap()).unwrap();

@@ -77,26 +77,12 @@ export const EXPORT_RECIPES = [
   {
     id: "forum-4mb",
     label: "Forum 4 MB",
-    description: "MP4, 540p, tight 4 MB cap for forum attachment limits.",
+    description: "Caps the export at 4 MB and removes audio. Leaves every other setting unchanged.",
+    // Partial recipes only set (and only match) the settings they list.
+    partial: true,
     settings: {
-      format: "mp4",
       sizeLimitMb: "4",
-      resize: {
-        mode: "maxEdge",
-        maxEdgePx: "540",
-        widthPx: "",
-        heightPx: "",
-        lockAspect: true,
-      },
-      audioEnabled: true,
-      advanced: {
-        videoCodec: "h264",
-        audioBitrateKbps: 96,
-        videoQuality: "auto",
-        encodeSpeed: "smaller",
-        frameRateCapFps: 30,
-        audioChannels: "mono",
-      },
+      audioEnabled: false,
     },
   },
   {
@@ -211,6 +197,30 @@ function normalizeAdvancedNumber(value) {
 
 export function recipeMatchesSettings(recipe, settings) {
   if (!recipe || !settings) return false;
+
+  if (recipe.partial) {
+    const partialSettings = recipe.settings ?? {};
+    if ("format" in partialSettings && settings.format !== partialSettings.format) return false;
+    if (
+      "sizeLimitMb" in partialSettings &&
+      normalizeTextSetting(settings.sizeLimitMb) !== normalizeTextSetting(partialSettings.sizeLimitMb)
+    ) {
+      return false;
+    }
+    if (
+      "audioEnabled" in partialSettings &&
+      Boolean(settings.audioEnabled) !== Boolean(partialSettings.audioEnabled)
+    ) {
+      return false;
+    }
+    if (
+      "normalizeAudio" in partialSettings &&
+      Boolean(settings.normalizeAudio) !== Boolean(partialSettings.normalizeAudio)
+    ) {
+      return false;
+    }
+    return true;
+  }
 
   const recipeSettings = recipe.settings;
   const recipeAdvanced = recipeSettings.advanced ?? {};

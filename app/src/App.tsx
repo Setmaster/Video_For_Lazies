@@ -2,6 +2,7 @@ import { useEffect, useEffectEvent, useMemo, useRef, useState, type CSSPropertie
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { confirm as confirmDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
@@ -35,6 +36,7 @@ import { basename, dirname, ensureUniqueOutputPath, extname, replaceExtension, s
 import { getActiveProgressUi } from "./lib/progress";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import { EXPORT_RECIPES, findMatchingExportRecipe, normalizeRecipeResizeSettings, type ExportRecipe } from "./lib/exportRecipes";
+import { buildPreviewColorFilter } from "./lib/previewFilter";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
@@ -88,7 +90,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.7.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -428,6 +430,9 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [manualUpdateBusy, setManualUpdateBusy] = useState(false);
   const [manualUpdateStatus, setManualUpdateStatus] = useState<string | null>(null);
+  // True when this instance was relaunched elevated to finish installing an
+  // update; the app applies it immediately and restarts on its own.
+  const [elevatedUpdateRun, setElevatedUpdateRun] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
 
   const jobIdRef = useRef<number | null>(null);
@@ -572,6 +577,18 @@ function App() {
         await invoke("finalize_update_startup");
       } catch (error) {
         console.warn("Failed to finalize pending update state:", error);
+      }
+
+      try {
+        if (await invoke<boolean>("elevated_update_pending")) {
+          if (!stop) {
+            setElevatedUpdateRun(true);
+            void applyUpdate();
+          }
+          return;
+        }
+      } catch (error) {
+        console.warn("Failed to check elevated update state:", error);
       }
 
       try {
@@ -852,6 +869,20 @@ function App() {
   }
 
   function applyExportRecipe(recipe: ExportRecipe) {
+    if (recipe.partial) {
+      // Partial recipes change only the settings they list and leave the rest
+      // of the current configuration (including the output path) untouched.
+      const partialSettings = recipe.settings;
+      if (partialSettings.format !== undefined) setFormat(partialSettings.format);
+      if (partialSettings.sizeLimitMb !== undefined) setSizeLimitMb(partialSettings.sizeLimitMb);
+      if (partialSettings.audioEnabled !== undefined) {
+        setAudioEnabled(format === "mp3" ? true : partialSettings.audioEnabled);
+      }
+      if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
+      setStatus(`Applied ${recipe.label}.`);
+      return;
+    }
+
     const recipeSettings = recipe.settings;
     const recipeAdvanced = recipeSettings.advanced;
     const recipeResize = normalizeRecipeResizeSettings(recipeSettings);
@@ -1605,7 +1636,10 @@ function App() {
     let unlisten: (() => void) | null = null;
     (async () => {
       try {
-        unlisten = await getCurrentWindow().onDragDropEvent((event) => {
+        // Drag-drop events are emitted to webview targets only (tauri 2.11
+        // manager/webview.rs emit_to_webview), so a Window-scoped listener
+        // never receives them; the WebviewWindow surface is required.
+        unlisten = await getCurrentWebviewWindow().onDragDropEvent((event) => {
           const p = event.payload;
           if (p.type === "enter" || p.type === "over") {
             if (jobIdRef.current === null) {
@@ -3005,6 +3039,11 @@ function App() {
     }
   }
 
+  const previewColorFilter = useMemo(
+    () => buildPreviewColorFilter(brightness, contrast, saturation),
+    [brightness, contrast, saturation],
+  );
+
   const trimSelectionStyle =
     trimTimeline && previewDurationS > 0
       ? {
@@ -3030,6 +3069,24 @@ function App() {
           <div className="vfl-drop-overlay-card">Drop a video to open</div>
         </div>
       ) : null}
+      {elevatedUpdateRun ? (
+        <div className="vfl-modal-backdrop" role="presentation">
+          <div className="vfl-elevated-update-card" role="alertdialog" aria-live="assertive" aria-label="Installing update">
+            <div className="vfl-about-title">Installing update</div>
+            <div className="vfl-muted">
+              {updateBusy
+                ? updateStatus ?? "Installing the update with administrator permission. The app restarts automatically."
+                : updateStatus ?? "Installing the update with administrator permission."}
+            </div>
+            {!updateBusy ? (
+              <div className="vfl-actions">
+                <button onClick={() => void applyUpdate()}>Try again</button>
+                <button onClick={() => setElevatedUpdateRun(false)}>Continue without updating</button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       {aboutOpen ? (
         <div className="vfl-modal-backdrop" role="presentation" onClick={() => setAboutOpen(false)}>
           <div
@@ -3053,7 +3110,7 @@ function App() {
             <div className="vfl-legal-list">
               <div className="vfl-legal-row">
                 <div className="vfl-summary-label">App</div>
-                <div className="vfl-summary-value">Version {APP_VERSION}, GPL-3.0-or-later</div>
+                <div className="vfl-summary-value">Version {APP_VERSION}</div>
               </div>
               <div className="vfl-legal-row">
                 <div className="vfl-summary-label">Runtime</div>
@@ -3114,7 +3171,6 @@ function App() {
         <div className="vfl-header-top">
           <div className="vfl-title">
             <div className="vfl-title-main">Video For Lazies</div>
-            <div className="vfl-title-sub">Fast Windows-friendly FFmpeg exports without a giant editor UI.</div>
           </div>
           <div className="vfl-header-utilities">
             <div className="vfl-header-badges">
@@ -3149,20 +3205,6 @@ function App() {
       <div className="vfl-split">
         <section className="vfl-pane-left">
               <div className="vfl-preview-section">
-                <div className="vfl-preview-head">
-                  <div>
-                    <div className="vfl-section-title">Preview, trim & crop</div>
-                    <div className="vfl-muted vfl-section-caption">
-                      Play, scrub, set trim points, and crop from one place. When crop is enabled, drag directly on the frame.
-                    </div>
-                  </div>
-                  {probe ? (
-                    <div className="vfl-preview-meta">
-                      {probe.width}x{probe.height} • {formatClock(probe.durationS)}
-                    </div>
-                  ) : null}
-                </div>
-
                 {probe && inputPath ? (
                   previewError ? (
                     <div className="vfl-error" role="alert">{previewError}</div>
@@ -3170,167 +3212,155 @@ function App() {
                     <div className="vfl-muted">Loading preview…</div>
                   ) : (
                     <div className="vfl-preview-layout">
-                      <div className="vfl-preview-main">
-                        <div className="vfl-cropper-wrap">
-                          <VideoCropper
-                            ref={cropperRef}
-                            src={videoSrc}
-                            rect={cropRect}
-                            onChange={setCropRect}
-                            aspect={aspect}
-                            frameAspectRatio={probe.width / probe.height}
-                            cropEnabled={cropEnabled}
-                            disabled={jobId !== null}
-                            onTimeUpdate={setPreviewTimeS}
-                            onPlaybackChange={setPreviewPlaying}
-                            onSourceReadyChange={setPreviewMediaReady}
-                          />
-                        </div>
+                      <div className="vfl-cropper-wrap">
+                        <VideoCropper
+                          ref={cropperRef}
+                          src={videoSrc}
+                          rect={cropRect}
+                          onChange={setCropRect}
+                          aspect={aspect}
+                          frameAspectRatio={probe.width / probe.height}
+                          cropEnabled={cropEnabled}
+                          disabled={jobId !== null}
+                          colorFilter={previewColorFilter}
+                          onTimeUpdate={setPreviewTimeS}
+                          onPlaybackChange={setPreviewPlaying}
+                          onSourceReadyChange={setPreviewMediaReady}
+                        />
+                      </div>
 
-                        <div className="vfl-preview-controls">
-                          <div className="vfl-preview-buttons">
-                            <button className="primary" onClick={togglePreviewPlayback} disabled={jobId !== null || !previewReady || !probe}>
-                              {previewPlaying ? "Pause" : "Play"}
-                            </button>
-                            <button onClick={() => stepPreview(-5)} disabled={jobId !== null || !previewReady || !probe}>
-                              Back 5s
-                            </button>
-                            <button onClick={() => stepPreview(5)} disabled={jobId !== null || !previewReady || !probe}>
-                              Forward 5s
-                            </button>
-                          </div>
-                          <input
-                            className="vfl-scrubber"
-                            type="range"
-                            min={0}
-                            max={previewDurationS || 0}
-                            step={0.01}
-                            value={clampedPreviewTimeS}
-                            style={rangeFillStyle(clampedPreviewTimeS, 0, previewDurationS || 0)}
-                            onChange={(e) => syncPreviewToTime(Number(e.currentTarget.value), "preview")}
-                            disabled={jobId !== null || !previewReady || !probe}
-                            aria-label="Preview timeline"
-                          />
-                          {trimTimeline ? (
-                            <div className="vfl-trim-timeline">
-                              <div className="vfl-trim-timeline-head">
-                                <div className="vfl-trim-timeline-label">Trim range</div>
-                                <div className="vfl-trim-timeline-summary">
-                                  {formatClock(trimTimeline.start)} to {trimTimeline.hasCustomEnd ? formatClock(trimTimeline.end) : "end"}
-                                </div>
-                              </div>
-                              <div className="vfl-trim-timeline-track" ref={trimTimelineTrackRef}>
-                                <div className="vfl-trim-timeline-rail" />
-                                {trimSelectionStyle ? <div className="vfl-trim-timeline-selection" style={trimSelectionStyle} /> : null}
-                                {trimPlayheadStyle ? <div className="vfl-trim-timeline-playhead" style={trimPlayheadStyle} /> : null}
-                                <button
-                                  type="button"
-                                  className={`vfl-trim-timeline-grab vfl-trim-timeline-grab-start ${activeTrimTarget === "start" ? "active" : ""}`}
-                                  style={{ left: `${(trimTimeline.start / previewDurationS) * 100}%` }}
-                                  onPointerDown={(e) => beginTrimHandleDrag("start", e)}
-                                  onFocus={() => focusTrimTarget("start")}
-                                  disabled={jobId !== null || !previewReady || !probe || previewDurationS <= 0}
-                                  aria-label="Trim start"
-                                />
-                                <button
-                                  type="button"
-                                  className={`vfl-trim-timeline-grab vfl-trim-timeline-grab-end ${activeTrimTarget === "end" ? "active" : ""}`}
-                                  style={{ left: `${(trimTimeline.end / previewDurationS) * 100}%` }}
-                                  onPointerDown={(e) => beginTrimHandleDrag("end", e)}
-                                  onFocus={() => focusTrimTarget("end")}
-                                  disabled={jobId !== null || !previewReady || !probe || previewDurationS <= 0}
-                                  aria-label="Trim end"
-                                />
-                              </div>
-                              <div className="vfl-trim-timeline-values">
-                                <button
-                                  type="button"
-                                  className={`vfl-trim-timeline-value ${activeTrimTarget === "start" ? "active" : ""}`}
-                                  onClick={() => focusTrimTarget("start")}
-                                  disabled={jobId !== null || !previewReady || !probe}
-                                >
-                                  Start {formatClock(trimTimeline.start)}
-                                </button>
-                                <button
-                                  type="button"
-                                  className={`vfl-trim-timeline-value ${activeTrimTarget === "end" ? "active" : ""}`}
-                                  onClick={() => focusTrimTarget("end")}
-                                  disabled={jobId !== null || !previewReady || !probe}
-                                >
-                                  {trimTimeline.hasCustomEnd ? `End ${formatClock(trimTimeline.end)}` : `End at clip end (${formatClock(previewDurationS)})`}
-                                </button>
-                              </div>
-                            </div>
-                          ) : null}
-                          <div className="vfl-preview-time">
-                            {formatClock(clampedPreviewTimeS)} / {formatClock(previewDurationS)}
-                          </div>
-                          <div className="vfl-actions vfl-preview-tools">
-                            <button
-                              onClick={saveCurrentFrame}
-                              disabled={jobId !== null || !previewReady || !probe || frameSaving}
-                              title="Save the current preview frame as a PNG"
-                            >
-                              {frameSaving ? "Saving…" : "Save frame (PNG)"}
-                            </button>
-                          </div>
+                      <input
+                        className="vfl-scrubber"
+                        type="range"
+                        min={0}
+                        max={previewDurationS || 0}
+                        step={0.01}
+                        value={clampedPreviewTimeS}
+                        style={rangeFillStyle(clampedPreviewTimeS, 0, previewDurationS || 0)}
+                        onChange={(e) => syncPreviewToTime(Number(e.currentTarget.value), "preview")}
+                        disabled={jobId !== null || !previewReady || !probe}
+                        aria-label="Preview timeline"
+                      />
+
+                      <div className="vfl-transport-row">
+                        <button className="primary" onClick={togglePreviewPlayback} disabled={jobId !== null || !previewReady || !probe}>
+                          {previewPlaying ? "Pause" : "Play"}
+                        </button>
+                        <button onClick={() => stepPreview(-5)} disabled={jobId !== null || !previewReady || !probe}>
+                          Back 5s
+                        </button>
+                        <button onClick={() => stepPreview(5)} disabled={jobId !== null || !previewReady || !probe}>
+                          Forward 5s
+                        </button>
+                        <button
+                          type="button"
+                          className="vfl-icon-button"
+                          onClick={saveCurrentFrame}
+                          disabled={jobId !== null || !previewReady || !probe || frameSaving}
+                          title="Save Frame"
+                          aria-label="Save the current preview frame as a PNG"
+                          aria-busy={frameSaving}
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M4.5 7.5h3.2l1.6-2.3h5.4l1.6 2.3h3.2a1 1 0 0 1 1 1v9.3a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1Z" />
+                            <circle cx="12" cy="13" r="3.4" />
+                          </svg>
+                        </button>
+                        <div className="vfl-transport-time">
+                          {formatClock(clampedPreviewTimeS)} / {formatClock(previewDurationS)}
                         </div>
                       </div>
 
-                      <div className="vfl-side-block vfl-trim-block vfl-stack-sm">
-                          <div className="vfl-subsection-title">Trim</div>
-                          <div className="vfl-row2">
-                            <div className="vfl-field">
-                              <label htmlFor="vfl-trim-start">Start (s)</label>
-                              <div className="vfl-control-row">
-                                <input
-                                  id="vfl-trim-start"
-                                  value={trimStart}
-                                  onFocus={() => focusTrimTarget("start")}
-                                  onChange={(e) => setTrimStart(e.currentTarget.value)}
-                                  disabled={jobId !== null}
-                                  inputMode="decimal"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={applyTrimStartFromCurrent}
-                                  disabled={jobId !== null || !previewReady || !probe}
-                                  title="Use the current preview time"
-                                >
-                                  Set start
-                                </button>
-                              </div>
-                            </div>
-                            <div className="vfl-field">
-                              <label htmlFor="vfl-trim-end">End (s)</label>
-                              <div className="vfl-control-row">
-                                <input
-                                  id="vfl-trim-end"
-                                  value={trimEnd}
-                                  onFocus={() => focusTrimTarget("end")}
-                                  onChange={(e) => setTrimEnd(e.currentTarget.value)}
-                                  disabled={jobId !== null}
-                                  placeholder="(optional)"
-                                  inputMode="decimal"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={applyTrimEndFromCurrent}
-                                  disabled={jobId !== null || !previewReady || !probe}
-                                  title="Use the current preview time"
-                                >
-                                  Set end
-                                </button>
-                                <button type="button" onClick={() => setTrimEnd("")} disabled={jobId !== null || trimEnd.trim() === ""}>
-                                  Clear
-                                </button>
-                              </div>
-                              <div className="vfl-inline-hint">Drag either trim handle or click Start/End above to make the preview jump to that boundary.</div>
-                            </div>
+                      {trimTimeline ? (
+                        <div className="vfl-trim-block">
+                          <div className="vfl-trim-head">
+                            <span className="vfl-trim-label">Trim</span>
+                            <span className="vfl-trim-range-summary">
+                              {formatClock(trimTimeline.start)} to {trimTimeline.hasCustomEnd ? formatClock(trimTimeline.end) : "end"}
+                            </span>
+                            <span className="vfl-trim-kept-chip" title={trimSummary ?? undefined}>
+                              {(trimTimeline.end - trimTimeline.start).toFixed(2)} s kept
+                            </span>
                           </div>
-                          <div className="vfl-field">
-                            <label htmlFor="trim-drag-snap">Drag snap (s)</label>
-                            <div className="vfl-control-row">
+                          <div
+                            className="vfl-trim-timeline-track"
+                            ref={trimTimelineTrackRef}
+                            title="Drag either trim handle or click Start/End above to make the preview jump to that boundary."
+                          >
+                            <div className="vfl-trim-timeline-rail" />
+                            {trimSelectionStyle ? <div className="vfl-trim-timeline-selection" style={trimSelectionStyle} /> : null}
+                            {trimPlayheadStyle ? <div className="vfl-trim-timeline-playhead" style={trimPlayheadStyle} /> : null}
+                            <button
+                              type="button"
+                              className={`vfl-trim-timeline-grab vfl-trim-timeline-grab-start ${activeTrimTarget === "start" ? "active" : ""}`}
+                              style={{ left: `${(trimTimeline.start / previewDurationS) * 100}%` }}
+                              onPointerDown={(e) => beginTrimHandleDrag("start", e)}
+                              onFocus={() => focusTrimTarget("start")}
+                              disabled={jobId !== null || !previewReady || !probe || previewDurationS <= 0}
+                              aria-label="Trim start"
+                            />
+                            <button
+                              type="button"
+                              className={`vfl-trim-timeline-grab vfl-trim-timeline-grab-end ${activeTrimTarget === "end" ? "active" : ""}`}
+                              style={{ left: `${(trimTimeline.end / previewDurationS) * 100}%` }}
+                              onPointerDown={(e) => beginTrimHandleDrag("end", e)}
+                              onFocus={() => focusTrimTarget("end")}
+                              disabled={jobId !== null || !previewReady || !probe || previewDurationS <= 0}
+                              aria-label="Trim end"
+                            />
+                          </div>
+                          <div className="vfl-trim-row">
+                            <div className="vfl-trim-field">
+                              <label htmlFor="vfl-trim-start">Start (s)</label>
+                              <input
+                                id="vfl-trim-start"
+                                value={trimStart}
+                                onFocus={() => focusTrimTarget("start")}
+                                onChange={(e) => setTrimStart(e.currentTarget.value)}
+                                disabled={jobId !== null}
+                                inputMode="decimal"
+                              />
+                              <button
+                                type="button"
+                                onClick={applyTrimStartFromCurrent}
+                                disabled={jobId !== null || !previewReady || !probe}
+                                title="Use the current preview time"
+                              >
+                                Set
+                              </button>
+                            </div>
+                            <div className="vfl-trim-field">
+                              <label htmlFor="vfl-trim-end">End (s)</label>
+                              <input
+                                id="vfl-trim-end"
+                                value={trimEnd}
+                                onFocus={() => focusTrimTarget("end")}
+                                onChange={(e) => setTrimEnd(e.currentTarget.value)}
+                                disabled={jobId !== null}
+                                placeholder="(end)"
+                                inputMode="decimal"
+                              />
+                              <button
+                                type="button"
+                                onClick={applyTrimEndFromCurrent}
+                                disabled={jobId !== null || !previewReady || !probe}
+                                title="Use the current preview time"
+                              >
+                                Set
+                              </button>
+                              <button type="button" onClick={() => setTrimEnd("")} disabled={jobId !== null || trimEnd.trim() === ""}>
+                                Clear
+                              </button>
+                            </div>
+                            <div
+                              className="vfl-trim-field"
+                              title={
+                                trimDragSnapIntervalS > 0
+                                  ? `While dragging Start or End, the handle snaps in ${trimDragSnapIntervalS}s steps and never allows a value above the current clip length.`
+                                  : "0 disables snapping."
+                              }
+                            >
+                              <label htmlFor="trim-drag-snap">Drag snap (s)</label>
                               <input
                                 id="trim-drag-snap"
                                 type="number"
@@ -3342,24 +3372,14 @@ function App() {
                                 disabled={jobId !== null || !probe}
                                 inputMode="numeric"
                               />
-                              <div className={`vfl-chip ${trimDragSnapIntervalS > 0 ? "active" : ""}`}>
-                                {trimDragSnapIntervalS > 0 ? `${trimDragSnapIntervalS}s snap` : "Disabled"}
-                              </div>
                             </div>
-                            <div className="vfl-inline-hint">
-                              {trimDragSnapIntervalS > 0
-                                ? `While dragging Start or End, the handle snaps in ${trimDragSnapIntervalS}s steps and never allows a value above the current clip length.`
-                                : "0 disables snapping."}
-                            </div>
-                            <div className="vfl-inline-hint">{trimShortcutHint}</div>
-                          </div>
-                          <div className="vfl-actions vfl-actions-wrap">
-                            <button type="button" onClick={resetTrim} disabled={jobId !== null}>
+                            <button type="button" className="vfl-trim-reset" onClick={resetTrim} disabled={jobId !== null}>
                               Reset trim
                             </button>
                           </div>
-                          {trimSummary ? <div className="vfl-inline-hint">{trimSummary}</div> : null}
-                      </div>
+                          <div className="vfl-kbd-hint">{trimShortcutHint}</div>
+                        </div>
+                      ) : null}
                     </div>
                   )
                 ) : (
@@ -3446,7 +3466,7 @@ function App() {
             onToggle={() => toggleCard("recipes")}
           >
             <div className="vfl-muted vfl-section-caption">
-              Apply a complete starting point, then adjust any setting before exporting.
+              Apply a starting point, then adjust any setting before exporting.
             </div>
             <div className="vfl-recipe-grid">
               {EXPORT_RECIPES.map((recipe) => {
