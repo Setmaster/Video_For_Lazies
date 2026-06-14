@@ -21,6 +21,20 @@ const PAYLOAD_MANIFEST_SCHEMA: &str = "com.setmaster.video-for-lazies.payload-ma
 const APPLY_PLAN_SCHEMA: &str = "com.setmaster.video-for-lazies.apply-plan.v1";
 const UPDATE_PREFS_SCHEMA: &str = "com.setmaster.video-for-lazies.update-prefs.v1";
 const UPDATE_STATE_DIR: &str = ".vfl-updates";
+// Filename prefix for the helper copy we actually launch from the temp dir.
+// It deliberately avoids installer keywords ("update", "setup", "install",
+// "patch"): on Windows, UAC installer-detection flags an executable whose name
+// contains one of those AND that lacks an explicit requestedExecutionLevel
+// manifest as requiring administrator, so a non-elevated CreateProcess of it
+// fails with ERROR_ELEVATION_REQUIRED (os error 740). The shipped binary keeps
+// its `vfl-update-helper` name (cross-version staging looks it up by that name);
+// only this launched copy is renamed. Verified on Windows: an identical binary
+// named "...update..." is refused 740 from a non-elevated caller while the same
+// binary named "vfl-apply-..." launches.
+const TEMP_HELPER_PREFIX: &str = "vfl-apply-";
+// Legacy launched-copy prefix from <= v1.8.0 (contained "update"); still swept
+// by cleanup so stale copies from older versions do not accumulate.
+const LEGACY_TEMP_HELPER_PREFIX: &str = "vfl-update-helper-";
 const PAYLOAD_MANIFEST_FILE_NAME: &str = "VFL_PAYLOAD_MANIFEST.json";
 const PORTABLE_ROOT_DIR_NAME: &str = "Video_For_Lazies";
 const UPDATE_MANIFEST_URL: &str = "https://github.com/Setmaster/Video_For_Lazies/releases/latest/download/vfl-update-manifest-v1.json";
@@ -799,7 +813,8 @@ fn stage_update(
 fn copy_staged_helper_to_temp(plan: &UpdateApplyPlan) -> Result<PathBuf, String> {
     let helper_source = plan.stage_dir.join(&plan.helper_name);
     let helper_target = std::env::temp_dir().join(format!(
-        "vfl-update-helper-{}{}",
+        "{}{}{}",
+        TEMP_HELPER_PREFIX,
         plan.update_id,
         executable_suffix()
     ));
@@ -1635,7 +1650,9 @@ fn cleanup_old_temp_helpers() {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !file_name.starts_with("vfl-update-helper-") {
+        if !file_name.starts_with(TEMP_HELPER_PREFIX)
+            && !file_name.starts_with(LEGACY_TEMP_HELPER_PREFIX)
+        {
             continue;
         }
         let Ok(meta) = entry.metadata() else {
@@ -1744,6 +1761,28 @@ mod tests {
         assert!(state_dir.exists());
         assert_eq!(fs::read_dir(&state_dir).unwrap().count(), 0);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn launched_helper_temp_name_avoids_uac_installer_keywords() {
+        // Windows UAC installer-detection refuses a non-elevated CreateProcess of
+        // an exe whose name contains these keywords and that lacks an explicit
+        // asInvoker manifest (ERROR_ELEVATION_REQUIRED, os error 740). The helper
+        // copy we actually launch must not contain any of them. Verified on
+        // Windows that the same binary fails 740 when named "...update..." and
+        // launches when named "vfl-apply-...".
+        let sample = format!("{TEMP_HELPER_PREFIX}1.8.1-1700000000000.exe");
+        let lower = sample.to_ascii_lowercase();
+        for keyword in ["update", "setup", "install", "patch"] {
+            assert!(
+                !lower.contains(keyword),
+                "launched helper name '{sample}' must not contain installer keyword '{keyword}'"
+            );
+        }
+        // Cleanup still sweeps the legacy ("...update...") copies older versions
+        // wrote, so they do not pile up after the rename.
+        assert_ne!(TEMP_HELPER_PREFIX, LEGACY_TEMP_HELPER_PREFIX);
+        assert!(LEGACY_TEMP_HELPER_PREFIX.contains("update"));
     }
 
     #[test]
