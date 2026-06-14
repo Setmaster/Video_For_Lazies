@@ -77,12 +77,13 @@ export const EXPORT_RECIPES = [
   {
     id: "forum-4mb",
     label: "Forum 4 MB",
-    description: "Caps the export at 4 MB and removes audio. Leaves every other setting unchanged.",
+    description: "Caps the export at 4 MB, removes audio, and makes each export unique. Leaves every other setting unchanged.",
     // Partial recipes only set (and only match) the settings they list.
     partial: true,
     settings: {
       sizeLimitMb: "4",
       audioEnabled: false,
+      perturbFirstFrame: true,
     },
   },
   {
@@ -219,6 +220,12 @@ export function recipeMatchesSettings(recipe, settings) {
     ) {
       return false;
     }
+    if (
+      "perturbFirstFrame" in partialSettings &&
+      Boolean(settings.perturbFirstFrame) !== Boolean(partialSettings.perturbFirstFrame)
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -243,6 +250,7 @@ export function recipeMatchesSettings(recipe, settings) {
     resizeMatches &&
     Boolean(settings.audioEnabled) === Boolean(recipeSettings.audioEnabled) &&
     Boolean(settings.normalizeAudio) === Boolean(recipeSettings.normalizeAudio) &&
+    Boolean(settings.perturbFirstFrame) === Boolean(recipeSettings.perturbFirstFrame) &&
     (currentAdvanced.videoCodec ?? "auto") === (recipeAdvanced.videoCodec ?? "auto") &&
     normalizeAdvancedNumber(currentAdvanced.audioBitrateKbps) === normalizeAdvancedNumber(recipeAdvanced.audioBitrateKbps) &&
     (currentAdvanced.videoQuality ?? "auto") === (recipeAdvanced.videoQuality ?? "auto") &&

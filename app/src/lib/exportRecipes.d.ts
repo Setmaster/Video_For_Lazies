@@ -22,6 +22,7 @@ export type ExportRecipeSettings = {
   maxEdgePx?: string;
   audioEnabled: boolean;
   normalizeAudio?: boolean;
+  perturbFirstFrame?: boolean;
   advanced: {
     videoCodec: VideoCodecPreference;
     audioBitrateKbps: number | null;
@@ -33,7 +34,7 @@ export type ExportRecipeSettings = {
 };
 
 export type PartialExportRecipeSettings = Partial<
-  Pick<ExportRecipeSettings, "format" | "sizeLimitMb" | "audioEnabled" | "normalizeAudio">
+  Pick<ExportRecipeSettings, "format" | "sizeLimitMb" | "audioEnabled" | "normalizeAudio" | "perturbFirstFrame">
 >;
 
 export type ExportRecipe =

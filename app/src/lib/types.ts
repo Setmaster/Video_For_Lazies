@@ -57,6 +57,9 @@ export interface EncodeRequest {
   resize?: ResizeSettings | null;
   maxEdgePx?: number | null;
   color?: ColorAdjust | null;
+  // Imperceptibly perturb the first frame so each export hashes differently
+  // (off by default; the Forum recipe enables it). Seed is chosen by the backend.
+  perturbFirstFrame: boolean;
 }
 
 export interface AdvancedEncodeSettings {
@@ -126,6 +129,7 @@ export interface AppSmokeConfig {
   resizeWidthPx?: number | null;
   resizeHeightPx?: number | null;
   skipPreviewInteractions?: boolean | null;
+  perturbFirstFrame?: boolean | null;
 }
 
 export interface AppSmokeStatus {

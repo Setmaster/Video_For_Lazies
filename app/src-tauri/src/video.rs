@@ -182,6 +182,16 @@ pub struct EncodeRequest {
     #[serde(default)]
     pub max_edge_px: Option<u32>,
     pub color: Option<ColorAdjust>,
+    /// When true, imperceptibly perturb only the first output frame so its hash
+    /// differs from the source / a vanilla export (defeats exact-hash dedupe on
+    /// forums). Off by default; the Forum 4 MB recipe turns it on.
+    #[serde(default)]
+    pub perturb_first_frame: bool,
+    /// Optional fixed seed for the first-frame perturbation. None (the normal
+    /// case) makes the backend pick a fresh random seed per export so repeated
+    /// exports stay unique; an explicit seed is used for deterministic tests.
+    #[serde(default)]
+    pub perturb_seed: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1871,11 +1881,50 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         filters.push(format!("fps={cap_fps}"));
     }
 
+    // Must be LAST: reverse/trim/fps reorder frames, and enable='eq(n,0)' targets
+    // the first frame entering this filter, so appending it here lands on the
+    // true first OUTPUT frame.
+    if let Some(perturb) = first_frame_perturb_filter(req) {
+        filters.push(perturb);
+    }
+
     Ok(if filters.is_empty() {
         None
     } else {
         Some(filters.join(","))
     })
+}
+
+/// Noise strength for the first-frame perturbation. Must stay >= 2: a lighter
+/// touch (e.g. a single LSB flip, or `alls=1`) is quantized away by the export
+/// re-encode and leaves the first frame unchanged. Measured 2026-06-13: alls>=2
+/// survives forum-grade compression (CRF 40) while staying imperceptible
+/// (PSNR ~35-40 dB). See research/2026-06-13-first-frame-uniqueness.md.
+const FIRST_FRAME_PERTURB_STRENGTH: u32 = 3;
+
+/// Builds the timeline-gated uniform-noise filter that imperceptibly perturbs
+/// only the first frame. Returns None when the feature is off. The comma inside
+/// `eq(n,0)` is backslash-escaped so the filter survives the `,`-join with the
+/// rest of the filterchain.
+fn first_frame_perturb_filter(req: &EncodeRequest) -> Option<String> {
+    if !req.perturb_first_frame {
+        return None;
+    }
+    // all_seed is an int in -1..=INT_MAX; mask into the non-negative i32 range.
+    let seed = req.perturb_seed.unwrap_or_else(random_perturb_seed) & (i32::MAX as u32);
+    Some(format!(
+        "noise=alls={FIRST_FRAME_PERTURB_STRENGTH}:allf=u:all_seed={seed}:enable='eq(n\\,0)'"
+    ))
+}
+
+/// A fresh per-export seed derived from the wall clock (no extra dependency).
+/// Uniqueness, not unpredictability, is the goal, so this need not be a CSPRNG.
+fn random_perturb_seed() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+        .unwrap_or(0)
 }
 
 fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option<String>, String> {
@@ -2438,7 +2487,9 @@ pub fn run_encode_job(
         && request.rotate_deg == 0
         && (request.speed - 1.0).abs() <= 1e-9
         && matches!(requested_resize(&request)?, ResizePlan::Source)
-        && color_is_noop(&request.color);
+        && color_is_noop(&request.color)
+        // First-frame perturbation requires a re-encode; never stream-copy.
+        && !request.perturb_first_frame;
 
     if no_op_transforms {
         let input_size = fs::metadata(&input_path)
@@ -3004,6 +3055,8 @@ mod tests {
             resize: None,
             max_edge_px: None,
             color: None,
+            perturb_first_frame: false,
+            perturb_seed: None,
         }
     }
 
@@ -3555,6 +3608,80 @@ Encoders:
 
         req.advanced.frame_rate_cap_fps = Some(60);
         assert_eq!(build_video_filters(&req, &probe).unwrap(), None);
+    }
+
+    #[test]
+    fn first_frame_perturb_absent_by_default() {
+        let req = base_request();
+        assert!(first_frame_perturb_filter(&req).is_none());
+        let probe = probe_10s_1920x1080_audio();
+        // A default request stays a no-op filtergraph.
+        assert_eq!(build_video_filters(&req, &probe).unwrap(), None);
+    }
+
+    #[test]
+    fn first_frame_perturb_appends_noise_filter_last() {
+        let mut req = base_request();
+        req.perturb_first_frame = true;
+        req.perturb_seed = Some(123_456);
+        // Add an earlier filter so we can prove the perturbation lands last.
+        req.color = Some(ColorAdjust {
+            brightness: 0.1,
+            contrast: 1.0,
+            saturation: 1.0,
+        });
+
+        let probe = probe_10s_1920x1080_audio();
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        // ends_with (not split-on-comma): the noise filter carries an escaped
+        // comma of its own, so it being the suffix proves it is appended last.
+        assert!(
+            filters.ends_with("noise=alls=3:allf=u:all_seed=123456:enable='eq(n\\,0)'"),
+            "perturb filter must be appended last: {filters}"
+        );
+        assert!(filters.starts_with("eq=brightness"));
+    }
+
+    #[test]
+    fn first_frame_perturb_stays_last_after_reverse_and_fps() {
+        let mut req = base_request();
+        req.perturb_first_frame = true;
+        req.perturb_seed = Some(7);
+        req.reverse = true;
+        req.advanced.frame_rate_cap_fps = Some(24);
+
+        let probe = probe_10s_1920x1080_audio();
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        assert!(filters.ends_with(":enable='eq(n\\,0)'"));
+        assert!(filters.contains("noise=alls=3:allf=u:all_seed=7:"));
+        assert!(filters.contains("reverse"));
+    }
+
+    #[test]
+    fn first_frame_perturb_disables_stream_copy_noop() {
+        // The stream-copy fast path keys off no_op_transforms; perturbation must
+        // force a re-encode. Mirror the no-op predicate used in run_encode_job.
+        let mut req = base_request();
+        req.perturb_first_frame = true;
+        let no_op = req.trim.is_none()
+            && req.crop.is_none()
+            && !req.reverse
+            && req.rotate_deg == 0
+            && (req.speed - 1.0).abs() <= 1e-9
+            && matches!(requested_resize(&req).unwrap(), ResizePlan::Source)
+            && color_is_noop(&req.color)
+            && !req.perturb_first_frame;
+        assert!(!no_op);
+    }
+
+    #[test]
+    fn first_frame_perturb_uses_random_seed_when_unset() {
+        let mut req = base_request();
+        req.perturb_first_frame = true;
+        req.perturb_seed = None;
+        let filter = first_frame_perturb_filter(&req).unwrap();
+        assert!(filter.starts_with("noise=alls=3:allf=u:all_seed="));
+        assert!(filter.ends_with(":enable='eq(n\\,0)'"));
     }
 
     #[test]

@@ -90,7 +90,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.7.0";
+const APP_VERSION = "1.8.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -383,6 +383,7 @@ function App() {
   const [outputAspectLocked, setOutputAspectLocked] = useState(true);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [normalizeAudio, setNormalizeAudio] = useState(false);
+  const [perturbFirstFrame, setPerturbFirstFrame] = useState(false);
   const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
   const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
   const [advancedVideoQuality, setAdvancedVideoQuality] = useState<VideoQualityPreference>("auto");
@@ -839,6 +840,7 @@ function App() {
     setOutputAspectLocked(true);
     setAudioEnabled(true);
     setNormalizeAudio(false);
+    setPerturbFirstFrame(false);
     setStripMetadata(true);
     setSampleDurationS(10);
     setSampleEstimate(null);
@@ -879,6 +881,7 @@ function App() {
         setAudioEnabled(format === "mp3" ? true : partialSettings.audioEnabled);
       }
       if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
+      if (partialSettings.perturbFirstFrame !== undefined) setPerturbFirstFrame(partialSettings.perturbFirstFrame);
       setStatus(`Applied ${recipe.label}.`);
       return;
     }
@@ -900,6 +903,7 @@ function App() {
         : recipeSettings.audioEnabled && (probe ? probe.hasAudio : true),
     );
     setNormalizeAudio(Boolean(recipeSettings.normalizeAudio));
+    setPerturbFirstFrame(Boolean(recipeSettings.perturbFirstFrame));
     setAdvancedVideoCodec(recipeAdvanced.videoCodec);
     setAdvancedAudioBitrateKbps(recipeAdvanced.audioBitrateKbps === null ? "auto" : String(recipeAdvanced.audioBitrateKbps));
     setAdvancedVideoQuality(recipeAdvanced.videoQuality);
@@ -967,6 +971,7 @@ function App() {
     setOutputAspectLocked(true);
     setAudioEnabled(true);
     setNormalizeAudio(false);
+    setPerturbFirstFrame(smokeConfig.perturbFirstFrame ?? false);
     autoMutedRef.current = false;
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
@@ -1309,6 +1314,7 @@ function App() {
       },
       audioEnabled,
       normalizeAudio,
+      perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       advanced: {
         videoCodec: advancedVideoCodec,
         audioBitrateKbps: advancedAudioBitrateRequest,
@@ -1328,6 +1334,7 @@ function App() {
       outputAspectLocked,
       audioEnabled,
       normalizeAudio,
+      perturbFirstFrame,
       advancedVideoCodec,
       advancedAudioBitrateRequest,
       advancedVideoQuality,
@@ -2210,6 +2217,7 @@ function App() {
       resize: resizeRequest.resize,
       maxEdgePx: resizeRequest.legacyMaxEdgePx,
       color: null,
+      perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
     };
   }
 
@@ -2271,6 +2279,7 @@ function App() {
       resize: resizeRequest.resize,
       maxEdgePx: resizeRequest.legacyMaxEdgePx,
       color,
+      perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
     };
   }
 
@@ -3666,6 +3675,23 @@ function App() {
                   {stripMetadata
                     ? "GPS and capture metadata from the source are removed from exports."
                     : "Source metadata, including GPS location when present, is copied into exports."}
+                </div>
+              </div>
+              <div className="vfl-field">
+                <div className="vfl-field-label">Sharing</div>
+                <label className="vfl-check vfl-check-card">
+                  <input
+                    type="checkbox"
+                    checked={format === "mp3" ? false : perturbFirstFrame}
+                    onChange={(e) => setPerturbFirstFrame(e.currentTarget.checked)}
+                    disabled={jobId !== null || format === "mp3"}
+                  />
+                  <span>Make each export unique</span>
+                </label>
+                <div className="vfl-inline-hint">
+                  {format === "mp3"
+                    ? "Only applies to video exports."
+                    : "Imperceptibly alters the first frame so each export has a different hash. Helps when a forum blocks re-uploaded duplicates. Does not defeat content fingerprinting."}
                 </div>
               </div>
             </div>
