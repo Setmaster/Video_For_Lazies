@@ -90,7 +90,7 @@ const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
-const APP_VERSION = "1.8.1";
+const APP_VERSION = "1.9.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -397,6 +397,7 @@ function App() {
   const [trimEnd, setTrimEnd] = useState("");
   const [trimDragSnapS, setTrimDragSnapS] = useState("0");
   const [reverse, setReverse] = useState(false);
+  const [loopVideo, setLoopVideo] = useState(false);
   const [speed, setSpeed] = useState("1.0");
   const [rotateDeg, setRotateDeg] = useState(0);
 
@@ -856,6 +857,7 @@ function App() {
     setTrimEnd("");
     setTrimDragSnapS("0");
     setReverse(false);
+    setLoopVideo(false);
     setSpeed("1.0");
     setRotateDeg(0);
 
@@ -983,6 +985,7 @@ function App() {
     setTrimEnd(smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined ? "" : formatNumberInput(smokeConfig.trimEndS));
     setTrimDragSnapS("0");
     setReverse(false);
+    setLoopVideo(smokeConfig.loopVideo ?? false);
     setSpeed("1.0");
     setRotateDeg(0);
     setCropEnabled(false);
@@ -1277,6 +1280,7 @@ function App() {
     Boolean(trimSummary) ||
     Boolean(cropEnabled && cropSummary && cropSummary !== "Full frame selected.") ||
     reverse ||
+    loopVideo ||
     rotateDeg !== 0 ||
     (Number.isFinite(Number(speed)) && Math.abs(Number(speed) - 1) > 0.001) ||
     (format !== "mp3" && resizeMode !== "source") ||
@@ -1385,6 +1389,7 @@ function App() {
 
     if (rotateDeg !== 0) chips.push(`Rotate ${rotateDeg}°`);
     if (reverse) chips.push("Reverse");
+    if (loopVideo) chips.push("Loop");
 
     const brightnessNum = Number(brightness);
     const contrastNum = Number(contrast);
@@ -2218,6 +2223,7 @@ function App() {
       maxEdgePx: resizeRequest.legacyMaxEdgePx,
       color: null,
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
+      loopVideo: false,
     };
   }
 
@@ -2280,6 +2286,7 @@ function App() {
       maxEdgePx: resizeRequest.legacyMaxEdgePx,
       color,
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
+      loopVideo: format === "mp3" ? false : loopVideo,
     };
   }
 
@@ -3802,6 +3809,20 @@ function App() {
                       />
                       Reverse (video + audio)
                     </label>
+                    <label className="vfl-check">
+                      <input
+                        type="checkbox"
+                        checked={format === "mp3" ? false : loopVideo}
+                        onChange={(e) => setLoopVideo(e.currentTarget.checked)}
+                        disabled={jobId !== null || format === "mp3"}
+                      />
+                      Loop (boomerang)
+                    </label>
+                    <div className="vfl-inline-hint">
+                      {format === "mp3"
+                        ? "Loop only applies to video exports."
+                        : "Plays the clip forward then in reverse so it loops seamlessly. Doubles the length."}
+                    </div>
                   </div>
 
                   <div className="vfl-subsection-title">Color</div>

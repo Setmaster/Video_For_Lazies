@@ -39,6 +39,7 @@ struct AppSmokeConfig {
     resize_height_px: Option<u32>,
     skip_preview_interactions: bool,
     perturb_first_frame: bool,
+    loop_video: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -217,6 +218,7 @@ fn parse_smoke_config_from_env(
     let resize_height_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_HEIGHT_PX", None)?;
     let skip_preview_interactions = parse_smoke_bool(env, "VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS")?;
     let perturb_first_frame = parse_smoke_bool(env, "VFL_SMOKE_PERTURB_FIRST_FRAME")?;
+    let loop_video = parse_smoke_bool(env, "VFL_SMOKE_LOOP")?;
 
     if size_limit_mb < 0.0 {
         return Err("VFL_SMOKE_SIZE_LIMIT_MB must be >= 0.".to_string());
@@ -262,6 +264,7 @@ fn parse_smoke_config_from_env(
         resize_height_px,
         skip_preview_interactions,
         perturb_first_frame,
+        loop_video,
     }))
 }
 
@@ -628,6 +631,7 @@ mod tests {
                 resize_height_px: None,
                 skip_preview_interactions: false,
                 perturb_first_frame: false,
+                loop_video: false,
             })
         );
     }
@@ -648,6 +652,7 @@ mod tests {
             ("VFL_SMOKE_RESIZE_HEIGHT_PX", "180"),
             ("VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS", "true"),
             ("VFL_SMOKE_PERTURB_FIRST_FRAME", "true"),
+            ("VFL_SMOKE_LOOP", "true"),
         ]);
 
         assert_eq!(
@@ -666,6 +671,7 @@ mod tests {
                 resize_height_px: Some(180),
                 skip_preview_interactions: true,
                 perturb_first_frame: true,
+                loop_video: true,
             })
         );
     }

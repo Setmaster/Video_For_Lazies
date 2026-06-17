@@ -60,6 +60,9 @@ export interface EncodeRequest {
   // Imperceptibly perturb the first frame so each export hashes differently
   // (off by default; the Forum recipe enables it). Seed is chosen by the backend.
   perturbFirstFrame: boolean;
+  // Play the clip forward then in reverse (a seamless boomerang loop). Doubles
+  // the output duration; N/A for audio-only mp3.
+  loopVideo: boolean;
 }
 
 export interface AdvancedEncodeSettings {
@@ -130,6 +133,7 @@ export interface AppSmokeConfig {
   resizeHeightPx?: number | null;
   skipPreviewInteractions?: boolean | null;
   perturbFirstFrame?: boolean | null;
+  loopVideo?: boolean | null;
 }
 
 export interface AppSmokeStatus {

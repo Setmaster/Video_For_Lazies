@@ -192,6 +192,11 @@ pub struct EncodeRequest {
     /// exports stay unique; an explicit seed is used for deterministic tests.
     #[serde(default)]
     pub perturb_seed: Option<u32>,
+    /// When true, the export plays forward then in reverse (a seamless
+    /// boomerang loop): the video/audio chains are wrapped with
+    /// split/reverse/concat, which doubles the output duration. N/A for mp3.
+    #[serde(default)]
+    pub loop_video: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1639,6 +1644,7 @@ fn estimate_output_duration_s(
     probe_duration_s: f64,
     trim: &Option<Trim>,
     speed: f64,
+    loop_video: bool,
 ) -> Result<f64, String> {
     if probe_duration_s <= 0.0 {
         return Err("Invalid duration from probe.".to_string());
@@ -1657,7 +1663,10 @@ fn estimate_output_duration_s(
         duration = end - start;
     }
 
-    Ok(duration / speed)
+    // The boomerang loop plays the clip forward then in reverse, so the output
+    // is twice as long. Size planning and the progress bar both depend on this.
+    let base = duration / speed;
+    Ok(if loop_video { base * 2.0 } else { base })
 }
 
 fn plan_bitrates(
@@ -1881,18 +1890,37 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         filters.push(format!("fps={cap_fps}"));
     }
 
-    // Must be LAST: reverse/trim/fps reorder frames, and enable='eq(n,0)' targets
-    // the first frame entering this filter, so appending it here lands on the
-    // true first OUTPUT frame.
+    // Must be LAST in the linear chain: reverse/trim/fps reorder frames, and
+    // enable='eq(n,0)' targets the first frame entering this filter, so this
+    // lands on the true first output frame (the boomerang wrap below keeps the
+    // forward segment first, so the first output frame is still this one).
     if let Some(perturb) = first_frame_perturb_filter(req) {
         filters.push(perturb);
     }
 
-    Ok(if filters.is_empty() {
+    let linear = if filters.is_empty() {
         None
     } else {
         Some(filters.join(","))
-    })
+    };
+    Ok(apply_boomerang_video(linear, req))
+}
+
+/// Wraps a linear video chain so the clip plays forward then in reverse (a
+/// seamless boomerang loop), via split/reverse/concat. A simple filtergraph
+/// (-vf) accepts this internal split/concat as long as it stays 1-in-1-out
+/// (verified). Returns the chain unchanged when loop is off. NOTE: the reverse
+/// filter buffers every frame of the clip in memory, so this targets short
+/// clips. The audio chain is boomeranged symmetrically in build_audio_filters,
+/// so the two stay in sync without a filter_complex.
+fn apply_boomerang_video(chain: Option<String>, req: &EncodeRequest) -> Option<String> {
+    if !req.loop_video {
+        return chain;
+    }
+    let prefix = chain.map(|c| format!("{c},")).unwrap_or_default();
+    Some(format!(
+        "{prefix}split[fv][rv0];[rv0]reverse[rv];[fv][rv]concat=n=2:v=1"
+    ))
 }
 
 /// Noise strength for the first-frame perturbation. Must stay >= 2: a lighter
@@ -1958,11 +1986,26 @@ fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         filters.push(atempo_chain(req.speed)?);
     }
 
-    Ok(if filters.is_empty() {
+    let linear = if filters.is_empty() {
         None
     } else {
         Some(filters.join(","))
-    })
+    };
+    Ok(apply_boomerang_audio(linear, req))
+}
+
+/// Boomerangs the audio (forward then reversed) so it stays in sync with the
+/// video boomerang. Only applies for loop on a video format; audio-only (mp3)
+/// is left untouched because Loop is a video effect and reversed audio there is
+/// not wanted. Reached only when audio is actually included.
+fn apply_boomerang_audio(chain: Option<String>, req: &EncodeRequest) -> Option<String> {
+    if !req.loop_video || matches!(req.format, OutputFormat::Mp3) {
+        return chain;
+    }
+    let prefix = chain.map(|c| format!("{c},")).unwrap_or_default();
+    Some(format!(
+        "{prefix}asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
+    ))
 }
 
 fn null_sink() -> &'static str {
@@ -2363,8 +2406,12 @@ pub fn run_encode_job(
     let advanced_audio_channel_count = audio_channel_count(&request);
     let advanced_force_reencode = advanced_forces_reencode(&request, &probe, size_limit_enabled)?;
 
-    let output_duration_s =
-        estimate_output_duration_s(probe.duration_s, &request.trim, request.speed)?;
+    let output_duration_s = estimate_output_duration_s(
+        probe.duration_s,
+        &request.trim,
+        request.speed,
+        request.loop_video,
+    )?;
     let duration_us = (output_duration_s * 1_000_000.0).max(1.0) as u64;
 
     let include_audio =
@@ -2488,8 +2535,10 @@ pub fn run_encode_job(
         && (request.speed - 1.0).abs() <= 1e-9
         && matches!(requested_resize(&request)?, ResizePlan::Source)
         && color_is_noop(&request.color)
-        // First-frame perturbation requires a re-encode; never stream-copy.
-        && !request.perturb_first_frame;
+        // First-frame perturbation and the boomerang loop both require a
+        // re-encode; never stream-copy when either is on.
+        && !request.perturb_first_frame
+        && !request.loop_video;
 
     if no_op_transforms {
         let input_size = fs::metadata(&input_path)
@@ -3057,6 +3106,7 @@ mod tests {
             color: None,
             perturb_first_frame: false,
             perturb_seed: None,
+            loop_video: false,
         }
     }
 
@@ -3485,8 +3535,93 @@ Encoders:
             start_s: 2.0,
             end_s: Some(8.0),
         });
-        let out = estimate_output_duration_s(10.0, &trim, 2.0).unwrap();
+        let out = estimate_output_duration_s(10.0, &trim, 2.0, false).unwrap();
         assert!((out - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_duration_doubles_for_loop() {
+        // Forward + reverse => 2x. Size planning and progress depend on this.
+        let plain = estimate_output_duration_s(10.0, &None, 1.0, false).unwrap();
+        let looped = estimate_output_duration_s(10.0, &None, 1.0, true).unwrap();
+        assert!((plain - 10.0).abs() < 1e-9);
+        assert!((looped - 20.0).abs() < 1e-9);
+        // Composes with trim + speed: (8-2)/2 = 3, doubled = 6.
+        let trim = Some(Trim {
+            start_s: 2.0,
+            end_s: Some(8.0),
+        });
+        let looped_trim = estimate_output_duration_s(10.0, &trim, 2.0, true).unwrap();
+        assert!((looped_trim - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loop_wraps_video_chain_as_boomerang() {
+        let mut req = base_request();
+        req.loop_video = true;
+        let probe = probe_10s_1920x1080_audio();
+        // With no other transforms, the whole -vf is the boomerang.
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(
+            filters,
+            "split[fv][rv0];[rv0]reverse[rv];[fv][rv]concat=n=2:v=1"
+        );
+
+        // With other transforms, the boomerang wraps the linear chain.
+        req.color = Some(ColorAdjust {
+            brightness: 0.1,
+            contrast: 1.0,
+            saturation: 1.0,
+        });
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        assert!(filters.starts_with("eq=brightness"));
+        assert!(filters.ends_with(",split[fv][rv0];[rv0]reverse[rv];[fv][rv]concat=n=2:v=1"));
+    }
+
+    #[test]
+    fn loop_wraps_audio_chain_and_skips_mp3() {
+        let mut req = base_request();
+        req.loop_video = true;
+        let probe = probe_10s_1920x1080_audio();
+        // Audio is boomeranged symmetrically with the video for video formats.
+        let af = build_audio_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(
+            af,
+            "asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
+        );
+        // Loop is a no-op for audio-only mp3 (no video to loop).
+        req.format = OutputFormat::Mp3;
+        assert_eq!(build_audio_filters(&req, &probe).unwrap(), None);
+    }
+
+    #[test]
+    fn loop_and_perturb_compose_with_perturb_in_forward_segment() {
+        let mut req = base_request();
+        req.loop_video = true;
+        req.perturb_first_frame = true;
+        req.perturb_seed = Some(9);
+        let probe = probe_10s_1920x1080_audio();
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        // Perturb sits in the linear chain (before split), so the forward
+        // segment's first frame is the perturbed one and it stays first.
+        assert!(filters.starts_with("noise=alls=3:allf=u:all_seed=9:enable='eq(n\\,0)',split[fv]"));
+        assert!(filters.ends_with("concat=n=2:v=1"));
+    }
+
+    #[test]
+    fn loop_disables_stream_copy_noop() {
+        let mut req = base_request();
+        req.loop_video = true;
+        let no_op = req.trim.is_none()
+            && req.crop.is_none()
+            && !req.reverse
+            && req.rotate_deg == 0
+            && (req.speed - 1.0).abs() <= 1e-9
+            && matches!(requested_resize(&req).unwrap(), ResizePlan::Source)
+            && color_is_noop(&req.color)
+            && !req.perturb_first_frame
+            && !req.loop_video;
+        assert!(!no_op);
     }
 
     #[test]

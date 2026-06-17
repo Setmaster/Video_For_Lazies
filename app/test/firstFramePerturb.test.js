@@ -24,7 +24,7 @@ test("backend builds a timeline-gated noise filter for the first frame", async (
 
   // It must be appended last and must disable the stream-copy fast path.
   assert.match(video, /Must be LAST[\s\S]*first_frame_perturb_filter\(req\)/);
-  assert.match(video, /&& !request\.perturb_first_frame;/);
+  assert.match(video, /&& !request\.perturb_first_frame\b/);
 });
 
 test("frontend plumbs perturbFirstFrame through requests, recipes, and reset", async () => {
