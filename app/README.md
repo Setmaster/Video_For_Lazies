@@ -47,7 +47,7 @@ Builds `release/Video_For_Lazies/`, packages a versioned x64 zip such as `releas
 
 On both platforms, verification checks that the shipped sidecar exposes `libx264` and can encode/probe a sample MP4. On Windows, verification also runs startup smoke, the packaged interaction/export smoke, and a second tight-target 1080p MP4 smoke.
 
-The GitHub `Portable Release` workflow builds and verifies Linux and Windows x64 zips. Manual runs default to `build_only=true`, which retains private GitHub Actions artifacts for 30 days without creating a release. An intentional `build_only=false` run continues through release notes, updater-manifest signing, combined checksums, and draft or published GitHub Release creation as configured.
+The GitHub `Portable Release` workflow builds and verifies Linux and Windows x64 zips. Manual runs default to `build_only=true`, which retains private GitHub Actions artifacts for 30 days without creating a release. An intentional `build_only=false` run continues through release notes, updater-manifest signing, combined checksums, and draft or published GitHub Release creation as configured. Tag-triggered runs intentionally create a draft prerelease for asset review before explicit stable publication.
 
 ## Tests
 
@@ -72,7 +72,7 @@ cargo test
 - Output path is auto-suggested in the same folder by incrementing a `-N` suffix, skips existing `-N` outputs and queued snapshots to avoid overwrites, and changing the export format updates the output extension.
 - Export format, normalize-speech, strip-metadata, and advanced overrides are remembered between launches (input/output paths are not persisted).
 - Quick size presets (4/10/25/50 MB), direct trim in/out handles under the preview, selected-boundary fine nudges plus compose shortcuts (`Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `[` and `]`), a `Current plan` card with plan status and last-export details, bottom-bar export/open actions plus queue position, and a `Save frame (PNG)` button beside the live preview controls.
-- Preview and shaping: trim, crop (drag-select with optional aspect lock, plus auto-detect), reverse, playback speed, rotate, and color adjustments (brightness, contrast, saturation).
+- Preview and shaping: trim, crop (drag-select with optional aspect lock, plus auto-detect), reverse, forward-then-reverse Loop, playback speed, rotate, and color adjustments (brightness, contrast, saturation).
 - Export settings: output format (`mp4`, `webm`, `mp3`), size limit (MB, optional), output dimensions (Original / Max edge / Custom with aspect lock), audio on/off, title metadata, and a strip-location-metadata privacy toggle (on by default).
 - Advanced: codec/quality/encode-speed/frame-rate-cap/audio overrides, speech normalization, and sample exports with a selectable 5/10/30 s window plus an extrapolated full-size estimate.
 

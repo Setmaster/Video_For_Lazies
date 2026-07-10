@@ -56,7 +56,11 @@ test("release docs make Portable Release the final blocking gate", async () => {
   assert.match(docs, /If `main` CI fails in repo code, tests, lint, version checks, or audits, stop/);
   assert.match(docs, /`build_only=true`/);
   assert.match(docs, /`build_only=false`/);
+  assert.match(docs, /Tag events have no dispatch inputs/);
+  assert.match(docs, /defaults them to `draft=true` and `prerelease=true`/);
+  assert.match(docs, /gh release edit vX\.Y\.Z --draft=false --prerelease=false --latest/);
   assert.match(appReadme, /Manual runs default to `build_only=true`/);
   assert.match(appReadme, /private GitHub Actions artifacts for 30 days/);
   assert.match(appReadme, /intentional `build_only=false` run/);
+  assert.match(appReadme, /Tag-triggered runs intentionally create a draft prerelease/);
 });

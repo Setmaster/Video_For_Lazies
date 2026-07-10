@@ -38,15 +38,19 @@ git push origin main v0.1.1
 
 For release-candidate checks before approval, run the manual workflow from the development branch with `build_only=true`. This verifies and retains private artifacts without creating a GitHub Release. For an owner-approved draft release, explicitly use `build_only=false` and leave `draft=true` until review is complete.
 
+Pushing a release tag intentionally creates a draft prerelease. Tag events do not have the manual `draft` or `prerelease` inputs, and the release step defaults missing values to `true` so assets can be reviewed before public promotion. After the tag workflow succeeds and the draft assets pass verification, explicitly publish the release as stable and latest.
+
 ## Release Gate Policy
 
 For ordinary patch releases, the blocking gate is:
 
 1. Local checks pass on `dev`.
 2. CI passes on `dev` for the exact commit that will be released.
-3. `dev` fast-forwards into `main`.
-4. The manual `Portable Release` workflow passes on `main`.
-5. Published assets are downloaded and verified against `SHA256SUMS.txt`, the update manifest hashes, and any targeted runtime smoke needed for the change.
+3. The manual `Portable Release` workflow passes with `build_only=true` for that exact `dev` commit, including Windows and Linux portable artifacts.
+4. `dev` fast-forwards into `main`, and CI passes on the same `main` commit.
+5. The release tag workflow passes and creates the reviewable draft prerelease.
+6. Draft assets are downloaded and verified against `SHA256SUMS.txt`, the update manifest hashes and signature, and any targeted runtime smoke needed for the change.
+7. The verified draft is explicitly published as stable and latest, then the latest release endpoint and update channel are checked.
 
 The `Portable Release` workflow is the final release gate because it rebuilds and verifies both Windows x64 and Linux x64 portable artifacts before publishing. A duplicate `main` push CI run is useful branch-health signal, but it should not block an owner-approved stable release when all of these are true:
 
@@ -85,7 +89,7 @@ The `Portable Release` GitHub Actions workflow builds verified x64 artifacts for
 - `linux-x64`
 - `win-x64`
 
-It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds and verifies both portable zips on every run. Manual dispatch defaults to `build_only=true`, which uploads private artifacts with 30-day retention and skips the release job. Tag pushes, or an explicit manual `build_only=false`, continue through release notes, the combined `SHA256SUMS.txt`, updater-manifest signing, and GitHub Release creation.
+It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds and verifies both portable zips on every run. Manual dispatch defaults to `build_only=true`, which uploads private artifacts with 30-day retention and skips the release job. Tag pushes, or an explicit manual `build_only=false`, continue through release notes, the combined `SHA256SUMS.txt`, updater-manifest signing, and GitHub Release creation. Tag events have no dispatch inputs, so the release script conservatively defaults them to `draft=true` and `prerelease=true`; stable publication is a separate, explicit step after draft verification.
 
 Manual dispatch inputs:
 
@@ -99,8 +103,9 @@ Manual dispatch inputs:
 Nonpublishing development-branch validation:
 
 ```bash
+VERSION="$(cd app && node scripts/check-version.mjs --value)"
 gh workflow run portable-artifacts.yml --ref dev \
-  -f version=1.9.0 \
+  -f version="$VERSION" \
   -f build_only=true \
   -f draft=true \
   -f prerelease=true
@@ -129,7 +134,22 @@ Release notes follow this template:
 <workflow verification summary>
 ```
 
-Recommended manual draft protocol:
+Recommended stable tag protocol:
+
+1. Require local checks, exact-SHA `dev` CI, and a `build_only=true` Windows/Linux workflow run to pass.
+2. Fast-forward `dev` into `main`, push `main`, and require exact-SHA `main` CI to pass.
+3. Create and push the lightweight `vX.Y.Z` tag at that commit.
+4. Wait for the tag-triggered `Portable Release` workflow to finish green and create its draft prerelease.
+5. Download and verify all five draft assets, both archive payloads, the signed update manifest, and generated release notes.
+6. Replace generated notes with curated notes when needed, then publish only the verified draft:
+
+```bash
+gh release edit vX.Y.Z --draft=false --prerelease=false --latest
+```
+
+7. Confirm `main`, `dev`, and the tag resolve to the same commit, then verify the latest release endpoint and `releases/latest/download` update-manifest assets.
+
+Alternative manual draft protocol for review without a pre-existing tag:
 
 1. Run `git fetch --tags origin`.
 2. Find the previous release tag with `git tag --merged HEAD --sort=-version:refname --list 'v[0-9]*'`.
@@ -140,6 +160,8 @@ Recommended manual draft protocol:
 7. Confirm the draft release is backed by the intended public `vX.Y.Z` tag.
 8. Confirm generated `SOURCE.md` in each zip names the intended release tag and source commit.
 9. Publish the draft only when the owner wants that release visible to the public.
+
+For a stable release, prefer the tag-first protocol above. Publishing a manual draft whose tag does not yet exist can create that tag and start a redundant tag workflow after the release artifacts were already built.
 
 Run locally on Linux or Windows:
 

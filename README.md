@@ -18,7 +18,7 @@ It is built with Tauri, React, Rust, and FFmpeg. The goal is a practical local t
 
 - Trim clips with direct in/out handles, keyboard nudges, and a live preview.
 - Crop by drawing over the preview, optionally with aspect lock or auto-detect crop.
-- Resize by max edge, rotate, reverse, change playback speed, and adjust brightness, contrast, and saturation.
+- Resize by max edge, rotate, reverse, create a forward-then-reverse Loop, change playback speed, and adjust brightness, contrast, and saturation.
 - Export to `mp4`, `webm`, or `mp3`.
 - Apply built-in recipes for quick sharing, size-limited uploads, archive-quality MP4, smaller WebM, and audio-only MP3.
 - Queue several export snapshots and run them sequentially with one FFmpeg job at a time.
