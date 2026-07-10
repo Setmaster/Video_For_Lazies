@@ -18,29 +18,30 @@ This app bundles FFmpeg for Windows x64 and Linux x64 release builds so end user
 
 - Provider: BtbN FFmpeg Builds
 - Variant: `win64-gpl-shared`
-- BtbN release tag: `autobuild-2026-06-08-14-24`
+- BtbN release tag: `autobuild-2026-06-30-13-34`
 - Binary archive:
-  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-08-14-24/ffmpeg-n8.1.1-11-ge4c7fbf6c0-win64-gpl-shared-8.1.zip`
+  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-win64-gpl-shared-8.1.zip`
 - Binary archive SHA256:
-  `b11fdf2ed53372f334a7732883cdbe9814cd730450672d58fa56c47111526580`
+  `ec51253085a831b517e68cb7a1e46d13fcc8324f5e61ac0b3fd73c56af41ca21`
 - FFmpeg version string from the bundle:
-  `n8.1.1-11-ge4c7fbf6c0-20260608`
+  `n8.1.2-21-gce3c09c101-20260630`
 
 ## Pinned Linux bundle
 
 - Provider: BtbN FFmpeg Builds
 - Variant: `linux64-gpl-shared`
-- BtbN release tag: `autobuild-2026-06-08-14-24`
+- BtbN release tag: `autobuild-2026-06-30-13-34`
 - Binary archive:
-  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-08-14-24/ffmpeg-n8.1.1-11-ge4c7fbf6c0-linux64-gpl-shared-8.1.tar.xz`
+  `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-shared-8.1.tar.xz`
 - Binary archive SHA256:
-  `30b0ca389e7d0e34b4ca1acb5fe38d57fbc2542d690a8c5b06c72bdac0a234d1`
+  `23f5d4c8e6fdc24fbbfcbbb8e83a727154f1ef70830b108ac7fd131856777405`
 - FFmpeg version string from the bundle:
-  `n8.1.1-11-ge4c7fbf6c0-20260608`
+  `n8.1.2-21-gce3c09c101-20260630`
 
 Note:
 
 - The bundle sync uses a specific BtbN release tag and verifies the pinned SHA256 so upstream changes fail loudly instead of silently changing the shipped runtime.
+- BtbN retains the last build of each month for two years but keeps only the last 14 ordinary daily builds. Release pins must use a month-end build covered by that retention policy. See the [upstream release retention policy](https://github.com/BtbN/FFmpeg-Builds/blob/master/README.md#release-retention-policy).
 
 ## Corresponding source snapshot
 
@@ -49,20 +50,20 @@ Note:
 - Upstream mirror:
   `https://github.com/FFmpeg/FFmpeg`
 - Exact source archive:
-  `https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/e4c7fbf6c0a922297d4df7288d7aea665af15e24`
+  `https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/ce3c09c101c83add623774d414a9f9498caf5c25`
 - Source archive SHA256:
-  `c4cb2356bef3c6d46a00098f42380a071475a44052933b499af6d7d4d7e6d520`
+  `39bfd9846bea941da736683f79cdf7c87117c20efebc0734981d5e7033434dc5`
 
 ### BtbN build recipe snapshot
 
 - Upstream repository:
   `https://github.com/BtbN/FFmpeg-Builds`
 - Exact build recipe archive:
-  `https://github.com/BtbN/FFmpeg-Builds/archive/97ef373e17b7c9de46e980de0a26698237f09a83.tar.gz`
+  `https://github.com/BtbN/FFmpeg-Builds/archive/7a83528ea3431e9eca982a712bc3a7cd0789d5d0.tar.gz`
 - Build recipe archive SHA256:
-  `0fc9bae62374dee03991cff5dacf192b3d9af4b36e16294bb70f7d66c7c22be8`
+  `0f0f15e02b4fd1b1bc37d2e3a6f57cd7a2078c31a51c8546110d3ccb40029d30`
 - Build recipe commit:
-  `97ef373e17b7c9de46e980de0a26698237f09a83`
+  `7a83528ea3431e9eca982a712bc3a7cd0789d5d0`
 
 ### x264 source snapshot
 
@@ -82,8 +83,8 @@ The staged Windows sidecar includes:
 - required shared FFmpeg DLLs from the pinned archive
 - upstream `LICENSE.txt`
 - `FFMPEG_BUNDLE_NOTICES.txt`
-- `source/ffmpeg-e4c7fbf6c0a922297d4df7288d7aea665af15e24.tar.gz`
-- `source/btbn-ffmpeg-builds-97ef373e17b7c9de46e980de0a26698237f09a83.tar.gz`
+- `source/ffmpeg-ce3c09c101c83add623774d414a9f9498caf5c25.tar.gz`
+- `source/btbn-ffmpeg-builds-7a83528ea3431e9eca982a712bc3a7cd0789d5d0.tar.gz`
 - `source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
 The staged Linux sidecar includes:
@@ -94,8 +95,8 @@ The staged Linux sidecar includes:
 - required shared FFmpeg libraries under `lib/`
 - upstream `LICENSE.txt`
 - `FFMPEG_BUNDLE_NOTICES.txt`
-- `source/ffmpeg-e4c7fbf6c0a922297d4df7288d7aea665af15e24.tar.gz`
-- `source/btbn-ffmpeg-builds-97ef373e17b7c9de46e980de0a26698237f09a83.tar.gz`
+- `source/ffmpeg-ce3c09c101c83add623774d414a9f9498caf5c25.tar.gz`
+- `source/btbn-ffmpeg-builds-7a83528ea3431e9eca982a712bc3a7cd0789d5d0.tar.gz`
 - `source/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
 
 The Linux root wrapper scripts set `LD_LIBRARY_PATH` to the bundled `ffmpeg-sidecar/lib/` directory before executing `bin/ffmpeg` or `bin/ffprobe`. The app still launches `ffmpeg-sidecar/ffmpeg` and `ffmpeg-sidecar/ffprobe`, so the runtime lookup contract stays the same across Windows and Linux.

@@ -27,9 +27,10 @@ test("tauri build hooks prepare the bundled ffmpeg sidecar", async () => {
   assert.match(json?.build?.beforeDevCommand ?? "", /prepare:ffmpeg-sidecar/);
   assert.match(bundleRaw, /win64-gpl-shared/);
   assert.match(bundleRaw, /linux64-gpl-shared/);
-  assert.match(bundleRaw, /autobuild-2026-06-08-14-24/);
-  assert.match(bundleRaw, /ffmpeg-n8\.1\.1-11-ge4c7fbf6c0-win64-gpl-shared-8\.1\.zip/);
-  assert.match(bundleRaw, /ffmpeg-n8\.1\.1-11-ge4c7fbf6c0-linux64-gpl-shared-8\.1\.tar\.xz/);
+  assert.match(bundleRaw, /autobuild-2026-06-30-13-34/);
+  assert.match(bundleRaw, /ffmpeg-n8\.1\.2-21-gce3c09c101-win64-gpl-shared-8\.1\.zip/);
+  assert.match(bundleRaw, /ffmpeg-n8\.1\.2-21-gce3c09c101-linux64-gpl-shared-8\.1\.tar\.xz/);
+  assert.match(bundleRaw, /month-end builds/);
   assert.match(bundleRaw, /pinned GPL shared build/i);
   assert.match(bundleRaw, /buildScriptsCommit/);
   assert.match(bundleRaw, /x264Commit/);
