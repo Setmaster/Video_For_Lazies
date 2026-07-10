@@ -544,6 +544,42 @@ fn push_metadata_args(args: &mut Vec<String>, request: &EncodeRequest) {
     }
 }
 
+fn build_stream_copy_args(input: &str, request: &EncodeRequest, probe: &VideoProbe) -> Vec<String> {
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        input.to_string(),
+        "-progress".to_string(),
+        "pipe:1".to_string(),
+        "-nostats".to_string(),
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-c:v".to_string(),
+        "copy".to_string(),
+    ];
+
+    if request.audio_enabled && probe.has_audio {
+        args.push("-map".to_string());
+        args.push("0:a:0?".to_string());
+        args.push("-c:a".to_string());
+        args.push("copy".to_string());
+    } else {
+        args.push("-an".to_string());
+    }
+
+    push_metadata_args(&mut args, request);
+
+    if matches!(request.format, OutputFormat::Mp4) {
+        args.push("-movflags".to_string());
+        args.push("+faststart".to_string());
+    }
+
+    args
+}
+
 fn temp_output_path(output_path: &Path, job_id: u64, label: &str) -> Result<PathBuf, String> {
     let parent = output_path
         .parent()
@@ -2552,45 +2588,7 @@ pub fn run_encode_job(
         } && !advanced_force_reencode;
 
         if should_try_stream_copy {
-            let mut args = vec![
-                "-y".to_string(),
-                "-hide_banner".to_string(),
-                "-loglevel".to_string(),
-                "error".to_string(),
-                "-i".to_string(),
-                input_str.clone(),
-                "-progress".to_string(),
-                "pipe:1".to_string(),
-                "-nostats".to_string(),
-                "-map".to_string(),
-                "0:v:0".to_string(),
-                "-c:v".to_string(),
-                "copy".to_string(),
-            ];
-
-            if request.audio_enabled && probe.has_audio {
-                args.push("-map".to_string());
-                args.push("0:a:0?".to_string());
-                args.push("-c:a".to_string());
-                args.push("copy".to_string());
-            } else {
-                args.push("-an".to_string());
-            }
-
-            if let Some(title) = request
-                .title
-                .as_deref()
-                .map(|t| t.trim())
-                .filter(|t| !t.is_empty())
-            {
-                args.push("-metadata".to_string());
-                args.push(format!("title={title}"));
-            }
-
-            if matches!(request.format, OutputFormat::Mp4) {
-                args.push("-movflags".to_string());
-                args.push("+faststart".to_string());
-            }
+            let mut args = build_stream_copy_args(&input_str, &request, &probe);
 
             let temp_path = temp_output_path(&output_path, job_id, "copy")?;
             args.push(temp_path.to_string_lossy().to_string());
@@ -3877,6 +3875,30 @@ Encoders:
         let mut args = Vec::new();
         push_metadata_args(&mut args, &req);
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn stream_copy_args_strip_metadata_before_explicit_title() {
+        let mut req = base_request();
+        req.title = Some("  Beach day  ".to_string());
+        req.strip_metadata = true;
+
+        let args = build_stream_copy_args("in.mp4", &req, &probe_10s_1920x1080_audio());
+        let strip_index = args
+            .iter()
+            .position(|arg| arg == "-map_metadata")
+            .expect("stream-copy args should strip inherited metadata");
+        assert_eq!(args.get(strip_index + 1).map(String::as_str), Some("-1"));
+
+        let title_index = args
+            .iter()
+            .position(|arg| arg == "-metadata")
+            .expect("stream-copy args should preserve an explicit title");
+        assert!(strip_index < title_index);
+        assert_eq!(
+            args.get(title_index + 1).map(String::as_str),
+            Some("title=Beach day")
+        );
     }
 
     #[test]
