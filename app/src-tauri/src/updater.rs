@@ -22,15 +22,11 @@ const APPLY_PLAN_SCHEMA: &str = "com.setmaster.video-for-lazies.apply-plan.v1";
 const UPDATE_PREFS_SCHEMA: &str = "com.setmaster.video-for-lazies.update-prefs.v1";
 const UPDATE_STATE_DIR: &str = ".vfl-updates";
 // Filename prefix for the helper copy we actually launch from the temp dir.
-// It deliberately avoids installer keywords ("update", "setup", "install",
-// "patch"): on Windows, UAC installer-detection flags an executable whose name
-// contains one of those AND that lacks an explicit requestedExecutionLevel
-// manifest as requiring administrator, so a non-elevated CreateProcess of it
-// fails with ERROR_ELEVATION_REQUIRED (os error 740). The shipped binary keeps
-// its `vfl-update-helper` name (cross-version staging looks it up by that name);
-// only this launched copy is renamed. Verified on Windows: an identical binary
-// named "...update..." is refused 740 from a non-elevated caller while the same
-// binary named "vfl-apply-..." launches.
+// The helper now embeds an explicit asInvoker manifest, and this keyword-free
+// name remains a second defense against Windows UAC installer detection if a
+// future packaging error strips that resource. The shipped binary keeps its
+// `vfl-update-helper` name because cross-version staging looks it up by that
+// name; only this launched copy is renamed.
 const TEMP_HELPER_PREFIX: &str = "vfl-apply-";
 // Legacy launched-copy prefix from <= v1.8.0 (contained "update"); still swept
 // by cleanup so stale copies from older versions do not accumulate.
@@ -200,6 +196,13 @@ enum PromptChoice {
     Dismiss,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateHelperLaunchOutcome {
+    Launched,
+    #[cfg(windows)]
+    ElevationRequired,
+}
+
 impl PromptChoice {
     fn parse(raw: &str) -> Result<Self, String> {
         match raw {
@@ -261,7 +264,15 @@ pub fn prepare_and_apply_update(app: AppHandle) -> Result<UpdateApplyResponse, S
 
     let plan = stage_update(&app, &manifest, &artifact, target)?;
     let helper_path = copy_staged_helper_to_temp(&plan)?;
-    launch_update_helper(&helper_path, &plan)?;
+    let _launch_outcome = launch_update_helper(&helper_path, &plan)?;
+
+    #[cfg(windows)]
+    if _launch_outcome == UpdateHelperLaunchOutcome::ElevationRequired {
+        // Reuse the established elevated-app path. The elevated instance
+        // restages the update with relaunch_via_shell=true, which prevents the
+        // updated app from inheriting an administrator token from the helper.
+        return elevate_for_update(&app, &check);
+    }
 
     let version = plan.to_version.clone();
     std::thread::spawn(move || {
@@ -828,7 +839,10 @@ fn copy_staged_helper_to_temp(plan: &UpdateApplyPlan) -> Result<PathBuf, String>
     Ok(helper_target)
 }
 
-fn launch_update_helper(helper_path: &Path, plan: &UpdateApplyPlan) -> Result<(), String> {
+fn launch_update_helper(
+    helper_path: &Path,
+    plan: &UpdateApplyPlan,
+) -> Result<UpdateHelperLaunchOutcome, String> {
     let mut command = Command::new(helper_path);
     command
         .arg("apply")
@@ -842,10 +856,22 @@ fn launch_update_helper(helper_path: &Path, plan: &UpdateApplyPlan) -> Result<()
         command.creation_flags(0x08000000);
     }
 
-    command
-        .spawn()
-        .map_err(|e| format!("Failed to launch update helper: {e}"))?;
-    Ok(())
+    match command.spawn() {
+        Ok(_) => Ok(UpdateHelperLaunchOutcome::Launched),
+        Err(error) => {
+            #[cfg(windows)]
+            if is_elevation_required_error(&error) {
+                return Ok(UpdateHelperLaunchOutcome::ElevationRequired);
+            }
+
+            Err(format!("Failed to launch update helper: {error}"))
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_elevation_required_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(740)
 }
 
 fn apply_update_plan(plan_path: &Path) -> Result<(), String> {
@@ -1765,12 +1791,8 @@ mod tests {
 
     #[test]
     fn launched_helper_temp_name_avoids_uac_installer_keywords() {
-        // Windows UAC installer-detection refuses a non-elevated CreateProcess of
-        // an exe whose name contains these keywords and that lacks an explicit
-        // asInvoker manifest (ERROR_ELEVATION_REQUIRED, os error 740). The helper
-        // copy we actually launch must not contain any of them. Verified on
-        // Windows that the same binary fails 740 when named "...update..." and
-        // launches when named "vfl-apply-...".
+        // Keep the launched copy keyword-free as a second defense if packaging
+        // ever strips the helper's explicit asInvoker manifest.
         let sample = format!("{TEMP_HELPER_PREFIX}1.8.1-1700000000000.exe");
         let lower = sample.to_ascii_lowercase();
         for keyword in ["update", "setup", "install", "patch"] {
@@ -1783,6 +1805,18 @@ mod tests {
         // wrote, so they do not pile up after the rename.
         assert_ne!(TEMP_HELPER_PREFIX, LEGACY_TEMP_HELPER_PREFIX);
         assert!(LEGACY_TEMP_HELPER_PREFIX.contains("update"));
+    }
+
+    #[test]
+    fn helper_elevation_fallback_is_limited_to_windows_error_740() {
+        assert!(is_elevation_required_error(&io::Error::from_raw_os_error(
+            740
+        )));
+        for code in [2, 5, 1223] {
+            assert!(!is_elevation_required_error(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
     }
 
     #[test]

@@ -30,6 +30,11 @@ import {
 } from "./updateManifests.mjs";
 
 const __filename = url.fileURLToPath(import.meta.url);
+const windowsUpdateHelperManifestVerifier = path.resolve(
+  appRoot,
+  "scripts",
+  "verify-windows-update-helper-manifest.ps1",
+);
 
 function psQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
@@ -266,6 +271,24 @@ async function assertPortableExecutable(portableDir, { platform = process.platfo
   await assertPortableFile(portableDir, platform === "win32" ? "vfl-update-helper.exe" : "vfl-update-helper");
 }
 
+async function verifyWindowsUpdateHelperManifest(portableDir, { platform = process.platform } = {}) {
+  if (platform !== "win32") return;
+
+  await runChecked("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    windowsUpdateHelperManifestVerifier,
+    "-HelperPath",
+    path.resolve(portableDir, "vfl-update-helper.exe"),
+    "-MainAppPath",
+    path.resolve(portableDir, getPortableExecutableName({ platform })),
+    "-RunSelfTest",
+  ]);
+}
+
 async function verifyPortableArtifact(portableDir, label, { platform = process.platform } = {}) {
   console.log(`Verifying extracted ${label} artifact: ${portableDir}`);
   await assertPortableExecutable(portableDir, { platform });
@@ -277,6 +300,7 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
   });
   await assertBundledLibx264(portableDir, { platform });
   await runBundledEncodeSmoke(portableDir, { platform });
+  await verifyWindowsUpdateHelperManifest(portableDir, { platform });
 
   if (platform === "linux") {
     await runPortableExportSmoke({ portableDir });

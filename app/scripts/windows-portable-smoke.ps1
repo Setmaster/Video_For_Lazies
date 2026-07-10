@@ -168,6 +168,12 @@ if (-not (Test-Path $exePath)) {
   throw "Portable smoke could not find app executable at $exePath"
 }
 
+$helperManifestVerifier = Join-Path $PSScriptRoot "verify-windows-update-helper-manifest.ps1"
+& $helperManifestVerifier `
+  -HelperPath (Join-Path $portableRoot "vfl-update-helper.exe") `
+  -MainAppPath $exePath `
+  -RunSelfTest
+
 if (-not $ScreenshotPath) {
   $ScreenshotPath = New-SmokeScreenshotPath
 }
