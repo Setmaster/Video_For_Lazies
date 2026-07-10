@@ -58,11 +58,11 @@ test("frontend Loop planning mirrors backend duration semantics", async () => {
   assert.match(plannedSummary, /const baseDurationS = Math\.max\(0\.001, \(endS - startS\) \/ speedNum\);/);
   assert.match(plannedSummary, /const durationS = format !== "mp3" && loopVideo \? baseDurationS \* 2 : baseDurationS;/);
   assert.match(plannedSummary, /\/ durationS \/ 1000/);
-  assert.match(plannedSummary, /\n    loopVideo,\n/);
+  assert.match(plannedSummary, /\r?\n    loopVideo,\r?\n/);
 
   const activeEditChips = sourceSection(app, "  const activeEditChips = useMemo", "  const lastExportSizeText =");
   assert.match(activeEditChips, /if \(format !== "mp3" && loopVideo\) chips\.push\("Loop"\);/);
-  assert.match(activeEditChips, /\n    loopVideo,\n/);
+  assert.match(activeEditChips, /\r?\n    loopVideo,\r?\n/);
 
   // Sample-size scaling must use the looped sample duration too, otherwise a
   // looped sample receives only half of its proportional size budget.
