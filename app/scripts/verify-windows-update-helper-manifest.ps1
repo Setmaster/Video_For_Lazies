@@ -57,6 +57,48 @@ function Get-RequestedExecutionLevels {
   @($Manifest.SelectNodes("//*[local-name()='requestedExecutionLevel']"))
 }
 
+function Invoke-HelperSelfTest {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$ExecutablePath,
+
+    [int]$TimeoutMilliseconds = 10000
+  )
+
+  $resolvedExecutable = (Resolve-Path -LiteralPath $ExecutablePath).Path
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $resolvedExecutable
+  $startInfo.Arguments = "--self-test"
+  $startInfo.WorkingDirectory = Split-Path -Parent $resolvedExecutable
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  try {
+    if (-not $process.Start()) {
+      throw "The update helper self-test process did not start."
+    }
+    if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+      $process.Kill()
+      throw "The update helper self-test timed out after $TimeoutMilliseconds ms."
+    }
+
+    $stdout = $process.StandardOutput.ReadToEnd().Trim()
+    $stderr = $process.StandardError.ReadToEnd().Trim()
+    if ($process.ExitCode -ne 0) {
+      throw "The update helper self-test failed with exit code $($process.ExitCode): $stderr"
+    }
+    if ($stdout -ne "vfl-update-helper ok") {
+      throw "The update helper self-test returned an unexpected response: $stdout"
+    }
+  } finally {
+    $process.Dispose()
+  }
+}
+
 $manifestTool = Resolve-ManifestTool
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "vfl-helper-manifest-$([Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
@@ -103,13 +145,7 @@ try {
   }
 
   if ($RunSelfTest) {
-    $selfTestOutput = @(& (Resolve-Path -LiteralPath $HelperPath).Path --self-test 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-      throw "The update helper self-test failed with exit code $LASTEXITCODE."
-    }
-    if (($selfTestOutput -join "`n").Trim() -ne "vfl-update-helper ok") {
-      throw "The update helper self-test returned an unexpected response."
-    }
+    Invoke-HelperSelfTest -ExecutablePath $HelperPath
   }
 
   $verificationSucceeded = $true

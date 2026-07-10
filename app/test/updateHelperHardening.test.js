@@ -45,6 +45,10 @@ test("Windows artifact verifier checks the embedded helper and main manifests", 
   assert.match(verifier, /mainLevels\.Count -ne 0/);
   assert.match(verifier, /commonControls\.Count -ne 1/);
   assert.match(verifier, /--self-test/);
+  assert.match(verifier, /ProcessStartInfo/);
+  assert.match(verifier, /UseShellExecute = \$false/);
+  assert.match(verifier, /RedirectStandardOutput = \$true/);
+  assert.match(verifier, /WaitForExit\(\$TimeoutMilliseconds\)/);
   assert.match(verifier, /vfl-update-helper ok/);
   assert.match(verifier, /Preserving updater manifest diagnostics/);
 
