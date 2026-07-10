@@ -1033,7 +1033,8 @@ function App() {
     const endS = Math.min(endRaw ?? probe.durationS, probe.durationS);
     if (endS <= startS) return null;
 
-    const durationS = Math.max(0.001, (endS - startS) / speedNum);
+    const baseDurationS = Math.max(0.001, (endS - startS) / speedNum);
+    const durationS = format !== "mp3" && loopVideo ? baseDurationS * 2 : baseDurationS;
     const sizeLimitEnabled = sizeMb > 0;
     const totalKbps = sizeLimitEnabled
       ? Math.max(1, Math.floor((sizeMb * 1_000_000 * 8 * 0.95) / durationS / 1000))
@@ -1083,6 +1084,7 @@ function App() {
     trimStart,
     trimEnd,
     format,
+    loopVideo,
     shapedVideoDimensions,
     resizeMode,
     maxEdgePx,
@@ -1389,7 +1391,7 @@ function App() {
 
     if (rotateDeg !== 0) chips.push(`Rotate ${rotateDeg}°`);
     if (reverse) chips.push("Reverse");
-    if (loopVideo) chips.push("Loop");
+    if (format !== "mp3" && loopVideo) chips.push("Loop");
 
     const brightnessNum = Number(brightness);
     const contrastNum = Number(contrast);
@@ -1425,6 +1427,7 @@ function App() {
     speed,
     rotateDeg,
     reverse,
+    loopVideo,
     brightness,
     contrast,
     saturation,
@@ -2541,7 +2544,7 @@ function App() {
       const latestStart = Math.max(sourceStart, sourceEnd - sampleSourceDuration);
       const sampleStart = clamp(anchorTime - sampleSourceDuration / 2, sourceStart, latestStart);
       const sampleEnd = Math.min(sourceEnd, sampleStart + sampleSourceDuration);
-      const outputSampleDuration = Math.max(0.1, (sampleEnd - sampleStart) / request.speed);
+      const outputSampleDuration = Math.max(0.1, (sampleEnd - sampleStart) / request.speed) * (request.loopVideo ? 2 : 1);
       const fullOutputDuration = plannedSummary?.durationS ?? null;
 
       if (request.sizeLimitMb > 0 && fullOutputDuration && fullOutputDuration > 0) {

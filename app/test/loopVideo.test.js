@@ -7,6 +7,14 @@ import url from "node:url";
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const read = (rel) => fs.readFile(path.resolve(__dirname, rel), "utf8");
 
+function sourceSection(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start);
+  assert.notEqual(start, -1, `Missing source marker: ${startMarker}`);
+  assert.notEqual(end, -1, `Missing source marker: ${endMarker}`);
+  return source.slice(start, end);
+}
+
 test("backend wraps the filter chains as a forward+reverse boomerang", async () => {
   const video = await read("../src-tauri/src/video.rs");
 
@@ -39,4 +47,24 @@ test("frontend exposes a Loop toggle wired through the request", async () => {
   const types = await read("../src/lib/types.ts");
   assert.match(types, /loopVideo: boolean;/);
   assert.match(types, /loopVideo\?: boolean \| null;/); // smoke config
+});
+
+test("frontend Loop planning mirrors backend duration semantics", async () => {
+  const app = await read("../src/App.tsx");
+  const plannedSummary = sourceSection(app, "  const plannedSummary = useMemo", "  const previewDurationS =");
+
+  // Only video exports double their planned duration, and the size-target
+  // bitrate calculation consumes that adjusted duration.
+  assert.match(plannedSummary, /const baseDurationS = Math\.max\(0\.001, \(endS - startS\) \/ speedNum\);/);
+  assert.match(plannedSummary, /const durationS = format !== "mp3" && loopVideo \? baseDurationS \* 2 : baseDurationS;/);
+  assert.match(plannedSummary, /\/ durationS \/ 1000/);
+  assert.match(plannedSummary, /\n    loopVideo,\n/);
+
+  const activeEditChips = sourceSection(app, "  const activeEditChips = useMemo", "  const lastExportSizeText =");
+  assert.match(activeEditChips, /if \(format !== "mp3" && loopVideo\) chips\.push\("Loop"\);/);
+  assert.match(activeEditChips, /\n    loopVideo,\n/);
+
+  // Sample-size scaling must use the looped sample duration too, otherwise a
+  // looped sample receives only half of its proportional size budget.
+  assert.match(app, /const outputSampleDuration = Math\.max\(0\.1, \(sampleEnd - sampleStart\) \/ request\.speed\) \* \(request\.loopVideo \? 2 : 1\);/);
 });
