@@ -36,7 +36,7 @@ git tag v0.1.1
 git push origin main v0.1.1
 ```
 
-For draft prereleases or release-candidate checks before approval, run the manual workflow from the development branch and leave the release as a draft.
+For release-candidate checks before approval, run the manual workflow from the development branch with `build_only=true`. This verifies and retains private artifacts without creating a GitHub Release. For an owner-approved draft release, explicitly use `build_only=false` and leave `draft=true` until review is complete.
 
 ## Release Gate Policy
 
@@ -85,15 +85,28 @@ The `Portable Release` GitHub Actions workflow builds verified x64 artifacts for
 - `linux-x64`
 - `win-x64`
 
-It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds both portable zips, creates release notes, stages a combined `SHA256SUMS.txt`, signs the updater manifest, and creates a GitHub Release with the final assets. It defaults to a draft prerelease so the generated changelog and uploaded binaries can be reviewed before publishing.
+It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds and verifies both portable zips on every run. Manual dispatch defaults to `build_only=true`, which uploads private artifacts with 30-day retention and skips the release job. Tag pushes, or an explicit manual `build_only=false`, continue through release notes, the combined `SHA256SUMS.txt`, updater-manifest signing, and GitHub Release creation.
 
 Manual dispatch inputs:
 
 - `version`: required SemVer value, for example `0.1.1`; must match app metadata.
+- `build_only`: defaults to `true`; builds, smokes, and uploads private artifacts without creating a GitHub Release. Set it to `false` only for an intentional release draft or publication run.
 - `release_notes`: optional curated changelog or summary. If blank, the workflow generates a summary from commits.
 - `previous_tag`: optional changelog start tag. Use `none` for a first release.
 - `draft`: defaults to `true`; keep this enabled until final review is complete.
 - `prerelease`: defaults to `true`; set to `false` for an owner-approved stable release.
+
+Nonpublishing development-branch validation:
+
+```bash
+gh workflow run portable-artifacts.yml --ref dev \
+  -f version=1.9.0 \
+  -f build_only=true \
+  -f draft=true \
+  -f prerelease=true
+```
+
+This run is expected to finish green after both platform artifacts pass. The release job is skipped and no tag, draft, or public release is created.
 
 Release notes follow this template:
 
@@ -122,7 +135,7 @@ Recommended manual draft protocol:
 2. Find the previous release tag with `git tag --merged HEAD --sort=-version:refname --list 'v[0-9]*'`.
 3. Review commits since that tag with `git log --oneline <previous-tag>..HEAD`, or use `git log --oneline HEAD` for the first release.
 4. Write the curated `release_notes` input using the template above.
-5. Trigger `Portable Release` with `draft=true`.
+5. Trigger `Portable Release` with `build_only=false` and `draft=true`.
 6. Review the draft release notes, Linux zip, Windows zip, `SHA256SUMS.txt`, `vfl-update-manifest-v1.json`, and `vfl-update-manifest-v1.json.sig`.
 7. Confirm the draft release is backed by the intended public `vX.Y.Z` tag.
 8. Confirm generated `SOURCE.md` in each zip names the intended release tag and source commit.

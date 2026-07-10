@@ -20,6 +20,14 @@ test("CI workflows use bounded reusable setup steps", async () => {
   assert.match(ci, /timeout-minutes:\s*45/);
   assert.match(release, /timeout-minutes:\s*75/);
   assert.match(release, /timeout-minutes:\s*45/);
+  assert.match(
+    release,
+    /build_only:[\s\S]*description:[^\n]*private artifacts[^\n]*[\s\S]*required:\s*true[\s\S]*default:\s*true[\s\S]*type:\s*boolean/,
+  );
+  assert.match(
+    release,
+    /release:[\s\S]*if:\s*\$\{\{\s*github\.event_name != 'workflow_dispatch' \|\| !inputs\.build_only\s*\}\}/,
+  );
   assert.match(ci, /uses:\s*\.\/\.github\/actions\/setup-linux-tauri-deps/);
   assert.match(release, /uses:\s*\.\/\.github\/actions\/setup-linux-tauri-deps/);
   assert.match(ci, /uses:\s*\.\/\.github\/actions\/install-cargo-audit/);
@@ -35,7 +43,10 @@ test("CI workflows use bounded reusable setup steps", async () => {
 });
 
 test("release docs make Portable Release the final blocking gate", async () => {
-  const docs = await readRepoFile("docs/release.md");
+  const [docs, appReadme] = await Promise.all([
+    readRepoFile("docs/release.md"),
+    readRepoFile("app/README.md"),
+  ]);
 
   assert.match(docs, /## Release Gate Policy/);
   assert.match(docs, /The `Portable Release` workflow is the final release gate/);
@@ -43,4 +54,9 @@ test("release docs make Portable Release the final blocking gate", async () => {
   assert.match(docs, /The merge to `main` was a fast-forward/);
   assert.match(docs, /stalled in runner setup or dependency installation/);
   assert.match(docs, /If `main` CI fails in repo code, tests, lint, version checks, or audits, stop/);
+  assert.match(docs, /`build_only=true`/);
+  assert.match(docs, /`build_only=false`/);
+  assert.match(appReadme, /Manual runs default to `build_only=true`/);
+  assert.match(appReadme, /private GitHub Actions artifacts for 30 days/);
+  assert.match(appReadme, /intentional `build_only=false` run/);
 });

@@ -7,6 +7,11 @@ on:
         description: "Version to build. Must match app metadata, for example 0.1.0."
         required: true
         type: string
+      build_only:
+        description: "Build and verify private artifacts without creating a GitHub Release."
+        required: true
+        default: true
+        type: boolean
       release_notes:
         description: "Curated release summary or changelog. Leave blank to generate from commits."
         required: false
@@ -190,6 +195,7 @@ jobs:
 
   release:
     name: Create GitHub Release
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.build_only }}
     needs: portable
     runs-on: ubuntu-24.04
     timeout-minutes: 15

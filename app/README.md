@@ -47,7 +47,7 @@ Builds `release/Video_For_Lazies/`, packages a versioned x64 zip such as `releas
 
 On both platforms, verification checks that the shipped sidecar exposes `libx264` and can encode/probe a sample MP4. On Windows, verification also runs startup smoke, the packaged interaction/export smoke, and a second tight-target 1080p MP4 smoke.
 
-The GitHub `Portable Release` workflow builds Linux and Windows x64 zips, creates release notes from the commit range since the previous release tag, and attaches the final zip assets plus a combined checksum file to a draft GitHub Release by default.
+The GitHub `Portable Release` workflow builds and verifies Linux and Windows x64 zips. Manual runs default to `build_only=true`, which retains private GitHub Actions artifacts for 30 days without creating a release. An intentional `build_only=false` run continues through release notes, updater-manifest signing, combined checksums, and draft or published GitHub Release creation as configured.
 
 ## Tests
 
