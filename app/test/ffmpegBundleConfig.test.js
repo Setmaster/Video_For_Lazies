@@ -43,7 +43,15 @@ test("tauri build hooks prepare the bundled ffmpeg sidecar", async () => {
   assert.match(syncRaw, /linuxWrapperScript/);
   assert.match(syncRaw, /LD_LIBRARY_PATH/);
   assert.match(syncRaw, /downloadFileWithCurl/);
-  assert.match(syncRaw, /missing libx264/i);
+  assert.match(syncRaw, /verifyFfmpegCapabilityContract/);
+  assert.match(syncRaw, /FFMPEG_CAPABILITY_CONTRACT_FILE_NAME/);
+  assert.match(syncRaw, /assertCapabilityContractCopy/);
+  assert.match(syncRaw, /DOWNLOAD_TIMEOUT_MS/);
+  assert.match(syncRaw, /ARCHIVE_PROCESS_TIMEOUT_MS/);
+  assert.match(syncRaw, /child\.on\("close"/);
+  assert.doesNotMatch(syncRaw, /currentNotice === expectedNotice/);
+  assert.match(syncRaw, /rm\(windowsSidecarDir, \{ recursive: true, force: true \}\)/);
+  assert.match(syncRaw, /rm\(linuxSidecarDir, \{ recursive: true, force: true \}\)/);
 });
 
 test("tauri config maps the generated current ffmpeg sidecar into app resources", async () => {
@@ -158,11 +166,16 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(wrapperRaw, /-InputWidth/);
   assert.match(wrapperRaw, /-OutputFormat/);
   assert.match(wrapperRaw, /outputFormat = "mp4"/);
-  assert.match(releaseRaw, /assertBundledLibx264/);
+  assert.match(releaseRaw, /assertBundledFfmpegCapabilities/);
+  assert.match(releaseRaw, /verifyFfmpegCapabilityContract/);
+  assert.match(releaseRaw, /assertCapabilityContractCopy/);
+  assert.match(releaseRaw, /FFMPEG_CAPABILITY_CONTRACT_FILE_NAME/);
+  assert.match(releaseRaw, /PORTABLE_BUILD_TIMEOUT_MS/);
+  assert.match(releaseRaw, /DEFAULT_COMMAND_TIMEOUT_MS/);
   assert.match(releaseRaw, /runBundledEncodeSmoke/);
+  assert.match(releaseRaw, /runPortableMediaDepthSmoke\(\{ portableDir, platform \}\)/);
   assert.match(releaseRaw, /runPortableExportSmoke\(\{ portableDir, outputFormat: "webm" \}\)/);
   assert.match(releaseRaw, /runPortableCodecPlanSmoke\(\{ portableDir \}\)/);
-  assert.match(releaseRaw, /missing libx264/);
   assert.match(releaseRaw, /getFfmpegSourceArchiveNames/);
   assert.match(appRaw, /smokeStatusWriteRef/);
   assert.match(appRaw, /smokeStageHistoryRef/);

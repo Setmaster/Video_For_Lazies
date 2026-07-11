@@ -13,6 +13,7 @@ import type {
   AppSmokeConfig,
   AppSmokeStatus,
   AudioChannelPreference,
+  ColorPolicy,
   Crop,
   ColorAdjust,
   EncodeSpeedPreference,
@@ -52,7 +53,21 @@ import {
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import { EXPORT_RECIPES, findMatchingExportRecipe, normalizeRecipeResizeSettings, type ExportRecipe } from "./lib/exportRecipes";
 import { buildPreviewColorFilter } from "./lib/previewFilter";
-import { cropRectToPixels } from "./lib/accessibility";
+import { alignCropRectForEncoding, cropRectToPixels, isFullFramePixelCrop } from "./lib/accessibility";
+import {
+  classifyColorSource,
+  codecOutputDimensionBlockingReason,
+  encodedOutputDimensions,
+  estimateTransformMemory,
+  fitMaxEdgeDisplayDimensions,
+  fitMaxEdgeDimensions,
+  hasNonSquarePixels,
+  sizeTargetRetainsAudio,
+  sourceRotationBlockingReason,
+  squarePixelDimensions,
+  timelineSpeedChanges,
+  trimRequestIsActive,
+} from "./lib/mediaDepth";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
@@ -347,9 +362,9 @@ function colorIsDefault(brightness: string, contrast: string, saturation: string
   const contrastNum = Number(contrast);
   const saturationNum = Number(saturation);
   return !(
-    (Number.isFinite(brightnessNum) && Math.abs(brightnessNum) > 0.001) ||
-    (Number.isFinite(contrastNum) && Math.abs(contrastNum - 1) > 0.001) ||
-    (Number.isFinite(saturationNum) && Math.abs(saturationNum - 1) > 0.001)
+    (Number.isFinite(brightnessNum) && Math.abs(brightnessNum) > 1e-9) ||
+    (Number.isFinite(contrastNum) && Math.abs(contrastNum - 1) > 1e-9) ||
+    (Number.isFinite(saturationNum) && Math.abs(saturationNum - 1) > 1e-9)
   );
 }
 
@@ -368,17 +383,12 @@ function dimensionsAfterShape(
   let height = probe.height;
 
   if (cropEnabled) {
-    const cropPx = {
-      x: Math.round(cropRect.x * probe.width),
-      y: Math.round(cropRect.y * probe.height),
-      width: Math.round(cropRect.w * probe.width),
-      height: Math.round(cropRect.h * probe.height),
-    };
-    const isFull =
-      cropPx.x <= 1 && cropPx.y <= 1 && cropPx.width >= probe.width - 2 && cropPx.height >= probe.height - 2;
+    const cropPx = cropRectToPixels(cropRect, probe.width, probe.height);
+    const isFull = isFullFramePixelCrop(cropPx, probe.width, probe.height);
     if (!isFull) {
-      width = evenPixel(cropPx.width);
-      height = evenPixel(cropPx.height);
+      const encodedCrop = alignCropRectForEncoding(cropPx);
+      width = encodedCrop.width;
+      height = encodedCrop.height;
     }
   }
 
@@ -389,19 +399,6 @@ function dimensionsAfterShape(
   }
 
   return { width, height };
-}
-
-function fitMaxEdgeDimensions(width: number, height: number, maxEdge: number) {
-  const longEdge = Math.max(width, height);
-  if (!Number.isFinite(maxEdge) || maxEdge < OUTPUT_DIMENSION_MIN_PX || longEdge <= maxEdge) {
-    return { width, height };
-  }
-
-  const scale = maxEdge / longEdge;
-  return {
-    width: evenPixel(Math.floor(width * scale)),
-    height: evenPixel(Math.floor(height * scale)),
-  };
 }
 
 function parseDimensionDraft(raw: string) {
@@ -446,6 +443,7 @@ function App() {
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [normalizeAudio, setNormalizeAudio] = useState(false);
   const [perturbFirstFrame, setPerturbFirstFrame] = useState(false);
+  const [colorPolicy, setColorPolicy] = useState<ColorPolicy>("auto");
   const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
   const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
   const [advancedVideoQuality, setAdvancedVideoQuality] = useState<VideoQualityPreference>("auto");
@@ -894,6 +892,7 @@ function App() {
     if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
     setOutputAuto(true);
     setOutputPath("");
+    setColorPolicy("auto");
 
     if (nextFormat !== formatRef.current) setFormat(nextFormat);
     setInputPath(path);
@@ -913,6 +912,7 @@ function App() {
     setAudioEnabled(true);
     setNormalizeAudio(false);
     setPerturbFirstFrame(false);
+    setColorPolicy("auto");
     setStripMetadata(true);
     setSampleDurationS(10);
     setSampleEstimate(null);
@@ -1001,7 +1001,6 @@ function App() {
 
   useEffect(() => {
     if (encodeCapabilities || encodeCapabilitiesError) return;
-    if (!openCards.advanced && advancedVideoCodec === "auto") return;
 
     let stop = false;
     (async () => {
@@ -1019,7 +1018,7 @@ function App() {
     return () => {
       stop = true;
     };
-  }, [openCards.advanced, advancedVideoCodec, encodeCapabilities, encodeCapabilitiesError]);
+  }, [encodeCapabilities, encodeCapabilitiesError]);
 
   useEffect(() => {
     if (!smokeConfig || smokeAppliedRef.current) return;
@@ -1045,6 +1044,7 @@ function App() {
     setAudioEnabled(true);
     setNormalizeAudio(false);
     setPerturbFirstFrame(smokeConfig.perturbFirstFrame ?? false);
+    setColorPolicy(smokeConfig.colorPolicy ?? "auto");
     autoMutedRef.current = false;
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
@@ -1055,7 +1055,7 @@ function App() {
     setTrimStart(formatNumberInput(smokeConfig.trimStartS));
     setTrimEnd(smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined ? "" : formatNumberInput(smokeConfig.trimEndS));
     setTrimDragSnapS("0");
-    setReverse(false);
+    setReverse(smokeConfig.reverse ?? false);
     setLoopVideo(smokeConfig.loopVideo ?? false);
     setSpeed("1.0");
     setRotateDeg(0);
@@ -1083,6 +1083,16 @@ function App() {
     if (!probe) return null;
     return dimensionsAfterShape(probe, cropEnabled, cropRect, rotateDeg);
   }, [probe, cropEnabled, cropRect, rotateDeg]);
+  const squarePixelVideoDimensions = useMemo(() => {
+    if (!probe || !shapedVideoDimensions) return null;
+    if (!hasNonSquarePixels(probe)) return shapedVideoDimensions;
+    return squarePixelDimensions({
+      probe,
+      width: shapedVideoDimensions.width,
+      height: shapedVideoDimensions.height,
+      manualRotateDeg: rotateDeg,
+    });
+  }, [probe, rotateDeg, shapedVideoDimensions]);
 
   const plannedSummary = useMemo(() => {
     if (!probe) return null;
@@ -1112,20 +1122,36 @@ function App() {
       : null;
 
     if (format === "mp3") {
-      return { durationS, totalKbps, sizeLimitEnabled, w: null as number | null, h: null as number | null };
+      return {
+        durationS,
+        totalKbps,
+        sizeLimitEnabled,
+        audioIncluded: Boolean(probe.hasAudio),
+        w: null as number | null,
+        h: null as number | null,
+        videoCodec: null as string | null,
+      };
     }
 
-    if (!shapedVideoDimensions) return null;
+    if (!squarePixelVideoDimensions) return null;
 
-    let w = shapedVideoDimensions.width;
-    let h = shapedVideoDimensions.height;
+    let w = squarePixelVideoDimensions.width;
+    let h = squarePixelVideoDimensions.height;
 
     if (resizeMode === "maxEdge") {
       const maxEdge = maxEdgePx.trim() === "" ? null : Number(maxEdgePx);
       if (maxEdge === null || !Number.isFinite(maxEdge) || maxEdge < OUTPUT_DIMENSION_MIN_PX || maxEdge > OUTPUT_DIMENSION_MAX_PX) {
         return null;
       }
-      const resized = fitMaxEdgeDimensions(w, h, maxEdge);
+      const resized = hasNonSquarePixels(probe) && shapedVideoDimensions
+        ? fitMaxEdgeDisplayDimensions({
+            probe,
+            width: shapedVideoDimensions.width,
+            height: shapedVideoDimensions.height,
+            maxEdge,
+            manualRotateDeg: rotateDeg,
+          })
+        : fitMaxEdgeDimensions(w, h, maxEdge);
       w = resized.width;
       h = resized.height;
     } else if (resizeMode === "custom") {
@@ -1147,7 +1173,80 @@ function App() {
       h = evenPixel(customHeight);
     }
 
-    return { durationS, totalKbps, sizeLimitEnabled, w, h };
+    const sourceVideoCopyCompatibleForPlanning =
+      format === "mp4"
+        ? probe.videoCodec === "h264" || probe.videoCodec === "mpeg4"
+        : probe.videoCodec === "vp8" || probe.videoCodec === "vp9";
+    const planningCrop = cropEnabled ? cropRectToPixels(cropRect, probe.width, probe.height) : null;
+    const planningCropIsActive = Boolean(
+      planningCrop && !isFullFramePixelCrop(planningCrop, probe.width, probe.height),
+    );
+    const planningFrameRateCap = Number(advancedFrameRateCapFps);
+    const planningFrameRateCapApplies = advancedFrameRateCapFps !== "auto" &&
+      Number.isFinite(planningFrameRateCap) &&
+      (probe.frameRate === null || probe.frameRate === undefined ||
+        probe.frameRate * speedNum > planningFrameRateCap + 0.01);
+    const videoEncodeAlreadyDefinite =
+      !sourceVideoCopyCompatibleForPlanning ||
+      trimRequestIsActive({ startS: startRaw, endS: endRaw, durationS: probe.durationS }) ||
+      planningCropIsActive ||
+      reverse ||
+      loopVideo ||
+      rotateDeg !== 0 ||
+      timelineSpeedChanges(speedNum) ||
+      resizeMode !== "source" ||
+      !colorIsDefault(brightness, contrast, saturation) ||
+      perturbFirstFrame ||
+      colorPolicy === "standardSdr" ||
+      hasNonSquarePixels(probe) ||
+      advancedVideoCodec !== "auto" ||
+      (!sizeLimitEnabled && advancedVideoQuality !== "auto") ||
+      advancedEncodeSpeed !== "auto" ||
+      planningFrameRateCapApplies;
+    const encodedDimensions = encodedOutputDimensions(w, h, videoEncodeAlreadyDefinite);
+    w = encodedDimensions.width;
+    h = encodedDimensions.height;
+
+    const capabilityDefaultCodec = encodeCapabilities?.videoCodecs.find(
+      (codec) => codec.format === format && codec.available && codec.isDefault,
+    )?.value;
+    const compatibleSourcePlanningCodec = sourceVideoCopyCompatibleForPlanning
+      ? probe.videoCodec
+      : null;
+    const planningVideoCodec = advancedVideoCodec === "auto"
+      ? capabilityDefaultCodec ?? compatibleSourcePlanningCodec ?? (format === "mp4" ? "h264" : "vp9")
+      : advancedVideoCodec;
+    const requestedFrameRateCap = Number(advancedFrameRateCapFps);
+    const planAudioForDimensions = (width: number, height: number) => sizeTargetRetainsAudio({
+      audioRequested: audioEnabled,
+      hasAudio: probe.hasAudio,
+      sizeLimitEnabled,
+      totalKbps,
+      codec: planningVideoCodec,
+      width,
+      height,
+      sourceFrameRate: probe.frameRate,
+      speed: speedNum,
+      frameRateCapFps:
+        Number.isFinite(requestedFrameRateCap) && requestedFrameRateCap > 0
+          ? requestedFrameRateCap
+          : null,
+    });
+    let audioIncluded = planAudioForDimensions(w, h);
+    const sourceAudioCopyCompatibleForPlanning =
+      format === "mp4"
+        ? probe.audioCodec === "aac"
+        : probe.audioCodec === "opus" || probe.audioCodec === "vorbis";
+    const retainedAudioForcesEncode = sizeLimitEnabled && audioIncluded &&
+      (!sourceAudioCopyCompatibleForPlanning || normalizeAudio || advancedAudioChannels !== "auto");
+    if (!videoEncodeAlreadyDefinite && retainedAudioForcesEncode) {
+      const audioFallbackDimensions = encodedOutputDimensions(w, h, true);
+      w = audioFallbackDimensions.width;
+      h = audioFallbackDimensions.height;
+      audioIncluded = planAudioForDimensions(w, h);
+    }
+
+    return { durationS, totalKbps, sizeLimitEnabled, audioIncluded, w, h, videoCodec: planningVideoCodec };
   }, [
     probe,
     sizeLimitMb,
@@ -1156,11 +1255,29 @@ function App() {
     trimEnd,
     format,
     loopVideo,
+    squarePixelVideoDimensions,
     shapedVideoDimensions,
     resizeMode,
     maxEdgePx,
     customWidthPx,
     customHeightPx,
+    cropEnabled,
+    cropRect,
+    reverse,
+    rotateDeg,
+    brightness,
+    contrast,
+    saturation,
+    perturbFirstFrame,
+    colorPolicy,
+    advancedVideoCodec,
+    advancedVideoQuality,
+    advancedEncodeSpeed,
+    advancedFrameRateCapFps,
+    advancedAudioChannels,
+    normalizeAudio,
+    audioEnabled,
+    encodeCapabilities,
   ]);
 
   const previewDurationS = probe?.durationS ?? 0;
@@ -1220,20 +1337,22 @@ function App() {
     () => (probe ? cropRectToPixels(cropRect, probe.width, probe.height) : null),
     [cropRect, probe],
   );
+  const encodedCropPixelRect = useMemo(
+    () => (cropPixelRect ? alignCropRectForEncoding(cropPixelRect) : null),
+    [cropPixelRect],
+  );
 
   const cropSummary = useMemo(() => {
-    if (!probe || !cropEnabled || !cropPixelRect) return null;
+    if (!probe || !cropEnabled || !cropPixelRect || !encodedCropPixelRect) return null;
 
-    const isFull =
-      cropPixelRect.x <= 1 &&
-      cropPixelRect.y <= 1 &&
-      cropPixelRect.width >= probe.width - 2 &&
-      cropPixelRect.height >= probe.height - 2;
+    const isFull = isFullFramePixelCrop(cropPixelRect, probe.width, probe.height);
 
     return isFull
       ? "Full frame selected."
-      : `${cropPixelRect.width}x${cropPixelRect.height} at ${cropPixelRect.x},${cropPixelRect.y}.`;
-  }, [probe, cropEnabled, cropPixelRect]);
+      : encodedCropPixelRect.width === cropPixelRect.width && encodedCropPixelRect.height === cropPixelRect.height
+        ? `${encodedCropPixelRect.width}x${encodedCropPixelRect.height} at ${encodedCropPixelRect.x},${encodedCropPixelRect.y}.`
+        : `${encodedCropPixelRect.width}x${encodedCropPixelRect.height} encoded crop at ${encodedCropPixelRect.x},${encodedCropPixelRect.y} (requested ${cropPixelRect.width}x${cropPixelRect.height}; output dimensions require even values).`;
+  }, [probe, cropEnabled, cropPixelRect, encodedCropPixelRect]);
 
   const inputSummary = useMemo(() => {
     if (!inputPath) return "Drop a video anywhere in the window or browse for one below.";
@@ -1251,35 +1370,6 @@ function App() {
       ? "Preparing source…"
       : "No source loaded";
 
-  const planSummaryText = useMemo(() => {
-    if (!plannedSummary) return null;
-    const shape =
-      plannedSummary.w !== null && plannedSummary.h !== null
-        ? `${plannedSummary.w}x${plannedSummary.h}`
-        : "audio only";
-    const bitrate = plannedSummary.totalKbps !== null ? `~${plannedSummary.totalKbps} kbps` : "no size limit";
-    return `${shape} • ${formatClock(plannedSummary.durationS)} • ${bitrate}`;
-  }, [plannedSummary]);
-  const outputDimensionsSummary = useMemo(() => {
-    if (format === "mp3") return "No video dimensions for MP3 output";
-    if (resizeMode === "source") {
-      return shapedVideoDimensions
-        ? `Original ${shapedVideoDimensions.width}x${shapedVideoDimensions.height}`
-        : "Original source dimensions";
-    }
-    if (resizeMode === "maxEdge") {
-      const maxEdge = maxEdgePx.trim();
-      return maxEdge ? `Max edge ${maxEdge} px` : "Set a max edge";
-    }
-    const width = customWidthPx.trim();
-    const height = customHeightPx.trim();
-    const widthNum = Number(width);
-    const heightNum = Number(height);
-    return width && height && Number.isFinite(widthNum) && Number.isFinite(heightNum)
-      ? `Custom ${evenPixel(widthNum)}x${evenPixel(heightNum)}`
-      : "Set custom width and height";
-  }, [format, resizeMode, shapedVideoDimensions, maxEdgePx, customWidthPx, customHeightPx]);
-
   const advancedAudioBitrateValue = advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps);
   const advancedAudioBitrateValid =
     advancedAudioBitrateValue !== null &&
@@ -1295,7 +1385,9 @@ function App() {
   const frameRateCapApplies =
     format !== "mp3" &&
     advancedFrameRateCapRequest !== null &&
-    (sourceFrameRate === null || sourceFrameRate > advancedFrameRateCapRequest + 0.01);
+    (sourceFrameRate === null ||
+      sourceFrameRate * (Number.isFinite(Number(speed)) && Number(speed) > 0 ? Number(speed) : 1) >
+        advancedFrameRateCapRequest + 0.01);
   const audioOverrideCanApply =
     format === "mp3" ? Boolean(probe?.hasAudio) : audioEnabled && Boolean(probe?.hasAudio);
   const advancedAudioChannelsApplies = advancedAudioChannels !== "auto" && audioOverrideCanApply;
@@ -1319,6 +1411,32 @@ function App() {
         .filter(Boolean)
         .join(" • ")
     : "Probe the source to inspect its selected streams.";
+  const sourceColorSummary = probe
+    ? [
+        probe.dynamicRange === "hdr10"
+          ? "HDR10"
+          : probe.dynamicRange === "hlg"
+            ? "HLG"
+            : probe.dynamicRange === "dolbyVision"
+              ? "Dolby Vision"
+              : probe.dynamicRange === "unknown"
+                ? probe.colorTransfer === "smpte2084"
+                  ? "Ambiguous PQ/HDR metadata"
+                  : "SDR metadata not declared"
+                : "SDR",
+        probe.bitDepth ? `${probe.bitDepth}-bit` : null,
+        probe.pixelFormat ?? null,
+      ]
+        .filter(Boolean)
+        .join(" • ")
+    : "Color metadata pending";
+  const sourceSarSummary = probe?.sampleAspectRatio
+    ? `${probe.sampleAspectRatio.numerator}:${probe.sampleAspectRatio.denominator} SAR${
+        probe.displayAspectRatio
+          ? ` • ${(probe.displayAspectRatio.numerator / probe.displayAspectRatio.denominator).toFixed(3)} display aspect`
+          : ""
+      }`
+    : "Square pixels assumed";
   const advancedQualitySummary =
     format === "mp3"
       ? "No video quality"
@@ -1363,15 +1481,28 @@ function App() {
     (advancedFrameRateCapRequest === null ? 0 : 1) +
     (advancedAudioChannels === "auto" ? 0 : 1) +
     (normalizeAudio ? 1 : 0);
+  const trimStartValue = trimStart.trim() === "" ? 0 : Number(trimStart);
+  const trimEndValue = trimEnd.trim() === "" ? null : Number(trimEnd);
+  const trimIsActive = trimRequestIsActive({
+    startS: trimStartValue,
+    endS: trimEndValue,
+    durationS: probe?.durationS ?? null,
+  });
+  const cropFilterPlanned = Boolean(
+    cropEnabled && cropPixelRect && probe && !isFullFramePixelCrop(cropPixelRect, probe.width, probe.height),
+  );
   const hasVideoEditTransforms =
-    Boolean(trimSummary) ||
-    Boolean(cropEnabled && cropSummary && cropSummary !== "Full frame selected.") ||
+    trimIsActive ||
+    cropFilterPlanned ||
     reverse ||
     loopVideo ||
     rotateDeg !== 0 ||
-    (Number.isFinite(Number(speed)) && Math.abs(Number(speed) - 1) > 0.001) ||
+    timelineSpeedChanges(speed) ||
     (format !== "mp3" && resizeMode !== "source") ||
-    !colorIsDefault(brightness, contrast, saturation);
+    !colorIsDefault(brightness, contrast, saturation) ||
+    (format !== "mp3" && perturbFirstFrame) ||
+    (format !== "mp3" && colorPolicy === "standardSdr") ||
+    (format !== "mp3" && hasNonSquarePixels(probe));
   const advancedForcesReencode =
     format !== "mp3" &&
     (advancedVideoCodec !== "auto" ||
@@ -1454,23 +1585,383 @@ function App() {
         value,
         label: VIDEO_CODEC_LABELS[value],
         ffmpegName: VIDEO_CODEC_FFMPEG_NAMES[value] ?? "",
-        available: true,
+        available: false,
         isDefault: value === fallbackVideoCodecOptions[0],
       }));
+  const colorSource = useMemo(() => classifyColorSource(probe), [probe]);
+  const featureCapability = (feature: string) =>
+    encodeCapabilities?.features?.find((capability) => capability.name === feature) ?? null;
+  const describeMissingFeature = (
+    feature: string,
+    label: string,
+    required?: { encoders?: string[]; filters?: string[] },
+  ) => {
+    const capability = featureCapability(feature);
+    const requiredEncoders = required?.encoders ? new Set(required.encoders) : null;
+    const requiredFilters = required?.filters ? new Set(required.filters) : null;
+    const missing = [
+      ...(capability?.missingEncoders ?? [])
+        .filter((name) => requiredEncoders === null || requiredEncoders.has(name))
+        .map((name) => `encoder ${name}`),
+      ...(capability?.missingFilters ?? [])
+        .filter((name) => requiredFilters === null || requiredFilters.has(name))
+        .map((name) => `filter ${name}`),
+    ];
+    if (capability && missing.length === 0) return null;
+    return missing.length
+      ? `${label} is unavailable because FFmpeg is missing ${missing.join(", ")}.`
+      : `${label} is unavailable in the active FFmpeg build.`;
+  };
+  const colorBlockingReason = (() => {
+    if (format === "mp3" || colorSource.kind === "standard") return null;
+    if (colorSource.kind === "unsupported") return colorSource.reason;
+    if (colorPolicy !== "standardSdr") {
+      return `${colorSource.label} source detected. Enable standard SDR conversion before exporting video.`;
+    }
+    if (format !== "mp4") return "Standard SDR conversion is available for MP4 output only.";
+    if (advancedVideoCodec !== "auto" && advancedVideoCodec !== "h264") {
+      return "Standard SDR conversion requires Auto or H.264 (libx264) video encoding.";
+    }
+    return describeMissingFeature("hdrToSdr", "Standard SDR conversion", {
+      encoders: ["libx264"],
+      filters: probe?.dynamicRange === "hdr10"
+        ? ["format", "tonemap", "zscale"]
+        : ["format", "zscale"],
+    });
+  })();
+  const sarNormalizationRequired = format !== "mp3" && hasNonSquarePixels(probe);
+  const sourceRotationReason = sourceRotationBlockingReason(probe);
+  const rotationBlockingReason = format === "mp3" ? null : sourceRotationReason;
+  const frameCapabilityBlockingReason = probe
+    ? describeMissingFeature("coreExport", "Frame export", { encoders: ["png"] })
+    : null;
+  const cropDetectCapabilityBlockingReason = probe
+    ? describeMissingFeature("coreExport", "Crop detection", { filters: ["cropdetect"] })
+    : null;
+  const frameExportBlockingReason = frameCapabilityBlockingReason ?? sourceRotationReason ??
+    (colorSource.kind === "standard"
+      ? hasNonSquarePixels(probe)
+        ? "Frame export is unavailable for non-square-pixel sources because PNG output would not preserve the visible display shape."
+        : null
+      : "Frame export is available only for standard 8-bit SDR sources because it does not apply the video export color conversion policy.");
+  const minimumSourceDimensionBlockingReason = format !== "mp3" && probe && (probe.width < 2 || probe.height < 2)
+    ? `Video export requires a source at least 2x2 pixels; this source is ${probe.width}x${probe.height}. Audio-only MP3 export remains available.`
+    : null;
+  const sarBlockingReason = sarNormalizationRequired
+    ? describeMissingFeature("sarNormalize", "Square-pixel normalization")
+    : null;
+  const capabilityInspectionBlockingReason = (() => {
+    if (encodeCapabilitiesError) return `FFmpeg capability inspection failed: ${encodeCapabilitiesError}`;
+    if (!encodeCapabilities) return "Checking the active FFmpeg capability contract.";
+    return null;
+  })();
+  const transformRequiredFilters = (() => {
+    const filters = new Set<string>();
+    const retainedAudio = Boolean(probe?.hasAudio) && Boolean(plannedSummary?.audioIncluded);
+    if (reverse) {
+      if (format !== "mp3") filters.add("reverse");
+      if (retainedAudio) {
+        filters.add("asetnsamples");
+        filters.add("areverse");
+      }
+    }
+    if (format !== "mp3" && loopVideo) {
+      filters.add("split");
+      filters.add("reverse");
+      filters.add("concat");
+      if (retainedAudio) {
+        filters.add("asetnsamples");
+        filters.add("asplit");
+        filters.add("areverse");
+      }
+    }
+    return [...filters];
+  })();
+  const transformCapabilityBlockingReason = transformRequiredFilters.length
+    ? describeMissingFeature("reverseLoop", "The selected Reverse and Loop plan", {
+        filters: transformRequiredFilters,
+      })
+    : null;
+  const sourceVideoCopyCompatible =
+    format === "mp4"
+      ? probe?.videoCodec === "h264" || probe?.videoCodec === "mpeg4"
+      : format === "webm"
+        ? probe?.videoCodec === "vp8" || probe?.videoCodec === "vp9"
+      : false;
+  const sizeTargetSourceAudioCopyCompatible =
+    format === "mp4"
+      ? probe?.audioCodec === "aac"
+      : format === "webm"
+        ? probe?.audioCodec === "opus" || probe?.audioCodec === "vorbis"
+        : false;
+  const sizeTargetSpeedChangesTimeline = timelineSpeedChanges(speed);
+  const sizeTargetRetainedAudioNeedsEncode = Boolean(plannedSummary?.audioIncluded) &&
+    (trimIsActive ||
+      reverse ||
+      loopVideo ||
+      sizeTargetSpeedChangesTimeline ||
+      normalizeAudio ||
+      advancedAudioChannels !== "auto" ||
+      !sizeTargetSourceAudioCopyCompatible);
+  const sizeTargetRequiresVideoEncoder = sizeLimitEnabled &&
+    (!sourceVideoCopyCompatible || sizeTargetRetainedAudioNeedsEncode);
+  const currentPlanRequiresVideoEncoder =
+    format !== "mp3" &&
+    (hasVideoEditTransforms ||
+      !sourceVideoCopyCompatible ||
+      sizeTargetRequiresVideoEncoder ||
+      advancedVideoCodec !== "auto" ||
+      advancedVideoQualityApplies ||
+      advancedEncodeSpeedApplies ||
+      frameRateCapApplies);
+  const plannedEncodeSummary = useMemo(() => {
+    if (!plannedSummary || format === "mp3" || plannedSummary.w === null || plannedSummary.h === null) {
+      return plannedSummary;
+    }
+    const dimensions = encodedOutputDimensions(
+      plannedSummary.w,
+      plannedSummary.h,
+      currentPlanRequiresVideoEncoder,
+    );
+    return { ...plannedSummary, w: dimensions.width, h: dimensions.height };
+  }, [plannedSummary, format, currentPlanRequiresVideoEncoder]);
+  const sourceDimensionBlockingReason = minimumSourceDimensionBlockingReason ??
+    (format !== "mp3" && currentPlanRequiresVideoEncoder &&
+      plannedEncodeSummary && plannedEncodeSummary.w !== null && plannedEncodeSummary.h !== null
+      ? codecOutputDimensionBlockingReason(
+          plannedEncodeSummary.videoCodec,
+          plannedEncodeSummary.w,
+          plannedEncodeSummary.h,
+        )
+      : null);
+  const planSummaryText = useMemo(() => {
+    if (!plannedEncodeSummary) return null;
+    const shape =
+      plannedEncodeSummary.w !== null && plannedEncodeSummary.h !== null
+        ? `${plannedEncodeSummary.w}x${plannedEncodeSummary.h}`
+        : "audio only";
+    const bitrate = plannedEncodeSummary.totalKbps !== null ? `~${plannedEncodeSummary.totalKbps} kbps` : "no size limit";
+    return `${shape} • ${formatClock(plannedEncodeSummary.durationS)} • ${bitrate}`;
+  }, [plannedEncodeSummary]);
+  const outputDimensionsSummary = useMemo(() => {
+    if (format === "mp3") return "No video dimensions for MP3 output";
+    if (resizeMode === "source") {
+      if (!plannedEncodeSummary || plannedEncodeSummary.w === null || plannedEncodeSummary.h === null) {
+        return "Original source dimensions";
+      }
+      if (hasNonSquarePixels(probe)) {
+        return `Square pixels ${plannedEncodeSummary.w}x${plannedEncodeSummary.h} (source ${shapedVideoDimensions?.width ?? probe?.width}x${shapedVideoDimensions?.height ?? probe?.height})`;
+      }
+      if (
+        currentPlanRequiresVideoEncoder &&
+        squarePixelVideoDimensions &&
+        (plannedEncodeSummary.w !== squarePixelVideoDimensions.width || plannedEncodeSummary.h !== squarePixelVideoDimensions.height)
+      ) {
+        return `Encoded ${plannedEncodeSummary.w}x${plannedEncodeSummary.h} (source ${squarePixelVideoDimensions.width}x${squarePixelVideoDimensions.height}; encoded output requires even dimensions)`;
+      }
+      return `Original ${plannedEncodeSummary.w}x${plannedEncodeSummary.h}`;
+    }
+    if (resizeMode === "maxEdge") {
+      const maxEdge = maxEdgePx.trim();
+      return maxEdge ? `Max edge ${maxEdge} px` : "Set a max edge";
+    }
+    const width = customWidthPx.trim();
+    const height = customHeightPx.trim();
+    const widthNum = Number(width);
+    const heightNum = Number(height);
+    return width && height && Number.isFinite(widthNum) && Number.isFinite(heightNum)
+      ? `Custom ${evenPixel(widthNum)}x${evenPixel(heightNum)}`
+      : "Set custom width and height";
+  }, [
+    format,
+    resizeMode,
+    probe,
+    shapedVideoDimensions,
+    squarePixelVideoDimensions,
+    maxEdgePx,
+    customWidthPx,
+    customHeightPx,
+    plannedEncodeSummary,
+    currentPlanRequiresVideoEncoder,
+  ]);
+  const autoVideoCodecBlockingReason =
+    currentPlanRequiresVideoEncoder &&
+    advancedVideoCodec === "auto" &&
+    encodeCapabilities &&
+    !videoCodecOptions.some((codec) => codec.available)
+      ? `No compatible video encoder is available for ${format.toUpperCase()} export.`
+      : null;
+  const retainedAudioForPlan = Boolean(probe?.hasAudio && plannedSummary?.audioIncluded);
+  const speedChangesTimeline = timelineSpeedChanges(speed);
+  const coreRequiredFilters = (() => {
+    const filters = new Set<string>();
+    if (format !== "mp3") {
+      if (trimIsActive) {
+        filters.add("trim");
+        filters.add("setpts");
+      }
+      if (cropFilterPlanned) filters.add("crop");
+      if (rotateDeg !== 0) filters.add("transpose");
+      if (resizeMode !== "source") filters.add("scale");
+      if (!colorIsDefault(brightness, contrast, saturation)) filters.add("eq");
+      if (speedChangesTimeline) filters.add("setpts");
+      if (frameRateCapApplies) filters.add("fps");
+      if (perturbFirstFrame) filters.add("noise");
+      const evenOutputFilterPlanned = cropFilterPlanned || resizeMode !== "source" || sarNormalizationRequired;
+      if (
+        currentPlanRequiresVideoEncoder &&
+        !evenOutputFilterPlanned &&
+        probe &&
+        (probe.width % 2 !== 0 || probe.height % 2 !== 0)
+      ) {
+        filters.add("crop");
+      }
+    }
+    if (retainedAudioForPlan) {
+      if (trimIsActive) {
+        filters.add("atrim");
+        filters.add("asetpts");
+      }
+      if (normalizeAudio) {
+        filters.add("loudnorm");
+        filters.add("aresample");
+      }
+      if (speedChangesTimeline) filters.add("atempo");
+    }
+    return [...filters];
+  })();
+  const sourceAudioCopyCompatible =
+    format === "mp4"
+      ? probe?.audioCodec === "aac"
+      : format === "webm"
+        ? probe?.audioCodec === "opus" || probe?.audioCodec === "vorbis"
+        : false;
+  const currentPlanRequiresAudioEncoder =
+    format === "mp3" ||
+    (retainedAudioForPlan &&
+      (trimIsActive ||
+        reverse ||
+        loopVideo ||
+        speedChangesTimeline ||
+        normalizeAudio ||
+        advancedAudioApplies ||
+        advancedAudioChannels !== "auto" ||
+        !sourceAudioCopyCompatible));
+  const coreFeature = featureCapability("coreExport");
+  const coreMissingEncoders = new Set(coreFeature?.missingEncoders ?? []);
+  const requiredAudioEncoders = !currentPlanRequiresAudioEncoder
+    ? []
+    : format === "mp3"
+      ? ["libmp3lame"]
+      : format === "mp4"
+        ? ["aac"]
+        : !coreMissingEncoders.has("libopus")
+          ? ["libopus"]
+          : ["libvorbis"];
+  const coreCapabilityBlockingReason =
+    coreRequiredFilters.length || requiredAudioEncoders.length
+      ? describeMissingFeature("coreExport", "The selected export plan", {
+          encoders: requiredAudioEncoders,
+          filters: coreRequiredFilters,
+        })
+      : null;
+  const transformMemoryEstimate = useMemo(() => {
+    if (!probe || !plannedEncodeSummary || (format !== "mp3" && (plannedEncodeSummary.w === null || plannedEncodeSummary.h === null))) {
+      return reverse || (format !== "mp3" && loopVideo)
+        ? {
+            bytes: null,
+            severity: "blocked" as const,
+            reason: "Reverse and Loop need a valid trim, speed, and output size before export can start.",
+            videoBytes: null,
+            audioBytes: null,
+          }
+        : { bytes: 0, severity: "ok" as const, reason: null, videoBytes: 0, audioBytes: 0 };
+    }
+    return estimateTransformMemory({
+      probe,
+      reverse,
+      loopVideo: format !== "mp3" && loopVideo,
+      trimStartS: trimTimeline?.start ?? 0,
+      trimEndS: trimTimeline?.end ?? probe.durationS,
+      speed: Number(speed),
+      frameRateCapFps: advancedFrameRateCapRequest,
+      width: plannedEncodeSummary.w ?? 1,
+      height: plannedEncodeSummary.h ?? 1,
+      decodedVideoBytesPerPixel:
+        format === "mp4" && colorSource.kind === "convertible" && colorPolicy === "standardSdr"
+          ? 1.5
+          : null,
+      normalizeAudio,
+      audioEnabled: Boolean(plannedEncodeSummary.audioIncluded),
+      videoEnabled: format !== "mp3",
+    });
+  }, [
+    probe,
+    plannedEncodeSummary,
+    reverse,
+    loopVideo,
+    format,
+    trimTimeline,
+    speed,
+    advancedFrameRateCapRequest,
+    audioEnabled,
+    normalizeAudio,
+    colorSource,
+    colorPolicy,
+  ]);
+  const transformMemoryBlockingReason = transformMemoryEstimate.severity === "blocked"
+    ? transformMemoryEstimate.reason ?? "Reverse or Loop exceeds the decoded-memory safety limit."
+    : null;
+  const exportBlockingReason =
+    capabilityInspectionBlockingReason ??
+    rotationBlockingReason ??
+    sourceDimensionBlockingReason ??
+    colorBlockingReason ??
+    sarBlockingReason ??
+    coreCapabilityBlockingReason ??
+    transformCapabilityBlockingReason ??
+    transformMemoryBlockingReason ??
+    autoVideoCodecBlockingReason ??
+    (selectedVideoCodecUnavailable ? "Choose an available codec before exporting." : null);
+  const colorHandlingSummary = format === "mp3"
+    ? "Video color is not included in MP3 output"
+    : colorSource.kind === "standard"
+      ? "Standard SDR path"
+      : colorSource.kind === "unsupported"
+        ? colorSource.reason
+        : colorPolicy === "standardSdr"
+          ? `${colorSource.label} -> 8-bit BT.709 SDR MP4`
+          : `${colorSource.label} needs an explicit SDR conversion choice`;
+  const displayHandlingSummary = format === "mp3"
+    ? "No video display geometry"
+    : rotationBlockingReason
+      ? rotationBlockingReason
+      : sourceDimensionBlockingReason
+        ? sourceDimensionBlockingReason
+    : sarNormalizationRequired && plannedEncodeSummary && plannedEncodeSummary.w !== null && plannedEncodeSummary.h !== null
+      ? resizeMode === "custom"
+        ? `${sourceSarSummary} -> custom ${plannedEncodeSummary.w}x${plannedEncodeSummary.h} square pixels`
+        : `${sourceSarSummary} -> ${plannedEncodeSummary.w}x${plannedEncodeSummary.h} square pixels with display shape preserved`
+      : resizeMode === "custom" && plannedEncodeSummary && plannedEncodeSummary.w !== null && plannedEncodeSummary.h !== null
+        ? `Custom ${plannedEncodeSummary.w}x${plannedEncodeSummary.h} square-pixel dimensions`
+        : "Square-pixel display shape preserved";
+  const transformMemorySummary = reverse || (format !== "mp3" && loopVideo)
+    ? transformMemoryEstimate.bytes === null
+      ? transformMemoryEstimate.reason ?? "Decoded-memory estimate unavailable"
+      : `${formatByteSize(transformMemoryEstimate.bytes)} decoded buffer (${transformMemoryEstimate.severity})`
+    : "No whole-clip Reverse/Loop buffer";
 
   const activeEditChips = useMemo(() => {
     const chips: string[] = [];
 
-    const trimStartNum = trimStart.trim() === "" ? 0 : Number(trimStart);
-    const trimEndNum = trimEnd.trim() === "" ? null : Number(trimEnd);
-    if ((Number.isFinite(trimStartNum) && trimStartNum > 0) || (trimEndNum !== null && Number.isFinite(trimEndNum) && trimEndNum > 0)) {
+    if (trimIsActive) {
       chips.push("Trim");
     }
 
-    if (cropEnabled && cropSummary && cropSummary !== "Full frame selected.") chips.push("Crop");
+    if (cropFilterPlanned) chips.push("Crop");
 
     const speedNum = Number(speed);
-    if (Number.isFinite(speedNum) && Math.abs(speedNum - 1) > 0.001) {
+    if (timelineSpeedChanges(speedNum)) {
       chips.push(`${speedNum.toFixed(2).replace(/\.?0+$/, "")}x speed`);
     }
 
@@ -1478,14 +1969,7 @@ function App() {
     if (reverse) chips.push("Reverse");
     if (format !== "mp3" && loopVideo) chips.push("Loop");
 
-    const brightnessNum = Number(brightness);
-    const contrastNum = Number(contrast);
-    const saturationNum = Number(saturation);
-    if (
-      (Number.isFinite(brightnessNum) && Math.abs(brightnessNum) > 0.001) ||
-      (Number.isFinite(contrastNum) && Math.abs(contrastNum - 1) > 0.001) ||
-      (Number.isFinite(saturationNum) && Math.abs(saturationNum - 1) > 0.001)
-    ) {
+    if (!colorIsDefault(brightness, contrast, saturation)) {
       chips.push("Color");
     }
 
@@ -1502,13 +1986,13 @@ function App() {
     if (advancedAudioBitrateRequest !== null) chips.push(`Audio ${advancedAudioBitrateRequest}k`);
     if (advancedAudioChannels !== "auto") chips.push(AUDIO_CHANNEL_LABELS[advancedAudioChannels]);
     if (normalizeAudioApplies) chips.push("Normalized audio");
+    if (format !== "mp3" && colorPolicy === "standardSdr") chips.push("Standard SDR");
+    if (format !== "mp3" && hasNonSquarePixels(probe)) chips.push("Square pixels");
 
     return chips;
   }, [
-    trimStart,
-    trimEnd,
-    cropEnabled,
-    cropSummary,
+    trimIsActive,
+    cropFilterPlanned,
     speed,
     rotateDeg,
     reverse,
@@ -1531,6 +2015,7 @@ function App() {
     advancedAudioBitrateRequest,
     advancedAudioChannels,
     normalizeAudioApplies,
+    colorPolicy,
   ]);
 
   const lastExportSizeText = lastExport?.outputSizeBytes ? `${(lastExport.outputSizeBytes / 1_000_000).toFixed(2)} MB` : null;
@@ -1587,7 +2072,7 @@ function App() {
     outputModeSummary,
   ]);
 
-  const exportReady = Boolean(inputPath && outputPath && probe && !selectedVideoCodecUnavailable);
+  const exportReady = Boolean(inputPath && outputPath && probe && !exportBlockingReason);
   const planHeroReady =
     exportReady && !attemptUi.isActive && !attemptUi.isFailure && !attemptUi.isCancelled;
   const queueCounts = useMemo(
@@ -1610,30 +2095,30 @@ function App() {
           ? "Analyzing the source video so the export plan can be calculated."
           : !outputPath
             ? "Pick an output path to enable export."
-            : selectedVideoCodecUnavailable
-              ? "Choose an available codec before exporting."
+            : exportBlockingReason
+              ? exportBlockingReason
             : lastExportIsCurrentOutcome
               ? "Last export completed. Review the output below or adjust the settings and export another variation."
               : "Source, output path, and current settings are valid. Export is ready.";
 
   const planWarnings = useMemo(() => {
     const warnings: string[] = [];
-    if (!probe || !plannedSummary) return warnings;
+    if (!probe || !plannedEncodeSummary) return warnings;
 
-    if (plannedSummary.sizeLimitEnabled) {
+    if (plannedEncodeSummary.sizeLimitEnabled) {
       warnings.push("Size targets are best effort; tight budgets can reduce quality, remove audio, or finish above target.");
-      if (plannedSummary.totalKbps !== null && plannedSummary.totalKbps < 160 && format !== "mp3") {
+      if (plannedEncodeSummary.totalKbps !== null && plannedEncodeSummary.totalKbps < 160 && format !== "mp3") {
         warnings.push("This target leaves a very low bitrate for video. Lower output dimensions, trim shorter, or raise the size limit.");
       }
-      if (format !== "mp3" && probe.hasAudio && audioEnabled && plannedSummary.totalKbps !== null && plannedSummary.totalKbps < 82) {
+      if (format !== "mp3" && probe.hasAudio && audioEnabled && plannedEncodeSummary.totalKbps !== null && plannedEncodeSummary.totalKbps < 82) {
         warnings.push("This target is too tight to keep audio; export may remove it to prioritize a playable video.");
       }
       if (
-        plannedSummary.totalKbps !== null &&
-        plannedSummary.w !== null &&
-        plannedSummary.h !== null &&
-        plannedSummary.w * plannedSummary.h >= 1280 * 720 &&
-        plannedSummary.totalKbps < 700
+        plannedEncodeSummary.totalKbps !== null &&
+        plannedEncodeSummary.w !== null &&
+        plannedEncodeSummary.h !== null &&
+        plannedEncodeSummary.w * plannedEncodeSummary.h >= 1280 * 720 &&
+        plannedEncodeSummary.totalKbps < 700
       ) {
         warnings.push("The current resolution is high for this bitrate. Smaller output dimensions will usually behave better.");
       }
@@ -1646,6 +2131,37 @@ function App() {
     if (selectedVideoCodecUnavailable) {
       warnings.push(`${VIDEO_CODEC_LABELS[advancedVideoCodec]} is not available in this FFmpeg build. Use Auto or another available codec.`);
     }
+
+    if (colorSource.kind === "convertible" && format !== "mp3") {
+      warnings.push(
+        colorPolicy === "standardSdr"
+          ? `${colorSource.label} will be converted to 8-bit BT.709 SDR for broad MP4 sharing.`
+          : `${colorSource.label} needs an explicit standard SDR conversion choice before video export.`,
+      );
+    } else if (colorSource.kind === "unsupported" && format !== "mp3") {
+      warnings.push(colorSource.reason);
+    }
+
+    if (sarNormalizationRequired && plannedEncodeSummary.w !== null && plannedEncodeSummary.h !== null) {
+      warnings.push(
+        resizeMode === "custom"
+          ? `Non-square source pixels will be normalized to the requested ${plannedEncodeSummary.w}x${plannedEncodeSummary.h} square-pixel dimensions. Custom dimensions are authoritative and may change the visible shape.`
+          : `Non-square source pixels will be normalized to ${plannedEncodeSummary.w}x${plannedEncodeSummary.h} square pixels while preserving the visible shape.`,
+      );
+    }
+
+    if (rotationBlockingReason) warnings.push(rotationBlockingReason);
+    if (sourceDimensionBlockingReason) warnings.push(sourceDimensionBlockingReason);
+
+    if (transformMemoryEstimate.severity === "warning" && transformMemoryEstimate.bytes !== null) {
+      warnings.push(
+        `Reverse/Loop may buffer about ${formatByteSize(transformMemoryEstimate.bytes)} of decoded media. Trim shorter or resize smaller if memory is tight.`,
+      );
+    } else if (transformMemoryEstimate.severity === "blocked") {
+      warnings.push(transformMemoryEstimate.reason ?? "Reverse/Loop exceeds the decoded-memory safety limit.");
+    }
+
+    if (capabilityInspectionBlockingReason && encodeCapabilitiesError) warnings.push(capabilityInspectionBlockingReason);
 
     if (sizeLimitEnabled && advancedAudioBitrateRequest !== null) {
       warnings.push("Audio bitrate override is held until no-limit exports; size-targeted exports plan audio bitrate automatically.");
@@ -1670,7 +2186,7 @@ function App() {
     return warnings;
   }, [
     probe,
-    plannedSummary,
+    plannedEncodeSummary,
     format,
     audioEnabled,
     selectedVideoCodecUnavailable,
@@ -1683,6 +2199,14 @@ function App() {
     sourceFrameRate,
     advancedAudioChannels,
     audioOverrideCanApply,
+    colorSource,
+    colorPolicy,
+    sarNormalizationRequired,
+    rotationBlockingReason,
+    sourceDimensionBlockingReason,
+    transformMemoryEstimate,
+    capabilityInspectionBlockingReason,
+    encodeCapabilitiesError,
   ]);
 
   function handleDroppedPaths(paths: string[]) {
@@ -1914,17 +2438,19 @@ function App() {
       if (!smokeInteractionDoneRef.current) {
         const trimStartS = Math.max(0, smokeConfig.trimStartS);
         const trimEndS = Math.max(trimStartS, Math.min(probe.durationS, smokeConfig.trimEndS ?? probe.durationS));
+        const expectedDurationS = Math.max(0, trimEndS - trimStartS) *
+          (smokeConfig.loopVideo && smokeConfig.format !== "mp3" ? 2 : 1);
         smokeMetricsRef.current = {
           trimStartS,
           trimEndS,
-          expectedDurationS: Math.max(0, trimEndS - trimStartS),
+          expectedDurationS,
         };
         smokeInteractionDoneRef.current = true;
         void reportSmokeStatus("interaction-ready", {
           message: "Headless packaged export smoke skipped preview playback checks after the source probe completed.",
           trimStartS,
           trimEndS,
-          expectedDurationS: Math.max(0, trimEndS - trimStartS),
+          expectedDurationS,
         });
         setStatus("Smoke: headless export checks ready.");
       }
@@ -2339,6 +2865,9 @@ function App() {
       audioEnabled: format === "mp3" ? true : audioEnabled,
       normalizeAudio,
       stripMetadata,
+      // Consent to reinterpret a source's color is source-specific. Files
+      // added without probing must make their own explicit choice later.
+      colorPolicy: "auto",
       advanced: buildAdvancedSettings(),
       trim: null,
       crop: null,
@@ -2380,11 +2909,12 @@ function App() {
     const trim = startS > 0 || endS !== null ? { startS, endS } : null;
 
     const cropPx = cropEnabled ? cropRectToPixels(cropRect, probe.width, probe.height) : null;
-    const crop =
-      cropPx &&
-      !(cropPx.x <= 1 && cropPx.y <= 1 && cropPx.width >= probe.width - 2 && cropPx.height >= probe.height - 2)
-        ? cropPx
-        : null;
+    const cropIsActive = cropPx && !isFullFramePixelCrop(cropPx, probe.width, probe.height);
+    const encodedCrop = cropIsActive ? alignCropRectForEncoding(cropPx) : null;
+    if (encodedCrop && (encodedCrop.width < 2 || encodedCrop.height < 2)) {
+      throw new Error("Crop width and height must each be at least 2 pixels.");
+    }
+    const crop = encodedCrop;
 
     return {
       inputPath,
@@ -2395,6 +2925,7 @@ function App() {
       audioEnabled: audioEnabled,
       normalizeAudio,
       stripMetadata,
+      colorPolicy,
       advanced: buildAdvancedSettings(),
       trim,
       crop,
@@ -3720,8 +4251,8 @@ function App() {
                           type="button"
                           className="vfl-icon-button"
                           onClick={saveCurrentFrame}
-                          disabled={encodeBusy || !previewReady || !probe || frameSaving}
-                          title="Save Frame"
+                          disabled={encodeBusy || !previewReady || !probe || frameSaving || Boolean(frameExportBlockingReason)}
+                          title={frameExportBlockingReason ?? "Save Frame"}
                           aria-label="Save the current preview frame as a PNG"
                           aria-busy={frameSaving}
                         >
@@ -3734,6 +4265,11 @@ function App() {
                           {formatClock(clampedPreviewTimeS)} / {formatClock(previewDurationS)}
                         </div>
                       </div>
+                      {frameExportBlockingReason ? (
+                        <div className="vfl-inline-hint" role="status">
+                          Save Frame unavailable: {frameExportBlockingReason}
+                        </div>
+                      ) : null}
 
                       {trimTimeline ? (
                         <div className="vfl-trim-block">
@@ -3915,6 +4451,18 @@ function App() {
                 </button>
               </div>
               <div className="vfl-inline-hint">Drag and drop works anywhere in the window.</div>
+              {probe ? (
+                <div className="vfl-source-facts" aria-label="Source media facts">
+                  <span>{sourceColorSummary}</span>
+                  <span>{sourceSarSummary}</span>
+                  {probe.attachedPictureCount ? (
+                    <span>{probe.attachedPictureCount} attached picture{probe.attachedPictureCount === 1 ? "" : "s"} ignored</span>
+                  ) : null}
+                  {probe.unsupportedRotationDeg !== null && probe.unsupportedRotationDeg !== undefined ? (
+                    <span>{probe.unsupportedRotationDeg.toFixed(3)}° source rotation is unsafe for video geometry</span>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
             <div className="vfl-field">
               <label htmlFor="vfl-output-path">Output</label>
@@ -4220,8 +4768,8 @@ function App() {
             <div className="vfl-actions vfl-actions-wrap">
               <button
                 onClick={autoDetectCrop}
-                disabled={encodeBusy || !probe || !inputPath || cropDetecting}
-                title="Detect black bars and suggest a crop"
+                disabled={encodeBusy || !probe || !inputPath || cropDetecting || Boolean(sourceRotationReason ?? cropDetectCapabilityBlockingReason)}
+                title={sourceRotationReason ?? cropDetectCapabilityBlockingReason ?? "Detect black bars and suggest a crop"}
                 aria-busy={cropDetecting}
                 aria-describedby="vfl-crop-detect-status"
               >
@@ -4248,7 +4796,9 @@ function App() {
               aria-live="polite"
               aria-atomic="true"
             >
-              {cropDetecting ? "Detecting crop…" : cropDetectHint ?? ""}
+              {cropDetecting
+                ? "Detecting crop…"
+                : cropDetectHint ?? sourceRotationReason ?? cropDetectCapabilityBlockingReason ?? ""}
             </div>
             {cropEnabled && cropSummary ? <div className="vfl-inline-hint">Current crop: {cropSummary}</div> : null}
           </RailCard>
@@ -4304,10 +4854,54 @@ function App() {
                         ? "Loop only applies to video exports."
                         : "Plays the clip forward then in reverse so it loops seamlessly. Doubles the length."}
                     </div>
+                    {reverse || (format !== "mp3" && loopVideo) ? (
+                      <div
+                        className={`vfl-memory-status ${transformMemoryEstimate.severity}`}
+                        role="status"
+                        aria-live="polite"
+                        aria-atomic="true"
+                      >
+                        <strong>Decoded buffer</strong>
+                        <span>
+                          {transformMemoryEstimate.bytes === null
+                            ? transformMemoryEstimate.reason
+                            : `${formatByteSize(transformMemoryEstimate.bytes)} estimated${
+                                transformMemoryEstimate.severity === "blocked"
+                                  ? " • above the 2 GiB safety limit"
+                                  : transformMemoryEstimate.severity === "warning"
+                                    ? " • memory warning"
+                                    : " • within the safety limit"
+                              }`}
+                        </span>
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="vfl-subsection-title">Color</div>
                   <div className="vfl-stack-md">
+                    {probe && format !== "mp3" && colorSource.kind !== "standard" ? (
+                      <div className={`vfl-color-policy ${colorSource.kind === "unsupported" ? "blocked" : ""}`}>
+                        <div className="vfl-field-label">Source color handling</div>
+                        {colorSource.kind === "convertible" ? (
+                          <>
+                            <label className="vfl-check vfl-check-card">
+                              <input
+                                type="checkbox"
+                                checked={colorPolicy === "standardSdr"}
+                                onChange={(event) => setColorPolicy(event.currentTarget.checked ? "standardSdr" : "auto")}
+                                disabled={encodeBusy}
+                              />
+                              <span>Convert {colorSource.label} to standard SDR for sharing</span>
+                            </label>
+                            <div className="vfl-inline-hint">
+                              Creates an 8-bit BT.709 MP4 for broad playback. HDR preservation is not supported in this version.
+                            </div>
+                          </>
+                        ) : (
+                          <div className="vfl-error" role="alert">{colorSource.reason} Audio-only MP3 export remains available.</div>
+                        )}
+                      </div>
+                    ) : null}
                     <div className="vfl-row2">
                       <div className="vfl-field vfl-slider-field">
                         <div className="vfl-slider-top">
@@ -4370,6 +4964,7 @@ function App() {
                           setBrightness("0");
                           setContrast("1");
                           setSaturation("1");
+                          setColorPolicy("auto");
                         }}
                         disabled={encodeBusy}
                       >
@@ -4711,6 +5306,18 @@ function App() {
                       <div className="vfl-summary-value">{outputDimensionsSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Color handling</div>
+                      <div className="vfl-summary-value">{colorHandlingSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Display handling</div>
+                      <div className="vfl-summary-value">{displayHandlingSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Transform memory</div>
+                      <div className="vfl-summary-value">{transformMemorySummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Planned</div>
                       <div className="vfl-summary-value">{planSummaryText ?? "Pick a valid input and settings to calculate the plan."}</div>
                     </div>
@@ -4814,6 +5421,29 @@ function App() {
                               <span>Actual</span>
                               <strong>{formatByteSize(lastExport.diagnostics.actualSizeBytes)}</strong>
                             </div>
+                            {lastExport.diagnostics.colorAction ? (
+                              <div>
+                                <span>Color</span>
+                                <strong>{lastExport.diagnostics.colorAction}</strong>
+                              </div>
+                            ) : null}
+                            {lastExport.diagnostics.sarAction ? (
+                              <div>
+                                <span>Display pixels</span>
+                                <strong>{lastExport.diagnostics.sarAction}</strong>
+                              </div>
+                            ) : null}
+                            {lastExport.diagnostics.reverseBufferEstimateBytes ? (
+                              <div>
+                                <span>Transform buffer</span>
+                                <strong>
+                                  {formatByteSize(lastExport.diagnostics.reverseBufferEstimateBytes)}
+                                  {lastExport.diagnostics.reverseBufferAction
+                                    ? ` (${lastExport.diagnostics.reverseBufferAction})`
+                                    : ""}
+                                </strong>
+                              </div>
+                            ) : null}
                           </div>
                           {lastExport.diagnostics.audioRemovedForSizeTarget ? (
                             <div className="vfl-export-result-note">Audio was removed to fit the requested size target.</div>

@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "features": {
+    "coreExport": {
+      "releaseRequired": true,
+      "encoders": [
+        "aac",
+        "libmp3lame",
+        "libopus",
+        "libvorbis",
+        "libvpx",
+        "libvpx-vp9",
+        "libx264",
+        "mpeg4",
+        "png"
+      ],
+      "filters": [
+        "aresample",
+        "asetpts",
+        "atempo",
+        "atrim",
+        "crop",
+        "cropdetect",
+        "eq",
+        "fps",
+        "loudnorm",
+        "noise",
+        "scale",
+        "setpts",
+        "transpose",
+        "trim"
+      ]
+    },
+    "hdrToSdr": {
+      "releaseRequired": true,
+      "encoders": [
+        "libx264"
+      ],
+      "filters": [
+        "format",
+        "tonemap",
+        "zscale"
+      ]
+    },
+    "sarNormalize": {
+      "releaseRequired": true,
+      "encoders": [],
+      "filters": [
+        "scale",
+        "setsar"
+      ]
+    },
+    "reverseLoop": {
+      "releaseRequired": true,
+      "encoders": [],
+      "filters": [
+        "areverse",
+        "asetnsamples",
+        "asplit",
+        "concat",
+        "reverse",
+        "split"
+      ]
+    }
+  }
+}

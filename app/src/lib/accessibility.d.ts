@@ -8,6 +8,14 @@ export function cropRectToPixels(
   frameHeight: number,
 ): CropPixelRect;
 
+export function isFullFramePixelCrop(
+  rect: CropPixelRect | null | undefined,
+  frameWidth: number,
+  frameHeight: number,
+): boolean;
+
+export function alignCropRectForEncoding(rect: CropPixelRect): CropPixelRect;
+
 export function pixelAspectToNormalizedRatio(
   pixelAspectRatio: number,
   contentWidth: number,

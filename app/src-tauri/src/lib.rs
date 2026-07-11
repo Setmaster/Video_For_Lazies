@@ -40,6 +40,8 @@ struct AppSmokeConfig {
     resize_height_px: Option<u32>,
     skip_preview_interactions: bool,
     perturb_first_frame: bool,
+    color_policy: video::ColorPolicy,
+    reverse: bool,
     loop_video: bool,
 }
 
@@ -132,6 +134,14 @@ fn parse_smoke_resize_mode(raw: &str) -> Result<video::ResizeMode, String> {
         "maxedge" | "max-edge" | "max_edge" => Ok(video::ResizeMode::MaxEdge),
         "custom" => Ok(video::ResizeMode::Custom),
         _ => Err("VFL_SMOKE_RESIZE_MODE must be one of: source, maxEdge, custom.".to_string()),
+    }
+}
+
+fn parse_smoke_color_policy(raw: &str) -> Result<video::ColorPolicy, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(video::ColorPolicy::Auto),
+        "standardsdr" | "standard-sdr" | "standard_sdr" => Ok(video::ColorPolicy::StandardSdr),
+        _ => Err("VFL_SMOKE_COLOR_POLICY must be one of: auto, standardSdr.".to_string()),
     }
 }
 
@@ -234,6 +244,12 @@ fn parse_smoke_config_from_env(
     let resize_height_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_HEIGHT_PX", None)?;
     let skip_preview_interactions = parse_smoke_bool(env, "VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS")?;
     let perturb_first_frame = parse_smoke_bool(env, "VFL_SMOKE_PERTURB_FIRST_FRAME")?;
+    let color_policy = parse_smoke_color_policy(
+        env.get("VFL_SMOKE_COLOR_POLICY")
+            .map(String::as_str)
+            .unwrap_or("auto"),
+    )?;
+    let reverse = parse_smoke_bool(env, "VFL_SMOKE_REVERSE")?;
     let loop_video = parse_smoke_bool(env, "VFL_SMOKE_LOOP")?;
 
     if size_limit_mb < 0.0 {
@@ -280,6 +296,8 @@ fn parse_smoke_config_from_env(
         resize_height_px,
         skip_preview_interactions,
         perturb_first_frame,
+        color_policy,
+        reverse,
         loop_video,
     }))
 }
@@ -588,7 +606,7 @@ mod tests {
         AppSmokeConfig, AppSmokeStatus, JobHandle, JobManager, is_supported_preview_path,
         merge_smoke_optional_fields, merge_smoke_stage_history, parse_smoke_config_from_env,
     };
-    use crate::video::{OutputFormat, ResizeMode};
+    use crate::video::{ColorPolicy, OutputFormat, ResizeMode};
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -669,6 +687,8 @@ mod tests {
                 resize_height_px: None,
                 skip_preview_interactions: false,
                 perturb_first_frame: false,
+                color_policy: ColorPolicy::Auto,
+                reverse: false,
                 loop_video: false,
             })
         );
@@ -690,6 +710,8 @@ mod tests {
             ("VFL_SMOKE_RESIZE_HEIGHT_PX", "180"),
             ("VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS", "true"),
             ("VFL_SMOKE_PERTURB_FIRST_FRAME", "true"),
+            ("VFL_SMOKE_COLOR_POLICY", "standardSdr"),
+            ("VFL_SMOKE_REVERSE", "true"),
             ("VFL_SMOKE_LOOP", "true"),
         ]);
 
@@ -709,9 +731,25 @@ mod tests {
                 resize_height_px: Some(180),
                 skip_preview_interactions: true,
                 perturb_first_frame: true,
+                color_policy: ColorPolicy::StandardSdr,
+                reverse: true,
                 loop_video: true,
             })
         );
+    }
+
+    #[test]
+    fn parse_smoke_config_rejects_unknown_color_policy() {
+        let status_path = temp_smoke_status_path("bad-color-policy");
+        let env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_COLOR_POLICY", "preserve-hdr"),
+        ]);
+
+        let err = parse_smoke_config_from_env(&env).unwrap_err();
+        assert!(err.contains("VFL_SMOKE_COLOR_POLICY"));
     }
 
     #[test]

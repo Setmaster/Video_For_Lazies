@@ -17,20 +17,24 @@ function parseAdjustment(raw, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function formatFilterValue(value) {
+  return Number(value.toFixed(6)).toString();
+}
+
 export function buildPreviewColorFilter(brightness, contrast, saturation) {
   const b = parseAdjustment(brightness, 0);
   const c = parseAdjustment(contrast, 1);
   const s = parseAdjustment(saturation, 1);
 
   const parts = [];
-  if (Math.abs(b) > 0.001) {
-    parts.push(`brightness(${clampNumber(1 + b, 0, 2).toFixed(3)})`);
+  if (Math.abs(b) > 1e-9) {
+    parts.push(`brightness(${formatFilterValue(clampNumber(1 + b, 0, 2))})`);
   }
-  if (Math.abs(c - 1) > 0.001) {
-    parts.push(`contrast(${clampNumber(c, 0, 2).toFixed(3)})`);
+  if (Math.abs(c - 1) > 1e-9) {
+    parts.push(`contrast(${formatFilterValue(clampNumber(c, 0, 2))})`);
   }
-  if (Math.abs(s - 1) > 0.001) {
-    parts.push(`saturate(${clampNumber(s, 0, 3).toFixed(3)})`);
+  if (Math.abs(s - 1) > 1e-9) {
+    parts.push(`saturate(${formatFilterValue(clampNumber(s, 0, 3))})`);
   }
   return parts.length ? parts.join(" ") : null;
 }

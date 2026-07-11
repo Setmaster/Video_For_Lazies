@@ -12,12 +12,34 @@ function finiteFrameDimension(value) {
 export function cropRectToPixels(rect, frameWidth, frameHeight) {
   const width = finiteFrameDimension(frameWidth);
   const height = finiteFrameDimension(frameHeight);
-  const x = clamp(Math.round(Number(rect?.x ?? 0) * width), 0, Math.max(0, width - 1));
-  const y = clamp(Math.round(Number(rect?.y ?? 0) * height), 0, Math.max(0, height - 1));
-  const cropWidth = clamp(Math.round(Number(rect?.w ?? 1) * width), 1, width - x);
-  const cropHeight = clamp(Math.round(Number(rect?.h ?? 1) * height), 1, height - y);
+  const minimumWidth = Math.min(DEFAULT_MIN_CROP_PX, width);
+  const minimumHeight = Math.min(DEFAULT_MIN_CROP_PX, height);
+  const x = clamp(Math.round(Number(rect?.x ?? 0) * width), 0, Math.max(0, width - minimumWidth));
+  const y = clamp(Math.round(Number(rect?.y ?? 0) * height), 0, Math.max(0, height - minimumHeight));
+  const cropWidth = clamp(Math.round(Number(rect?.w ?? 1) * width), minimumWidth, width - x);
+  const cropHeight = clamp(Math.round(Number(rect?.h ?? 1) * height), minimumHeight, height - y);
 
   return { x, y, width: cropWidth, height: cropHeight };
+}
+
+export function isFullFramePixelCrop(rect, frameWidth, frameHeight) {
+  const width = finiteFrameDimension(frameWidth);
+  const height = finiteFrameDimension(frameHeight);
+  return Number(rect?.x) === 0 &&
+    Number(rect?.y) === 0 &&
+    Number(rect?.width) === width &&
+    Number(rect?.height) === height;
+}
+
+export function alignCropRectForEncoding(rect) {
+  const width = Math.max(DEFAULT_MIN_CROP_PX, Math.floor(Number(rect?.width) / 2) * 2);
+  const height = Math.max(DEFAULT_MIN_CROP_PX, Math.floor(Number(rect?.height) / 2) * 2);
+  return {
+    x: Math.max(0, Math.floor(Number(rect?.x) || 0)),
+    y: Math.max(0, Math.floor(Number(rect?.y) || 0)),
+    width,
+    height,
+  };
 }
 
 export function pixelAspectToNormalizedRatio(pixelAspectRatio, contentWidth, contentHeight) {

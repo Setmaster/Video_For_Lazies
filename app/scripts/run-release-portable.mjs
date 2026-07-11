@@ -16,6 +16,13 @@ import {
 import { runPortableSmoke } from "./run-portable-smoke.mjs";
 import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
 import { runPortableCodecPlanSmoke } from "./run-portable-codec-plan-smoke.mjs";
+import { runPortableMediaDepthSmoke } from "./run-portable-media-depth-smoke.mjs";
+import {
+  FFMPEG_CAPABILITY_CONTRACT_FILE_NAME,
+  assertCapabilityContractCopy,
+  formatFfmpegCapabilitySummary,
+  verifyFfmpegCapabilityContract,
+} from "./ffmpegCapabilities.mjs";
 import {
   buildChecksumLines,
   getPortableChecksumPath,
@@ -31,6 +38,8 @@ import {
 } from "./updateManifests.mjs";
 
 const __filename = url.fileURLToPath(import.meta.url);
+const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+const PORTABLE_BUILD_TIMEOUT_MS = 45 * 60 * 1000;
 const windowsUpdateHelperManifestVerifier = path.resolve(
   appRoot,
   "scripts",
@@ -42,33 +51,56 @@ function psQuote(value) {
 }
 
 async function runChecked(command, args, options = {}) {
+  const { timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, ...spawnOverrides } = options;
   const spawnOptions = {
     stdio: "inherit",
-    cwd: options.cwd,
+    cwd: spawnOverrides.cwd,
   };
-  if (options.env) {
-    spawnOptions.env = options.env;
+  if (spawnOverrides.env) {
+    spawnOptions.env = spawnOverrides.env;
   }
 
   await new Promise((resolve, reject) => {
     const child = spawn(command, args, spawnOptions);
+    let settled = false;
+    const finish = (action) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      action();
+    };
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(() => reject(new Error(`${command} timed out after ${timeoutMs} ms.`)));
+    }, timeoutMs);
 
-    child.on("error", reject);
-    child.on("exit", (code) => {
+    child.on("error", (error) => finish(() => reject(error)));
+    child.on("close", (code, signal) => finish(() => {
       if (code === 0) {
         resolve();
         return;
       }
-      reject(new Error(`${command} exited with code ${code}`));
-    });
+      reject(new Error(`${command} exited with code ${String(code)} (signal ${signal ?? "none"}).`));
+    }));
   });
 }
 
-async function captureStdout(command, args) {
+async function captureStdout(command, args, { timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS } = {}) {
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finish = (action) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      action();
+    };
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(() => reject(new Error(`${command} timed out after ${timeoutMs} ms.`)));
+    }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -76,14 +108,14 @@ async function captureStdout(command, args) {
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
-    child.on("error", reject);
-    child.on("exit", (code) => {
+    child.on("error", (error) => finish(() => reject(error)));
+    child.on("close", (code, signal) => finish(() => {
       if (code === 0) {
         resolve(stdout);
         return;
       }
-      reject(new Error(`${command} exited with code ${code}\n${stderr}`));
-    });
+      reject(new Error(`${command} exited with code ${String(code)} (signal ${signal ?? "none"})\n${stderr}`));
+    }));
   });
 }
 
@@ -177,12 +209,20 @@ function getBundledExecutablePath(portableDir, name, { platform = process.platfo
   return path.resolve(portableDir, ffmpegSidecarResourceTarget, `${name}${suffix}`);
 }
 
-async function assertBundledLibx264(portableDir, { platform = process.platform } = {}) {
+async function assertBundledFfmpegCapabilities(portableDir, { platform = process.platform } = {}) {
   const ffmpegPath = getBundledExecutablePath(portableDir, "ffmpeg", { platform });
-  const encoders = await captureStdout(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-encoders"]);
-  if (!/\blibx264\b/.test(encoders)) {
-    throw new Error(`Bundled ffmpeg is missing libx264: ${ffmpegPath}`);
-  }
+  const copiedContractPath = path.resolve(
+    portableDir,
+    ffmpegSidecarResourceTarget,
+    FFMPEG_CAPABILITY_CONTRACT_FILE_NAME,
+  );
+  const contract = await assertCapabilityContractCopy(copiedContractPath);
+  const result = await verifyFfmpegCapabilityContract({
+    ffmpegPath,
+    contract,
+    label: `Extracted ${platform} portable FFmpeg`,
+  });
+  console.log(`Extracted portable FFmpeg capability contract passed: ${formatFfmpegCapabilitySummary(result)}`);
 }
 
 async function runBundledEncodeSmoke(portableDir, { platform = process.platform } = {}) {
@@ -254,6 +294,7 @@ async function assertPortableLegalPayload(portableDir, { platform = process.plat
     const sidecarRequiredFiles = [
       path.join(ffmpegSidecarResourceTarget, "LICENSE.txt"),
       path.join(ffmpegSidecarResourceTarget, "FFMPEG_BUNDLE_NOTICES.txt"),
+      path.join(ffmpegSidecarResourceTarget, FFMPEG_CAPABILITY_CONTRACT_FILE_NAME),
       ...getFfmpegSourceArchiveNames({ platform }).map((name) => path.join(ffmpegSidecarResourceTarget, "source", name)),
     ];
     for (const relativePath of sidecarRequiredFiles) {
@@ -299,9 +340,10 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
     version: await getProjectVersion(),
     platform,
   });
-  await assertBundledLibx264(portableDir, { platform });
+  await assertBundledFfmpegCapabilities(portableDir, { platform });
   await runBundledEncodeSmoke(portableDir, { platform });
   await verifyWindowsUpdateHelperManifest(portableDir, { platform });
+  await runPortableMediaDepthSmoke({ portableDir, platform });
 
   if (platform === "linux") {
     await runPortableExportSmoke({ portableDir });
@@ -351,11 +393,17 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
 
 async function runPortableBuild() {
   if (process.platform === "win32") {
-    await runChecked("cmd.exe", ["/d", "/s", "/c", "npm run portable"], { cwd: appRoot });
+    await runChecked("cmd.exe", ["/d", "/s", "/c", "npm run portable"], {
+      cwd: appRoot,
+      timeoutMs: PORTABLE_BUILD_TIMEOUT_MS,
+    });
     return;
   }
 
-  await runChecked("npm", ["run", "portable"], { cwd: appRoot });
+  await runChecked("npm", ["run", "portable"], {
+    cwd: appRoot,
+    timeoutMs: PORTABLE_BUILD_TIMEOUT_MS,
+  });
 }
 
 async function main() {

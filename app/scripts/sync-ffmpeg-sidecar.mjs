@@ -26,7 +26,6 @@ import {
   linuxSidecarDir,
   linuxSidecarLicenseName,
   linuxSidecarNoticeName,
-  linuxSourceArchiveNames,
   linuxSourceArchivePath,
   linuxSourceDir,
   linuxSourceUrl,
@@ -44,16 +43,49 @@ import {
   windowsSidecarLicenseName,
   windowsSidecarNoticeName,
   windowsSourceArchivePath,
-  windowsSourceArchiveNames,
   windowsSourceDir,
   windowsSourceUrl,
   windowsX264SourceArchivePath,
   windowsX264SourceUrl,
   FFMPEG_BUNDLE,
 } from "./ffmpegBundle.mjs";
+import {
+  FFMPEG_CAPABILITY_CONTRACT_FILE_NAME,
+  assertCapabilityContractCopy,
+  ffmpegCapabilityContractPath,
+  formatFfmpegCapabilitySummary,
+  verifyFfmpegCapabilityContract,
+} from "./ffmpegCapabilities.mjs";
 
 const WINDOWS_X64_BUNDLE = FFMPEG_BUNDLE.windowsX64;
 const LINUX_X64_BUNDLE = FFMPEG_BUNDLE.linuxX64;
+const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
+const ARCHIVE_PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
+
+function waitForSuccessfulClose(child, label, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (action) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      action();
+    };
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      child.kill();
+      finish(() => reject(new Error(`${label} timed out after ${timeoutMs} ms.`)));
+    }, timeoutMs);
+    child.on("error", (error) => finish(() => reject(error)));
+    child.on("close", (code, signal) => finish(() => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`${label} exited with code ${String(code)} (signal ${signal ?? "none"}).`));
+    }));
+  });
+}
 
 async function pathExists(targetPath) {
   try {
@@ -76,7 +108,13 @@ async function sha256File(filePath) {
 }
 
 async function downloadFile(url, destinationPath) {
-  const response = await fetch(url);
+  let response;
+  try {
+    response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  } catch {
+    await downloadFileWithCurl(url, destinationPath);
+    return;
+  }
   if (!response.ok || !response.body) {
     await response.body?.cancel();
     await downloadFileWithCurl(url, destinationPath);
@@ -106,6 +144,10 @@ async function downloadFileWithCurl(url, destinationPath) {
         "3",
         "--retry-delay",
         "2",
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        String(DOWNLOAD_TIMEOUT_MS / 1000),
         "--user-agent",
         "Video-For-Lazies-release-builder",
         "--output",
@@ -114,14 +156,7 @@ async function downloadFileWithCurl(url, destinationPath) {
       ],
       { stdio: "inherit" },
     );
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(`curl exited with code ${code} while downloading ${url}`));
-    });
+    waitForSuccessfulClose(child, `curl download ${url}`, DOWNLOAD_TIMEOUT_MS).then(resolve, reject);
   });
 
   await fsp.rename(tempPath, destinationPath);
@@ -149,58 +184,18 @@ function escapePowerShellLiteral(value) {
 }
 
 async function runPowerShell(command) {
-  await new Promise((resolve, reject) => {
-    const child = spawn(
-      "powershell.exe",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-      { stdio: "inherit" },
-    );
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(`PowerShell exited with code ${code}`));
-    });
-  });
+  const child = spawn(
+    "powershell.exe",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    { stdio: "inherit" },
+  );
+  await waitForSuccessfulClose(child, "PowerShell archive extraction", ARCHIVE_PROCESS_TIMEOUT_MS);
 }
 
 async function runChecked(command, args, options = {}) {
-  await new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "inherit", ...options });
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(`${command} exited with code ${code}`));
-    });
-  });
-}
-
-async function captureStdout(command, args) {
-  return await new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve(stdout);
-        return;
-      }
-      reject(new Error(`${command} exited with code ${code}\n${stderr}`));
-    });
-  });
+  const { timeoutMs = ARCHIVE_PROCESS_TIMEOUT_MS, ...spawnOptions } = options;
+  const child = spawn(command, args, { stdio: "inherit", ...spawnOptions });
+  await waitForSuccessfulClose(child, `${command} ${args.join(" ")}`, timeoutMs);
 }
 
 async function extractZipToTemp(zipPath) {
@@ -247,23 +242,35 @@ async function syncCurrentSidecarFrom(sourceDir) {
   await fsp.cp(sourceDir, currentSidecarDir, { recursive: true });
 }
 
-async function verifyBundleCapabilities(ffmpegPath, label) {
+async function verifyBundleCapabilities(sidecarDir, ffmpegPath, label) {
   if (!(await pathExists(ffmpegPath))) {
     throw new Error(`Bundled ffmpeg missing after staging for ${label}: ${ffmpegPath}`);
   }
 
-  const encoders = await captureStdout(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-encoders"]);
-  if (!/\blibx264\b/.test(encoders)) {
-    throw new Error(`Pinned ${label} FFmpeg bundle is missing libx264: ${ffmpegPath}`);
-  }
+  const result = await verifyFfmpegCapabilityContract({
+    ffmpegPath,
+    label: `Pinned ${label} FFmpeg bundle`,
+  });
+  const copiedContractPath = path.resolve(sidecarDir, FFMPEG_CAPABILITY_CONTRACT_FILE_NAME);
+  await fsp.copyFile(ffmpegCapabilityContractPath, copiedContractPath);
+  await assertCapabilityContractCopy(copiedContractPath);
+  console.log(`${label} FFmpeg capability contract passed: ${formatFfmpegCapabilitySummary(result)}`);
 }
 
 async function verifyWindowsBundleCapabilities() {
-  await verifyBundleCapabilities(path.resolve(windowsSidecarDir, "ffmpeg.exe"), "Windows");
+  await verifyBundleCapabilities(
+    windowsSidecarDir,
+    path.resolve(windowsSidecarDir, "ffmpeg.exe"),
+    "Windows",
+  );
 }
 
 async function verifyLinuxBundleCapabilities() {
-  await verifyBundleCapabilities(path.resolve(linuxSidecarDir, "ffmpeg"), "Linux");
+  await verifyBundleCapabilities(
+    linuxSidecarDir,
+    path.resolve(linuxSidecarDir, "ffmpeg"),
+    "Linux",
+  );
 }
 
 async function stageWindowsBundle() {
@@ -294,23 +301,6 @@ async function stageWindowsBundle() {
 
   const expectedNotice = buildWindowsBundleNotice();
   const noticePath = path.resolve(windowsSidecarDir, windowsSidecarNoticeName);
-  const placeholderReadmePath = path.resolve(windowsSidecarDir, "README.txt");
-  const expectedRuntimePaths = windowsRuntimeExecutables.map((name) => path.resolve(windowsSidecarDir, name));
-  const stagedSourcePaths = windowsSourceArchiveNames.map((name) => path.resolve(windowsSourceDir, name));
-
-  if (
-    await pathExists(noticePath)
-    && (await Promise.all(stagedSourcePaths.map(pathExists))).every(Boolean)
-    && (await Promise.all(expectedRuntimePaths.map(pathExists))).every(Boolean)
-  ) {
-    const currentNotice = await fsp.readFile(noticePath, "utf8");
-    if (currentNotice === expectedNotice) {
-      await fsp.rm(placeholderReadmePath, { force: true });
-      await verifyWindowsBundleCapabilities();
-      await syncCurrentSidecarFrom(windowsSidecarDir);
-      return;
-    }
-  }
 
   const extractRoot = await extractZipToTemp(windowsBundleArchivePath);
   try {
@@ -398,25 +388,6 @@ async function stageLinuxBundle() {
 
   const expectedNotice = buildLinuxBundleNotice();
   const noticePath = path.resolve(linuxSidecarDir, linuxSidecarNoticeName);
-  const expectedRuntimePaths = [
-    ...linuxRuntimeExecutables.map((name) => path.resolve(linuxSidecarDir, name)),
-    ...linuxInternalRuntimeExecutables.map((name) => path.resolve(linuxSidecarDir, "bin", name)),
-    ...linuxRuntimeLibraries.map((name) => path.resolve(linuxSidecarDir, "lib", name)),
-  ];
-  const stagedSourcePaths = linuxSourceArchiveNames.map((name) => path.resolve(linuxSourceDir, name));
-
-  if (
-    await pathExists(noticePath)
-    && (await Promise.all(stagedSourcePaths.map(pathExists))).every(Boolean)
-    && (await Promise.all(expectedRuntimePaths.map(pathExists))).every(Boolean)
-  ) {
-    const currentNotice = await fsp.readFile(noticePath, "utf8");
-    if (currentNotice === expectedNotice) {
-      await verifyLinuxBundleCapabilities();
-      await syncCurrentSidecarFrom(linuxSidecarDir);
-      return;
-    }
-  }
 
   const extractRoot = await extractTarXzToTemp(linuxBundleArchivePath);
   try {

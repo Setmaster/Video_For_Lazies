@@ -4,7 +4,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import url from "node:url";
 import {
+  alignCropRectForEncoding,
   cropRectToPixels,
+  isFullFramePixelCrop,
   pixelAspectToNormalizedRatio,
   resolveTrimSliderKey,
   updateCropRectFromPixelField,
@@ -20,6 +22,23 @@ test("numeric crop helpers keep source-pixel edits inside the frame", () => {
     width: 500,
     height: 250,
   });
+
+  assert.deepEqual(cropRectToPixels({ x: 0.999, y: 0.999, w: 0.001, h: 0.001 }, 40, 30), {
+    x: 38,
+    y: 28,
+    width: 2,
+    height: 2,
+  });
+
+  const tinyCrop = cropRectToPixels({ x: 1 / 3, y: 1 / 3, w: 2 / 3, h: 2 / 3 }, 3, 3);
+  assert.deepEqual(tinyCrop, { x: 1, y: 1, width: 2, height: 2 });
+  assert.equal(isFullFramePixelCrop(tinyCrop, 3, 3), false);
+  assert.equal(isFullFramePixelCrop({ x: 0, y: 0, width: 3, height: 3 }, 3, 3), true);
+  assert.deepEqual(alignCropRectForEncoding(tinyCrop), tinyCrop);
+  assert.deepEqual(
+    alignCropRectForEncoding(cropRectToPixels({ x: 0.125, y: 0, w: 0.875, h: 1 }, 4, 4)),
+    { x: 1, y: 0, width: 2, height: 4 },
+  );
 
   const moved = updateCropRectFromPixelField(rect, "x", 900, 1000, 500);
   assert.deepEqual(cropRectToPixels(moved, 1000, 500), {

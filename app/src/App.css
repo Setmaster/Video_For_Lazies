@@ -548,6 +548,54 @@ button:focus-visible {
   flex-wrap: wrap;
 }
 
+.vfl-source-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.vfl-source-facts span {
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--inset);
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.vfl-color-policy,
+.vfl-memory-status {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 9px;
+  border: 1px solid rgba(var(--accent), 0.35);
+  border-radius: var(--radius-sm);
+  background: rgba(var(--accent), 0.08);
+}
+
+.vfl-color-policy.blocked,
+.vfl-memory-status.blocked {
+  border-color: rgba(227, 108, 125, 0.5);
+  background: rgba(227, 108, 125, 0.08);
+}
+
+.vfl-memory-status.warning {
+  border-color: rgba(226, 180, 94, 0.45);
+  background: rgba(226, 180, 94, 0.08);
+}
+
+.vfl-memory-status strong {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.vfl-memory-status span {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 /* ---------- chips & segmented ---------- */
 .vfl-chips {
   display: flex;

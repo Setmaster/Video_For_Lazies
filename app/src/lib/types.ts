@@ -5,6 +5,25 @@ export type EncodeSpeedPreference = "auto" | "faster" | "balanced" | "smaller";
 export type AudioChannelPreference = "auto" | "stereo" | "mono";
 export type ResizeMode = "source" | "maxEdge" | "custom";
 export type StreamAction = "copy" | "encode" | "drop";
+export type ColorPolicy = "auto" | "standardSdr";
+export type DynamicRange = "sdr" | "hdr10" | "hlg" | "dolbyVision" | "unknown";
+
+export interface Rational {
+  numerator: number;
+  denominator: number;
+}
+
+export interface StreamDispositions {
+  default: boolean;
+  original: boolean;
+  comment: boolean;
+  forced: boolean;
+  hearingImpaired: boolean;
+  visualImpaired: boolean;
+  attachedPic: boolean;
+  timedThumbnails: boolean;
+  stillImage: boolean;
+}
 
 export interface VideoProbe {
   durationS: number;
@@ -19,6 +38,26 @@ export interface VideoProbe {
   audioStreamIndex?: number | null;
   audioCodec?: string | null;
   audioIsDefault: boolean;
+  codedWidth?: number | null;
+  codedHeight?: number | null;
+  rotationDeg?: number | null;
+  unsupportedRotationDeg?: number | null;
+  pixelFormat?: string | null;
+  bitDepth?: number | null;
+  colorRange?: string | null;
+  colorPrimaries?: string | null;
+  colorTransfer?: string | null;
+  colorSpace?: string | null;
+  dynamicRange?: DynamicRange | null;
+  sampleAspectRatio?: Rational | null;
+  displayAspectRatio?: Rational | null;
+  attachedPictureCount?: number | null;
+  selectedVideoDispositions?: StreamDispositions | null;
+  audioSampleRate?: number | null;
+  audioChannels?: number | null;
+  audioSampleFormat?: string | null;
+  decodedVideoBytesPerPixel?: number | null;
+  decodedAudioBytesPerSample?: number | null;
 }
 
 export interface Trim {
@@ -55,6 +94,7 @@ export interface EncodeRequest {
   audioEnabled: boolean;
   normalizeAudio: boolean;
   stripMetadata: boolean;
+  colorPolicy: ColorPolicy;
   advanced?: AdvancedEncodeSettings | null;
 
   trim?: Trim | null;
@@ -94,6 +134,17 @@ export interface VideoCodecCapability {
 export interface EncodeCapabilities {
   videoCodecs: VideoCodecCapability[];
   audioBitrateKbps: number[];
+  ffmpegVersion?: string | null;
+  contractSchemaVersion?: number | null;
+  features?: EncodeFeatureCapability[] | null;
+}
+
+export interface EncodeFeatureCapability {
+  name: string;
+  available: boolean;
+  releaseRequired: boolean;
+  missingEncoders: string[];
+  missingFilters: string[];
 }
 
 export interface EncodeProgressPayload {
@@ -132,6 +183,10 @@ export interface ExportDiagnostics {
   attempts: number;
   audioRemovedForSizeTarget: boolean;
   copyFallbackReason?: string | null;
+  colorAction?: string | null;
+  sarAction?: string | null;
+  reverseBufferEstimateBytes?: number | null;
+  reverseBufferAction?: string | null;
   commandPreview: string;
 }
 
@@ -150,6 +205,8 @@ export interface AppSmokeConfig {
   skipPreviewInteractions?: boolean | null;
   perturbFirstFrame?: boolean | null;
   loopVideo?: boolean | null;
+  colorPolicy?: ColorPolicy | null;
+  reverse?: boolean | null;
 }
 
 export interface AppSmokeStatus {

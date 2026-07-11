@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -22,13 +23,72 @@ const FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const CROP_DETECT_TIMEOUT: Duration = Duration::from_secs(60);
 const FRAME_EXTRACT_TIMEOUT: Duration = Duration::from_secs(45);
 const ENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const ENCODE_INITIAL_BUFFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const SIZE_COPY_MONITOR_HEADROOM_BYTES: u64 = 1024 * 1024;
 const FFMPEG_SIDECAR_DIR: &str = "ffmpeg-sidecar";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+static FFMPEG_CAPABILITY_CACHE: OnceLock<Mutex<HashMap<String, FfmpegRuntimeCapabilities>>> =
+    OnceLock::new();
+static FFMPEG_PIXEL_FORMAT_CACHE: OnceLock<
+    Mutex<HashMap<String, HashMap<String, PixelFormatDescriptor>>>,
+> = OnceLock::new();
 const AUDIO_BITRATE_PRESETS_KBPS: &[u32] = &[96, 128, 192, 256, 320];
+const REVERSE_BUFFER_SAFETY_FACTOR: f64 = 1.5;
+const REVERSE_BUFFER_VIDEO_FRAME_OVERHEAD_BYTES: u128 = 8 * 1024;
+const REVERSE_BUFFER_AUDIO_FRAME_OVERHEAD_BYTES: u128 = 8 * 1024;
+const REVERSE_AUDIO_FRAME_SAMPLES: u128 = 1024;
+const REVERSE_BUFFER_WARNING_BYTES: u64 = 512 * 1024 * 1024;
+const REVERSE_BUFFER_HARD_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const OUTPUT_DIMENSION_MAX_PX: u32 = 32_768;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Rational {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+impl Rational {
+    const SQUARE: Self = Self {
+        numerator: 1,
+        denominator: 1,
+    };
+
+    fn as_f64(self) -> f64 {
+        self.numerator as f64 / self.denominator as f64
+    }
+
+    fn is_square(self) -> bool {
+        self.numerator == self.denominator
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DynamicRange {
+    Sdr,
+    Hdr10,
+    Hlg,
+    DolbyVision,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamDispositions {
+    pub default: bool,
+    pub original: bool,
+    pub comment: bool,
+    pub forced: bool,
+    pub hearing_impaired: bool,
+    pub visual_impaired: bool,
+    pub attached_pic: bool,
+    pub timed_thumbnails: bool,
+    pub still_image: bool,
+}
 
 fn command_no_window(bin: &str) -> Command {
     #[cfg(windows)]
@@ -47,8 +107,16 @@ fn command_no_window(bin: &str) -> Command {
 #[serde(rename_all = "camelCase")]
 pub struct VideoProbe {
     pub duration_s: f64,
+    /// Display-oriented sample-grid width. This intentionally retains the
+    /// pre-v1.10 meaning used by crop coordinates.
     pub width: u32,
+    /// Display-oriented sample-grid height. This intentionally retains the
+    /// pre-v1.10 meaning used by crop coordinates.
     pub height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub rotation_deg: u32,
+    pub unsupported_rotation_deg: Option<f64>,
     pub frame_rate: Option<f64>,
     pub has_audio: bool,
     pub source_format: Option<String>,
@@ -58,6 +126,22 @@ pub struct VideoProbe {
     pub audio_stream_index: Option<u32>,
     pub audio_codec: Option<String>,
     pub audio_is_default: bool,
+    pub pixel_format: Option<String>,
+    pub bit_depth: Option<u8>,
+    pub color_range: Option<String>,
+    pub color_primaries: Option<String>,
+    pub color_transfer: Option<String>,
+    pub color_space: Option<String>,
+    pub dynamic_range: DynamicRange,
+    pub sample_aspect_ratio: Rational,
+    pub display_aspect_ratio: Rational,
+    pub attached_picture_count: u32,
+    pub selected_video_dispositions: StreamDispositions,
+    pub audio_sample_rate: Option<u32>,
+    pub audio_channels: Option<u32>,
+    pub audio_sample_format: Option<String>,
+    pub decoded_video_bytes_per_pixel: Option<f64>,
+    pub decoded_audio_bytes_per_sample: Option<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +166,14 @@ pub struct ColorAdjust {
     pub brightness: f64,
     pub contrast: f64,
     pub saturation: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ColorPolicy {
+    #[default]
+    Auto,
+    StandardSdr,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -181,6 +273,8 @@ pub struct EncodeRequest {
     #[serde(default)]
     pub strip_metadata: bool,
     #[serde(default)]
+    pub color_policy: ColorPolicy,
+    #[serde(default)]
     pub advanced: AdvancedEncodeSettings,
 
     pub trim: Option<Trim>,
@@ -252,6 +346,10 @@ pub struct ExportDiagnostics {
     pub attempts: u32,
     pub audio_removed_for_size_target: bool,
     pub copy_fallback_reason: Option<String>,
+    pub color_action: String,
+    pub sar_action: String,
+    pub reverse_buffer_estimate_bytes: Option<u64>,
+    pub reverse_buffer_action: Option<String>,
     pub command_preview: String,
 }
 
@@ -297,6 +395,30 @@ impl VideoCodec {
             VideoCodec::LibVpx => "vp8",
         }
     }
+
+    fn max_output_dimension(self) -> u32 {
+        match self {
+            VideoCodec::LibX264 => 16_384,
+            VideoCodec::Mpeg4 => 8_190,
+            VideoCodec::LibVpxVp9 => 32_768,
+            VideoCodec::LibVpx => 16_382,
+        }
+    }
+}
+
+fn validate_codec_output_dimensions(
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let limit = codec.max_output_dimension();
+    if width > limit || height > limit {
+        return Err(format!(
+            "The {} encoder supports at most {limit} pixels per output dimension; planned output is {width}x{height}. Choose a bounded resize or another codec.",
+            codec.as_ffmpeg_name()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,7 +427,6 @@ enum AudioCodec {
     LibOpus,
     LibVorbis,
     LibMp3Lame,
-    Mp3,
 }
 
 impl AudioCodec {
@@ -315,7 +436,6 @@ impl AudioCodec {
             AudioCodec::LibOpus => "libopus",
             AudioCodec::LibVorbis => "libvorbis",
             AudioCodec::LibMp3Lame => "libmp3lame",
-            AudioCodec::Mp3 => "mp3",
         }
     }
 
@@ -324,7 +444,7 @@ impl AudioCodec {
             AudioCodec::Aac => "aac",
             AudioCodec::LibOpus => "opus",
             AudioCodec::LibVorbis => "vorbis",
-            AudioCodec::LibMp3Lame | AudioCodec::Mp3 => "mp3",
+            AudioCodec::LibMp3Lame => "mp3",
         }
     }
 }
@@ -399,6 +519,115 @@ enum PlanReason {
     AudioChannels,
     SizeTarget,
     AudioOnlyOutput,
+    ColorConversion,
+    SampleAspectRatio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaColorAction {
+    Unchanged,
+    Hdr10ToStandardSdr,
+    HighBitDepthSdrToStandardSdr,
+    NotApplicable,
+}
+
+impl MediaColorAction {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Unchanged => "Source color unchanged",
+            Self::Hdr10ToStandardSdr => "HDR10 converted to 8-bit limited-range BT.709 SDR",
+            Self::HighBitDepthSdrToStandardSdr => {
+                "High-bit-depth SDR converted to 8-bit limited-range BT.709 SDR"
+            }
+            Self::NotApplicable => "Not applicable to audio-only output",
+        }
+    }
+
+    fn converts_to_standard_sdr(self) -> bool {
+        matches!(
+            self,
+            Self::Hdr10ToStandardSdr | Self::HighBitDepthSdrToStandardSdr
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SarAction {
+    Unchanged,
+    Normalize { width: u32, height: u32 },
+    NotApplicable,
+}
+
+impl SarAction {
+    fn diagnostic(self, source_sar: Rational) -> String {
+        match self {
+            Self::Unchanged => "Source sample aspect ratio unchanged".to_string(),
+            Self::Normalize { width, height } => format!(
+                "Sample aspect ratio {}:{} normalized to square pixels at {width}x{height}",
+                source_sar.numerator, source_sar.denominator
+            ),
+            Self::NotApplicable => "Not applicable to audio-only output".to_string(),
+        }
+    }
+
+    fn normalizes(self) -> bool {
+        matches!(self, Self::Normalize { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverseBufferAction {
+    WithinLimit,
+    Warning,
+}
+
+impl ReverseBufferAction {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::WithinLimit => "Decoded reverse buffer is within the guarded limit",
+            Self::Warning => "Decoded reverse buffer exceeds the 512 MiB warning threshold",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReverseBufferEstimate {
+    bytes: u64,
+    action: ReverseBufferAction,
+}
+
+#[derive(Debug, Clone)]
+struct FfmpegRunLimits {
+    initial_progress_timeout: Duration,
+    idle_timeout: Duration,
+    output_size_limit: Option<(PathBuf, u64)>,
+}
+
+fn ffmpeg_run_limits(reverse: bool) -> FfmpegRunLimits {
+    FfmpegRunLimits {
+        initial_progress_timeout: if reverse {
+            ENCODE_INITIAL_BUFFER_TIMEOUT
+        } else {
+            ENCODE_IDLE_TIMEOUT
+        },
+        idle_timeout: ENCODE_IDLE_TIMEOUT,
+        output_size_limit: None,
+    }
+}
+
+fn size_copy_run_limits(target_bytes: u64, output_path: &Path) -> FfmpegRunLimits {
+    let mut limits = ffmpeg_run_limits(false);
+    limits.output_size_limit = Some((
+        output_path.to_path_buf(),
+        target_bytes.saturating_add(SIZE_COPY_MONITOR_HEADROOM_BYTES),
+    ));
+    limits
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaPolicyPlan {
+    color_action: MediaColorAction,
+    sar_action: SarAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,7 +661,9 @@ struct EncodeCommandPlan {
     #[allow(dead_code)] // retained for plan inspection and focused tests
     audio_reasons: Vec<PlanReason>,
     size_contract: Option<SizeLimitedEncodeContract>,
-    size_copy_candidate: Option<CopyCandidatePlan>,
+    size_copy_candidates: Vec<CopyCandidatePlan>,
+    media_policy: MediaPolicyPlan,
+    reverse_buffer_estimate: Option<ReverseBufferEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,6 +682,47 @@ pub struct VideoCodecCapability {
 pub struct EncodeCapabilities {
     pub video_codecs: Vec<VideoCodecCapability>,
     pub audio_bitrate_kbps: Vec<u32>,
+    pub ffmpeg_version: String,
+    pub contract_schema_version: u32,
+    pub features: Vec<EncodeFeatureCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeFeatureCapability {
+    pub name: String,
+    pub release_required: bool,
+    pub available: bool,
+    pub missing_encoders: Vec<String>,
+    pub missing_filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FfmpegCapabilityContract {
+    schema_version: u32,
+    features: HashMap<String, FfmpegFeatureRequirement>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FfmpegFeatureRequirement {
+    release_required: bool,
+    encoders: Vec<String>,
+    filters: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FfmpegRuntimeCapabilities {
+    version: String,
+    encoder_names: HashSet<String>,
+    filter_names: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PixelFormatDescriptor {
+    bit_depth: u8,
+    decoded_bytes_per_pixel: f64,
 }
 
 fn trimmed_env_var(name: &str) -> Option<String> {
@@ -716,6 +988,52 @@ fn build_copy_candidate_args(
     args
 }
 
+fn push_encoded_video_format_args(args: &mut Vec<String>, media_policy: MediaPolicyPlan) {
+    args.extend(["-pix_fmt", "yuv420p"].into_iter().map(String::from));
+    if media_policy.color_action.converts_to_standard_sdr() {
+        args.extend(
+            [
+                "-color_range",
+                "tv",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        // libx264 needs explicit VUI signalling in addition to FFmpeg's generic
+        // color options. Without this, the exact bundled sidecar can mux range
+        // and matrix while leaving primaries/transfer unspecified.
+        args.extend(
+            [
+                "-x264-params",
+                "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+    }
+}
+
+fn push_video_output_policy_args(
+    args: &mut Vec<String>,
+    format: OutputFormat,
+    video_action: StreamAction,
+    media_policy: MediaPolicyPlan,
+) {
+    if format != OutputFormat::Mp4 {
+        return;
+    }
+    args.extend(["-movflags", "+faststart"].into_iter().map(String::from));
+    if video_action == StreamAction::Encode {
+        push_encoded_video_format_args(args, media_policy);
+    }
+}
+
 fn build_single_pass_args(
     input: &str,
     request: &EncodeRequest,
@@ -810,28 +1128,30 @@ fn build_single_pass_args(
     }
 
     push_metadata_args(&mut args, request);
-    if matches!(request.format, OutputFormat::Mp4) {
-        args.extend(["-movflags", "+faststart"].into_iter().map(String::from));
-        if plan.video_action == StreamAction::Encode {
-            args.extend(["-pix_fmt", "yuv420p"].into_iter().map(String::from));
-        }
-    }
+    push_video_output_policy_args(
+        &mut args,
+        request.format,
+        plan.video_action,
+        plan.media_policy,
+    );
     Ok(args)
 }
 
-fn full_reencode_fallback(plan: &EncodeCommandPlan) -> EncodeCommandPlan {
+fn full_reencode_fallback(plan: &EncodeCommandPlan) -> Result<EncodeCommandPlan, String> {
     let mut fallback = plan.clone();
     if fallback.video_action == StreamAction::Copy {
+        let video_encoder = fallback.video_encoder.ok_or_else(|| {
+            "No compatible video encoder is available for stream-copy fallback.".to_string()
+        })?;
         fallback.video_action = StreamAction::Encode;
-        fallback.output_video_codec = fallback
-            .video_encoder
-            .map(|codec| codec.as_codec_name().to_string());
+        fallback.output_video_codec = Some(video_encoder.as_codec_name().to_string());
     }
     if fallback.audio_action == StreamAction::Copy {
+        let audio_encoder = fallback.audio_encoder.ok_or_else(|| {
+            "No compatible audio encoder is available for stream-copy fallback.".to_string()
+        })?;
         fallback.audio_action = StreamAction::Encode;
-        fallback.output_audio_codec = fallback
-            .audio_encoder
-            .map(|codec| codec.as_codec_name().to_string());
+        fallback.output_audio_codec = Some(audio_encoder.as_codec_name().to_string());
     }
     fallback.mode = match (fallback.video_action, fallback.audio_action) {
         (StreamAction::Encode, StreamAction::Copy) => EncodeMode::VideoEncodeAudioCopy,
@@ -840,7 +1160,7 @@ fn full_reencode_fallback(plan: &EncodeCommandPlan) -> EncodeCommandPlan {
         (StreamAction::Encode, StreamAction::Encode | StreamAction::Drop) => EncodeMode::FullEncode,
         (StreamAction::Drop, _) => unreachable!("video output cannot drop video"),
     };
-    fallback
+    Ok(fallback)
 }
 
 fn create_temp_output(output_path: &Path, job_id: u64, label: &str) -> Result<TempPath, String> {
@@ -901,38 +1221,453 @@ fn parse_encoder_names(stdout: &str) -> HashSet<String> {
         .collect()
 }
 
-fn cached_encoder_names(ffmpeg_bin: &str) -> Result<HashSet<String>, String> {
-    let cache = ENCODER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+fn parse_filter_names(stdout: &str) -> HashSet<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let flags = parts.next()?;
+            if flags.len() != 2
+                || !flags
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphabetic() || ch == '.')
+            {
+                return None;
+            }
+            let name = parts.next()?;
+            (!name.contains('=')).then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn parse_pixel_format_descriptors(stdout: &str) -> HashMap<String, PixelFormatDescriptor> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let flags = parts.next()?;
+            if flags.len() != 5
+                || !flags
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic() || character == '.')
+            {
+                return None;
+            }
+            let name = parts.next()?;
+            let component_count = parts.next()?.parse::<u8>().ok()?;
+            let logical_bits_per_pixel = parts.next()?.parse::<u32>().ok()?;
+            let component_depths = parts
+                .next()?
+                .split('-')
+                .map(str::parse::<u8>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            if component_count == 0
+                || logical_bits_per_pixel == 0
+                || component_depths.len() != component_count as usize
+            {
+                return None;
+            }
+            let bit_depth = *component_depths.iter().max()?;
+            if bit_depth == 0 || bit_depth > 32 {
+                return None;
+            }
+            // FFmpeg's BITS_PER_PIXEL column describes logical component bits.
+            // AVFrame storage uses 8, 16, or 32-bit component slots, so scale
+            // to the next slot width. This is exact for ordinary planar/float
+            // formats and conservative for packed mixed-depth formats.
+            let storage_bits = if bit_depth <= 8 {
+                8.0
+            } else if bit_depth <= 16 {
+                16.0
+            } else {
+                32.0
+            };
+            let decoded_bytes_per_pixel =
+                logical_bits_per_pixel as f64 * storage_bits / bit_depth as f64 / 8.0;
+            decoded_bytes_per_pixel.is_finite().then_some((
+                name.to_string(),
+                PixelFormatDescriptor {
+                    bit_depth,
+                    decoded_bytes_per_pixel,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn parse_ffmpeg_version(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ffmpeg version "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+}
+
+fn run_ffmpeg_capability_probe(
+    ffmpeg_bin: &str,
+    argument: &str,
+    label: &str,
+) -> Result<String, String> {
+    let mut cmd = command_no_window(ffmpeg_bin);
+    cmd.arg("-hide_banner");
+    if argument != "-version" {
+        cmd.arg("-loglevel").arg("error");
+    }
+    cmd.arg(argument);
+    let output = run_command_output_with_timeout(
+        cmd,
+        "ffmpeg",
+        "VFL_FFMPEG_PATH",
+        ffmpeg_bin,
+        label,
+        ENCODER_PROBE_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("{label} failed.\n\n{stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn cached_ffmpeg_capabilities(ffmpeg_bin: &str) -> Result<FfmpegRuntimeCapabilities, String> {
+    let cache = FFMPEG_CAPABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock()
         && let Some(existing) = guard.get(ffmpeg_bin)
     {
         return Ok(existing.clone());
     }
 
-    let mut cmd = command_no_window(ffmpeg_bin);
-    cmd.arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-encoders");
-    let output = run_command_output_with_timeout(
-        cmd,
-        "ffmpeg",
-        "VFL_FFMPEG_PATH",
-        ffmpeg_bin,
-        "ffmpeg encoder probe",
-        ENCODER_PROBE_TIMEOUT,
-    )?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg encoder probe failed.\n\n{stderr}"));
-    }
-
-    let parsed = parse_encoder_names(&String::from_utf8_lossy(&output.stdout));
+    let encoder_output =
+        run_ffmpeg_capability_probe(ffmpeg_bin, "-encoders", "ffmpeg encoder probe")?;
+    let filter_output = run_ffmpeg_capability_probe(ffmpeg_bin, "-filters", "ffmpeg filter probe")?;
+    let version_output =
+        run_ffmpeg_capability_probe(ffmpeg_bin, "-version", "ffmpeg version probe")?;
+    let parsed = FfmpegRuntimeCapabilities {
+        version: parse_ffmpeg_version(&version_output)
+            .ok_or_else(|| "ffmpeg version probe returned no recognizable version.".to_string())?,
+        encoder_names: parse_encoder_names(&encoder_output),
+        filter_names: parse_filter_names(&filter_output),
+    };
     if let Ok(mut guard) = cache.lock() {
         guard.insert(ffmpeg_bin.to_string(), parsed.clone());
     }
     Ok(parsed)
+}
+
+fn cached_ffmpeg_pixel_formats(
+    ffmpeg_bin: &str,
+) -> Result<HashMap<String, PixelFormatDescriptor>, String> {
+    let cache = FFMPEG_PIXEL_FORMAT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(existing) = guard.get(ffmpeg_bin)
+    {
+        return Ok(existing.clone());
+    }
+
+    let output = run_ffmpeg_capability_probe(ffmpeg_bin, "-pix_fmts", "ffmpeg pixel-format probe")?;
+    let parsed = parse_pixel_format_descriptors(&output);
+    if parsed.is_empty() {
+        return Err("ffmpeg pixel-format probe returned no usable descriptors.".to_string());
+    }
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(ffmpeg_bin.to_string(), parsed.clone());
+    }
+    Ok(parsed)
+}
+
+fn is_feature_contract_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && chars.all(|character| character.is_ascii_alphanumeric())
+}
+
+fn is_ffmpeg_capability_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
+        })
+}
+
+fn validate_capability_names(values: &[String], label: &str) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for value in values {
+        if !is_ffmpeg_capability_name(value) {
+            return Err(format!(
+                "{label} contains an invalid FFmpeg capability name: {value}."
+            ));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(format!(
+                "{label} contains a duplicate FFmpeg capability name: {value}."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_ffmpeg_capability_contract(raw: &str) -> Result<FfmpegCapabilityContract, String> {
+    let contract: FfmpegCapabilityContract = serde_json::from_str(raw)
+        .map_err(|error| format!("Bundled FFmpeg capability contract is invalid: {error}"))?;
+    if contract.schema_version != 1 {
+        return Err(format!(
+            "Unsupported FFmpeg capability contract schema version: {}.",
+            contract.schema_version
+        ));
+    }
+    if contract.features.is_empty() {
+        return Err("Bundled FFmpeg capability contract has no features.".to_string());
+    }
+    for (name, requirement) in &contract.features {
+        if !is_feature_contract_name(name) {
+            return Err(format!(
+                "Bundled FFmpeg capability contract has an invalid feature name: {name}."
+            ));
+        }
+        validate_capability_names(
+            &requirement.encoders,
+            &format!("FFmpeg capability feature {name}.encoders"),
+        )?;
+        validate_capability_names(
+            &requirement.filters,
+            &format!("FFmpeg capability feature {name}.filters"),
+        )?;
+    }
+    for required_name in ["coreExport", "hdrToSdr", "sarNormalize", "reverseLoop"] {
+        if !contract.features.contains_key(required_name) {
+            return Err(format!(
+                "Bundled FFmpeg capability contract is missing feature: {required_name}."
+            ));
+        }
+    }
+    Ok(contract)
+}
+
+fn ffmpeg_capability_contract() -> Result<FfmpegCapabilityContract, String> {
+    parse_ffmpeg_capability_contract(include_str!("../../ffmpeg-capabilities.json"))
+}
+
+fn feature_capability(
+    name: &str,
+    requirement: &FfmpegFeatureRequirement,
+    runtime: &FfmpegRuntimeCapabilities,
+) -> EncodeFeatureCapability {
+    let mut missing_encoders = requirement
+        .encoders
+        .iter()
+        .filter(|encoder| !runtime.encoder_names.contains(encoder.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut missing_filters = requirement
+        .filters
+        .iter()
+        .filter(|filter| !runtime.filter_names.contains(filter.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing_encoders.sort();
+    missing_filters.sort();
+    EncodeFeatureCapability {
+        name: name.to_string(),
+        release_required: requirement.release_required,
+        available: missing_encoders.is_empty() && missing_filters.is_empty(),
+        missing_encoders,
+        missing_filters,
+    }
+}
+
+#[cfg(test)]
+fn require_ffmpeg_feature(
+    name: &str,
+    contract: &FfmpegCapabilityContract,
+    runtime: &FfmpegRuntimeCapabilities,
+) -> Result<(), String> {
+    let requirement = contract
+        .features
+        .get(name)
+        .ok_or_else(|| format!("FFmpeg capability contract is missing feature: {name}."))?;
+    let capability = feature_capability(name, requirement, runtime);
+    if capability.available {
+        return Ok(());
+    }
+    let mut missing = capability
+        .missing_encoders
+        .iter()
+        .map(|value| format!("encoder {value}"))
+        .chain(
+            capability
+                .missing_filters
+                .iter()
+                .map(|value| format!("filter {value}")),
+        )
+        .collect::<Vec<_>>();
+    missing.sort();
+    Err(format!(
+        "This FFmpeg build cannot provide {name}; missing {}.",
+        missing.join(", ")
+    ))
+}
+
+fn filter_names_from_graph(graph: Option<&str>) -> HashSet<String> {
+    let Some(graph) = graph else {
+        return HashSet::new();
+    };
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut parentheses = 0u32;
+    for (index, ch) in graph.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => parentheses = parentheses.saturating_add(1),
+            ')' => parentheses = parentheses.saturating_sub(1),
+            ',' | ';' if parentheses == 0 => {
+                segments.push(&graph[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    segments.push(&graph[start..]);
+
+    segments
+        .into_iter()
+        .filter_map(|segment| {
+            let mut token = segment.trim();
+            while let Some(remainder) = token.strip_prefix('[') {
+                let end = remainder.find(']')?;
+                token = remainder[end + 1..].trim_start();
+            }
+            let end = token
+                .find(|ch: char| ch == '=' || ch == '[' || ch.is_whitespace())
+                .unwrap_or(token.len());
+            let name = token[..end].trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn require_ffmpeg_capability_subset<'a>(
+    label: &str,
+    required_encoders: impl IntoIterator<Item = &'a str>,
+    required_filters: impl IntoIterator<Item = &'a str>,
+    contract: &FfmpegCapabilityContract,
+    runtime: &FfmpegRuntimeCapabilities,
+) -> Result<(), String> {
+    let declared_encoders = contract
+        .features
+        .values()
+        .flat_map(|feature| feature.encoders.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    let declared_filters = contract
+        .features
+        .values()
+        .flat_map(|feature| feature.filters.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    let mut undeclared = Vec::new();
+    let mut missing = Vec::new();
+
+    for encoder in required_encoders {
+        if !declared_encoders.contains(encoder) {
+            undeclared.push(format!("encoder {encoder}"));
+        } else if !runtime.encoder_names.contains(encoder) {
+            missing.push(format!("encoder {encoder}"));
+        }
+    }
+    for filter in required_filters {
+        if !declared_filters.contains(filter) {
+            undeclared.push(format!("filter {filter}"));
+        } else if !runtime.filter_names.contains(filter) {
+            missing.push(format!("filter {filter}"));
+        }
+    }
+    undeclared.sort();
+    undeclared.dedup();
+    missing.sort();
+    missing.dedup();
+    if !undeclared.is_empty() {
+        return Err(format!(
+            "The FFmpeg capability contract does not declare {label}: {}.",
+            undeclared.join(", ")
+        ));
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "The active FFmpeg build cannot provide {label}; missing {}.",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn require_encode_plan_capabilities(
+    plan: &EncodeCommandPlan,
+    contract: &FfmpegCapabilityContract,
+    runtime: &FfmpegRuntimeCapabilities,
+) -> Result<(), String> {
+    let mut encoders = Vec::new();
+    if plan.video_action == StreamAction::Encode {
+        encoders.push(
+            plan.video_encoder
+                .ok_or_else(|| "Missing video encoder for the encode plan.".to_string())?
+                .as_ffmpeg_name(),
+        );
+    }
+    if plan.audio_action == StreamAction::Encode {
+        encoders.push(
+            plan.audio_encoder
+                .ok_or_else(|| "Missing audio encoder for the encode plan.".to_string())?
+                .as_ffmpeg_name(),
+        );
+    }
+    let video_filters = if plan.video_action == StreamAction::Encode {
+        filter_names_from_graph(plan.video_filters.as_deref())
+    } else {
+        HashSet::new()
+    };
+    let audio_filters = if plan.audio_action == StreamAction::Encode {
+        filter_names_from_graph(plan.audio_filters.as_deref())
+    } else {
+        HashSet::new()
+    };
+    let filters = video_filters
+        .into_iter()
+        .chain(audio_filters)
+        .collect::<HashSet<_>>();
+    require_ffmpeg_capability_subset(
+        "the selected export plan",
+        encoders,
+        filters.iter().map(String::as_str),
+        contract,
+        runtime,
+    )
+}
+
+fn require_initial_encode_plan_capabilities(
+    plan: &EncodeCommandPlan,
+    contract: &FfmpegCapabilityContract,
+    runtime: &FfmpegRuntimeCapabilities,
+) -> Result<(), String> {
+    if !plan.size_copy_candidates.is_empty() {
+        // A compatible size-target stream copy uses no encoder or filter. Its
+        // re-encode fallback is checked only if the bounded copy misses.
+        return Ok(());
+    }
+    require_encode_plan_capabilities(plan, contract, runtime)
 }
 
 fn video_quality_preference(advanced: &AdvancedEncodeSettings) -> VideoQualityPreference {
@@ -1037,16 +1772,18 @@ fn codec_ffmpeg_name(preference: VideoCodecPreference) -> Option<&'static str> {
 
 fn auto_video_codec(format: OutputFormat, encoder_names: &HashSet<String>) -> Option<VideoCodec> {
     match format {
-        OutputFormat::Mp4 => Some(if encoder_names.contains("libx264") {
-            VideoCodec::LibX264
-        } else {
-            VideoCodec::Mpeg4
-        }),
-        OutputFormat::Webm => Some(if encoder_names.contains("libvpx-vp9") {
-            VideoCodec::LibVpxVp9
-        } else {
-            VideoCodec::LibVpx
-        }),
+        OutputFormat::Mp4 => encoder_names
+            .contains("libx264")
+            .then_some(VideoCodec::LibX264)
+            .or_else(|| encoder_names.contains("mpeg4").then_some(VideoCodec::Mpeg4)),
+        OutputFormat::Webm => encoder_names
+            .contains("libvpx-vp9")
+            .then_some(VideoCodec::LibVpxVp9)
+            .or_else(|| {
+                encoder_names
+                    .contains("libvpx")
+                    .then_some(VideoCodec::LibVpx)
+            }),
         OutputFormat::Mp3 => None,
     }
 }
@@ -1056,17 +1793,18 @@ fn audio_codec_for_format(
     encoder_names: &HashSet<String>,
 ) -> Option<AudioCodec> {
     match format {
-        OutputFormat::Mp4 => Some(AudioCodec::Aac),
-        OutputFormat::Webm => Some(if encoder_names.contains("libopus") {
-            AudioCodec::LibOpus
-        } else {
-            AudioCodec::LibVorbis
-        }),
-        OutputFormat::Mp3 => Some(if encoder_names.contains("libmp3lame") {
-            AudioCodec::LibMp3Lame
-        } else {
-            AudioCodec::Mp3
-        }),
+        OutputFormat::Mp4 => encoder_names.contains("aac").then_some(AudioCodec::Aac),
+        OutputFormat::Webm => encoder_names
+            .contains("libopus")
+            .then_some(AudioCodec::LibOpus)
+            .or_else(|| {
+                encoder_names
+                    .contains("libvorbis")
+                    .then_some(AudioCodec::LibVorbis)
+            }),
+        OutputFormat::Mp3 => encoder_names
+            .contains("libmp3lame")
+            .then_some(AudioCodec::LibMp3Lame),
     }
 }
 
@@ -1109,15 +1847,12 @@ fn select_codec_plan(
         OutputFormat::Mp4 | OutputFormat::Webm => {
             let preference = advanced.video_codec.unwrap_or(VideoCodecPreference::Auto);
             let video_codec = requested_video_codec(format, preference, encoder_names)?
-                .or_else(|| auto_video_codec(format, encoder_names))
-                .ok_or_else(|| "Missing video codec selection.".to_string())?;
+                .or_else(|| auto_video_codec(format, encoder_names));
             Ok(CodecSelection {
-                video_codec: Some(video_codec),
+                video_codec,
                 audio_codec: audio_codec_for_format(format, encoder_names),
-                quality_mode: Some(quality_mode_for_codec(
-                    video_codec,
-                    video_quality_preference(advanced),
-                )),
+                quality_mode: video_codec
+                    .map(|codec| quality_mode_for_codec(codec, video_quality_preference(advanced))),
             })
         }
         OutputFormat::Mp3 => Ok(CodecSelection {
@@ -1158,20 +1893,35 @@ fn video_codec_capabilities_for_format(
 
 pub fn encode_capabilities() -> Result<EncodeCapabilities, String> {
     let ffmpeg_bin = default_ffmpeg();
-    let encoder_names = cached_encoder_names(&ffmpeg_bin)?;
+    let runtime = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
+    let contract = ffmpeg_capability_contract()?;
     let mut video_codecs = Vec::new();
     video_codecs.extend(video_codec_capabilities_for_format(
         OutputFormat::Mp4,
-        &encoder_names,
+        &runtime.encoder_names,
     ));
     video_codecs.extend(video_codec_capabilities_for_format(
         OutputFormat::Webm,
-        &encoder_names,
+        &runtime.encoder_names,
     ));
+    let mut feature_names = contract.features.keys().cloned().collect::<Vec<_>>();
+    feature_names.sort();
+    let features = feature_names
+        .iter()
+        .filter_map(|name| {
+            contract
+                .features
+                .get(name)
+                .map(|requirement| feature_capability(name, requirement, &runtime))
+        })
+        .collect();
 
     Ok(EncodeCapabilities {
         video_codecs,
         audio_bitrate_kbps: AUDIO_BITRATE_PRESETS_KBPS.to_vec(),
+        ffmpeg_version: runtime.version,
+        contract_schema_version: contract.schema_version,
+        features,
     })
 }
 
@@ -1263,19 +2013,19 @@ fn normalized_codec_name(codec: Option<&str>) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-fn video_copy_compatible(format: OutputFormat, codec: Option<&str>) -> bool {
-    let Some(codec) = codec.map(str::trim) else {
-        return false;
-    };
+fn compatible_source_video_codec(format: OutputFormat, codec: Option<&str>) -> Option<VideoCodec> {
+    let codec = codec.map(str::trim)?;
     match format {
-        OutputFormat::Mp4 => {
-            codec.eq_ignore_ascii_case("h264") || codec.eq_ignore_ascii_case("mpeg4")
-        }
-        OutputFormat::Webm => {
-            codec.eq_ignore_ascii_case("vp8") || codec.eq_ignore_ascii_case("vp9")
-        }
-        OutputFormat::Mp3 => false,
+        OutputFormat::Mp4 if codec.eq_ignore_ascii_case("h264") => Some(VideoCodec::LibX264),
+        OutputFormat::Mp4 if codec.eq_ignore_ascii_case("mpeg4") => Some(VideoCodec::Mpeg4),
+        OutputFormat::Webm if codec.eq_ignore_ascii_case("vp9") => Some(VideoCodec::LibVpxVp9),
+        OutputFormat::Webm if codec.eq_ignore_ascii_case("vp8") => Some(VideoCodec::LibVpx),
+        OutputFormat::Mp4 | OutputFormat::Webm | OutputFormat::Mp3 => None,
     }
+}
+
+fn video_copy_compatible(format: OutputFormat, codec: Option<&str>) -> bool {
+    compatible_source_video_codec(format, codec).is_some()
 }
 
 fn audio_copy_compatible(format: OutputFormat, codec: Option<&str>) -> bool {
@@ -1307,11 +2057,308 @@ fn video_transform_requires_encode(request: &EncodeRequest) -> Result<bool, Stri
         || request.perturb_first_frame)
 }
 
+fn color_metadata_is_complete(probe: &VideoProbe) -> bool {
+    probe.color_range.is_some()
+        && probe.color_primaries.is_some()
+        && probe.color_transfer.is_some()
+        && probe.color_space.is_some()
+}
+
+fn require_standard_sdr_contract(
+    request: &EncodeRequest,
+    selected_video_encoder: Option<VideoCodec>,
+) -> Result<(), String> {
+    if request.color_policy != ColorPolicy::StandardSdr {
+        return Err(
+            "This source requires the explicit Standard SDR color policy before video export."
+                .to_string(),
+        );
+    }
+    if request.format != OutputFormat::Mp4 {
+        return Err("Standard SDR conversion currently requires MP4 output.".to_string());
+    }
+    if selected_video_encoder != Some(VideoCodec::LibX264) {
+        return Err(
+            "Standard SDR conversion currently requires the H.264 (libx264) encoder.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn require_supported_source_rotation(probe: &VideoProbe) -> Result<(), String> {
+    if let Some(rotation_deg) = probe.unsupported_rotation_deg {
+        return Err(format!(
+            "The source uses a {rotation_deg:.3}° display rotation. Video export supports only exact 0°, 90°, 180°, or 270° source rotations because other display matrices cannot be mapped safely to crop and pixel-aspect geometry. Audio-only MP3 export remains available."
+        ));
+    }
+    Ok(())
+}
+
+fn require_minimum_video_dimensions(probe: &VideoProbe) -> Result<(), String> {
+    if probe.width < 2 || probe.height < 2 {
+        return Err(format!(
+            "Video export requires a source at least 2x2 pixels; this source is {}x{}. Audio-only MP3 export remains available.",
+            probe.width, probe.height
+        ));
+    }
+    Ok(())
+}
+
+fn require_safe_frame_export_color(probe: &VideoProbe) -> Result<(), String> {
+    let bit_depth = probe.bit_depth.ok_or_else(|| {
+        "Frame export is unavailable because the source pixel-component depth could not be determined."
+            .to_string()
+    })?;
+    let unsafe_color = matches!(
+        probe.dynamic_range,
+        DynamicRange::Hdr10 | DynamicRange::Hlg | DynamicRange::DolbyVision
+    ) || bit_depth > 8
+        || (probe.dynamic_range == DynamicRange::Unknown
+            && probe
+                .color_transfer
+                .as_deref()
+                .is_some_and(|transfer| matches!(transfer, "smpte2084" | "arib-std-b67")));
+    if unsafe_color {
+        return Err(
+            "Frame export is available only for standard 8-bit SDR sources. This source requires color handling that PNG frame export does not apply safely."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn require_safe_frame_export_geometry(probe: &VideoProbe) -> Result<(), String> {
+    if !probe.sample_aspect_ratio.is_square() {
+        return Err(
+            "Frame export is unavailable for non-square-pixel sources because PNG output would not preserve the visible display shape. Export a square-pixel video first."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn resolve_media_policy(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    selected_video_encoder: Option<VideoCodec>,
+) -> Result<MediaPolicyPlan, String> {
+    if request.format == OutputFormat::Mp3 {
+        return Ok(MediaPolicyPlan {
+            color_action: MediaColorAction::NotApplicable,
+            sar_action: SarAction::NotApplicable,
+        });
+    }
+
+    require_minimum_video_dimensions(probe)?;
+    require_supported_source_rotation(probe)?;
+
+    let source_bit_depth = probe.bit_depth.ok_or_else(|| {
+        "The source pixel-component depth could not be determined, so video export cannot choose a safe color policy. Audio-only MP3 export remains available."
+            .to_string()
+    })?;
+    let high_bit_depth = source_bit_depth > 8;
+    let color_action = match probe.dynamic_range {
+        DynamicRange::DolbyVision => {
+            return Err(
+                "Dolby Vision input is not supported for video export. Convert it to standard SDR first."
+                    .to_string(),
+            );
+        }
+        DynamicRange::Hlg => {
+            return Err(
+                "HLG HDR input is not supported for video export. Convert it to standard SDR first."
+                    .to_string(),
+            );
+        }
+        DynamicRange::Hdr10 => {
+            require_standard_sdr_contract(request, selected_video_encoder)?;
+            MediaColorAction::Hdr10ToStandardSdr
+        }
+        DynamicRange::Sdr if high_bit_depth => {
+            if !color_metadata_is_complete(probe) {
+                return Err(
+                    "High-bit-depth SDR input has incomplete color metadata and cannot be converted safely."
+                        .to_string(),
+                );
+            }
+            require_standard_sdr_contract(request, selected_video_encoder)?;
+            MediaColorAction::HighBitDepthSdrToStandardSdr
+        }
+        DynamicRange::Unknown
+            if high_bit_depth
+                || probe
+                    .color_transfer
+                    .as_deref()
+                    .is_some_and(|transfer| matches!(transfer, "smpte2084" | "arib-std-b67")) =>
+        {
+            return Err(
+                "The source has contradictory or incomplete high-bit-depth/HDR metadata, so Video For Lazies cannot choose a safe color conversion."
+                    .to_string(),
+            );
+        }
+        DynamicRange::Sdr | DynamicRange::Unknown => MediaColorAction::Unchanged,
+    };
+
+    let sar_action = if probe.sample_aspect_ratio.is_square() {
+        SarAction::Unchanged
+    } else {
+        let (width, height) = estimated_output_dimensions(request, probe)?;
+        SarAction::Normalize { width, height }
+    };
+
+    Ok(MediaPolicyPlan {
+        color_action,
+        sar_action,
+    })
+}
+
+fn retained_source_duration_s(request: &EncodeRequest, probe: &VideoProbe) -> Result<f64, String> {
+    let mut start = 0.0;
+    let mut end = probe.duration_s;
+    if let Some(trim) = &request.trim {
+        start = trim.start_s.max(0.0);
+        end = trim.end_s.unwrap_or(probe.duration_s).min(probe.duration_s);
+    }
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return Err("Trim end must be greater than start.".to_string());
+    }
+    Ok(end - start)
+}
+
+fn guard_reverse_buffer_bytes(bytes: u64) -> Result<ReverseBufferEstimate, String> {
+    if bytes >= REVERSE_BUFFER_HARD_LIMIT_BYTES {
+        return Err(format!(
+            "Reverse/Loop would require about {:.2} GiB of decoded buffering, above the 2 GiB safety limit. Trim shorter, crop or resize smaller, or disable Reverse/Loop.",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ));
+    }
+    let action = if bytes >= REVERSE_BUFFER_WARNING_BYTES {
+        ReverseBufferAction::Warning
+    } else {
+        ReverseBufferAction::WithinLimit
+    };
+    Ok(ReverseBufferEstimate { bytes, action })
+}
+
+fn reverse_buffer_estimate(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    media_policy: MediaPolicyPlan,
+    retain_audio: bool,
+) -> Result<Option<ReverseBufferEstimate>, String> {
+    let reverse_video = request.reverse && request.format != OutputFormat::Mp3;
+    let loop_video = request.loop_video && request.format != OutputFormat::Mp3;
+    let reverse_audio = request.reverse && retain_audio && probe.has_audio;
+    let loop_audio = loop_video && retain_audio && probe.has_audio;
+    if !reverse_video && !loop_video && !reverse_audio && !loop_audio {
+        return Ok(None);
+    }
+
+    let retained_duration_s = retained_source_duration_s(request, probe)?;
+    let mut total_bytes = 0u128;
+
+    if reverse_video || loop_video {
+        let frame_rate = probe
+            .frame_rate
+            .filter(|fps| fps.is_finite() && *fps > 0.0)
+            .ok_or_else(|| {
+                "Reverse/Loop is unavailable because the source frame rate could not be determined."
+                    .to_string()
+            })?;
+        let bytes_per_pixel = if media_policy.color_action.converts_to_standard_sdr() {
+            1.5
+        } else {
+            probe.decoded_video_bytes_per_pixel.ok_or_else(|| {
+                "Reverse/Loop is unavailable because the decoded pixel layout could not be determined."
+                    .to_string()
+            })?
+        };
+        let (width, height) = estimated_output_dimensions(request, probe)?;
+        let source_frame_count = (retained_duration_s * frame_rate).ceil();
+        if !source_frame_count.is_finite() || source_frame_count <= 0.0 {
+            return Err("Reverse/Loop decoded frame count is invalid.".to_string());
+        }
+        let bytes_per_frame = ((width as f64) * (height as f64) * bytes_per_pixel).ceil() as u128
+            + REVERSE_BUFFER_VIDEO_FRAME_OVERHEAD_BYTES;
+        if reverse_video {
+            total_bytes = total_bytes
+                .saturating_add(bytes_per_frame.saturating_mul(source_frame_count as u128));
+        }
+        if loop_video {
+            // The Loop reverse stage wraps the completed linear chain. setpts
+            // changes timestamps but not frame count; only an active fps filter
+            // drops frames before this stage.
+            let loop_frame_count = if let Some(cap_fps) = frame_rate_cap_filter_fps(request, probe)?
+            {
+                (retained_duration_s / effective_speed(request) * cap_fps as f64).ceil()
+            } else {
+                source_frame_count
+            };
+            if !loop_frame_count.is_finite() || loop_frame_count <= 0.0 {
+                return Err("Loop decoded frame count is invalid.".to_string());
+            }
+            total_bytes = total_bytes
+                .saturating_add(bytes_per_frame.saturating_mul(loop_frame_count as u128));
+        }
+    }
+
+    if reverse_audio || loop_audio {
+        // FFprobe normally supplies these layout facts. Missing source facts are
+        // not safe to guess because high-rate, multichannel layouts can exceed
+        // ordinary 48 kHz stereo by a large factor. When normalization is active,
+        // loudnorm/aresample make the post-filter rate and conservative sample
+        // storage known, but the retained channel count must still be known.
+        let sample_rate = if request.normalize_audio {
+            48_000
+        } else {
+            probe.audio_sample_rate.ok_or_else(|| {
+                "Reverse/Loop is unavailable because the retained audio sample rate could not be determined."
+                    .to_string()
+            })?
+        } as u128;
+        let channels = probe.audio_channels.ok_or_else(|| {
+            "Reverse/Loop is unavailable because the retained audio channel count could not be determined."
+                .to_string()
+        })? as u128;
+        let bytes_per_sample = if request.normalize_audio {
+            8
+        } else {
+            probe.decoded_audio_bytes_per_sample.ok_or_else(|| {
+                "Reverse/Loop is unavailable because the retained decoded audio sample format could not be determined."
+                    .to_string()
+            })?
+        } as u128;
+        let bytes_per_audio_frame = channels.saturating_mul(bytes_per_sample);
+        if reverse_audio {
+            let sample_count = (retained_duration_s * sample_rate as f64).ceil() as u128;
+            let frame_count = sample_count.div_ceil(REVERSE_AUDIO_FRAME_SAMPLES);
+            total_bytes = total_bytes
+                .saturating_add(sample_count.saturating_mul(bytes_per_audio_frame))
+                .saturating_add(
+                    frame_count.saturating_mul(REVERSE_BUFFER_AUDIO_FRAME_OVERHEAD_BYTES),
+                );
+        }
+        if loop_audio {
+            let sample_count = (retained_duration_s / effective_speed(request) * sample_rate as f64)
+                .ceil() as u128;
+            let frame_count = sample_count.div_ceil(REVERSE_AUDIO_FRAME_SAMPLES);
+            total_bytes = total_bytes
+                .saturating_add(sample_count.saturating_mul(bytes_per_audio_frame))
+                .saturating_add(
+                    frame_count.saturating_mul(REVERSE_BUFFER_AUDIO_FRAME_OVERHEAD_BYTES),
+                );
+        }
+    }
+
+    total_bytes = total_bytes.saturating_mul((REVERSE_BUFFER_SAFETY_FACTOR * 100.0) as u128) / 100;
+    let bytes = total_bytes.min(u64::MAX as u128) as u64;
+    guard_reverse_buffer_bytes(bytes).map(Some)
+}
+
 fn build_encode_command_plan(
     request: &EncodeRequest,
     probe: &VideoProbe,
     codec_selection: CodecSelection,
-    source_size_bytes: u64,
     resolved_perturb_seed: Option<u32>,
 ) -> Result<EncodeCommandPlan, String> {
     let size_limit_enabled = request.size_limit_mb > 0.0;
@@ -1327,13 +2374,13 @@ fn build_encode_command_plan(
         );
     }
 
+    let media_policy = resolve_media_policy(request, probe, codec_selection.video_codec)?;
     let audio_filters = build_audio_filters(&resolved_request, probe)?;
     let video_filters = if matches!(request.format, OutputFormat::Mp3) {
         None
     } else {
-        build_video_filters(&resolved_request, probe)?
+        build_video_filters_with_policy(&resolved_request, probe, media_policy)?
     };
-
     if matches!(request.format, OutputFormat::Mp3) {
         if !request.audio_enabled {
             return Err("Audio must be enabled for MP3 output.".to_string());
@@ -1341,9 +2388,10 @@ fn build_encode_command_plan(
         let audio_stream_index = probe
             .audio_stream_index
             .ok_or_else(|| "Input file has no audio stream.".to_string())?;
-        let audio_encoder = codec_selection
-            .audio_codec
-            .unwrap_or(AudioCodec::LibMp3Lame);
+        let audio_encoder = codec_selection.audio_codec.ok_or_else(|| {
+            "No MP3 audio encoder is available in the active FFmpeg build.".to_string()
+        })?;
+        let reverse_buffer_estimate = reverse_buffer_estimate(request, probe, media_policy, true)?;
         return Ok(EncodeCommandPlan {
             mode: EncodeMode::AudioOnlyEncode,
             video_stream_index: None,
@@ -1365,14 +2413,14 @@ fn build_encode_command_plan(
             video_reasons: vec![PlanReason::AudioOnlyOutput],
             audio_reasons: vec![PlanReason::AudioOnlyOutput],
             size_contract: None,
-            size_copy_candidate: None,
+            size_copy_candidates: Vec::new(),
+            media_policy,
+            reverse_buffer_estimate,
         });
     }
 
-    let selected_video_encoder = codec_selection
-        .video_codec
-        .ok_or_else(|| "Missing video codec selection.".to_string())?;
-    let selected_audio_encoder = codec_selection.audio_codec.unwrap_or(AudioCodec::Aac);
+    let selected_video_encoder = codec_selection.video_codec;
+    let selected_audio_encoder = codec_selection.audio_codec;
     let timeline_change = timeline_requires_encode(request);
 
     let mut video_reasons = Vec::new();
@@ -1392,6 +2440,14 @@ fn build_encode_command_plan(
         } else {
             PlanReason::VideoTransform
         });
+    }
+    if media_policy.color_action.converts_to_standard_sdr() {
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::ColorConversion);
+    }
+    if media_policy.sar_action.normalizes() {
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::SampleAspectRatio);
     }
     if request
         .advanced
@@ -1452,6 +2508,89 @@ fn build_encode_command_plan(
     }
 
     if size_limit_enabled {
+        let copy_audio_action = if natural_video_action == StreamAction::Copy {
+            planned_size_copy_audio_action(
+                request,
+                probe,
+                natural_audio_action,
+                selected_video_encoder,
+            )?
+        } else {
+            natural_audio_action
+        };
+        let mut size_copy_candidates = Vec::new();
+        if natural_video_action == StreamAction::Copy {
+            if natural_audio_action == StreamAction::Copy {
+                size_copy_candidates.push(CopyCandidatePlan {
+                    video_stream_index: probe.video_stream_index,
+                    audio_stream_index: probe.audio_stream_index,
+                    audio_action: StreamAction::Copy,
+                });
+            }
+            if copy_audio_action == StreamAction::Drop {
+                size_copy_candidates.push(CopyCandidatePlan {
+                    video_stream_index: probe.video_stream_index,
+                    audio_stream_index: probe.audio_stream_index,
+                    audio_action: StreamAction::Drop,
+                });
+            }
+        }
+        let copy_only_plan =
+            |candidates: Vec<CopyCandidatePlan>| -> Result<EncodeCommandPlan, String> {
+                let candidate = candidates
+                    .first()
+                    .ok_or_else(|| "Missing size-copy candidate.".to_string())?;
+                let reverse_buffer_estimate = reverse_buffer_estimate(
+                    request,
+                    probe,
+                    media_policy,
+                    candidate.audio_action != StreamAction::Drop,
+                )?;
+                let mut copy_video_reasons = video_reasons.clone();
+                let mut copy_audio_reasons = audio_reasons.clone();
+                copy_video_reasons.push(PlanReason::SizeTarget);
+                copy_audio_reasons.push(PlanReason::SizeTarget);
+                Ok(EncodeCommandPlan {
+                    mode: EncodeMode::SizeTargeted,
+                    video_stream_index: Some(probe.video_stream_index),
+                    audio_stream_index: probe.audio_stream_index,
+                    source_video_codec: probe.video_codec.clone(),
+                    source_audio_codec: probe.audio_codec.clone(),
+                    video_action: StreamAction::Copy,
+                    audio_action: candidate.audio_action,
+                    video_encoder: selected_video_encoder,
+                    audio_encoder: selected_audio_encoder,
+                    output_video_codec: probe.video_codec.clone(),
+                    output_audio_codec: (candidate.audio_action == StreamAction::Copy)
+                        .then(|| probe.audio_codec.clone())
+                        .flatten(),
+                    quality_mode: codec_selection.quality_mode,
+                    encode_speed,
+                    audio_bitrate_kbps: None,
+                    audio_channels: advanced_audio_channels,
+                    video_filters: video_filters.clone(),
+                    audio_filters: audio_filters.clone(),
+                    video_reasons: copy_video_reasons,
+                    audio_reasons: copy_audio_reasons,
+                    size_contract: None,
+                    size_copy_candidates: candidates,
+                    media_policy,
+                    reverse_buffer_estimate,
+                })
+            };
+        if !size_copy_candidates.is_empty() {
+            return copy_only_plan(size_copy_candidates);
+        }
+        let selected_video_encoder = selected_video_encoder.ok_or_else(|| {
+            format!(
+                "No compatible video encoder is available for {} size-targeted export.",
+                match request.format {
+                    OutputFormat::Mp4 => "MP4",
+                    OutputFormat::Webm => "WebM",
+                    OutputFormat::Mp3 => unreachable!(),
+                }
+            )
+        })?;
         let output_duration_s = estimate_output_duration_s(
             probe.duration_s,
             &request.trim,
@@ -1471,23 +2610,25 @@ fn build_encode_command_plan(
         } else {
             StreamAction::Drop
         };
+        let planned_audio_encoder = if audio_action == StreamAction::Encode {
+            match selected_audio_encoder {
+                Some(encoder) => Some(encoder),
+                None => return Err(
+                    "No compatible audio encoder is available for the selected size-targeted output."
+                        .to_string(),
+                ),
+            }
+        } else {
+            None
+        };
+        let reverse_buffer_estimate = reverse_buffer_estimate(
+            request,
+            probe,
+            media_policy,
+            audio_action == StreamAction::Encode,
+        )?;
         video_reasons.push(PlanReason::SizeTarget);
         audio_reasons.push(PlanReason::SizeTarget);
-
-        let target_bytes = (request.size_limit_mb * MB_BYTES as f64) as u64;
-        let explicitly_dropping_existing_audio =
-            !request.audio_enabled && probe.audio_stream_index.is_some();
-        let size_copy_candidate = (natural_video_action == StreamAction::Copy
-            && matches!(
-                natural_audio_action,
-                StreamAction::Copy | StreamAction::Drop
-            )
-            && (source_size_bytes <= target_bytes || explicitly_dropping_existing_audio))
-            .then_some(CopyCandidatePlan {
-                video_stream_index: probe.video_stream_index,
-                audio_stream_index: probe.audio_stream_index,
-                audio_action: natural_audio_action,
-            });
 
         return Ok(EncodeCommandPlan {
             mode: EncodeMode::SizeTargeted,
@@ -1498,10 +2639,10 @@ fn build_encode_command_plan(
             video_action: StreamAction::Encode,
             audio_action,
             video_encoder: Some(selected_video_encoder),
-            audio_encoder: (audio_action == StreamAction::Encode).then_some(selected_audio_encoder),
+            audio_encoder: planned_audio_encoder,
             output_video_codec: Some(selected_video_encoder.as_codec_name().to_string()),
-            output_audio_codec: (audio_action == StreamAction::Encode)
-                .then(|| selected_audio_encoder.as_codec_name().to_string()),
+            output_audio_codec: planned_audio_encoder
+                .map(|codec| codec.as_codec_name().to_string()),
             quality_mode: codec_selection.quality_mode,
             encode_speed,
             audio_bitrate_kbps: None,
@@ -1511,7 +2652,9 @@ fn build_encode_command_plan(
             video_reasons,
             audio_reasons,
             size_contract: Some(size_contract),
-            size_copy_candidate,
+            size_copy_candidates: Vec::new(),
+            media_policy,
+            reverse_buffer_estimate,
         });
     }
 
@@ -1522,14 +2665,46 @@ fn build_encode_command_plan(
         (StreamAction::Encode, StreamAction::Encode | StreamAction::Drop) => EncodeMode::FullEncode,
         (StreamAction::Drop, _) => unreachable!("video output must retain a video stream"),
     };
+    if natural_video_action == StreamAction::Encode && selected_video_encoder.is_none() {
+        return Err(format!(
+            "No compatible video encoder is available for {} export with the selected transforms.",
+            match request.format {
+                OutputFormat::Mp4 => "MP4",
+                OutputFormat::Webm => "WebM",
+                OutputFormat::Mp3 => unreachable!(),
+            }
+        ));
+    }
+    if natural_video_action == StreamAction::Encode {
+        let selected_video_encoder = selected_video_encoder
+            .ok_or_else(|| "Missing video encoder for output-dimension validation.".to_string())?;
+        let (width, height) = estimated_output_dimensions(request, probe)?;
+        validate_codec_output_dimensions(selected_video_encoder, width, height)?;
+    }
+    if natural_audio_action == StreamAction::Encode && selected_audio_encoder.is_none() {
+        return Err(
+            "No compatible audio encoder is available for the selected output and transforms."
+                .to_string(),
+        );
+    }
+    let reverse_buffer_estimate = reverse_buffer_estimate(
+        request,
+        probe,
+        media_policy,
+        natural_audio_action != StreamAction::Drop,
+    )?;
     let output_video_codec = match natural_video_action {
         StreamAction::Copy => probe.video_codec.clone(),
-        StreamAction::Encode => Some(selected_video_encoder.as_codec_name().to_string()),
+        StreamAction::Encode => {
+            selected_video_encoder.map(|codec| codec.as_codec_name().to_string())
+        }
         StreamAction::Drop => None,
     };
     let output_audio_codec = match natural_audio_action {
         StreamAction::Copy => probe.audio_codec.clone(),
-        StreamAction::Encode => Some(selected_audio_encoder.as_codec_name().to_string()),
+        StreamAction::Encode => {
+            selected_audio_encoder.map(|codec| codec.as_codec_name().to_string())
+        }
         StreamAction::Drop => None,
     };
 
@@ -1541,9 +2716,10 @@ fn build_encode_command_plan(
         source_audio_codec: probe.audio_codec.clone(),
         video_action: natural_video_action,
         audio_action: natural_audio_action,
-        video_encoder: Some(selected_video_encoder),
+        video_encoder: selected_video_encoder,
         audio_encoder: (natural_audio_action != StreamAction::Drop)
-            .then_some(selected_audio_encoder),
+            .then_some(selected_audio_encoder)
+            .flatten(),
         output_video_codec,
         output_audio_codec,
         quality_mode: codec_selection.quality_mode,
@@ -1555,8 +2731,65 @@ fn build_encode_command_plan(
         video_reasons,
         audio_reasons,
         size_contract: None,
-        size_copy_candidate: None,
+        size_copy_candidates: Vec::new(),
+        media_policy,
+        reverse_buffer_estimate,
     })
+}
+
+fn build_size_reencode_fallback_plan(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    initial_plan: &EncodeCommandPlan,
+) -> Result<EncodeCommandPlan, String> {
+    let selected_video_encoder = initial_plan.video_encoder.ok_or_else(|| {
+        "Compatible stream copy could not satisfy the size target, and the active FFmpeg build has no compatible video encoder fallback."
+            .to_string()
+    })?;
+    let output_duration_s = estimate_output_duration_s(
+        probe.duration_s,
+        &request.trim,
+        request.speed,
+        request.loop_video,
+    )?;
+    let include_audio = request.audio_enabled && probe.audio_stream_index.is_some();
+    let size_contract = build_size_limited_encode_contract(
+        request,
+        probe,
+        selected_video_encoder,
+        output_duration_s,
+        include_audio,
+    )?;
+    let audio_action = if size_contract.plan.include_audio {
+        StreamAction::Encode
+    } else {
+        StreamAction::Drop
+    };
+    let planned_audio_encoder = if audio_action == StreamAction::Encode {
+        Some(initial_plan.audio_encoder.ok_or_else(|| {
+            "Compatible stream copy could not satisfy the size target, and the active FFmpeg build has no compatible audio encoder fallback."
+                .to_string()
+        })?)
+    } else {
+        None
+    };
+    let reverse_buffer_estimate = reverse_buffer_estimate(
+        request,
+        probe,
+        initial_plan.media_policy,
+        audio_action == StreamAction::Encode,
+    )?;
+    let mut fallback = initial_plan.clone();
+    fallback.video_action = StreamAction::Encode;
+    fallback.audio_action = audio_action;
+    fallback.audio_encoder = planned_audio_encoder;
+    fallback.output_video_codec = Some(selected_video_encoder.as_codec_name().to_string());
+    fallback.output_audio_codec =
+        planned_audio_encoder.map(|codec| codec.as_codec_name().to_string());
+    fallback.size_contract = Some(size_contract);
+    fallback.size_copy_candidates.clear();
+    fallback.reverse_buffer_estimate = reverse_buffer_estimate;
+    Ok(fallback)
 }
 
 fn encode_speed_args_for_codec(
@@ -1687,6 +2920,40 @@ fn requested_resize(req: &EncodeRequest) -> Result<ResizePlan, String> {
     }
 }
 
+fn oriented_sample_aspect_ratio(req: &EncodeRequest, probe: &VideoProbe) -> f64 {
+    let mut ratio = probe.sample_aspect_ratio.as_f64();
+    if matches!(probe.rotation_deg, 90 | 270) {
+        ratio = 1.0 / ratio;
+    }
+    if matches!(req.rotate_deg, 90 | 270) {
+        ratio = 1.0 / ratio;
+    }
+    ratio
+}
+
+#[cfg(test)]
+fn fit_max_edge_dimensions(width: u32, height: u32, max_edge_px: u32) -> (u32, u32) {
+    let long_edge = width.max(height);
+    if long_edge <= max_edge_px {
+        return (even_at_least_two(width), even_at_least_two(height));
+    }
+    if width >= height {
+        let scaled_height =
+            (((height as f64) * (max_edge_px as f64)) / (width as f64)).round() as u32;
+        (
+            even_at_least_two(max_edge_px),
+            even_at_least_two(scaled_height),
+        )
+    } else {
+        let scaled_width =
+            (((width as f64) * (max_edge_px as f64)) / (height as f64)).round() as u32;
+        (
+            even_at_least_two(scaled_width),
+            even_at_least_two(max_edge_px),
+        )
+    }
+}
+
 fn estimated_output_dimensions(
     req: &EncodeRequest,
     probe: &VideoProbe,
@@ -1695,6 +2962,7 @@ fn estimated_output_dimensions(
     let mut height = probe.height.max(2);
 
     if let Some(crop) = &req.crop {
+        validate_crop(crop, probe)?;
         width = even_at_least_two(crop.width);
         height = even_at_least_two(crop.height);
     }
@@ -1704,23 +2972,39 @@ fn estimated_output_dimensions(
         _ => {}
     }
 
-    match requested_resize(req)? {
-        ResizePlan::Source => {}
-        ResizePlan::MaxEdge(max_edge_px) => {
-            let long_edge = width.max(height);
-            if long_edge > max_edge_px {
-                if width >= height {
-                    let scaled_height =
-                        (((height as f64) * (max_edge_px as f64)) / (width as f64)).round() as u32;
-                    width = even_at_least_two(max_edge_px);
-                    height = even_at_least_two(scaled_height);
-                } else {
-                    let scaled_width =
-                        (((width as f64) * (max_edge_px as f64)) / (height as f64)).round() as u32;
-                    width = even_at_least_two(scaled_width);
-                    height = even_at_least_two(max_edge_px);
-                }
+    let resize_plan = requested_resize(req)?;
+    let mut logical_width = width as f64;
+    let logical_height = height as f64;
+    if !probe.sample_aspect_ratio.is_square() && !matches!(resize_plan, ResizePlan::Custom { .. }) {
+        let effective_sar = oriented_sample_aspect_ratio(req, probe);
+        if !effective_sar.is_finite() || effective_sar <= 0.0 {
+            return Err("Could not normalize the source sample aspect ratio.".to_string());
+        }
+        logical_width *= effective_sar;
+    }
+
+    match resize_plan {
+        ResizePlan::Source => {
+            if !logical_width.is_finite() || !logical_height.is_finite() {
+                return Err("Could not calculate finite square-pixel source dimensions. Choose a bounded resize or correct the source aspect metadata.".to_string());
             }
+            width = even_at_least_two(logical_width.round() as u32);
+            height = even_at_least_two(logical_height.round() as u32);
+        }
+        ResizePlan::MaxEdge(max_edge_px) => {
+            if !logical_width.is_finite() || logical_width <= 0.0 || logical_height <= 0.0 {
+                return Err(
+                    "Could not calculate bounded square-pixel output dimensions.".to_string(),
+                );
+            }
+            let long_edge = logical_width.max(logical_height);
+            let scale = if long_edge > max_edge_px as f64 {
+                max_edge_px as f64 / long_edge
+            } else {
+                1.0
+            };
+            width = even_at_least_two((logical_width * scale).round() as u32);
+            height = even_at_least_two((logical_height * scale).round() as u32);
         }
         ResizePlan::Custom {
             width_px,
@@ -1731,9 +3015,29 @@ fn estimated_output_dimensions(
         }
     }
 
-    // The filter chain forces even output for every path, so the plan should
-    // match even for untouched odd-dimension sources.
-    Ok((even_at_least_two(width), even_at_least_two(height)))
+    // Apply the same final bound to every path, including metadata-derived
+    // dimensions. Custom dimensions stay authoritative and a max-edge resize
+    // may safely tame extreme source aspect metadata before this check.
+    let width = even_at_least_two(width);
+    let height = even_at_least_two(height);
+    if width > OUTPUT_DIMENSION_MAX_PX || height > OUTPUT_DIMENSION_MAX_PX {
+        return Err(format!(
+            "Planned output dimensions must each be <= {OUTPUT_DIMENSION_MAX_PX} px; calculated {width}x{height}."
+        ));
+    }
+    Ok((width, height))
+}
+
+fn validate_crop(crop: &Crop, probe: &VideoProbe) -> Result<(), String> {
+    if crop.width < 2 || crop.height < 2 {
+        return Err("Crop width and height must each be at least 2 pixels.".to_string());
+    }
+    if crop.x.saturating_add(crop.width) > probe.width
+        || crop.y.saturating_add(crop.height) > probe.height
+    {
+        return Err("Crop area is outside the video bounds.".to_string());
+    }
+    Ok(())
 }
 
 fn minimum_video_bitrate_kbps(
@@ -1754,6 +3058,48 @@ fn minimum_video_bitrate_kbps(
         }
         VideoCodec::LibX264 | VideoCodec::LibVpxVp9 | VideoCodec::LibVpx => 50,
     }
+}
+
+fn planned_size_copy_audio_action(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    natural_audio_action: StreamAction,
+    selected_video_encoder: Option<VideoCodec>,
+) -> Result<StreamAction, String> {
+    if natural_audio_action == StreamAction::Drop {
+        return Ok(StreamAction::Drop);
+    }
+    let planning_codec = selected_video_encoder
+        .or_else(|| compatible_source_video_codec(request.format, probe.video_codec.as_deref()))
+        .ok_or_else(|| {
+            "Could not identify the compatible source video codec for size planning.".to_string()
+        })?;
+    let output_duration_s = estimate_output_duration_s(
+        probe.duration_s,
+        &request.trim,
+        request.speed,
+        request.loop_video,
+    )?;
+    let min_video_kbps = minimum_video_bitrate_kbps(
+        planning_codec,
+        probe.width.max(2),
+        probe.height.max(2),
+        output_frame_rate_for_planning(request, probe)?,
+    );
+    let plan = plan_bitrates(
+        request.size_limit_mb,
+        output_duration_s,
+        request.audio_enabled && probe.audio_stream_index.is_some(),
+        96,
+        32,
+        min_video_kbps,
+        0.95,
+    )?;
+    Ok(if plan.include_audio {
+        natural_audio_action
+    } else {
+        StreamAction::Drop
+    })
 }
 
 fn split_sequence_stem(stem: &str) -> (String, u32) {
@@ -1824,23 +3170,27 @@ pub fn extract_frame(input_path: String, time_s: f64, output_path: String) -> Re
     let temp_path = create_temp_output(&output_path, 0, "frame")?;
 
     let ffmpeg_bin = default_ffmpeg();
+    let probe = probe_video(input_path.to_string_lossy().to_string())?;
+    require_supported_source_rotation(&probe)?;
+    require_safe_frame_export_color(&probe)?;
+    require_safe_frame_export_geometry(&probe)?;
+    let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
+    let capability_contract = ffmpeg_capability_contract()?;
+    require_ffmpeg_capability_subset(
+        "PNG frame export",
+        ["png"],
+        std::iter::empty::<&str>(),
+        &capability_contract,
+        &runtime_capabilities,
+    )?;
 
     let mut cmd = command_no_window(&ffmpeg_bin);
-    // Input-side seeking: output-side -ss decodes the whole stream up to the
-    // timestamp and times out on long sources.
-    cmd.arg("-y")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-nostdin")
-        .arg("-ss")
-        .arg(format!("{time_s:.3}"))
-        .arg("-i")
-        .arg(input_path.as_os_str())
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-an")
-        .arg(temp_path.as_os_str());
+    cmd.args(frame_extract_command_args(
+        &input_path,
+        time_s,
+        probe.video_stream_index,
+        temp_path.as_ref(),
+    ));
     let output = run_command_output_with_timeout(
         cmd,
         "ffmpeg",
@@ -1863,6 +3213,35 @@ pub fn extract_frame(input_path: String, time_s: f64, output_path: String) -> Re
     Ok(())
 }
 
+fn frame_extract_command_args(
+    input_path: &Path,
+    time_s: f64,
+    video_stream_index: u32,
+    output_path: &Path,
+) -> Vec<OsString> {
+    // Input-side seeking: output-side -ss decodes the whole stream up to the
+    // timestamp and times out on long sources.
+    [
+        OsString::from("-y"),
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-nostdin"),
+        OsString::from("-ss"),
+        OsString::from(format!("{time_s:.3}")),
+        OsString::from("-i"),
+        input_path.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from(format!("0:{video_stream_index}")),
+        OsString::from("-frames:v"),
+        OsString::from("1"),
+        OsString::from("-an"),
+        output_path.as_os_str().to_os_string(),
+    ]
+    .into_iter()
+    .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct FFProbeOutput {
     #[serde(default)]
@@ -1881,6 +3260,7 @@ struct FFProbeFormat {
 struct FFProbeSideData {
     side_data_type: Option<String>,
     rotation: Option<serde_json::Value>,
+    displaymatrix: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1893,7 +3273,21 @@ struct FFProbeDisposition {
     #[serde(default)]
     default: u8,
     #[serde(default)]
+    original: u8,
+    #[serde(default)]
+    comment: u8,
+    #[serde(default)]
+    forced: u8,
+    #[serde(default)]
+    hearing_impaired: u8,
+    #[serde(default)]
+    visual_impaired: u8,
+    #[serde(default)]
     attached_pic: u8,
+    #[serde(default)]
+    timed_thumbnails: u8,
+    #[serde(default)]
+    still_image: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1904,6 +3298,20 @@ struct FFProbeStream {
     duration: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    pix_fmt: Option<String>,
+    bits_per_raw_sample: Option<String>,
+    bits_per_sample: Option<u8>,
+    color_range: Option<String>,
+    color_primaries: Option<String>,
+    color_transfer: Option<String>,
+    color_space: Option<String>,
+    sample_aspect_ratio: Option<String>,
+    display_aspect_ratio: Option<String>,
+    sample_rate: Option<String>,
+    channels: Option<u32>,
+    sample_fmt: Option<String>,
+    codec_tag_string: Option<String>,
+    profile: Option<String>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     #[serde(default)]
@@ -1922,6 +3330,8 @@ fn select_primary_video_stream(streams: &[FFProbeStream]) -> Option<&FFProbeStre
                 && stream.width.is_some()
                 && stream.height.is_some()
                 && stream.disposition.attached_pic == 0
+                && stream.disposition.timed_thumbnails == 0
+                && stream.disposition.still_image == 0
         })
         .min_by_key(|stream| {
             (
@@ -1951,19 +3361,80 @@ fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
-/// Display rotation in degrees (0/90/180/270), from the display matrix side
-/// data or the legacy rotate tag. Rotations off the 90-degree grid return 0
-/// because ffmpeg's autorotation ignores them too.
-fn stream_rotation_deg(stream: &FFProbeStream) -> u32 {
-    let raw = stream
-        .side_data_list
-        .iter()
-        .filter(|sd| {
-            sd.side_data_type
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case("Display Matrix"))
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SourceRotation {
+    quarter_turn_deg: u32,
+    unsupported_deg: Option<f64>,
+}
+
+fn parse_display_matrix(value: &str) -> Option<[[i64; 3]; 3]> {
+    let rows = value
+        .lines()
+        .filter_map(|line| {
+            let values = line
+                .split_once(':')?
+                .1
+                .split_whitespace()
+                .filter_map(|value| value.parse::<i64>().ok())
+                .collect::<Vec<_>>();
+            (values.len() == 3).then(|| [values[0], values[1], values[2]])
         })
-        .find_map(|sd| sd.rotation.as_ref().and_then(json_number_to_f64))
+        .collect::<Vec<_>>();
+    (rows.len() == 3).then(|| [rows[0], rows[1], rows[2]])
+}
+
+fn pure_quarter_turn_from_display_matrix(matrix: [[i64; 3]; 3]) -> Option<u32> {
+    const UNIT: i64 = 65_536;
+    const PERSPECTIVE_UNIT: i64 = 1_073_741_824;
+    const TOLERANCE: i64 = 2;
+    let near = |actual: i64, expected: i64| actual.abs_diff(expected) <= TOLERANCE as u64;
+    if !near(matrix[0][2], 0)
+        || !near(matrix[1][2], 0)
+        || !near(matrix[2][0], 0)
+        || !near(matrix[2][1], 0)
+        || !near(matrix[2][2], PERSPECTIVE_UNIT)
+    {
+        return None;
+    }
+    let [a, b, _, c, d] = [
+        matrix[0][0],
+        matrix[0][1],
+        matrix[0][2],
+        matrix[1][0],
+        matrix[1][1],
+    ];
+    if near(a, UNIT) && near(b, 0) && near(c, 0) && near(d, UNIT) {
+        Some(0)
+    } else if near(a, -UNIT) && near(b, 0) && near(c, 0) && near(d, -UNIT) {
+        Some(180)
+    } else if near(a, 0) && near(b, -UNIT) && near(c, UNIT) && near(d, 0) {
+        Some(90)
+    } else if near(a, 0) && near(b, UNIT) && near(c, -UNIT) && near(d, 0) {
+        Some(270)
+    } else {
+        None
+    }
+}
+
+fn display_matrix_rotation_deg(matrix: [[i64; 3]; 3]) -> f64 {
+    let rotation = (matrix[1][0] as f64)
+        .atan2(matrix[0][0] as f64)
+        .to_degrees();
+    ((rotation % 360.0) + 360.0) % 360.0
+}
+
+/// Read display rotation from the matrix or legacy tag. Only exact quarter
+/// turns are modeled by the crop/SAR geometry. FFmpeg can apply arbitrary
+/// matrices without changing the coded canvas, so preserve every other angle
+/// as an explicit unsupported fact instead of coercing or ignoring it.
+fn stream_rotation(stream: &FFProbeStream) -> SourceRotation {
+    let display_matrix = stream.side_data_list.iter().find(|sd| {
+        sd.side_data_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("Display Matrix"))
+    });
+    let raw = display_matrix
+        .and_then(|sd| sd.rotation.as_ref().and_then(json_number_to_f64))
         .or_else(|| {
             stream
                 .tags
@@ -1971,17 +3442,66 @@ fn stream_rotation_deg(stream: &FFProbeStream) -> u32 {
                 .and_then(|t| t.rotate.as_deref())
                 .and_then(|r| r.trim().parse::<f64>().ok())
         });
+    if display_matrix.is_some()
+        && display_matrix
+            .and_then(|side_data| side_data.displaymatrix.as_deref())
+            .is_none()
+    {
+        let normalized = raw
+            .filter(|value| value.is_finite())
+            .map(|value| ((value % 360.0) + 360.0) % 360.0)
+            .unwrap_or(0.0);
+        return SourceRotation {
+            quarter_turn_deg: 0,
+            unsupported_deg: Some(normalized),
+        };
+    }
+    if let Some(matrix_text) =
+        display_matrix.and_then(|side_data| side_data.displaymatrix.as_deref())
+    {
+        let Some(matrix) = parse_display_matrix(matrix_text) else {
+            return SourceRotation {
+                quarter_turn_deg: 0,
+                unsupported_deg: Some(raw.filter(|value| value.is_finite()).unwrap_or(0.0)),
+            };
+        };
+        if let Some(matrix_quarter_turn) = pure_quarter_turn_from_display_matrix(matrix) {
+            return SourceRotation {
+                // The matrix is authoritative. ffprobe's convenience rotation
+                // value is rounded and can disagree for 89°/91° matrices.
+                quarter_turn_deg: matrix_quarter_turn,
+                unsupported_deg: None,
+            };
+        }
+        return SourceRotation {
+            quarter_turn_deg: 0,
+            unsupported_deg: Some(display_matrix_rotation_deg(matrix)),
+        };
+    }
     let Some(raw) = raw else {
-        return 0;
+        return SourceRotation {
+            quarter_turn_deg: 0,
+            unsupported_deg: None,
+        };
     };
     if !raw.is_finite() {
-        return 0;
+        return SourceRotation {
+            quarter_turn_deg: 0,
+            unsupported_deg: None,
+        };
     }
-    let nearest = (raw / 90.0).round() * 90.0;
-    if (raw - nearest).abs() > 2.0 {
-        return 0;
+    let normalized = ((raw % 360.0) + 360.0) % 360.0;
+    let nearest = (normalized / 90.0).round() * 90.0;
+    if (normalized - nearest).abs() <= 0.001 || (normalized - 360.0).abs() <= 0.001 {
+        return SourceRotation {
+            quarter_turn_deg: ((nearest as u32) % 360),
+            unsupported_deg: None,
+        };
     }
-    (((nearest as i64 % 360) + 360) % 360) as u32
+    SourceRotation {
+        quarter_turn_deg: 0,
+        unsupported_deg: Some(normalized),
+    }
 }
 
 fn parse_ffprobe_rate(rate: Option<&str>) -> Option<f64> {
@@ -2004,6 +3524,288 @@ fn parse_ffprobe_rate(rate: Option<&str>) -> Option<f64> {
     (parsed > 0.0 && parsed.is_finite()).then_some(parsed)
 }
 
+fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
+}
+
+fn reduced_rational(numerator: u64, denominator: u64) -> Option<Rational> {
+    if numerator == 0 || denominator == 0 {
+        return None;
+    }
+    let gcd = gcd_u64(numerator, denominator);
+    let numerator = numerator / gcd;
+    let denominator = denominator / gcd;
+    if numerator > u32::MAX as u64 || denominator > u32::MAX as u64 {
+        return None;
+    }
+    Some(Rational {
+        numerator: numerator as u32,
+        denominator: denominator as u32,
+    })
+}
+
+fn parse_ffprobe_rational(value: Option<&str>) -> Option<Rational> {
+    let value = value?.trim();
+    let (numerator, denominator) = value.split_once(':').or_else(|| value.split_once('/'))?;
+    reduced_rational(
+        numerator.trim().parse::<u64>().ok()?,
+        denominator.trim().parse::<u64>().ok()?,
+    )
+}
+
+fn normalized_probe_field(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "unknown" | "unspecified" | "reserved" | "reserved0" | "n/a"
+                )
+        })
+        .map(str::to_ascii_lowercase)
+}
+
+fn stream_dispositions(disposition: &FFProbeDisposition) -> StreamDispositions {
+    StreamDispositions {
+        default: disposition.default != 0,
+        original: disposition.original != 0,
+        comment: disposition.comment != 0,
+        forced: disposition.forced != 0,
+        hearing_impaired: disposition.hearing_impaired != 0,
+        visual_impaired: disposition.visual_impaired != 0,
+        attached_pic: disposition.attached_pic != 0,
+        timed_thumbnails: disposition.timed_thumbnails != 0,
+        still_image: disposition.still_image != 0,
+    }
+}
+
+fn pixel_format_bit_depth(pixel_format: Option<&str>) -> Option<u8> {
+    let pixel_format = pixel_format?.trim().to_ascii_lowercase();
+    if pixel_format.is_empty() {
+        return None;
+    }
+    if pixel_format.starts_with("gbrpf32") || pixel_format.starts_with("gbrapf32") {
+        return Some(32);
+    }
+    if pixel_format.starts_with("gbrpf16")
+        || pixel_format.starts_with("gbrapf16")
+        || pixel_format.starts_with("rgb48")
+        || pixel_format.starts_with("bgr48")
+        || pixel_format.starts_with("rgba64")
+        || pixel_format.starts_with("bgra64")
+    {
+        return Some(16);
+    }
+    // These numbers describe chroma layout, not component depth. Handle them
+    // before scanning pixel-format suffixes for an explicit bit depth.
+    if pixel_format.starts_with("nv12")
+        || pixel_format.starts_with("nv16")
+        || pixel_format.starts_with("nv21")
+        || pixel_format.starts_with("nv24")
+        || pixel_format.starts_with("nv42")
+    {
+        return Some(8);
+    }
+    if pixel_format.starts_with("nv20") {
+        return Some(10);
+    }
+    for depth in [16u8, 14, 12, 10, 9] {
+        if pixel_format.contains(&depth.to_string()) {
+            return Some(depth);
+        }
+    }
+    if pixel_format.starts_with("p010") {
+        return Some(10);
+    }
+    if pixel_format.starts_with("p012") {
+        return Some(12);
+    }
+    if pixel_format.starts_with("p016") || pixel_format.contains("48") {
+        return Some(16);
+    }
+    [
+        "yuv", "yuva", "nv", "rgb", "bgr", "rgba", "bgra", "argb", "abgr", "gbrp", "gray", "ya",
+        "uyvy", "yuyv", "pal8", "monob", "monow",
+    ]
+    .iter()
+    .any(|prefix| pixel_format.starts_with(prefix))
+    .then_some(8)
+}
+
+fn stream_bit_depth(stream: &FFProbeStream) -> Option<u8> {
+    stream
+        .bits_per_raw_sample
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|depth| *depth > 0)
+        .or_else(|| stream.bits_per_sample.filter(|depth| *depth > 0))
+        .or_else(|| pixel_format_bit_depth(stream.pix_fmt.as_deref()))
+}
+
+fn decoded_video_bytes_per_pixel(pixel_format: Option<&str>, bit_depth: Option<u8>) -> Option<f64> {
+    let pixel_format = pixel_format?.trim().to_ascii_lowercase();
+    if pixel_format.is_empty() {
+        return None;
+    }
+    if pixel_format.starts_with("gbrapf32") {
+        return Some(16.0);
+    }
+    if pixel_format.starts_with("gbrpf32") {
+        return Some(12.0);
+    }
+    if pixel_format.starts_with("gbrapf16") {
+        return Some(8.0);
+    }
+    if pixel_format.starts_with("gbrpf16") {
+        return Some(6.0);
+    }
+    let storage_bytes = if bit_depth.unwrap_or(8) > 8 { 2.0 } else { 1.0 };
+    if pixel_format.starts_with("yuva420") {
+        return Some(2.5 * storage_bytes);
+    }
+    if pixel_format.starts_with("yuva422") {
+        return Some(3.0 * storage_bytes);
+    }
+    if pixel_format.starts_with("yuva444") {
+        return Some(4.0 * storage_bytes);
+    }
+    if pixel_format.starts_with("yuv420")
+        || pixel_format.starts_with("nv12")
+        || pixel_format.starts_with("nv21")
+        || pixel_format.starts_with("p010")
+        || pixel_format.starts_with("p012")
+        || pixel_format.starts_with("p016")
+    {
+        return Some(1.5 * storage_bytes);
+    }
+    if pixel_format.starts_with("yuv422")
+        || pixel_format.starts_with("nv16")
+        || pixel_format.starts_with("nv20")
+    {
+        return Some(2.0 * storage_bytes);
+    }
+    if pixel_format.starts_with("yuv444") || pixel_format.starts_with("gbrp") {
+        return Some(3.0 * storage_bytes);
+    }
+    if pixel_format.starts_with("gray") || pixel_format.starts_with("y8") {
+        return Some(storage_bytes);
+    }
+    if pixel_format.starts_with("uyvy422") || pixel_format.starts_with("yuyv422") {
+        return Some(2.0);
+    }
+    if pixel_format.starts_with("pal8") {
+        return Some(1.0);
+    }
+    if pixel_format.starts_with("rgb24") || pixel_format.starts_with("bgr24") {
+        return Some(3.0);
+    }
+    if ["rgba", "bgra", "argb", "abgr"]
+        .iter()
+        .any(|prefix| pixel_format.starts_with(prefix))
+    {
+        return Some(4.0);
+    }
+    if pixel_format.starts_with("rgb48") || pixel_format.starts_with("bgr48") {
+        return Some(6.0);
+    }
+    if pixel_format.starts_with("rgba64") || pixel_format.starts_with("bgra64") {
+        return Some(8.0);
+    }
+    None
+}
+
+fn decoded_audio_bytes_per_sample(sample_format: Option<&str>) -> Option<u8> {
+    let sample_format = sample_format?.trim().to_ascii_lowercase();
+    let packed = sample_format.strip_suffix('p').unwrap_or(&sample_format);
+    match packed {
+        "u8" | "s8" => Some(1),
+        "s16" => Some(2),
+        "s32" | "flt" => Some(4),
+        "s64" | "dbl" => Some(8),
+        _ => None,
+    }
+}
+
+fn stream_has_dolby_vision(stream: &FFProbeStream) -> bool {
+    stream
+        .codec_tag_string
+        .as_deref()
+        .is_some_and(|tag| matches!(tag.to_ascii_lowercase().as_str(), "dvh1" | "dvhe"))
+        || stream.profile.as_deref().is_some_and(|profile| {
+            let profile = profile.to_ascii_lowercase();
+            profile.contains("dolby vision") || profile.contains("dovi")
+        })
+        || stream.side_data_list.iter().any(|side_data| {
+            side_data.side_data_type.as_deref().is_some_and(|kind| {
+                let kind = kind.to_ascii_lowercase();
+                kind.contains("dolby vision") || kind.contains("dovi")
+            })
+        })
+}
+
+fn classify_dynamic_range(
+    stream: &FFProbeStream,
+    bit_depth: Option<u8>,
+    color_range: Option<&str>,
+    color_primaries: Option<&str>,
+    color_transfer: Option<&str>,
+    color_space: Option<&str>,
+) -> DynamicRange {
+    if stream_has_dolby_vision(stream) {
+        return DynamicRange::DolbyVision;
+    }
+    if color_transfer.is_some_and(|transfer| transfer.eq_ignore_ascii_case("arib-std-b67")) {
+        return DynamicRange::Hlg;
+    }
+    if color_transfer.is_some_and(|transfer| transfer.eq_ignore_ascii_case("smpte2084")) {
+        let complete_hdr10 = bit_depth.is_some_and(|depth| depth >= 10)
+            && color_range.is_some_and(|range| matches!(range, "tv" | "mpeg"))
+            && color_primaries.is_some_and(|primaries| primaries == "bt2020")
+            && color_space.is_some_and(|space| matches!(space, "bt2020nc" | "bt2020c"));
+        return if complete_hdr10 {
+            DynamicRange::Hdr10
+        } else {
+            DynamicRange::Unknown
+        };
+    }
+    if color_range.is_some()
+        && color_primaries.is_some()
+        && color_transfer.is_some()
+        && color_space.is_some()
+    {
+        DynamicRange::Sdr
+    } else {
+        DynamicRange::Unknown
+    }
+}
+
+fn oriented_display_aspect_ratio(
+    coded_width: u32,
+    coded_height: u32,
+    sample_aspect_ratio: Rational,
+    rotation_deg: u32,
+) -> Rational {
+    let unrotated = reduced_rational(
+        coded_width as u64 * sample_aspect_ratio.numerator as u64,
+        coded_height as u64 * sample_aspect_ratio.denominator as u64,
+    )
+    .unwrap_or(Rational::SQUARE);
+    if matches!(rotation_deg, 90 | 270) {
+        Rational {
+            numerator: unrotated.denominator,
+            denominator: unrotated.numerator,
+        }
+    } else {
+        unrotated
+    }
+}
+
 pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     let video_path = PathBuf::from(path);
     if !video_path.exists() {
@@ -2014,6 +3816,8 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     }
 
     let ffprobe_bin = default_ffprobe();
+    let ffmpeg_bin = default_ffmpeg();
+    let pixel_formats = cached_ffmpeg_pixel_formats(&ffmpeg_bin)?;
     let mut cmd = command_no_window(&ffprobe_bin);
     cmd.arg("-v")
         .arg("error")
@@ -2037,10 +3841,18 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_probe_output(&stdout)
+    parse_probe_output_with_pixel_formats(&stdout, Some(&pixel_formats))
 }
 
+#[cfg(test)]
 fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
+    parse_probe_output_with_pixel_formats(stdout, None)
+}
+
+fn parse_probe_output_with_pixel_formats(
+    stdout: &str,
+    pixel_formats: Option<&HashMap<String, PixelFormatDescriptor>>,
+) -> Result<VideoProbe, String> {
     let parsed: FFProbeOutput =
         serde_json::from_str(stdout).map_err(|e| format!("ffprobe returned invalid JSON: {e}"))?;
 
@@ -2056,7 +3868,7 @@ fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
         .and_then(|d| d.parse::<f64>().ok())
         .unwrap_or(0.0);
 
-    if duration_s <= 0.0 {
+    if duration_s <= 0.0 || !duration_s.is_finite() {
         duration_s = selected_video
             .duration
             .as_deref()
@@ -2064,32 +3876,120 @@ fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
             .unwrap_or(0.0);
     }
 
-    if duration_s <= 0.0 {
+    if duration_s <= 0.0 || !duration_s.is_finite() {
         return Err("Could not determine video duration (ffprobe).".to_string());
     }
 
-    let mut width = selected_video
+    let coded_width = selected_video
         .width
         .ok_or_else(|| "Could not determine video width (ffprobe).".to_string())?;
-    let mut height = selected_video
+    let coded_height = selected_video
         .height
         .ok_or_else(|| "Could not determine video height (ffprobe).".to_string())?;
+    let source_rotation = stream_rotation(selected_video);
+    let rotation_deg = source_rotation.quarter_turn_deg;
+    let mut width = coded_width;
+    let mut height = coded_height;
     // The webview preview, ffmpeg autorotation, and cropdetect all work in
     // display space, so report display-oriented dimensions.
-    if matches!(stream_rotation_deg(selected_video), 90 | 270) {
+    if matches!(rotation_deg, 90 | 270) {
         std::mem::swap(&mut width, &mut height);
     }
-    let frame_rate = parse_ffprobe_rate(selected_video.avg_frame_rate.as_deref())
-        .or_else(|| parse_ffprobe_rate(selected_video.r_frame_rate.as_deref()));
+    // Reverse/Loop buffer safety needs a conservative frame-rate ceiling.
+    // VFR media can report a low whole-file average while a retained segment
+    // reaches the much higher r_frame_rate, so use the maximum valid fact.
+    let frame_rate = [
+        parse_ffprobe_rate(selected_video.avg_frame_rate.as_deref()),
+        parse_ffprobe_rate(selected_video.r_frame_rate.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by(|left, right| left.total_cmp(right));
     let video_stream_index = selected_video
         .index
         .ok_or_else(|| "Selected video stream has no absolute index (ffprobe).".to_string())?;
     let audio_stream_index = selected_audio.and_then(|stream| stream.index);
+    let parsed_sample_aspect_ratio =
+        parse_ffprobe_rational(selected_video.sample_aspect_ratio.as_deref());
+    let declared_display_aspect_ratio =
+        parse_ffprobe_rational(selected_video.display_aspect_ratio.as_deref());
+    let derived_sample_aspect_ratio = declared_display_aspect_ratio.and_then(|display_aspect| {
+        reduced_rational(
+            display_aspect.numerator as u64 * coded_height as u64,
+            display_aspect.denominator as u64 * coded_width as u64,
+        )
+    });
+    let sample_aspect_ratio = parsed_sample_aspect_ratio
+        .or(derived_sample_aspect_ratio)
+        .unwrap_or(Rational::SQUARE);
+    let display_aspect_ratio =
+        oriented_display_aspect_ratio(coded_width, coded_height, sample_aspect_ratio, rotation_deg);
+    let pixel_format = normalized_probe_field(selected_video.pix_fmt.as_deref());
+    let pixel_descriptor = pixel_format
+        .as_deref()
+        .and_then(|name| pixel_formats.and_then(|formats| formats.get(name)));
+    let declared_bit_depth = selected_video
+        .bits_per_raw_sample
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|depth| *depth > 0)
+        .or_else(|| selected_video.bits_per_sample.filter(|depth| *depth > 0));
+    let descriptor_bit_depth = pixel_descriptor.map(|descriptor| descriptor.bit_depth);
+    let bit_depth = match (declared_bit_depth, descriptor_bit_depth) {
+        (Some(declared), Some(described)) => Some(declared.max(described)),
+        (Some(declared), None) => Some(declared),
+        (None, Some(described)) => Some(described),
+        (None, None) if pixel_formats.is_none() => stream_bit_depth(selected_video),
+        (None, None) => None,
+    };
+    let color_range = normalized_probe_field(selected_video.color_range.as_deref());
+    let color_primaries = normalized_probe_field(selected_video.color_primaries.as_deref());
+    let color_transfer = normalized_probe_field(selected_video.color_transfer.as_deref());
+    let color_space = normalized_probe_field(selected_video.color_space.as_deref());
+    let dynamic_range = classify_dynamic_range(
+        selected_video,
+        bit_depth,
+        color_range.as_deref(),
+        color_primaries.as_deref(),
+        color_transfer.as_deref(),
+        color_space.as_deref(),
+    );
+    let decoded_video_bytes_per_pixel = pixel_descriptor
+        .map(|descriptor| descriptor.decoded_bytes_per_pixel)
+        .or_else(|| {
+            pixel_formats
+                .is_none()
+                .then(|| decoded_video_bytes_per_pixel(pixel_format.as_deref(), bit_depth))
+                .flatten()
+        });
+    let audio_sample_rate = selected_audio
+        .and_then(|stream| stream.sample_rate.as_deref())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0);
+    let audio_channels = selected_audio
+        .and_then(|stream| stream.channels)
+        .filter(|value| *value > 0);
+    let audio_sample_format =
+        selected_audio.and_then(|stream| normalized_probe_field(stream.sample_fmt.as_deref()));
+    let decoded_audio_bytes_per_sample =
+        decoded_audio_bytes_per_sample(audio_sample_format.as_deref());
+    let attached_picture_count = parsed
+        .streams
+        .iter()
+        .filter(|stream| {
+            stream.codec_type.as_deref() == Some("video") && stream.disposition.attached_pic != 0
+        })
+        .count()
+        .min(u32::MAX as usize) as u32;
 
     Ok(VideoProbe {
         duration_s,
         width,
         height,
+        coded_width,
+        coded_height,
+        rotation_deg,
+        unsupported_rotation_deg: source_rotation.unsupported_deg,
         frame_rate,
         has_audio: selected_audio.is_some(),
         source_format: parsed.format.format_name,
@@ -2100,6 +4000,22 @@ fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
         audio_codec: selected_audio
             .and_then(|stream| normalized_codec_name(stream.codec_name.as_deref())),
         audio_is_default: selected_audio.is_some_and(|stream| stream.disposition.default != 0),
+        pixel_format,
+        bit_depth,
+        color_range,
+        color_primaries,
+        color_transfer,
+        color_space,
+        dynamic_range,
+        sample_aspect_ratio,
+        display_aspect_ratio,
+        attached_picture_count,
+        selected_video_dispositions: stream_dispositions(&selected_video.disposition),
+        audio_sample_rate,
+        audio_channels,
+        audio_sample_format,
+        decoded_video_bytes_per_pixel,
+        decoded_audio_bytes_per_sample,
     })
 }
 
@@ -2152,11 +4068,12 @@ fn parse_cropdetect_from_stderr(stderr: &str, probe: &VideoProbe) -> Option<Crop
             continue;
         }
 
-        // Snap to even values to match the encoder's crop rounding behavior.
+        // Encoded width/height stay even, but exact=1 preserves an odd source
+        // origin without shifting the detected content.
         let w = (crop.width / 2) * 2;
         let h = (crop.height / 2) * 2;
-        let x = (crop.x / 2) * 2;
-        let y = (crop.y / 2) * 2;
+        let x = crop.x;
+        let y = crop.y;
 
         if w == 0 || h == 0 {
             continue;
@@ -2202,24 +4119,23 @@ pub fn detect_crop(path: String) -> Result<Option<Crop>, String> {
     }
 
     let probe = probe_video(input_path.to_string_lossy().to_string())?;
+    require_supported_source_rotation(&probe)?;
     let ffmpeg_bin = default_ffmpeg();
+    let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
+    let capability_contract = ffmpeg_capability_contract()?;
+    require_ffmpeg_capability_subset(
+        "crop detection",
+        std::iter::empty::<&str>(),
+        ["cropdetect"],
+        &capability_contract,
+        &runtime_capabilities,
+    )?;
 
     let mut cmd = command_no_window(&ffmpeg_bin);
-    cmd.arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("info")
-        .arg("-nostdin")
-        .arg("-i")
-        .arg(input_path.as_os_str())
-        .arg("-an")
-        .arg("-sn")
-        .arg("-vf")
-        .arg("cropdetect=24:2:0")
-        .arg("-frames:v")
-        .arg("200")
-        .arg("-f")
-        .arg("null")
-        .arg(null_sink());
+    cmd.args(crop_detect_command_args(
+        &input_path,
+        probe.video_stream_index,
+    ));
     let output = run_command_output_with_timeout(
         cmd,
         "ffmpeg",
@@ -2239,6 +4155,30 @@ pub fn detect_crop(path: String) -> Result<Option<Crop>, String> {
     }
 
     Ok(parse_cropdetect_from_stderr(&stderr, &probe))
+}
+
+fn crop_detect_command_args(input_path: &Path, video_stream_index: u32) -> Vec<OsString> {
+    [
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("info"),
+        OsString::from("-nostdin"),
+        OsString::from("-i"),
+        input_path.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from(format!("0:{video_stream_index}")),
+        OsString::from("-an"),
+        OsString::from("-sn"),
+        OsString::from("-vf"),
+        OsString::from("cropdetect=24:2:0"),
+        OsString::from("-frames:v"),
+        OsString::from("200"),
+        OsString::from("-f"),
+        OsString::from("null"),
+        OsString::from(null_sink()),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn estimate_output_duration_s(
@@ -2396,7 +4336,22 @@ fn custom_scale_filter(width_px: u32, height_px: u32) -> String {
     )
 }
 
+#[cfg(test)]
 fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option<String>, String> {
+    let selected_encoder = match req.format {
+        OutputFormat::Mp4 => Some(VideoCodec::LibX264),
+        OutputFormat::Webm => Some(VideoCodec::LibVpxVp9),
+        OutputFormat::Mp3 => None,
+    };
+    let media_policy = resolve_media_policy(req, probe, selected_encoder)?;
+    build_video_filters_with_policy(req, probe, media_policy)
+}
+
+fn build_video_filters_with_policy(
+    req: &EncodeRequest,
+    probe: &VideoProbe,
+    media_policy: MediaPolicyPlan,
+) -> Result<Option<String>, String> {
     let mut filters: Vec<String> = Vec::new();
 
     if let Some(t) = &req.trim {
@@ -2410,21 +4365,15 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
     }
 
     if let Some(c) = &req.crop {
-        if c.width == 0 || c.height == 0 {
-            return Err("Crop width/height must be > 0.".to_string());
-        }
-        if c.x.saturating_add(c.width) > probe.width || c.y.saturating_add(c.height) > probe.height
-        {
-            return Err("Crop area is outside the video bounds.".to_string());
-        }
+        validate_crop(c, probe)?;
 
         // Help H.264/YUV420 compatibility by snapping to even dimensions.
         let w = (c.width / 2) * 2;
         let h = (c.height / 2) * 2;
-        let x = (c.x / 2) * 2;
-        let y = (c.y / 2) * 2;
+        let x = c.x;
+        let y = c.y;
 
-        filters.push(format!("crop=w={w}:h={h}:x={x}:y={y}"));
+        filters.push(format!("crop=w={w}:h={h}:x={x}:y={y}:exact=1"));
     }
 
     match req.rotate_deg {
@@ -2440,22 +4389,41 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
     }
 
     let resize_plan = requested_resize(req)?;
-    match resize_plan {
-        ResizePlan::Source => {}
-        ResizePlan::MaxEdge(max_edge_px) => filters.push(max_edge_scale_filter(max_edge_px)),
-        ResizePlan::Custom {
-            width_px,
-            height_px,
-        } => filters.push(custom_scale_filter(width_px, height_px)),
+    match media_policy.sar_action {
+        SarAction::Normalize { width, height } => {
+            filters.push(custom_scale_filter(width, height));
+            filters.push("setsar=1".to_string());
+        }
+        SarAction::Unchanged | SarAction::NotApplicable => match resize_plan {
+            ResizePlan::Source => {}
+            ResizePlan::MaxEdge(max_edge_px) => filters.push(max_edge_scale_filter(max_edge_px)),
+            ResizePlan::Custom {
+                width_px,
+                height_px,
+            } => filters.push(custom_scale_filter(width_px, height_px)),
+        },
     }
 
     // Crop and the scale filters already guarantee even output; an untouched
     // odd-dimension source would otherwise fail yuv420p encoders.
     if req.crop.is_none()
         && resize_plan == ResizePlan::Source
+        && !media_policy.sar_action.normalizes()
         && (probe.width % 2 == 1 || probe.height % 2 == 1)
     {
         filters.push("crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2".to_string());
+    }
+
+    match media_policy.color_action {
+        MediaColorAction::Hdr10ToStandardSdr => filters.push(
+            "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap=mobius:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
+                .to_string(),
+        ),
+        MediaColorAction::HighBitDepthSdrToStandardSdr => filters.push(
+            "zscale=p=bt709:t=bt709:m=bt709:r=tv:dither=error_diffusion,format=yuv420p"
+                .to_string(),
+        ),
+        MediaColorAction::Unchanged | MediaColorAction::NotApplicable => {}
     }
 
     if let Some(c) = &req.color {
@@ -2580,6 +4548,7 @@ fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
     }
 
     if req.reverse {
+        filters.push(format!("asetnsamples=n={REVERSE_AUDIO_FRAME_SAMPLES}:p=0"));
         filters.push("areverse".to_string());
     }
 
@@ -2605,7 +4574,7 @@ fn apply_boomerang_audio(chain: Option<String>, req: &EncodeRequest) -> Option<S
     }
     let prefix = chain.map(|c| format!("{c},")).unwrap_or_default();
     Some(format!(
-        "{prefix}asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
+        "{prefix}asetnsamples=n={REVERSE_AUDIO_FRAME_SAMPLES}:p=0,asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
     ))
 }
 
@@ -2676,6 +4645,7 @@ fn run_ffmpeg_with_progress(
     pass: u8,
     total_passes: u8,
     duration_us: u64,
+    limits: FfmpegRunLimits,
     cancel: &AtomicBool,
     child_slot: &Arc<Mutex<Option<Child>>>,
 ) -> Result<(), String> {
@@ -2731,22 +4701,56 @@ fn run_ffmpeg_with_progress(
     });
 
     let process_done = Arc::new(AtomicBool::new(false));
-    let idle_timed_out = Arc::new(AtomicBool::new(false));
+    let watchdog_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let saw_progress_output = Arc::new(AtomicBool::new(false));
     let last_output_at = Arc::new(Mutex::new(Instant::now()));
+    let process_started_at = Instant::now();
     let watchdog_child_slot = child_slot.clone();
     let watchdog_done = process_done.clone();
-    let watchdog_timed_out = idle_timed_out.clone();
+    let watchdog_error_thread = watchdog_error.clone();
+    let watchdog_saw_progress = saw_progress_output.clone();
     let watchdog_last_output = last_output_at.clone();
     let watchdog_thread = std::thread::spawn(move || {
         while !watchdog_done.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(500));
-            let idle_for = watchdog_last_output
-                .lock()
-                .ok()
-                .map(|last_output| last_output.elapsed())
-                .unwrap_or_default();
-            if idle_for >= ENCODE_IDLE_TIMEOUT {
-                watchdog_timed_out.store(true, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+            let output_size_error = limits.output_size_limit.as_ref().and_then(
+                |(output_path, max_bytes)| {
+                    fs::metadata(output_path)
+                        .ok()
+                        .filter(|metadata| metadata.len() > *max_bytes)
+                        .map(|metadata| {
+                            format!(
+                                "Compatible stream-copy output exceeded the bounded {} byte temporary-file limit ({} bytes written).",
+                                max_bytes,
+                                metadata.len()
+                            )
+                        })
+                },
+            );
+            let timeout_error = if watchdog_saw_progress.load(Ordering::Relaxed) {
+                let idle_for = watchdog_last_output
+                    .lock()
+                    .ok()
+                    .map(|last_output| last_output.elapsed())
+                    .unwrap_or_default();
+                (idle_for >= limits.idle_timeout).then(|| {
+                    format!(
+                        "ffmpeg made no progress for {} seconds and was stopped.",
+                        limits.idle_timeout.as_secs()
+                    )
+                })
+            } else {
+                (process_started_at.elapsed() >= limits.initial_progress_timeout).then(|| {
+                    format!(
+                        "ffmpeg produced no initial progress for {} seconds and was stopped.",
+                        limits.initial_progress_timeout.as_secs()
+                    )
+                })
+            };
+            if let Some(error) = output_size_error.or(timeout_error) {
+                if let Ok(mut slot) = watchdog_error_thread.lock() {
+                    *slot = Some(error);
+                }
                 if let Ok(mut guard) = watchdog_child_slot.lock()
                     && let Some(child) = guard.as_mut()
                 {
@@ -2786,6 +4790,7 @@ fn run_ffmpeg_with_progress(
         if let Ok(mut last_output) = last_output_at.lock() {
             *last_output = Instant::now();
         }
+        saw_progress_output.store(true, Ordering::Relaxed);
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -2834,11 +4839,8 @@ fn run_ffmpeg_with_progress(
         return Err("Canceled.".to_string());
     }
 
-    if idle_timed_out.load(Ordering::Relaxed) {
-        return Err(format!(
-            "ffmpeg made no progress for {} seconds and was stopped.",
-            ENCODE_IDLE_TIMEOUT.as_secs()
-        ));
+    if let Some(error) = watchdog_error.lock().ok().and_then(|slot| slot.clone()) {
+        return Err(error);
     }
 
     if let Some(error) = read_error {
@@ -2930,6 +4932,7 @@ fn build_size_limited_encode_contract(
     include_audio: bool,
 ) -> Result<SizeLimitedEncodeContract, String> {
     let (planned_width, planned_height) = estimated_output_dimensions(request, probe)?;
+    validate_codec_output_dimensions(selected_video_codec, planned_width, planned_height)?;
     let planned_frame_rate = output_frame_rate_for_planning(request, probe)?;
     let min_video_kbps = minimum_video_bitrate_kbps(
         selected_video_codec,
@@ -3021,20 +5024,22 @@ pub fn run_encode_job(
 
     let ffmpeg_bin = default_ffmpeg();
     let probe = probe_video(input_path.to_string_lossy().to_string())?;
-    let encoder_names = cached_encoder_names(&ffmpeg_bin)?;
-    let codec_selection = select_codec_plan(request.format, &encoder_names, &request.advanced)?;
-    let source_size_bytes = fs::metadata(&input_path)
-        .map_err(|error| format!("Failed to stat input file: {error}"))?
-        .len();
+    let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
+    let capability_contract = ffmpeg_capability_contract()?;
+    let codec_selection = select_codec_plan(
+        request.format,
+        &runtime_capabilities.encoder_names,
+        &request.advanced,
+    )?;
     let resolved_perturb_seed = request
         .perturb_first_frame
         .then(|| request.perturb_seed.unwrap_or_else(random_perturb_seed));
-    let command_plan = build_encode_command_plan(
-        &request,
-        &probe,
-        codec_selection,
-        source_size_bytes,
-        resolved_perturb_seed,
+    let mut command_plan =
+        build_encode_command_plan(&request, &probe, codec_selection, resolved_perturb_seed)?;
+    require_initial_encode_plan_capabilities(
+        &command_plan,
+        &capability_contract,
+        &runtime_capabilities,
     )?;
 
     let output_duration_s = estimate_output_duration_s(
@@ -3100,6 +5105,7 @@ pub fn run_encode_job(
             1,
             1,
             duration_us,
+            ffmpeg_run_limits(request.reverse),
             cancel.as_ref(),
             child_slot,
         )?;
@@ -3136,15 +5142,31 @@ pub fn run_encode_job(
                 attempts: 1,
                 audio_removed_for_size_target: false,
                 copy_fallback_reason: None,
+                color_action: command_plan
+                    .media_policy
+                    .color_action
+                    .diagnostic()
+                    .to_string(),
+                sar_action: command_plan
+                    .media_policy
+                    .sar_action
+                    .diagnostic(probe.sample_aspect_ratio),
+                reverse_buffer_estimate_bytes: command_plan
+                    .reverse_buffer_estimate
+                    .map(|estimate| estimate.bytes),
+                reverse_buffer_action: command_plan
+                    .reverse_buffer_estimate
+                    .map(|estimate| estimate.action.diagnostic().to_string()),
                 command_preview,
             }),
         });
     }
 
     let mut size_copy_fallback_reason: Option<String> = None;
-    if let Some(candidate) = command_plan.size_copy_candidate.as_ref() {
+    for (candidate_index, candidate) in command_plan.size_copy_candidates.iter().enumerate() {
         let mut args = build_copy_candidate_args(&input_str, &request, candidate);
-        let temp_path = create_temp_output(&output_path, job_id, "size-copy")?;
+        let label = format!("size-copy-{}", candidate_index + 1);
+        let temp_path = create_temp_output(&output_path, job_id, &label)?;
         args.push(temp_path.to_string_lossy().to_string());
         let temp_str = temp_path.to_string_lossy().to_string();
         let command_preview =
@@ -3159,6 +5181,7 @@ pub fn run_encode_job(
             1,
             1,
             duration_us,
+            size_copy_run_limits(target_bytes, temp_path.as_ref()),
             cancel.as_ref(),
             child_slot,
         ) {
@@ -3170,6 +5193,9 @@ pub fn run_encode_job(
                     if cancel.load(Ordering::Relaxed) {
                         return Err("Canceled.".to_string());
                     }
+                    let audio_removed_for_size_target = request.audio_enabled
+                        && probe.has_audio
+                        && candidate.audio_action == StreamAction::Drop;
                     publish_output_file(temp_path, &output_path)?;
                     return Ok(EncodeFinishedPayload {
                         attempt_id,
@@ -3177,7 +5203,8 @@ pub fn run_encode_job(
                         ok: true,
                         output_path: Some(output_path.to_string_lossy().to_string()),
                         output_size_bytes: Some(out_size),
-                        message: None,
+                        message: audio_removed_for_size_target
+                            .then(|| "Audio was removed to fit the size target.".to_string()),
                         diagnostics: Some(ExportDiagnostics {
                             mode: EncodeMode::Remux.label().to_string(),
                             video_action: Some(StreamAction::Copy),
@@ -3194,24 +5221,62 @@ pub fn run_encode_job(
                             requested_size_bytes: Some(target_bytes),
                             actual_size_bytes: Some(out_size),
                             passes: 1,
-                            attempts: 1,
-                            audio_removed_for_size_target: false,
-                            copy_fallback_reason: None,
+                            attempts: (candidate_index + 1) as u32,
+                            audio_removed_for_size_target,
+                            copy_fallback_reason: size_copy_fallback_reason.clone(),
+                            color_action: command_plan
+                                .media_policy
+                                .color_action
+                                .diagnostic()
+                                .to_string(),
+                            sar_action: command_plan
+                                .media_policy
+                                .sar_action
+                                .diagnostic(probe.sample_aspect_ratio),
+                            reverse_buffer_estimate_bytes: command_plan
+                                .reverse_buffer_estimate
+                                .map(|estimate| estimate.bytes),
+                            reverse_buffer_action: command_plan
+                                .reverse_buffer_estimate
+                                .map(|estimate| estimate.action.diagnostic().to_string()),
                             command_preview,
                         }),
                     });
                 }
-                size_copy_fallback_reason =
-                    Some("Compatible copy exceeded the size target.".to_string());
+                let detail = if candidate.audio_action == StreamAction::Copy {
+                    "Compatible A/V copy exceeded the size target."
+                } else {
+                    "Compatible video-only copy exceeded the size target."
+                };
+                size_copy_fallback_reason = Some(match size_copy_fallback_reason {
+                    Some(previous) => format!("{previous} {detail}"),
+                    None => detail.to_string(),
+                });
             }
             Err(error) => {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(error);
                 }
-                size_copy_fallback_reason =
-                    Some("Compatible copy was rejected by FFmpeg.".to_string());
+                let detail = if candidate.audio_action == StreamAction::Copy {
+                    "Compatible A/V copy was rejected by FFmpeg."
+                } else {
+                    "Compatible video-only copy was rejected by FFmpeg."
+                };
+                size_copy_fallback_reason = Some(match size_copy_fallback_reason {
+                    Some(previous) => format!("{previous} {detail}"),
+                    None => detail.to_string(),
+                });
             }
         }
+    }
+
+    if size_limit_enabled && command_plan.size_contract.is_none() {
+        command_plan = build_size_reencode_fallback_plan(&request, &probe, &command_plan)?;
+        require_encode_plan_capabilities(
+            &command_plan,
+            &capability_contract,
+            &runtime_capabilities,
+        )?;
     }
 
     if !size_limit_enabled {
@@ -3245,6 +5310,7 @@ pub fn run_encode_job(
                 1,
                 1,
                 duration_us,
+                ffmpeg_run_limits(request.reverse),
                 cancel.as_ref(),
                 child_slot,
             ) {
@@ -3290,6 +5356,21 @@ pub fn run_encode_job(
                             attempts: execution_attempts,
                             audio_removed_for_size_target: false,
                             copy_fallback_reason,
+                            color_action: executed_plan
+                                .media_policy
+                                .color_action
+                                .diagnostic()
+                                .to_string(),
+                            sar_action: executed_plan
+                                .media_policy
+                                .sar_action
+                                .diagnostic(probe.sample_aspect_ratio),
+                            reverse_buffer_estimate_bytes: executed_plan
+                                .reverse_buffer_estimate
+                                .map(|estimate| estimate.bytes),
+                            reverse_buffer_action: executed_plan
+                                .reverse_buffer_estimate
+                                .map(|estimate| estimate.action.diagnostic().to_string()),
                             command_preview,
                         }),
                     });
@@ -3303,7 +5384,24 @@ pub fn run_encode_job(
                     if !contains_copy || execution_attempts >= 2 {
                         return Err(error);
                     }
-                    executed_plan = full_reencode_fallback(&executed_plan);
+                    let Ok(fallback_plan) = full_reencode_fallback(&executed_plan) else {
+                        // Preserve the real stream-copy failure when this
+                        // partial FFmpeg build has no valid encode fallback.
+                        return Err(error);
+                    };
+                    if fallback_plan.video_action == StreamAction::Encode {
+                        let codec = fallback_plan.video_encoder.ok_or_else(|| {
+                            "Missing video encoder for stream-copy fallback.".to_string()
+                        })?;
+                        let (width, height) = estimated_output_dimensions(&request, &probe)?;
+                        validate_codec_output_dimensions(codec, width, height)?;
+                    }
+                    require_encode_plan_capabilities(
+                        &fallback_plan,
+                        &capability_contract,
+                        &runtime_capabilities,
+                    )?;
+                    executed_plan = fallback_plan;
                     copy_fallback_reason =
                         Some("Stream-copy execution was rejected by FFmpeg.".to_string());
                 }
@@ -3373,6 +5471,9 @@ pub fn run_encode_job(
             pass1.push("-vf".to_string());
             pass1.push(vf.clone());
         }
+        if request.format == OutputFormat::Mp4 {
+            push_encoded_video_format_args(&mut pass1, command_plan.media_policy);
+        }
 
         pass1.push("-f".to_string());
         pass1.push("null".to_string());
@@ -3387,6 +5488,7 @@ pub fn run_encode_job(
             1,
             2,
             duration_us,
+            ffmpeg_run_limits(request.reverse),
             cancel.as_ref(),
             child_slot,
         ) {
@@ -3461,13 +5563,12 @@ pub fn run_encode_job(
 
         push_metadata_args(&mut pass2, &request);
 
-        if matches!(request.format, OutputFormat::Mp4) {
-            pass2.extend(
-                ["-movflags", "+faststart", "-pix_fmt", "yuv420p"]
-                    .into_iter()
-                    .map(|s| s.to_string()),
-            );
-        }
+        push_video_output_policy_args(
+            &mut pass2,
+            request.format,
+            StreamAction::Encode,
+            command_plan.media_policy,
+        );
 
         let temp_output = create_temp_output(&output_path, job_id, &format!("pass2-{attempt}"))?;
         pass2.push(temp_output.to_string_lossy().to_string());
@@ -3490,6 +5591,7 @@ pub fn run_encode_job(
             2,
             2,
             duration_us,
+            ffmpeg_run_limits(request.reverse),
             cancel.as_ref(),
             child_slot,
         ) {
@@ -3550,6 +5652,21 @@ pub fn run_encode_job(
                     attempts: attempt,
                     audio_removed_for_size_target,
                     copy_fallback_reason: size_copy_fallback_reason.clone(),
+                    color_action: command_plan
+                        .media_policy
+                        .color_action
+                        .diagnostic()
+                        .to_string(),
+                    sar_action: command_plan
+                        .media_policy
+                        .sar_action
+                        .diagnostic(probe.sample_aspect_ratio),
+                    reverse_buffer_estimate_bytes: command_plan
+                        .reverse_buffer_estimate
+                        .map(|estimate| estimate.bytes),
+                    reverse_buffer_action: command_plan
+                        .reverse_buffer_estimate
+                        .map(|estimate| estimate.action.diagnostic().to_string()),
                     command_preview,
                 }),
             });
@@ -3599,6 +5716,21 @@ pub fn run_encode_job(
                     attempts: attempt,
                     audio_removed_for_size_target,
                     copy_fallback_reason: size_copy_fallback_reason.clone(),
+                    color_action: command_plan
+                        .media_policy
+                        .color_action
+                        .diagnostic()
+                        .to_string(),
+                    sar_action: command_plan
+                        .media_policy
+                        .sar_action
+                        .diagnostic(probe.sample_aspect_ratio),
+                    reverse_buffer_estimate_bytes: command_plan
+                        .reverse_buffer_estimate
+                        .map(|estimate| estimate.bytes),
+                    reverse_buffer_action: command_plan
+                        .reverse_buffer_estimate
+                        .map(|estimate| estimate.action.diagnostic().to_string()),
                     command_preview,
                 }),
             });
@@ -3622,6 +5754,7 @@ mod tests {
             audio_enabled: true,
             normalize_audio: false,
             strip_metadata: false,
+            color_policy: ColorPolicy::Auto,
             advanced: AdvancedEncodeSettings::default(),
             trim: None,
             crop: None,
@@ -3642,6 +5775,10 @@ mod tests {
             duration_s: 10.0,
             width: 1920,
             height: 1080,
+            coded_width: 1920,
+            coded_height: 1080,
+            rotation_deg: 0,
+            unsupported_rotation_deg: None,
             frame_rate: Some(30.0),
             has_audio: true,
             source_format: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
@@ -3651,13 +5788,35 @@ mod tests {
             audio_stream_index: Some(1),
             audio_codec: Some("aac".to_string()),
             audio_is_default: true,
+            pixel_format: Some("yuv420p".to_string()),
+            bit_depth: Some(8),
+            color_range: Some("tv".to_string()),
+            color_primaries: Some("bt709".to_string()),
+            color_transfer: Some("bt709".to_string()),
+            color_space: Some("bt709".to_string()),
+            dynamic_range: DynamicRange::Sdr,
+            sample_aspect_ratio: Rational::SQUARE,
+            display_aspect_ratio: Rational {
+                numerator: 16,
+                denominator: 9,
+            },
+            attached_picture_count: 0,
+            selected_video_dispositions: StreamDispositions {
+                default: true,
+                ..StreamDispositions::default()
+            },
+            audio_sample_rate: Some(48_000),
+            audio_channels: Some(2),
+            audio_sample_format: Some("fltp".to_string()),
+            decoded_video_bytes_per_pixel: Some(1.5),
+            decoded_audio_bytes_per_sample: Some(4),
         }
     }
 
     fn test_command_plan(
         request: &EncodeRequest,
         probe: &VideoProbe,
-        source_size_bytes: u64,
+        _source_size_bytes: u64,
     ) -> EncodeCommandPlan {
         let encoders = HashSet::from([
             "libx264".to_string(),
@@ -3674,7 +5833,6 @@ mod tests {
             request,
             probe,
             codecs,
-            source_size_bytes,
             request.perturb_first_frame.then_some(123),
         )
         .unwrap()
@@ -3966,6 +6124,22 @@ Encoders:
     }
 
     #[test]
+    fn codec_output_dimension_limits_match_the_pinned_encoders() {
+        for (codec, limit) in [
+            (VideoCodec::LibX264, 16_384),
+            (VideoCodec::Mpeg4, 8_190),
+            (VideoCodec::LibVpx, 16_382),
+            (VideoCodec::LibVpxVp9, 32_768),
+        ] {
+            validate_codec_output_dimensions(codec, limit, 2).unwrap();
+            validate_codec_output_dimensions(codec, 2, limit).unwrap();
+            let error = validate_codec_output_dimensions(codec, limit + 2, 2).unwrap_err();
+            assert!(error.contains(codec.as_ffmpeg_name()));
+            assert!(error.contains(&limit.to_string()));
+        }
+    }
+
+    #[test]
     fn select_codec_plan_honors_explicit_available_codec() {
         let encoder_names = HashSet::from([
             "libx264".to_string(),
@@ -4093,11 +6267,11 @@ Encoders:
         req.advanced.video_quality = Some(VideoQualityPreference::Higher);
 
         let plan = test_command_plan(&req, &probe, 1_000_000);
-        assert!(plan.size_copy_candidate.is_some());
+        assert!(!plan.size_copy_candidates.is_empty());
 
         req.advanced.encode_speed = Some(EncodeSpeedPreference::Smaller);
         let plan = test_command_plan(&req, &probe, 1_000_000);
-        assert!(plan.size_copy_candidate.is_none());
+        assert!(plan.size_copy_candidates.is_empty());
     }
 
     #[test]
@@ -4212,17 +6386,105 @@ Encoders:
     #[test]
     fn size_copy_candidate_requires_all_retained_streams_to_be_compatible() {
         let req = base_request();
-        let compatible = test_command_plan(&req, &probe_10s_1920x1080_audio(), 1_000_000);
-        assert!(compatible.size_copy_candidate.is_some());
+        let selected_streams_with_large_unmapped_payload = VideoProbe {
+            attached_picture_count: 1,
+            ..probe_10s_1920x1080_audio()
+        };
+        // Whole-container size can be dominated by an attached picture or
+        // extra unmapped streams. Always measure the selected-stream remux.
+        let compatible = test_command_plan(
+            &req,
+            &selected_streams_with_large_unmapped_payload,
+            100_000_000,
+        );
+        assert!(!compatible.size_copy_candidates.is_empty());
 
         let incompatible_audio = VideoProbe {
             audio_codec: Some("opus".to_string()),
             ..probe_10s_1920x1080_audio()
         };
         let plan = test_command_plan(&req, &incompatible_audio, 1_000_000);
-        assert!(plan.size_copy_candidate.is_none());
+        assert!(plan.size_copy_candidates.is_empty());
         assert_eq!(plan.video_action, StreamAction::Encode);
         assert_eq!(plan.audio_action, StreamAction::Encode);
+    }
+
+    #[test]
+    fn tight_size_target_drops_incompatible_audio_before_bounded_video_copy() {
+        let mut request = base_request();
+        request.size_limit_mb = 0.1;
+        let compatible_plan = test_command_plan(&request, &probe_10s_1920x1080_audio(), 12_494);
+        assert_eq!(
+            compatible_plan
+                .size_copy_candidates
+                .iter()
+                .map(|candidate| candidate.audio_action)
+                .collect::<Vec<_>>(),
+            [StreamAction::Copy, StreamAction::Drop]
+        );
+
+        let probe = VideoProbe {
+            audio_codec: Some("mp3".to_string()),
+            ..probe_10s_1920x1080_audio()
+        };
+
+        let bundled_plan = test_command_plan(&request, &probe, 100_000);
+        let candidate = bundled_plan.size_copy_candidates.first().unwrap();
+        assert_eq!(bundled_plan.video_action, StreamAction::Copy);
+        assert_eq!(candidate.audio_action, StreamAction::Drop);
+        assert!(bundled_plan.size_contract.is_none());
+        let fallback = build_size_reencode_fallback_plan(&request, &probe, &bundled_plan).unwrap();
+        assert_eq!(fallback.video_action, StreamAction::Encode);
+        assert_eq!(fallback.audio_action, StreamAction::Drop);
+        assert!(
+            fallback
+                .size_contract
+                .as_ref()
+                .is_some_and(|contract| contract.audio_removed_for_size_target)
+        );
+
+        let no_encoders =
+            select_codec_plan(request.format, &HashSet::new(), &request.advanced).unwrap();
+        let copy_only = build_encode_command_plan(&request, &probe, no_encoders, None).unwrap();
+        assert_eq!(copy_only.video_action, StreamAction::Copy);
+        assert_eq!(copy_only.audio_action, StreamAction::Drop);
+        assert!(!copy_only.size_copy_candidates.is_empty());
+        assert!(
+            build_size_reencode_fallback_plan(&request, &probe, &copy_only)
+                .unwrap_err()
+                .contains("no compatible video encoder fallback")
+        );
+    }
+
+    #[test]
+    fn oversized_compatible_source_defers_fallback_bounds_until_copy_misses() {
+        let mut request = base_request();
+        request.format = OutputFormat::Webm;
+        request.size_limit_mb = 0.1;
+        request.audio_enabled = false;
+        let probe = VideoProbe {
+            width: 40_000,
+            height: 2,
+            coded_width: 40_000,
+            coded_height: 2,
+            source_format: Some("matroska,webm".to_string()),
+            video_codec: Some("vp9".to_string()),
+            has_audio: false,
+            audio_stream_index: None,
+            audio_codec: None,
+            ..probe_10s_1920x1080_audio()
+        };
+
+        let initial = test_command_plan(&request, &probe, 1_489);
+        assert_eq!(initial.video_action, StreamAction::Copy);
+        assert_eq!(initial.audio_action, StreamAction::Drop);
+        assert!(!initial.size_copy_candidates.is_empty());
+        assert!(initial.size_contract.is_none());
+        assert!(
+            build_size_reencode_fallback_plan(&request, &probe, &initial)
+                .unwrap_err()
+                .contains("32768")
+        );
     }
 
     #[test]
@@ -4283,6 +6545,38 @@ Encoders:
         assert_eq!(parse_ffprobe_rate(Some("60")).unwrap(), 60.0);
         assert_eq!(parse_ffprobe_rate(Some("0/0")), None);
         assert_eq!(parse_ffprobe_rate(Some("")), None);
+    }
+
+    #[test]
+    fn probe_uses_conservative_vfr_rate_for_reverse_buffer_planning() {
+        let json = r#"{
+            "format":{"duration":"11"},
+            "streams":[{
+                "index":0,"codec_type":"video","width":3840,"height":2160,
+                "pix_fmt":"yuv420p10le","avg_frame_rate":"130/11","r_frame_rate":"120/1"
+            }]
+        }"#;
+        let probe = parse_probe_output(json).unwrap();
+        assert_eq!(probe.frame_rate, Some(120.0));
+
+        let mut request = base_request();
+        request.reverse = true;
+        request.audio_enabled = false;
+        request.trim = Some(Trim {
+            start_s: 10.0,
+            end_s: Some(11.0),
+        });
+        let error = reverse_buffer_estimate(
+            &request,
+            &probe,
+            MediaPolicyPlan {
+                color_action: MediaColorAction::Unchanged,
+                sar_action: SarAction::Unchanged,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("2 GiB safety limit"));
     }
 
     #[test]
@@ -4350,9 +6644,16 @@ Encoders:
         let af = build_audio_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             af,
-            "asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
+            "asetnsamples=n=1024:p=0,asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
+        );
+        req.reverse = true;
+        let reverse_and_loop = build_audio_filters(&req, &probe).unwrap().unwrap();
+        assert_eq!(
+            reverse_and_loop.matches("asetnsamples=n=1024:p=0").count(),
+            2
         );
         // Loop is a no-op for audio-only mp3 (no video to loop).
+        req.reverse = false;
         req.format = OutputFormat::Mp3;
         assert_eq!(build_audio_filters(&req, &probe).unwrap(), None);
     }
@@ -4408,7 +6709,28 @@ Encoders:
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "trim=start=1:end=5,setpts=PTS-STARTPTS,crop=w=100:h=98:x=0:y=2,transpose=1,reverse,setpts=PTS/2.000000000"
+            "trim=start=1:end=5,setpts=PTS-STARTPTS,crop=w=100:h=98:x=1:y=3:exact=1,transpose=1,reverse,setpts=PTS/2.000000000"
+        );
+    }
+
+    #[test]
+    fn crop_preserves_odd_origin_with_exact_chroma_positioning() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+        req.crop = Some(Crop {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        });
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.width = 3;
+        probe.height = 3;
+        probe.coded_width = 3;
+        probe.coded_height = 3;
+        assert_eq!(
+            build_video_filters(&req, &probe).unwrap().as_deref(),
+            Some("crop=w=2:h=2:x=1:y=1:exact=1")
         );
     }
 
@@ -4594,7 +6916,7 @@ Encoders:
         let filters = build_audio_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "atrim=start=1:end=5,asetpts=PTS-STARTPTS,areverse,atempo=2.0,atempo=2.000000"
+            "atrim=start=1:end=5,asetpts=PTS-STARTPTS,asetnsamples=n=1024:p=0,areverse,atempo=2.0,atempo=2.000000"
         );
     }
 
@@ -4703,7 +7025,8 @@ Encoders:
                     "height": 1080,
                     "avg_frame_rate": "30/1",
                     "side_data_list": [
-                        {"side_data_type": "Display Matrix", "rotation": -90}
+                        {"side_data_type": "Display Matrix", "rotation": -90,
+                         "displaymatrix": "\n00000000:           0      -65536           0\n00000001:       65536           0           0\n00000002:           0           0  1073741824"}
                     ]
                 },
                 {"index": 5, "codec_name": "aac", "codec_type": "audio"}
@@ -4717,6 +7040,70 @@ Encoders:
         assert_eq!(probe.video_codec.as_deref(), Some("h264"));
         assert_eq!(probe.audio_codec.as_deref(), Some("aac"));
         assert!((probe.duration_s - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn display_matrix_is_authoritative_and_rejects_rounded_arbitrary_rotation() {
+        let exact_quarter_turn = r#"{
+            "format":{"duration":"1"},
+            "streams":[{
+                "index":0,"codec_type":"video","width":320,"height":180,
+                "pix_fmt":"yuv420p","avg_frame_rate":"24/1",
+                "side_data_list":[{
+                    "side_data_type":"Display Matrix","rotation":-90,
+                    "displaymatrix":"\n00000000:           0      -65536           0\n00000001:       65536           0           0\n00000002:           0           0  1073741824"
+                }]
+            }]
+        }"#;
+        let exact = parse_probe_output(exact_quarter_turn).unwrap();
+        assert_eq!(exact.rotation_deg, 90);
+        assert_eq!(exact.unsupported_rotation_deg, None);
+        assert_eq!((exact.width, exact.height), (180, 320));
+
+        let matrix_without_rotation = exact_quarter_turn.replace(",\"rotation\":-90", "");
+        let matrix_only = parse_probe_output(&matrix_without_rotation).unwrap();
+        assert_eq!(matrix_only.rotation_deg, 90);
+
+        let disagreeing_rotation =
+            exact_quarter_turn.replace("\"rotation\":-90", "\"rotation\":180");
+        let matrix_wins = parse_probe_output(&disagreeing_rotation).unwrap();
+        assert_eq!(matrix_wins.rotation_deg, 90);
+
+        let missing_matrix_text = r#"{
+            "format":{"duration":"1"},
+            "streams":[{
+                "index":0,"codec_type":"video","width":320,"height":180,
+                "pix_fmt":"yuv420p","avg_frame_rate":"24/1",
+                "side_data_list":[{"side_data_type":"Display Matrix","rotation":90}]
+            }]
+        }"#;
+        let missing_matrix = parse_probe_output(missing_matrix_text).unwrap();
+        assert_eq!(missing_matrix.rotation_deg, 0);
+        assert_eq!(missing_matrix.unsupported_rotation_deg, Some(90.0));
+
+        let rounded_91 = r#"{
+            "format":{"duration":"1"},
+            "streams":[{
+                "index":0,"codec_type":"video","width":320,"height":180,
+                "pix_fmt":"yuv420p","avg_frame_rate":"24/1",
+                "side_data_list":[{
+                    "side_data_type":"Display Matrix","rotation":90,
+                    "displaymatrix":"\n00000000:       -1143      -65526           0\n00000001:       65526       -1143           0\n00000002:           0           0  1073741824"
+                }]
+            }]
+        }"#;
+        let arbitrary = parse_probe_output(rounded_91).unwrap();
+        assert_eq!(arbitrary.rotation_deg, 0);
+        assert_eq!((arbitrary.width, arbitrary.height), (320, 180));
+        assert!((arbitrary.unsupported_rotation_deg.unwrap() - 91.0).abs() < 0.01);
+        assert!(
+            resolve_media_policy(&base_request(), &arbitrary, Some(VideoCodec::LibX264))
+                .unwrap_err()
+                .contains("supports only exact")
+        );
+        let mut mp3 = base_request();
+        mp3.format = OutputFormat::Mp3;
+        assert!(resolve_media_policy(&mp3, &arbitrary, None).is_ok());
     }
 
     #[test]
@@ -4737,7 +7124,8 @@ Encoders:
                 {"index": 0, "codec_name": "h264", "codec_type": "video", "width": 640, "height": 480,
                  "avg_frame_rate": "30/1",
                  "side_data_list": [
-                    {"side_data_type": "Display Matrix", "rotation": 180}
+                    {"side_data_type": "Display Matrix", "rotation": 180,
+                     "displaymatrix": "\n00000000:      -65536           0           0\n00000001:           0      -65536           0\n00000002:           0           0  1073741824"}
                  ]}
             ]
         }"#;
@@ -4955,6 +7343,39 @@ Encoders:
     }
 
     #[test]
+    fn source_dimension_bound_applies_after_even_encode_geometry() {
+        let request = base_request();
+        let at_boundary = VideoProbe {
+            width: 32_769,
+            height: 2,
+            coded_width: 32_769,
+            coded_height: 2,
+            ..probe_10s_1920x1080_audio()
+        };
+        assert_eq!(
+            estimated_output_dimensions(&request, &at_boundary).unwrap(),
+            (32_768, 2)
+        );
+
+        let over_boundary = VideoProbe {
+            width: 32_770,
+            coded_width: 32_770,
+            ..at_boundary
+        };
+        assert!(
+            estimated_output_dimensions(&request, &over_boundary)
+                .unwrap_err()
+                .contains("32768")
+        );
+    }
+
+    #[test]
+    fn max_edge_dimension_rounding_matches_the_frontend_mirror() {
+        assert_eq!(fit_max_edge_dimensions(853, 481, 720), (720, 406));
+        assert_eq!(fit_max_edge_dimensions(853, 481, 900), (852, 480));
+    }
+
+    #[test]
     fn crop_out_of_bounds_errors() {
         let mut req = base_request();
         req.crop = Some(Crop {
@@ -4966,6 +7387,38 @@ Encoders:
         let probe = probe_10s_1920x1080_audio();
         let err = build_video_filters(&req, &probe).unwrap_err();
         assert!(err.to_lowercase().contains("outside"));
+    }
+
+    #[test]
+    fn crop_smaller_than_two_pixels_is_rejected_before_ffmpeg() {
+        let mut req = base_request();
+        req.crop = Some(Crop {
+            x: 10,
+            y: 10,
+            width: 1,
+            height: 20,
+        });
+        let probe = probe_10s_1920x1080_audio();
+        let err = build_video_filters(&req, &probe).unwrap_err();
+        assert!(err.contains("at least 2 pixels"));
+        assert!(
+            estimated_output_dimensions(&req, &probe)
+                .unwrap_err()
+                .contains("at least 2 pixels")
+        );
+    }
+
+    #[test]
+    fn sub_two_pixel_source_is_rejected_for_video_but_not_mp3() {
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.width = 1;
+        let video_error =
+            resolve_media_policy(&base_request(), &probe, Some(VideoCodec::LibX264)).unwrap_err();
+        assert!(video_error.contains("at least 2x2 pixels"));
+
+        let mut mp3 = base_request();
+        mp3.format = OutputFormat::Mp3;
+        assert!(resolve_media_policy(&mp3, &probe, None).is_ok());
     }
 
     #[test]
@@ -4985,9 +7438,1111 @@ Encoders:
     }
 
     #[test]
+    fn parse_cropdetect_preserves_odd_exact_origin() {
+        let probe = probe_10s_1920x1080_audio();
+        let crop =
+            parse_cropdetect_from_stderr("[Parsed_cropdetect_0 @ 0x000] crop=98:78:1:3\n", &probe)
+                .unwrap();
+        assert_eq!(crop.x, 1);
+        assert_eq!(crop.y, 3);
+        assert_eq!(crop.width, 98);
+        assert_eq!(crop.height, 78);
+    }
+
+    #[test]
     fn parse_cropdetect_returns_none_when_absent() {
         let probe = probe_10s_1920x1080_audio();
         let stderr = "no crop here\n";
         assert!(parse_cropdetect_from_stderr(stderr, &probe).is_none());
+    }
+
+    fn hdr10_probe() -> VideoProbe {
+        VideoProbe {
+            pixel_format: Some("yuv420p10le".to_string()),
+            bit_depth: Some(10),
+            color_range: Some("tv".to_string()),
+            color_primaries: Some("bt2020".to_string()),
+            color_transfer: Some("smpte2084".to_string()),
+            color_space: Some("bt2020nc".to_string()),
+            dynamic_range: DynamicRange::Hdr10,
+            decoded_video_bytes_per_pixel: Some(3.0),
+            ..probe_10s_1920x1080_audio()
+        }
+    }
+
+    fn ten_bit_sdr_probe() -> VideoProbe {
+        VideoProbe {
+            pixel_format: Some("yuv420p10le".to_string()),
+            bit_depth: Some(10),
+            dynamic_range: DynamicRange::Sdr,
+            decoded_video_bytes_per_pixel: Some(3.0),
+            ..probe_10s_1920x1080_audio()
+        }
+    }
+
+    fn anamorphic_probe() -> VideoProbe {
+        VideoProbe {
+            width: 720,
+            height: 576,
+            coded_width: 720,
+            coded_height: 576,
+            sample_aspect_ratio: Rational {
+                numerator: 16,
+                denominator: 15,
+            },
+            display_aspect_ratio: Rational {
+                numerator: 4,
+                denominator: 3,
+            },
+            ..probe_10s_1920x1080_audio()
+        }
+    }
+
+    #[test]
+    fn parse_probe_exposes_hdr_sar_audio_and_disposition_facts() {
+        let json = r#"{
+            "format": {"duration": "12", "format_name": "matroska,webm"},
+            "streams": [
+                {"index": 0, "codec_name": "mjpeg", "codec_type": "video",
+                 "width": 600, "height": 600,
+                 "disposition": {"default": 1, "attached_pic": 1}},
+                {"index": 3, "codec_name": "h264", "codec_type": "video",
+                 "width": 720, "height": 576, "avg_frame_rate": "25/1",
+                 "pix_fmt": "yuv420p10le", "bits_per_raw_sample": "10",
+                 "color_range": "tv", "color_primaries": "bt2020",
+                 "color_transfer": "smpte2084", "color_space": "bt2020nc",
+                 "sample_aspect_ratio": "16:15", "display_aspect_ratio": "4:3",
+                 "disposition": {"default": 0, "original": 1, "forced": 1}},
+                {"index": 7, "codec_name": "aac", "codec_type": "audio",
+                 "sample_rate": "48000", "channels": 2, "sample_fmt": "fltp",
+                 "disposition": {"default": 1}}
+            ]
+        }"#;
+        let probe = parse_probe_output(json).unwrap();
+        assert_eq!((probe.width, probe.height), (720, 576));
+        assert_eq!((probe.coded_width, probe.coded_height), (720, 576));
+        assert_eq!(probe.dynamic_range, DynamicRange::Hdr10);
+        assert_eq!(probe.pixel_format.as_deref(), Some("yuv420p10le"));
+        assert_eq!(probe.bit_depth, Some(10));
+        assert_eq!(
+            probe.sample_aspect_ratio,
+            Rational {
+                numerator: 16,
+                denominator: 15
+            }
+        );
+        assert_eq!(
+            probe.display_aspect_ratio,
+            Rational {
+                numerator: 4,
+                denominator: 3
+            }
+        );
+        assert_eq!(probe.attached_picture_count, 1);
+        assert!(probe.selected_video_dispositions.original);
+        assert!(probe.selected_video_dispositions.forced);
+        assert_eq!(probe.audio_sample_rate, Some(48_000));
+        assert_eq!(probe.audio_channels, Some(2));
+        assert_eq!(probe.audio_sample_format.as_deref(), Some("fltp"));
+        assert_eq!(probe.decoded_video_bytes_per_pixel, Some(3.0));
+        assert_eq!(probe.decoded_audio_bytes_per_sample, Some(4));
+    }
+
+    #[test]
+    fn probe_derives_sar_from_declared_dar_and_orients_it_for_rotation() {
+        let json = r#"{
+            "format": {"duration": "5"},
+            "streams": [{
+                "index": 0, "codec_name": "h264", "codec_type": "video",
+                "width": 720, "height": 576, "display_aspect_ratio": "4:3",
+                "pix_fmt": "yuv420p", "avg_frame_rate": "25/1",
+                "side_data_list": [{"side_data_type": "Display Matrix", "rotation": -90,
+                    "displaymatrix": "\n00000000:           0      -65536           0\n00000001:       65536           0           0\n00000002:           0           0  1073741824"}]
+            }]
+        }"#;
+        let probe = parse_probe_output(json).unwrap();
+        assert_eq!(
+            probe.sample_aspect_ratio,
+            Rational {
+                numerator: 16,
+                denominator: 15
+            }
+        );
+        assert_eq!((probe.width, probe.height), (576, 720));
+        assert_eq!(
+            probe.display_aspect_ratio,
+            Rational {
+                numerator: 3,
+                denominator: 4
+            }
+        );
+    }
+
+    #[test]
+    fn probe_classifies_hlg_dolby_vision_and_ambiguous_pq() {
+        let hlg = r#"{"format":{"duration":"1"},"streams":[{"index":0,"codec_type":"video","width":16,"height":16,"pix_fmt":"yuv420p10le","color_transfer":"arib-std-b67"}]}"#;
+        assert_eq!(
+            parse_probe_output(hlg).unwrap().dynamic_range,
+            DynamicRange::Hlg
+        );
+
+        let dovi = r#"{"format":{"duration":"1"},"streams":[{"index":0,"codec_type":"video","codec_tag_string":"dvh1","width":16,"height":16,"pix_fmt":"yuv420p10le"}]}"#;
+        assert_eq!(
+            parse_probe_output(dovi).unwrap().dynamic_range,
+            DynamicRange::DolbyVision
+        );
+
+        let ambiguous = r#"{"format":{"duration":"1"},"streams":[{"index":0,"codec_type":"video","width":16,"height":16,"pix_fmt":"yuv420p10le","color_transfer":"smpte2084","color_primaries":"bt709","color_space":"bt709","color_range":"tv"}]}"#;
+        assert_eq!(
+            parse_probe_output(ambiguous).unwrap().dynamic_range,
+            DynamicRange::Unknown
+        );
+
+        let sentinels = r#"{"format":{"duration":"1"},"streams":[{"index":0,"codec_type":"video","width":16,"height":16,"pix_fmt":"yuv420p10le","color_range":"unspecified","color_primaries":"reserved","color_transfer":"unknown","color_space":"reserved0"}]}"#;
+        let sentinel_probe = parse_probe_output(sentinels).unwrap();
+        assert_eq!(sentinel_probe.dynamic_range, DynamicRange::Unknown);
+        assert_eq!(sentinel_probe.color_range, None);
+        assert_eq!(sentinel_probe.color_primaries, None);
+        assert_eq!(sentinel_probe.color_transfer, None);
+        assert_eq!(sentinel_probe.color_space, None);
+        let mut request = base_request();
+        request.color_policy = ColorPolicy::StandardSdr;
+        assert!(
+            resolve_media_policy(&request, &sentinel_probe, Some(VideoCodec::LibX264))
+                .unwrap_err()
+                .contains("contradictory")
+        );
+    }
+
+    #[test]
+    fn semiplanar_pixel_formats_use_component_depth_not_layout_digits() {
+        assert_eq!(pixel_format_bit_depth(Some("nv16")), Some(8));
+        assert_eq!(
+            decoded_video_bytes_per_pixel(Some("nv16"), Some(8)),
+            Some(2.0)
+        );
+        assert_eq!(pixel_format_bit_depth(Some("nv20le")), Some(10));
+        assert_eq!(
+            decoded_video_bytes_per_pixel(Some("nv20le"), Some(10)),
+            Some(4.0)
+        );
+    }
+
+    #[test]
+    fn ffmpeg_pixel_format_table_drives_exact_depth_and_conservative_storage() {
+        let descriptors = parse_pixel_format_descriptors(
+            "\
+IO... yuv410p                3              9      8-8-8\n\
+IO... nv20le                 3             20      10-10-10\n\
+IO... yuv420p10le            3             15      10-10-10\n\
+IO... grayf32le              1             32      32\n\
+..... rgba128le              4            128      32-32-32-32\n\
+IO... 0rgb                    3             24      8-8-8\n\
+IO... rgb0                    3             24      8-8-8\n\
+IO... vuyx                    3             24      8-8-8\n\
+IO... xv36le                  3             36      12-12-12\n",
+        );
+        assert_eq!(descriptors["yuv410p"].bit_depth, 8);
+        assert_eq!(descriptors["yuv410p"].decoded_bytes_per_pixel, 1.125);
+        assert_eq!(descriptors["nv20le"].bit_depth, 10);
+        assert_eq!(descriptors["nv20le"].decoded_bytes_per_pixel, 4.0);
+        assert_eq!(descriptors["yuv420p10le"].decoded_bytes_per_pixel, 3.0);
+        assert_eq!(descriptors["grayf32le"].bit_depth, 32);
+        assert_eq!(descriptors["grayf32le"].decoded_bytes_per_pixel, 4.0);
+        assert_eq!(descriptors["rgba128le"].bit_depth, 32);
+        assert_eq!(descriptors["rgba128le"].decoded_bytes_per_pixel, 16.0);
+        for padded in ["0rgb", "rgb0", "vuyx"] {
+            assert_eq!(descriptors[padded].decoded_bytes_per_pixel, 3.0);
+            assert!(
+                descriptors[padded].decoded_bytes_per_pixel * REVERSE_BUFFER_SAFETY_FACTOR >= 4.0
+            );
+        }
+        assert_eq!(descriptors["xv36le"].decoded_bytes_per_pixel, 6.0);
+        assert!(
+            descriptors["xv36le"].decoded_bytes_per_pixel * REVERSE_BUFFER_SAFETY_FACTOR >= 8.0
+        );
+    }
+
+    #[test]
+    fn pixel_descriptor_depth_cannot_be_downgraded_by_stream_metadata() {
+        let descriptors = parse_pixel_format_descriptors(
+            "IO... yuv420p10le            3             15      10-10-10\n",
+        );
+        let json = r#"{
+            "format":{"duration":"1"},
+            "streams":[{
+                "index":0,"codec_type":"video","width":320,"height":180,
+                "pix_fmt":"yuv420p10le","bits_per_raw_sample":"8",
+                "avg_frame_rate":"24/1"
+            }]
+        }"#;
+        let probe = parse_probe_output_with_pixel_formats(json, Some(&descriptors)).unwrap();
+        assert_eq!(probe.bit_depth, Some(10));
+        assert_eq!(probe.decoded_video_bytes_per_pixel, Some(3.0));
+    }
+
+    #[test]
+    fn hdr10_and_high_bit_sdr_require_explicit_standard_sdr_mp4_h264() {
+        let req = base_request();
+        let error =
+            resolve_media_policy(&req, &hdr10_probe(), Some(VideoCodec::LibX264)).unwrap_err();
+        assert!(error.contains("explicit Standard SDR"));
+
+        let mut standard = req.clone();
+        standard.color_policy = ColorPolicy::StandardSdr;
+        let hdr_policy =
+            resolve_media_policy(&standard, &hdr10_probe(), Some(VideoCodec::LibX264)).unwrap();
+        assert_eq!(
+            hdr_policy.color_action,
+            MediaColorAction::Hdr10ToStandardSdr
+        );
+        let sdr_policy =
+            resolve_media_policy(&standard, &ten_bit_sdr_probe(), Some(VideoCodec::LibX264))
+                .unwrap();
+        assert_eq!(
+            sdr_policy.color_action,
+            MediaColorAction::HighBitDepthSdrToStandardSdr
+        );
+
+        standard.format = OutputFormat::Webm;
+        assert!(
+            resolve_media_policy(&standard, &hdr10_probe(), Some(VideoCodec::LibVpxVp9))
+                .unwrap_err()
+                .contains("requires MP4")
+        );
+        standard.format = OutputFormat::Mp4;
+        assert!(
+            resolve_media_policy(&standard, &hdr10_probe(), Some(VideoCodec::Mpeg4))
+                .unwrap_err()
+                .contains("libx264")
+        );
+    }
+
+    #[test]
+    fn unsupported_or_ambiguous_high_bit_color_fails_closed_but_mp3_bypasses() {
+        let mut req = base_request();
+        req.color_policy = ColorPolicy::StandardSdr;
+        let hlg = VideoProbe {
+            dynamic_range: DynamicRange::Hlg,
+            bit_depth: Some(10),
+            ..hdr10_probe()
+        };
+        assert!(
+            resolve_media_policy(&req, &hlg, Some(VideoCodec::LibX264))
+                .unwrap_err()
+                .contains("HLG")
+        );
+        let dovi = VideoProbe {
+            dynamic_range: DynamicRange::DolbyVision,
+            ..hdr10_probe()
+        };
+        assert!(
+            resolve_media_policy(&req, &dovi, Some(VideoCodec::LibX264))
+                .unwrap_err()
+                .contains("Dolby Vision")
+        );
+        let ambiguous = VideoProbe {
+            dynamic_range: DynamicRange::Unknown,
+            ..hdr10_probe()
+        };
+        assert!(
+            resolve_media_policy(&req, &ambiguous, Some(VideoCodec::LibX264))
+                .unwrap_err()
+                .contains("contradictory")
+        );
+
+        req.format = OutputFormat::Mp3;
+        let policy = resolve_media_policy(&req, &ambiguous, None).unwrap();
+        assert_eq!(policy.color_action, MediaColorAction::NotApplicable);
+    }
+
+    #[test]
+    fn frame_export_accepts_only_standard_eight_bit_sdr_color() {
+        assert!(require_safe_frame_export_color(&probe_10s_1920x1080_audio()).is_ok());
+        let undeclared_sdr = VideoProbe {
+            dynamic_range: DynamicRange::Unknown,
+            color_range: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_space: None,
+            ..probe_10s_1920x1080_audio()
+        };
+        assert!(require_safe_frame_export_color(&undeclared_sdr).is_ok());
+
+        for probe in [
+            hdr10_probe(),
+            VideoProbe {
+                dynamic_range: DynamicRange::Hlg,
+                ..hdr10_probe()
+            },
+            VideoProbe {
+                dynamic_range: DynamicRange::DolbyVision,
+                ..hdr10_probe()
+            },
+            VideoProbe {
+                dynamic_range: DynamicRange::Unknown,
+                ..hdr10_probe()
+            },
+            ten_bit_sdr_probe(),
+        ] {
+            assert!(
+                require_safe_frame_export_color(&probe)
+                    .unwrap_err()
+                    .contains("standard 8-bit SDR")
+            );
+        }
+        let unknown_depth = VideoProbe {
+            bit_depth: None,
+            ..probe_10s_1920x1080_audio()
+        };
+        assert!(
+            require_safe_frame_export_color(&unknown_depth)
+                .unwrap_err()
+                .contains("could not be determined")
+        );
+    }
+
+    #[test]
+    fn frame_export_rejects_non_square_pixels_in_every_orientation() {
+        let anamorphic = anamorphic_probe();
+        assert!(
+            require_safe_frame_export_geometry(&anamorphic)
+                .unwrap_err()
+                .contains("non-square-pixel")
+        );
+        let rotated_anamorphic = VideoProbe {
+            width: 576,
+            height: 720,
+            rotation_deg: 90,
+            ..anamorphic
+        };
+        assert!(
+            require_safe_frame_export_geometry(&rotated_anamorphic)
+                .unwrap_err()
+                .contains("visible display shape")
+        );
+        assert!(require_safe_frame_export_geometry(&probe_10s_1920x1080_audio()).is_ok());
+    }
+
+    #[test]
+    fn standard_sdr_filters_and_output_flags_are_explicit_bt709() {
+        let mut req = base_request();
+        req.color_policy = ColorPolicy::StandardSdr;
+        let policy = resolve_media_policy(&req, &hdr10_probe(), Some(VideoCodec::LibX264)).unwrap();
+        let filters = build_video_filters_with_policy(&req, &hdr10_probe(), policy)
+            .unwrap()
+            .unwrap();
+        assert!(filters.contains("zscale=t=linear:npl=100"));
+        assert!(filters.contains("tonemap=tonemap=mobius"));
+        assert!(filters.contains("zscale=p=bt709:t=bt709:m=bt709:r=tv"));
+        assert!(filters.contains("format=yuv420p"));
+
+        let mut args = Vec::new();
+        push_encoded_video_format_args(&mut args, policy);
+        for expected in [
+            ["-pix_fmt", "yuv420p"],
+            ["-color_range", "tv"],
+            ["-color_primaries", "bt709"],
+            ["-color_trc", "bt709"],
+            ["-colorspace", "bt709"],
+        ] {
+            assert!(args.windows(2).any(|pair| pair == expected));
+        }
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "-x264-params",
+                "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv",
+            ]
+        }));
+
+        let mut ordinary_args = Vec::new();
+        push_encoded_video_format_args(
+            &mut ordinary_args,
+            MediaPolicyPlan {
+                color_action: MediaColorAction::Unchanged,
+                sar_action: SarAction::Unchanged,
+            },
+        );
+        assert_eq!(ordinary_args, ["-pix_fmt", "yuv420p"]);
+    }
+
+    #[test]
+    fn sar_normalization_preserves_display_aspect_and_custom_is_authoritative() {
+        let probe = anamorphic_probe();
+        let req = base_request();
+        assert_eq!(
+            estimated_output_dimensions(&req, &probe).unwrap(),
+            (768, 576)
+        );
+        let policy = resolve_media_policy(&req, &probe, Some(VideoCodec::LibX264)).unwrap();
+        assert_eq!(
+            policy.sar_action,
+            SarAction::Normalize {
+                width: 768,
+                height: 576
+            }
+        );
+        let filters = build_video_filters_with_policy(&req, &probe, policy)
+            .unwrap()
+            .unwrap();
+        assert!(filters.contains("scale=w=768:h=576,setsar=1"));
+
+        let mut custom = req.clone();
+        custom.resize = Some(ResizeSettings {
+            mode: ResizeMode::Custom,
+            max_edge_px: None,
+            width_px: Some(640),
+            height_px: Some(360),
+        });
+        assert_eq!(
+            estimated_output_dimensions(&custom, &probe).unwrap(),
+            (640, 360)
+        );
+        let custom_policy =
+            resolve_media_policy(&custom, &probe, Some(VideoCodec::LibX264)).unwrap();
+        assert_eq!(
+            custom_policy.sar_action,
+            SarAction::Normalize {
+                width: 640,
+                height: 360
+            }
+        );
+    }
+
+    #[test]
+    fn extreme_sar_is_bounded_after_resize_and_custom_remains_authoritative() {
+        let probe = VideoProbe {
+            width: 720,
+            height: 576,
+            coded_width: 720,
+            coded_height: 576,
+            sample_aspect_ratio: Rational {
+                numerator: u32::MAX,
+                denominator: 1,
+            },
+            ..probe_10s_1920x1080_audio()
+        };
+        let source = base_request();
+        assert!(
+            estimated_output_dimensions(&source, &probe)
+                .unwrap_err()
+                .contains("32768")
+        );
+
+        let mut bounded = source.clone();
+        bounded.resize = Some(ResizeSettings {
+            mode: ResizeMode::MaxEdge,
+            max_edge_px: Some(720),
+            width_px: None,
+            height_px: None,
+        });
+        let bounded_dimensions = estimated_output_dimensions(&bounded, &probe).unwrap();
+        assert!(bounded_dimensions.0 <= 720 && bounded_dimensions.1 <= 720);
+
+        let mut custom = source;
+        custom.resize = Some(ResizeSettings {
+            mode: ResizeMode::Custom,
+            max_edge_px: None,
+            width_px: Some(640),
+            height_px: Some(360),
+        });
+        assert_eq!(
+            estimated_output_dimensions(&custom, &probe).unwrap(),
+            (640, 360)
+        );
+    }
+
+    #[test]
+    fn sar_orientation_inverts_for_metadata_and_manual_quarter_turns() {
+        let metadata_rotated = VideoProbe {
+            width: 576,
+            height: 720,
+            rotation_deg: 90,
+            ..anamorphic_probe()
+        };
+        let req = base_request();
+        assert_eq!(
+            estimated_output_dimensions(&req, &metadata_rotated).unwrap(),
+            (540, 720)
+        );
+
+        let mut manually_rotated = req;
+        manually_rotated.rotate_deg = 90;
+        assert_eq!(
+            estimated_output_dimensions(&manually_rotated, &metadata_rotated).unwrap(),
+            (768, 576)
+        );
+    }
+
+    #[test]
+    fn sar_policy_forces_video_encode_and_discloses_reason() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+        let plan = test_command_plan(&req, &anamorphic_probe(), 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert!(plan.video_reasons.contains(&PlanReason::SampleAspectRatio));
+        assert!(plan.media_policy.sar_action.normalizes());
+    }
+
+    #[test]
+    fn reverse_buffer_estimate_matches_reverse_stage_math_and_warns() {
+        let mut req = base_request();
+        req.reverse = true;
+        let probe = probe_10s_1920x1080_audio();
+        let policy = resolve_media_policy(&req, &probe, Some(VideoCodec::LibX264)).unwrap();
+        let estimate = reverse_buffer_estimate(&req, &probe, policy, true)
+            .unwrap()
+            .unwrap();
+        // Video pixels plus 8 KiB retained-frame overhead, audio samples, then
+        // the shared 1.5 packed-layout/alignment safety factor.
+        assert_eq!(estimate.bytes, 1_414_889_472);
+        assert_eq!(estimate.action, ReverseBufferAction::Warning);
+    }
+
+    #[test]
+    fn reverse_buffer_guard_thresholds_are_inclusive() {
+        assert_eq!(
+            guard_reverse_buffer_bytes(REVERSE_BUFFER_WARNING_BYTES - 1)
+                .unwrap()
+                .action,
+            ReverseBufferAction::WithinLimit
+        );
+        assert_eq!(
+            guard_reverse_buffer_bytes(REVERSE_BUFFER_WARNING_BYTES)
+                .unwrap()
+                .action,
+            ReverseBufferAction::Warning
+        );
+        assert!(guard_reverse_buffer_bytes(REVERSE_BUFFER_HARD_LIMIT_BYTES - 1).is_ok());
+        assert!(guard_reverse_buffer_bytes(REVERSE_BUFFER_HARD_LIMIT_BYTES).is_err());
+    }
+
+    #[test]
+    fn reverse_watchdog_allows_bounded_initial_buffering_and_size_copy_is_disk_bounded() {
+        let ordinary = ffmpeg_run_limits(false);
+        assert_eq!(ordinary.initial_progress_timeout, ENCODE_IDLE_TIMEOUT);
+        assert_eq!(ordinary.idle_timeout, ENCODE_IDLE_TIMEOUT);
+        let reverse = ffmpeg_run_limits(true);
+        assert_eq!(
+            reverse.initial_progress_timeout,
+            ENCODE_INITIAL_BUFFER_TIMEOUT
+        );
+        assert_eq!(reverse.idle_timeout, ENCODE_IDLE_TIMEOUT);
+
+        let output = Path::new("candidate.tmp.mp4");
+        let copy = size_copy_run_limits(1_000_000, output);
+        assert_eq!(
+            copy.output_size_limit,
+            Some((
+                output.to_path_buf(),
+                1_000_000 + SIZE_COPY_MONITOR_HEADROOM_BYTES
+            ))
+        );
+    }
+
+    #[test]
+    fn loop_buffer_estimate_uses_post_speed_active_fps_cap_and_audio_duration() {
+        let mut req = base_request();
+        req.loop_video = true;
+        req.speed = 2.0;
+        req.advanced.frame_rate_cap_fps = Some(30);
+        let probe = probe_10s_1920x1080_audio();
+        let policy = resolve_media_policy(&req, &probe, Some(VideoCodec::LibX264)).unwrap();
+        let estimate = reverse_buffer_estimate(&req, &probe, policy, true)
+            .unwrap()
+            .unwrap();
+        // video Loop stage: (10/2)*30 frames; audio Loop stage: 5 seconds.
+        assert_eq!(estimate.bytes, 707_450_880);
+        assert_eq!(estimate.action, ReverseBufferAction::Warning);
+    }
+
+    #[test]
+    fn loop_setpts_without_active_fps_cap_keeps_source_frame_count() {
+        let mut req = base_request();
+        req.loop_video = true;
+        req.speed = 2.0;
+        let probe = probe_10s_1920x1080_audio();
+        let policy = resolve_media_policy(&req, &probe, Some(VideoCodec::LibX264)).unwrap();
+        let estimate = reverse_buffer_estimate(&req, &probe, policy, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(estimate.bytes, 1_409_134_080);
+    }
+
+    #[test]
+    fn reverse_and_loop_stage_costs_sum_and_hard_limit_rejects() {
+        let mut req = base_request();
+        req.reverse = true;
+        req.loop_video = true;
+        let error = reverse_buffer_estimate(
+            &req,
+            &probe_10s_1920x1080_audio(),
+            MediaPolicyPlan {
+                color_action: MediaColorAction::Unchanged,
+                sar_action: SarAction::Unchanged,
+            },
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("2 GiB safety limit"));
+
+        let mut small = probe_10s_1920x1080_audio();
+        small.duration_s = 5.0;
+        small.width = 640;
+        small.height = 360;
+        small.coded_width = 640;
+        small.coded_height = 360;
+        small.display_aspect_ratio = Rational {
+            numerator: 16,
+            denominator: 9,
+        };
+        let policy = resolve_media_policy(&req, &small, Some(VideoCodec::LibX264)).unwrap();
+        let estimate = reverse_buffer_estimate(&req, &small, policy, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(estimate.bytes, 170_741_760);
+        assert_eq!(estimate.action, ReverseBufferAction::WithinLimit);
+    }
+
+    #[test]
+    fn tiny_high_frame_count_video_is_bounded_by_per_frame_retention_overhead() {
+        let mut request = base_request();
+        request.reverse = true;
+        request.audio_enabled = false;
+        let probe = VideoProbe {
+            duration_s: 170.0,
+            width: 16,
+            height: 16,
+            coded_width: 16,
+            coded_height: 16,
+            frame_rate: Some(1_000.0),
+            pixel_format: Some("pal8".to_string()),
+            decoded_video_bytes_per_pixel: Some(1.0),
+            has_audio: false,
+            audio_stream_index: None,
+            ..probe_10s_1920x1080_audio()
+        };
+        assert!(
+            reverse_buffer_estimate(
+                &request,
+                &probe,
+                MediaPolicyPlan {
+                    color_action: MediaColorAction::Unchanged,
+                    sar_action: SarAction::Unchanged,
+                },
+                false,
+            )
+            .unwrap_err()
+            .contains("2 GiB safety limit")
+        );
+    }
+
+    #[test]
+    fn reverse_requires_known_video_rate_and_pixel_layout_only_when_enabled() {
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.frame_rate = None;
+        probe.decoded_video_bytes_per_pixel = None;
+        let req = base_request();
+        let policy = resolve_media_policy(&req, &probe, Some(VideoCodec::LibX264)).unwrap();
+        assert_eq!(
+            reverse_buffer_estimate(&req, &probe, policy, true).unwrap(),
+            None
+        );
+
+        let mut reverse = req;
+        reverse.reverse = true;
+        assert!(
+            reverse_buffer_estimate(&reverse, &probe, policy, true)
+                .unwrap_err()
+                .contains("frame rate")
+        );
+        probe.frame_rate = Some(30.0);
+        assert!(
+            reverse_buffer_estimate(&reverse, &probe, policy, true)
+                .unwrap_err()
+                .contains("pixel layout")
+        );
+    }
+
+    #[test]
+    fn normalized_audio_reverse_uses_the_post_resample_48khz_buffer() {
+        let mut request = base_request();
+        request.format = OutputFormat::Mp3;
+        request.reverse = true;
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.duration_s = 1_800.0;
+        probe.audio_sample_rate = Some(8_000);
+        probe.audio_channels = Some(2);
+        probe.decoded_audio_bytes_per_sample = Some(8);
+        let policy = resolve_media_policy(&request, &probe, None).unwrap();
+
+        let source_rate = reverse_buffer_estimate(&request, &probe, policy, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_rate.bytes, 518_406_144);
+        assert_eq!(source_rate.action, ReverseBufferAction::WithinLimit);
+
+        request.normalize_audio = true;
+        let error = reverse_buffer_estimate(&request, &probe, policy, true).unwrap_err();
+        assert!(error.contains("2 GiB safety limit"));
+    }
+
+    #[test]
+    fn reverse_audio_fails_closed_on_unknown_retained_layout_but_ignores_dropped_audio() {
+        let mut request = base_request();
+        request.reverse = true;
+        let policy = resolve_media_policy(
+            &request,
+            &probe_10s_1920x1080_audio(),
+            Some(VideoCodec::LibX264),
+        )
+        .unwrap();
+
+        for (field, probe) in [
+            (
+                "sample rate",
+                VideoProbe {
+                    audio_sample_rate: None,
+                    ..probe_10s_1920x1080_audio()
+                },
+            ),
+            (
+                "channel count",
+                VideoProbe {
+                    audio_channels: None,
+                    ..probe_10s_1920x1080_audio()
+                },
+            ),
+            (
+                "sample format",
+                VideoProbe {
+                    decoded_audio_bytes_per_sample: None,
+                    ..probe_10s_1920x1080_audio()
+                },
+            ),
+        ] {
+            assert!(
+                reverse_buffer_estimate(&request, &probe, policy, true)
+                    .unwrap_err()
+                    .contains(field),
+                "{field}"
+            );
+            assert!(reverse_buffer_estimate(&request, &probe, policy, false).is_ok());
+        }
+
+        let normalized_unknown_source = VideoProbe {
+            audio_sample_rate: None,
+            decoded_audio_bytes_per_sample: None,
+            ..probe_10s_1920x1080_audio()
+        };
+        request.normalize_audio = true;
+        assert!(
+            reverse_buffer_estimate(&request, &normalized_unknown_source, policy, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn size_target_audio_drop_excludes_unknown_audio_from_reverse_memory() {
+        let mut request = base_request();
+        request.size_limit_mb = 0.3;
+        request.reverse = true;
+        let probe = VideoProbe {
+            duration_s: 60.0,
+            width: 16,
+            height: 16,
+            coded_width: 16,
+            coded_height: 16,
+            audio_sample_rate: None,
+            audio_channels: None,
+            decoded_audio_bytes_per_sample: None,
+            ..probe_10s_1920x1080_audio()
+        };
+        let plan = test_command_plan(&request, &probe, 1_000_000);
+        assert_eq!(plan.audio_action, StreamAction::Drop);
+        assert!(plan.reverse_buffer_estimate.is_some());
+    }
+
+    #[test]
+    fn selected_stream_map_is_present_in_frame_and_crop_commands() {
+        let frame =
+            frame_extract_command_args(Path::new("input.mkv"), 1.25, 7, Path::new("frame.png"));
+        let frame = frame
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(frame.windows(2).any(|pair| pair == ["-map", "0:7"]));
+
+        let crop = crop_detect_command_args(Path::new("input.mkv"), 9);
+        let crop = crop
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(crop.windows(2).any(|pair| pair == ["-map", "0:9"]));
+    }
+
+    #[test]
+    fn capability_contract_and_inventory_parsers_are_machine_readable() {
+        let contract = ffmpeg_capability_contract().unwrap();
+        assert_eq!(contract.schema_version, 1);
+        for name in ["coreExport", "hdrToSdr", "sarNormalize", "reverseLoop"] {
+            assert!(contract.features.contains_key(name));
+        }
+        let filters = parse_filter_names(
+            " .. scale             V->V\n TS zscale            V->V\n -- = legend\n",
+        );
+        assert!(filters.contains("scale"));
+        assert!(filters.contains("zscale"));
+        assert_eq!(
+            parse_ffmpeg_version("ffmpeg version n8.1 Copyright\n"),
+            Some("n8.1".to_string())
+        );
+    }
+
+    #[test]
+    fn capability_contract_rejects_schema_drift_and_duplicate_names() {
+        let valid_features = r#"{
+            "coreExport":{"releaseRequired":true,"encoders":[],"filters":[]},
+            "hdrToSdr":{"releaseRequired":true,"encoders":[],"filters":[]},
+            "sarNormalize":{"releaseRequired":true,"encoders":[],"filters":[]},
+            "reverseLoop":{"releaseRequired":true,"encoders":[],"filters":[]}
+        }"#;
+        let unknown_top =
+            format!(r#"{{"schemaVersion":1,"features":{valid_features},"unexpected":true}}"#);
+        assert!(
+            parse_ffmpeg_capability_contract(&unknown_top)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        let unknown_feature_field = r#"{
+            "schemaVersion":1,
+            "features":{
+                "coreExport":{"releaseRequired":true,"encoders":[],"filters":[],"extra":true},
+                "hdrToSdr":{"releaseRequired":true,"encoders":[],"filters":[]},
+                "sarNormalize":{"releaseRequired":true,"encoders":[],"filters":[]},
+                "reverseLoop":{"releaseRequired":true,"encoders":[],"filters":[]}
+            }
+        }"#;
+        assert!(
+            parse_ffmpeg_capability_contract(unknown_feature_field)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        let duplicate = r#"{
+            "schemaVersion":1,
+            "features":{
+                "coreExport":{"releaseRequired":true,"encoders":["libx264","libx264"],"filters":[]},
+                "hdrToSdr":{"releaseRequired":true,"encoders":[],"filters":[]},
+                "sarNormalize":{"releaseRequired":true,"encoders":[],"filters":[]},
+                "reverseLoop":{"releaseRequired":true,"encoders":[],"filters":[]}
+            }
+        }"#;
+        assert!(
+            parse_ffmpeg_capability_contract(duplicate)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+
+        let missing_array = r#"{
+            "schemaVersion":1,
+            "features":{
+                "coreExport":{"releaseRequired":true,"filters":[]},
+                "hdrToSdr":{"releaseRequired":true,"encoders":[],"filters":[]},
+                "sarNormalize":{"releaseRequired":true,"encoders":[],"filters":[]},
+                "reverseLoop":{"releaseRequired":true,"encoders":[],"filters":[]}
+            }
+        }"#;
+        assert!(
+            parse_ffmpeg_capability_contract(missing_array)
+                .unwrap_err()
+                .contains("missing field")
+        );
+    }
+
+    #[test]
+    fn feature_capability_lists_missing_encoders_and_filters() {
+        let requirement = FfmpegFeatureRequirement {
+            release_required: true,
+            encoders: vec!["libx264".to_string(), "missing-encoder".to_string()],
+            filters: vec!["zscale".to_string(), "missing-filter".to_string()],
+        };
+        let runtime = FfmpegRuntimeCapabilities {
+            version: "test".to_string(),
+            encoder_names: HashSet::from(["libx264".to_string()]),
+            filter_names: HashSet::from(["zscale".to_string()]),
+        };
+        let capability = feature_capability("hdrToSdr", &requirement, &runtime);
+        assert!(!capability.available);
+        assert_eq!(capability.missing_encoders, ["missing-encoder"]);
+        assert_eq!(capability.missing_filters, ["missing-filter"]);
+        assert!(
+            require_ffmpeg_feature(
+                "hdrToSdr",
+                &FfmpegCapabilityContract {
+                    schema_version: 1,
+                    features: HashMap::from([("hdrToSdr".to_string(), requirement)]),
+                },
+                &runtime
+            )
+            .unwrap_err()
+            .contains("missing encoder missing-encoder")
+        );
+    }
+
+    #[test]
+    fn request_capability_gate_allows_partial_runtime_for_feasible_remuxes() {
+        let contract = ffmpeg_capability_contract().unwrap();
+        let empty_runtime = FfmpegRuntimeCapabilities {
+            version: "partial".to_string(),
+            encoder_names: HashSet::new(),
+            filter_names: HashSet::new(),
+        };
+        let mut request = base_request();
+        request.size_limit_mb = 0.0;
+        let codecs = select_codec_plan(request.format, &HashSet::new(), &request.advanced).unwrap();
+        assert_eq!(codecs.video_codec, None);
+        let remux = build_encode_command_plan(&request, &probe_10s_1920x1080_audio(), codecs, None)
+            .unwrap();
+        assert_eq!(remux.video_action, StreamAction::Copy);
+        assert_eq!(remux.audio_action, StreamAction::Copy);
+        require_encode_plan_capabilities(&remux, &contract, &empty_runtime).unwrap();
+        assert!(full_reencode_fallback(&remux).is_err());
+
+        request.size_limit_mb = 8.0;
+        let size_copy =
+            build_encode_command_plan(&request, &probe_10s_1920x1080_audio(), codecs, None)
+                .unwrap();
+        assert_eq!(size_copy.video_action, StreamAction::Copy);
+        assert!(!size_copy.size_copy_candidates.is_empty());
+        assert!(size_copy.size_contract.is_none());
+        require_encode_plan_capabilities(&size_copy, &contract, &empty_runtime).unwrap();
+
+        let video_only_inventory = HashSet::from(["libx264".to_string()]);
+        let video_only_codecs =
+            select_codec_plan(request.format, &video_only_inventory, &request.advanced).unwrap();
+        let no_audio_encoder_size_copy = build_encode_command_plan(
+            &request,
+            &probe_10s_1920x1080_audio(),
+            video_only_codecs,
+            None,
+        )
+        .unwrap();
+        assert_eq!(no_audio_encoder_size_copy.video_action, StreamAction::Copy);
+        assert_eq!(no_audio_encoder_size_copy.audio_action, StreamAction::Copy);
+        assert!(no_audio_encoder_size_copy.size_contract.is_none());
+
+        request.size_limit_mb = 0.0;
+        request.crop = Some(Crop {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        });
+        assert!(
+            build_encode_command_plan(&request, &probe_10s_1920x1080_audio(), codecs, None,)
+                .unwrap_err()
+                .contains("No compatible video encoder")
+        );
+
+        request.crop = None;
+        request.perturb_first_frame = true;
+        assert!(
+            build_encode_command_plan(&request, &probe_10s_1920x1080_audio(), codecs, Some(123),)
+                .unwrap_err()
+                .contains("No compatible video encoder")
+        );
+
+        let mut odd_probe = probe_10s_1920x1080_audio();
+        odd_probe.width = 1919;
+        request.perturb_first_frame = false;
+        request.size_limit_mb = 8.0;
+        let encoder_names = HashSet::from(["libx264".to_string(), "aac".to_string()]);
+        let fallback_codecs =
+            select_codec_plan(request.format, &encoder_names, &request.advanced).unwrap();
+        let fallback_plan =
+            build_encode_command_plan(&request, &odd_probe, fallback_codecs, None).unwrap();
+        assert!(!fallback_plan.size_copy_candidates.is_empty());
+        assert!(
+            fallback_plan
+                .video_filters
+                .as_deref()
+                .is_some_and(|filters| filters.contains("crop="))
+        );
+        let encoder_only_runtime = FfmpegRuntimeCapabilities {
+            version: "partial".to_string(),
+            encoder_names,
+            filter_names: HashSet::new(),
+        };
+        require_initial_encode_plan_capabilities(&fallback_plan, &contract, &encoder_only_runtime)
+            .unwrap();
+        let encoded_fallback =
+            build_size_reencode_fallback_plan(&request, &odd_probe, &fallback_plan).unwrap();
+        assert!(
+            require_encode_plan_capabilities(&encoded_fallback, &contract, &encoder_only_runtime,)
+                .unwrap_err()
+                .contains("filter crop")
+        );
+    }
+
+    #[test]
+    fn request_capability_gate_checks_only_actual_encoders_and_filter_graph_nodes() {
+        let filters = filter_names_from_graph(Some(
+            "scale=w='if(gte(iw,ih),trunc(min(iw,720)/2)*2,-2)',eq=contrast=1.1,split[f][r0];[r0]reverse[r];[f][r]concat=n=2:v=1",
+        ));
+        assert_eq!(
+            filters,
+            HashSet::from([
+                "scale".to_string(),
+                "eq".to_string(),
+                "split".to_string(),
+                "reverse".to_string(),
+                "concat".to_string(),
+            ])
+        );
+
+        let mut request = base_request();
+        request.size_limit_mb = 0.0;
+        request.audio_enabled = false;
+        request.crop = Some(Crop {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        });
+        let encoders = HashSet::from(["libx264".to_string()]);
+        let codecs = select_codec_plan(request.format, &encoders, &request.advanced).unwrap();
+        let plan = build_encode_command_plan(&request, &probe_10s_1920x1080_audio(), codecs, None)
+            .unwrap();
+        let contract = ffmpeg_capability_contract().unwrap();
+        let runtime = FfmpegRuntimeCapabilities {
+            version: "partial".to_string(),
+            encoder_names: encoders,
+            filter_names: HashSet::from(["crop".to_string()]),
+        };
+        require_encode_plan_capabilities(&plan, &contract, &runtime).unwrap();
+
+        let missing_filter = FfmpegRuntimeCapabilities {
+            filter_names: HashSet::new(),
+            ..runtime
+        };
+        assert!(
+            require_encode_plan_capabilities(&plan, &contract, &missing_filter)
+                .unwrap_err()
+                .contains("filter crop")
+        );
+    }
+
+    #[test]
+    fn mp3_plan_requires_the_contract_declared_encoder() {
+        let mut request = base_request();
+        request.format = OutputFormat::Mp3;
+        request.size_limit_mb = 0.0;
+        let codecs = select_codec_plan(request.format, &HashSet::new(), &request.advanced).unwrap();
+        assert!(
+            build_encode_command_plan(&request, &probe_10s_1920x1080_audio(), codecs, None,)
+                .unwrap_err()
+                .contains("No MP3 audio encoder")
+        );
     }
 }
