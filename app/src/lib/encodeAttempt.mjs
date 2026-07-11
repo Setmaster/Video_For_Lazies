@@ -2,6 +2,39 @@ function validId(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function withFinishedOutcome(base, payload) {
+  let outcome = base;
+  if (typeof payload.outputPath === "string" && payload.outputPath.length > 0) {
+    outcome = { ...outcome, outputPath: payload.outputPath };
+  }
+  const outputSizeBytes = Number.isFinite(payload.outputSizeBytes) && payload.outputSizeBytes >= 0
+    ? payload.outputSizeBytes
+    : Number.isFinite(payload.targetResult?.actualBytes) && payload.targetResult.actualBytes >= 0
+      ? payload.targetResult.actualBytes
+      : null;
+  if (outputSizeBytes !== null) {
+    outcome = { ...outcome, outputSizeBytes };
+  }
+  if (payload.targetResult !== null && payload.targetResult !== undefined) {
+    outcome = { ...outcome, targetResult: cloneJson(payload.targetResult) };
+  }
+  if (payload.diagnostics !== null && payload.diagnostics !== undefined) {
+    outcome = { ...outcome, diagnostics: cloneJson(payload.diagnostics) };
+  }
+  if (
+    !("message" in outcome) &&
+    typeof payload.message === "string" &&
+    payload.message.length > 0
+  ) {
+    outcome = { ...outcome, message: payload.message };
+  }
+  return outcome;
+}
+
 export function createIdleEncodeAttempt() {
   return { kind: "idle" };
 }
@@ -97,31 +130,35 @@ export function finishEncodeAttempt(state, payload, completedAtMs) {
   }
 
   if (payload.ok) {
-    return {
-      kind: "succeeded",
+    const targetMissed = payload.targetResult?.status === "missed";
+    return withFinishedOutcome({
+      kind: targetMissed ? "target-missed" : "succeeded",
       attemptId: payload.attemptId,
       jobId: payload.jobId,
+      ...(targetMissed
+        ? { message: String(payload.message || "Export completed, but missed the requested size target.") }
+        : {}),
       completedAtMs,
-    };
+    }, payload);
   }
 
   const message = String(payload.message || "Encode failed.");
   if (state.kind === "cancelling") {
-    return {
+    return withFinishedOutcome({
       kind: "cancelled",
       attemptId: payload.attemptId,
       jobId: payload.jobId,
       message,
       completedAtMs,
-    };
+    }, payload);
   }
-  return {
+  return withFinishedOutcome({
     kind: "failed",
     attemptId: payload.attemptId,
     jobId: payload.jobId,
     message,
     completedAtMs,
-  };
+  }, payload);
 }
 
 export function settleEncodeFinished(pending, state, payload, completedAtMs) {
@@ -135,7 +172,7 @@ export function settleEncodeFinished(pending, state, payload, completedAtMs) {
   }
 
   const settledState =
-    typeof pending?.outputPath === "string" && pending.outputPath
+    !("outputPath" in nextState) && typeof pending?.outputPath === "string" && pending.outputPath
       ? { ...nextState, outputPath: pending.outputPath }
       : nextState;
   return {
@@ -154,6 +191,7 @@ export function deriveEncodeAttemptPresentation(state) {
         isSuccess: false,
         isFailure: false,
         isCancelled: false,
+        isTargetMissed: false,
         kicker: "Starting export",
         summary: "Starting",
         message: "Starting export…",
@@ -164,6 +202,7 @@ export function deriveEncodeAttemptPresentation(state) {
         isSuccess: false,
         isFailure: false,
         isCancelled: false,
+        isTargetMissed: false,
         kicker: "Encoding now",
         summary: "Encoding",
         message: "Encoding…",
@@ -174,6 +213,7 @@ export function deriveEncodeAttemptPresentation(state) {
         isSuccess: false,
         isFailure: false,
         isCancelled: false,
+        isTargetMissed: false,
         kicker: "Canceling export",
         summary: "Canceling",
         message: "Canceling…",
@@ -184,9 +224,21 @@ export function deriveEncodeAttemptPresentation(state) {
         isSuccess: true,
         isFailure: false,
         isCancelled: false,
+        isTargetMissed: false,
         kicker: "Export complete",
         summary: "Done",
         message: "Last export completed.",
+      };
+    case "target-missed":
+      return {
+        isActive: false,
+        isSuccess: false,
+        isFailure: false,
+        isCancelled: false,
+        isTargetMissed: true,
+        kicker: "Size target missed",
+        summary: "Target missed",
+        message: state.message,
       };
     case "failed":
       return {
@@ -194,6 +246,7 @@ export function deriveEncodeAttemptPresentation(state) {
         isSuccess: false,
         isFailure: true,
         isCancelled: false,
+        isTargetMissed: false,
         kicker: "Export failed",
         summary: "Failed",
         message: state.message,
@@ -204,6 +257,7 @@ export function deriveEncodeAttemptPresentation(state) {
         isSuccess: false,
         isFailure: false,
         isCancelled: true,
+        isTargetMissed: false,
         kicker: "Export canceled",
         summary: "Canceled",
         message: state.message,
@@ -214,6 +268,7 @@ export function deriveEncodeAttemptPresentation(state) {
         isSuccess: false,
         isFailure: false,
         isCancelled: false,
+        isTargetMissed: false,
         kicker: null,
         summary: null,
         message: null,

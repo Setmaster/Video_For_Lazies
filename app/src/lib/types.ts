@@ -111,6 +111,9 @@ export interface EncodeRequest {
   // Play the clip forward then in reverse (a seamless boomerang loop). Doubles
   // the output duration; N/A for audio-only mp3.
   loopVideo: boolean;
+  strictFit: boolean;
+  strictFitAllowAudioRemoval: boolean;
+  subtitlePath?: string | null;
 }
 
 export interface AdvancedEncodeSettings {
@@ -162,8 +165,42 @@ export interface EncodeFinishedPayload {
   ok: boolean;
   outputPath?: string | null;
   outputSizeBytes?: number | null;
+  targetResult?: TargetResult | null;
   message?: string | null;
   diagnostics?: ExportDiagnostics | null;
+}
+
+export type SizeTargetStatus = "met" | "missed";
+
+export interface FitPlanResult {
+  planNumber: number;
+  label: string;
+  mutations: string[];
+  width?: number | null;
+  height?: number | null;
+  videoBitrateKbps?: number | null;
+  audioAction?: StreamAction | null;
+  audioBitrateKbps?: number | null;
+  actualSizeBytes: number;
+  status: SizeTargetStatus;
+  ffmpegInvocations: number;
+  selected: boolean;
+}
+
+export interface TargetResult {
+  status: SizeTargetStatus;
+  targetBytes: number;
+  actualBytes: number;
+  overshootBytes: number;
+  strictFit: boolean;
+  selectedPlanNumber: number;
+  plans: FitPlanResult[];
+}
+
+export interface SubtitleInspection {
+  cueCount: number;
+  firstCueStartS: number;
+  lastCueEndS: number;
 }
 
 export interface ExportDiagnostics {
@@ -182,6 +219,8 @@ export interface ExportDiagnostics {
   passes: number;
   attempts: number;
   audioRemovedForSizeTarget: boolean;
+  subtitleBurnedIn: boolean;
+  subtitleCueCount?: number | null;
   copyFallbackReason?: string | null;
   colorAction?: string | null;
   sarAction?: string | null;
@@ -206,10 +245,15 @@ export interface AppSmokeConfig {
   resizeHeightPx?: number | null;
   skipPreviewInteractions?: boolean | null;
   workflowQueueExport?: boolean | null;
+  g5QueueTargetMiss?: boolean | null;
   perturbFirstFrame?: boolean | null;
   loopVideo?: boolean | null;
   colorPolicy?: ColorPolicy | null;
   reverse?: boolean | null;
+  strictFit?: boolean | null;
+  strictFitAllowAudioRemoval?: boolean | null;
+  // Launch-only input. It is never copied into AppSmokeStatus.
+  subtitlePath?: string | null;
 }
 
 export interface AppSmokeStatus {
@@ -222,6 +266,9 @@ export interface AppSmokeStatus {
   trimEndS?: number | null;
   expectedDurationS?: number | null;
   stageHistory?: string[] | null;
+  targetResult?: TargetResult | null;
+  diagnostics?: ExportDiagnostics | null;
+  queueOutcomeKind?: "done" | "target-missed" | null;
 }
 
 export interface UpdateNotes {

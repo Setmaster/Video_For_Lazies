@@ -6,6 +6,7 @@ import {
   findExportRecipe,
   findMatchingExportRecipe,
   normalizeRecipeResizeSettings,
+  recipeMatchesSettings,
 } from "../src/lib/exportRecipes.mjs";
 
 test("built-in export recipes cover the supported output formats", () => {
@@ -21,6 +22,17 @@ test("findMatchingExportRecipe matches a full recipe settings snapshot", () => {
   const recipe = findExportRecipe("discord-10mb");
 
   assert.equal(findMatchingExportRecipe(recipe.settings)?.id, "discord-10mb");
+});
+
+test("full built-in recipes explicitly default both Strict Fit fields off", () => {
+  for (const recipe of EXPORT_RECIPES.filter(({ partial }) => !partial)) {
+    assert.equal(recipe.settings.strictFit, false, `${recipe.id} must default Strict Fit off`);
+    assert.equal(
+      recipe.settings.strictFitAllowAudioRemoval,
+      false,
+      `${recipe.id} must default Strict Fit audio removal off`,
+    );
+  }
 });
 
 test("discord recipe targets the current 10 MB free upload limit", () => {
@@ -57,6 +69,72 @@ test("partial forum recipe matches a 4 MB cap with audio off and frame uniquify 
   assert.equal(findMatchingExportRecipe({ ...base, sizeLimitMb: "4", perturbFirstFrame: true }), null);
   assert.equal(findMatchingExportRecipe({ ...base, audioEnabled: false, perturbFirstFrame: true }), null);
   assert.equal(findMatchingExportRecipe({ ...base, sizeLimitMb: "4", audioEnabled: false }), null);
+});
+
+test("partial recipes only match Strict Fit fields when they explicitly list them", () => {
+  const base = findExportRecipe("quick-share").settings;
+  const forumSettings = {
+    ...base,
+    sizeLimitMb: "4",
+    audioEnabled: false,
+    perturbFirstFrame: true,
+    strictFit: true,
+    strictFitAllowAudioRemoval: true,
+  };
+  assert.equal(findMatchingExportRecipe(forumSettings)?.id, "forum-4mb");
+
+  const strictOnly = { partial: true, settings: { strictFit: true } };
+  assert.equal(recipeMatchesSettings(strictOnly, forumSettings), true);
+  assert.equal(recipeMatchesSettings(strictOnly, { ...forumSettings, strictFit: false }), false);
+
+  const allowRemovalOnly = {
+    partial: true,
+    settings: { strictFitAllowAudioRemoval: true },
+  };
+  const discord = findExportRecipe("discord-10mb").settings;
+  assert.equal(
+    recipeMatchesSettings(allowRemovalOnly, {
+      ...discord,
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
+    }),
+    true,
+  );
+  assert.equal(
+    recipeMatchesSettings(allowRemovalOnly, {
+      ...discord,
+      strictFit: false,
+      strictFitAllowAudioRemoval: true,
+    }),
+    false,
+  );
+});
+
+test("full recipe matching canonicalizes Strict Fit defaults and invalid combinations", () => {
+  const quickShare = findExportRecipe("quick-share");
+  const withoutStrictFitFields = { ...quickShare.settings };
+  delete withoutStrictFitFields.strictFit;
+  delete withoutStrictFitFields.strictFitAllowAudioRemoval;
+
+  assert.equal(findMatchingExportRecipe(withoutStrictFitFields)?.id, "quick-share");
+  assert.equal(
+    findMatchingExportRecipe({
+      ...quickShare.settings,
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
+    })?.id,
+    "quick-share",
+  );
+
+  const discord = findExportRecipe("discord-10mb");
+  assert.equal(
+    findMatchingExportRecipe({
+      ...discord.settings,
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
+    }),
+    null,
+  );
 });
 
 test("enabling frame uniquify makes a full recipe snapshot read as custom", () => {

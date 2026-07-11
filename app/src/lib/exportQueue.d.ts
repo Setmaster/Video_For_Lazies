@@ -1,8 +1,8 @@
-import type { EncodeRequest, ExportDiagnostics, OutputFormat } from "./types";
+import type { EncodeRequest, ExportDiagnostics, OutputFormat, TargetResult } from "./types";
 
 export type QueuePathPlatform = "auto" | "windows" | "win32" | "posix" | "linux" | "darwin";
-export type ExportQueueItemStatus = "queued" | "running" | "done" | "failed" | "cancelled";
-export type ExportQueueOutcomeKind = "done" | "failed" | "cancelled";
+export type ExportQueueItemStatus = "queued" | "running" | "done" | "target-missed" | "failed" | "cancelled";
+export type ExportQueueOutcomeKind = "done" | "target-missed" | "failed" | "cancelled";
 
 export interface ExportQueueOutcome {
   runId: number;
@@ -10,6 +10,7 @@ export interface ExportQueueOutcome {
   message: string | null;
   outputPath: string | null;
   outputSizeBytes: number | null;
+  targetResult: TargetResult | null;
   diagnostics: ExportDiagnostics | null;
   completedAtMs: number | null;
 }
@@ -46,6 +47,7 @@ export interface ExportQueueOutcomeInput {
   message?: string | null;
   outputPath?: string | null;
   outputSizeBytes?: number | null;
+  targetResult?: TargetResult | null;
   diagnostics?: ExportDiagnostics | null;
   completedAtMs?: number | null;
 }
@@ -76,6 +78,7 @@ export interface ExportQueueCounts {
   queued: number;
   running: number;
   done: number;
+  missed: number;
   failed: number;
   cancelled: number;
 }

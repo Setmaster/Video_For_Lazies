@@ -26,6 +26,8 @@ import type {
   OutputFormat,
   ResizeMode,
   StreamAction,
+  SubtitleInspection,
+  TargetResult,
   UpdateApplyResponse,
   UpdateCheckResponse,
   VideoCodecPreference,
@@ -98,12 +100,20 @@ import {
   fitMaxEdgeDisplayDimensions,
   fitMaxEdgeDimensions,
   hasNonSquarePixels,
-  sizeTargetRetainsAudio,
   sourceRotationBlockingReason,
   squarePixelDimensions,
   timelineSpeedChanges,
   trimRequestIsActive,
 } from "./lib/mediaDepth";
+import {
+  exactTargetBytesFromMegabytes,
+  strictFitCorrectiveActions,
+  summarizeStrictFitPlan,
+  summarizeStrictFitPolicy,
+  summarizeTargetResult,
+  targetResultFormatData,
+  type StrictFitCorrectiveAction,
+} from "./lib/strictFit";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
@@ -118,6 +128,7 @@ const OUTPUT_DIMENSION_MIN_PX = 16;
 const OUTPUT_DIMENSION_MAX_PX = 32768;
 const AUDIO_BITRATE_PRESETS_KBPS = [96, 128, 192, 256, 320] as const;
 const FRAME_RATE_CAP_PRESETS_FPS = [24, 30, 60] as const;
+const SIZE_TARGET_EXACTNESS_ERROR = "Size limit is too large to track exactly in bytes. Enter a smaller MB value.";
 const VIDEO_CODEC_LABELS: Record<VideoCodecPreference, string> = {
   auto: "Auto",
   h264: "H.264",
@@ -255,6 +266,18 @@ type SmokeInteractionResult =
       expectedDurationS: number;
     };
 
+type TargetCorrectiveContext = {
+  sourcePathIdentity: string | null;
+  format: OutputFormat;
+  width: number | null;
+  height: number | null;
+  currentMaxEdgePx: number | null;
+  plannedFrameRateFps: number | null;
+  hasAudio: boolean;
+  audioEnabled: boolean;
+  strictFit: boolean;
+};
+
 type LastExportResult = {
   outputPath: string;
   outputSizeBytes: number | null;
@@ -262,12 +285,15 @@ type LastExportResult = {
   format: OutputFormat;
   message: string | null;
   diagnostics: ExportDiagnostics | null;
+  targetResult: TargetResult | null;
+  correctiveContext: TargetCorrectiveContext;
   completedAtMs: number;
 };
 const QUEUE_STATUS_LABELS: Record<ExportQueueItem["status"], string> = {
   queued: "Queued",
   running: "Running",
   done: "Done",
+  "target-missed": "Target missed",
   failed: "Failed",
   cancelled: "Canceled",
 };
@@ -389,6 +415,61 @@ function formatStreamAction(action: StreamAction | null | undefined) {
   return "not present";
 }
 
+function TargetResultDetails({ targetResult }: { targetResult: TargetResult }) {
+  const data = targetResultFormatData(targetResult);
+  if (!data) {
+    return (
+      <div className="vfl-error" role="alert">
+        The backend returned inconsistent exact-byte target evidence. The artifact was not reclassified in the app.
+      </div>
+    );
+  }
+
+  const boundedPlans = targetResult.plans.slice(0, 4);
+  const selectedPlans = targetResult.plans.filter((plan) => plan.selected);
+  const planHistoryValid =
+    targetResult.plans.length <= 4 &&
+    selectedPlans.length === 1 &&
+    selectedPlans[0]?.planNumber === targetResult.selectedPlanNumber;
+  return (
+    <section
+      className={`vfl-target-result ${data.missed ? "missed" : "met"}`}
+      aria-label={data.missed ? "Size target missed" : "Size target met"}
+      data-target-status={data.status}
+    >
+      <div className="vfl-target-result-title">
+        {data.missed ? "Target missed" : "Target met"}
+      </div>
+      <div className="vfl-target-result-summary">{summarizeTargetResult(targetResult)}</div>
+      <div className="vfl-target-result-values">
+        <div><span>Target</span><strong>{data.targetBytesText}</strong></div>
+        <div><span>Actual</span><strong>{data.actualBytesText}</strong></div>
+        <div>
+          <span>{data.missed ? "Over target" : "Remaining"}</span>
+          <strong>{data.missed ? `${data.overshootBytesText} (${data.overshootPercentText})` : data.remainingBytesText}</strong>
+        </div>
+      </div>
+      {!planHistoryValid ? (
+        <div className="vfl-error" role="alert">
+          The backend returned an invalid or unbounded fit-plan history. Only the first four plans are shown.
+        </div>
+      ) : null}
+      {boundedPlans.length ? (
+        <details className="vfl-fit-plan-history">
+          <summary>Fit plan history ({boundedPlans.length} of 4 maximum)</summary>
+          <ol>
+            {boundedPlans.map((plan) => (
+              <li key={plan.planNumber} className={plan.selected ? "selected" : ""}>
+                {summarizeStrictFitPlan(plan) ?? `Plan ${plan.planNumber} returned invalid display data.`}
+              </li>
+            ))}
+          </ol>
+        </details>
+      ) : null}
+    </section>
+  );
+}
+
 function QueueDiagnosticsDetails({
   outcome,
   summary = "Diagnostics",
@@ -421,6 +502,16 @@ function QueueDiagnosticsDetails({
       ) : null}
       {diagnostics.reverseBufferAction ? (
         <div className="vfl-export-result-note">Transform buffer: {diagnostics.reverseBufferAction}</div>
+      ) : null}
+      {diagnostics.subtitleBurnedIn ? (
+        <div className="vfl-export-result-note">
+          External subtitles burned in{diagnostics.subtitleCueCount ? ` (${diagnostics.subtitleCueCount} cues)` : ""}.
+        </div>
+      ) : null}
+      {diagnostics.audioRemovedForSizeTarget ? (
+        <div className="vfl-export-result-note">
+          Audio was removed by the explicitly permitted final Strict Fit plan.
+        </div>
       ) : null}
       {diagnostics.failureStage ? (
         <div className="vfl-export-result-note">Failure stage: {diagnostics.failureStage}</div>
@@ -517,6 +608,13 @@ function App() {
   const [customHeightPx, setCustomHeightPx] = useState("");
   const [outputAspectLocked, setOutputAspectLocked] = useState(true);
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [strictFit, setStrictFit] = useState(false);
+  const [strictFitAllowAudioRemoval, setStrictFitAllowAudioRemoval] = useState(false);
+  const [subtitlePath, setSubtitlePath] = useState("");
+  const [subtitleInspection, setSubtitleInspection] = useState<SubtitleInspection | null>(null);
+  const [subtitleInspecting, setSubtitleInspecting] = useState(false);
+  const [subtitleError, setSubtitleError] = useState<string | null>(null);
+  const [subtitleStatus, setSubtitleStatus] = useState("No external subtitles selected.");
   const [normalizeAudio, setNormalizeAudio] = useState(false);
   const [perturbFirstFrame, setPerturbFirstFrame] = useState(false);
   const [colorPolicy, setColorPolicy] = useState<ColorPolicy>("auto");
@@ -560,6 +658,7 @@ function App() {
   const [smokeConfig, setSmokeConfig] = useState<AppSmokeConfig | null>(null);
   const [previewMediaReady, setPreviewMediaReady] = useState(false);
   const [lastExport, setLastExport] = useState<LastExportResult | null>(null);
+  const [appliedCorrectiveKinds, setAppliedCorrectiveKinds] = useState<string[]>([]);
   const [latestAttempt, setLatestAttempt] = useState<EncodeAttemptState>(() => createIdleEncodeAttempt());
   const [exportQueueState, setExportQueueState] = useState<ExportQueueState>(() => createExportQueueState());
   const [queuePreparationBusy, setQueuePreparationBusy] = useState(false);
@@ -610,6 +709,8 @@ function App() {
   const queueRunButtonRef = useRef<HTMLButtonElement | null>(null);
   const queueStopButtonRef = useRef<HTMLButtonElement | null>(null);
   const queueRegionRef = useRef<HTMLDivElement | null>(null);
+  const subtitleBrowseButtonRef = useRef<HTMLButtonElement | null>(null);
+  const subtitleInspectionTokenRef = useRef(0);
   const modalOpenRef = useRef(false);
   const smokeConfigRef = useRef<AppSmokeConfig | null>(null);
   const smokeStageRef = useRef<string | null>(null);
@@ -638,6 +739,7 @@ function App() {
     queueItemId: number | null;
     queueRunId: number | null;
     sample: { outputDurationS: number; fullDurationS: number | null } | null;
+    correctiveContext: TargetCorrectiveContext;
   } | null>(null);
 
   function updateLatestAttempt(next: EncodeAttemptState) {
@@ -737,6 +839,9 @@ function App() {
             trimEndS: extra.trimEndS ?? null,
             expectedDurationS: extra.expectedDurationS ?? null,
             stageHistory: smokeStageHistoryRef.current,
+            targetResult: extra.targetResult ?? null,
+            diagnostics: extra.diagnostics ?? null,
+            queueOutcomeKind: extra.queueOutcomeKind ?? null,
           },
         });
       } catch (error) {
@@ -1055,6 +1160,28 @@ function App() {
     };
   }, [settingsReady]);
 
+  function safeSubtitleError(error: unknown, selectedPath?: string) {
+    let message = coerceErrorMessage(error, "The selected subtitle file could not be validated.");
+    if (selectedPath) {
+      message = message.split(selectedPath).join("the selected subtitle file");
+      const selectedName = basename(selectedPath);
+      if (selectedName) message = message.split(selectedName).join("the selected subtitle file");
+    }
+    return message;
+  }
+
+  function clearExternalSubtitle(message = "No external subtitles selected.", focusBrowse = false) {
+    subtitleInspectionTokenRef.current += 1;
+    setSubtitlePath("");
+    setSubtitleInspection(null);
+    setSubtitleInspecting(false);
+    setSubtitleError(null);
+    setSubtitleStatus(message);
+    if (focusBrowse) {
+      window.setTimeout(() => focusButtonWhenAvailable(subtitleBrowseButtonRef), 0);
+    }
+  }
+
   function applyNewInput(path: string, nextFormat: OutputFormat) {
     if (
       jobIdRef.current !== null ||
@@ -1066,6 +1193,9 @@ function App() {
     setOutputAuto(true);
     setOutputPath("");
     setColorPolicy("auto");
+    if (queuePathIdentity(path) !== queuePathIdentity(inputPathRef.current)) {
+      clearExternalSubtitle("External subtitles cleared for the new source.");
+    }
 
     if (nextFormat !== formatRef.current) setFormat(nextFormat);
     setInputPath(path);
@@ -1089,6 +1219,9 @@ function App() {
     setCustomHeightPx("");
     setOutputAspectLocked(true);
     setAudioEnabled(true);
+    setStrictFit(false);
+    setStrictFitAllowAudioRemoval(false);
+    clearExternalSubtitle("External subtitles cleared by Reset.");
     setNormalizeAudio(false);
     setPerturbFirstFrame(false);
     setColorPolicy("auto");
@@ -1145,6 +1278,8 @@ function App() {
     setAudioEnabled(recipeWantsAudio && sourceHasAudio);
     setNormalizeAudio(Boolean(recipeSettings.normalizeAudio));
     setPerturbFirstFrame(Boolean(recipeSettings.perturbFirstFrame));
+    setStrictFit(Boolean(recipeSettings.strictFit));
+    setStrictFitAllowAudioRemoval(Boolean(recipeSettings.strictFitAllowAudioRemoval));
     setAdvancedVideoCodec(recipeAdvanced.videoCodec);
     setAdvancedAudioBitrateKbps(recipeAdvanced.audioBitrateKbps === null ? "auto" : String(recipeAdvanced.audioBitrateKbps));
     setAdvancedVideoQuality(recipeAdvanced.videoQuality);
@@ -1186,6 +1321,10 @@ function App() {
       }
       if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
       if (partialSettings.perturbFirstFrame !== undefined) setPerturbFirstFrame(partialSettings.perturbFirstFrame);
+      if (partialSettings.strictFit !== undefined) setStrictFit(partialSettings.strictFit);
+      if (partialSettings.strictFitAllowAudioRemoval !== undefined) {
+        setStrictFitAllowAudioRemoval(partialSettings.strictFitAllowAudioRemoval);
+      }
       setStatus(`Applied ${recipe.label}.`);
       return;
     }
@@ -1310,6 +1449,11 @@ function App() {
   }, [format]);
 
   useEffect(() => {
+    if (strictFit && audioEnabled && probe?.hasAudio !== false) return;
+    setStrictFitAllowAudioRemoval(false);
+  }, [strictFit, audioEnabled, probe?.hasAudio]);
+
+  useEffect(() => {
     if (isVideoCodecCompatible(format, advancedVideoCodec)) return;
     setAdvancedVideoCodec("auto");
   }, [format, advancedVideoCodec]);
@@ -1357,6 +1501,35 @@ function App() {
     setCustomHeightPx(smokeConfig.resizeHeightPx === null || smokeConfig.resizeHeightPx === undefined ? "" : formatNumberInput(smokeConfig.resizeHeightPx));
     setOutputAspectLocked(true);
     setAudioEnabled(true);
+    const smokeStrictFit = smokeConfig.format !== "mp3" && smokeConfig.sizeLimitMb > 0 && smokeConfig.strictFit === true;
+    setStrictFit(smokeStrictFit);
+    setStrictFitAllowAudioRemoval(smokeStrictFit && smokeConfig.strictFitAllowAudioRemoval === true);
+    clearExternalSubtitle("No external subtitles selected.");
+    if (smokeConfig.subtitlePath) {
+      const configuredSubtitlePath = smokeConfig.subtitlePath;
+      const token = subtitleInspectionTokenRef.current + 1;
+      subtitleInspectionTokenRef.current = token;
+      setSubtitleInspecting(true);
+      void invoke<SubtitleInspection>("inspect_srt", { path: configuredSubtitlePath })
+        .then((inspection) => {
+          if (subtitleInspectionTokenRef.current !== token) return;
+          setSubtitlePath(configuredSubtitlePath);
+          setSubtitleInspection(inspection);
+          setSubtitleError(null);
+          setSubtitleStatus(
+            `${basename(configuredSubtitlePath)} selected, ${inspection.cueCount} cue${inspection.cueCount === 1 ? "" : "s"} validated.`,
+          );
+        })
+        .catch((error) => {
+          if (subtitleInspectionTokenRef.current !== token) return;
+          const message = safeSubtitleError(error, configuredSubtitlePath);
+          setSubtitleError(message);
+          void reportSmokeFailure(`Packaged app smoke subtitle validation failed: ${message}`);
+        })
+        .finally(() => {
+          if (subtitleInspectionTokenRef.current === token) setSubtitleInspecting(false);
+        });
+    }
     setNormalizeAudio(false);
     setPerturbFirstFrame(smokeConfig.perturbFirstFrame ?? false);
     setColorPolicy(smokeConfig.colorPolicy ?? "auto");
@@ -1393,7 +1566,18 @@ function App() {
     setTrimDragSnapS((current) => normalizeTrimDragSnapInput(current, probe?.durationS ?? null));
   }, [probe?.durationS]);
 
-  const sizeLimitEnabled = sizeLimitMb.trim() !== "" && Number(sizeLimitMb) > 0;
+  const parsedSizeLimitMb = Number(sizeLimitMb);
+  const exactSizeTargetBytes = exactTargetBytesFromMegabytes(parsedSizeLimitMb);
+  const sizeLimitEnabled = sizeLimitMb.trim() !== "" && parsedSizeLimitMb > 0;
+  const sizeTargetExactnessBlockingReason =
+    sizeLimitEnabled && exactSizeTargetBytes === null
+      ? SIZE_TARGET_EXACTNESS_ERROR
+      : null;
+  useEffect(() => {
+    if (format !== "mp3" && sizeLimitEnabled) return;
+    setStrictFit(false);
+    setStrictFitAllowAudioRemoval(false);
+  }, [format, sizeLimitEnabled]);
   const shapedVideoDimensions = useMemo(() => {
     if (!probe) return null;
     return dimensionsAfterShape(probe, cropEnabled, cropRect, rotateDeg);
@@ -1414,6 +1598,7 @@ function App() {
 
     const sizeMb = Number(sizeLimitMb);
     if (!Number.isFinite(sizeMb) || sizeMb < 0) return null;
+    if (sizeMb > 0 && exactTargetBytesFromMegabytes(sizeMb) === null) return null;
 
     const speedNum = Number(speed);
     if (!Number.isFinite(speedNum) || speedNum <= 0) return null;
@@ -1512,6 +1697,7 @@ function App() {
       resizeMode !== "source" ||
       !colorIsDefault(brightness, contrast, saturation) ||
       perturbFirstFrame ||
+      Boolean(subtitlePath) ||
       colorPolicy === "standardSdr" ||
       hasNonSquarePixels(probe) ||
       advancedVideoCodec !== "auto" ||
@@ -1531,23 +1717,7 @@ function App() {
     const planningVideoCodec = advancedVideoCodec === "auto"
       ? capabilityDefaultCodec ?? compatibleSourcePlanningCodec ?? (format === "mp4" ? "h264" : "vp9")
       : advancedVideoCodec;
-    const requestedFrameRateCap = Number(advancedFrameRateCapFps);
-    const planAudioForDimensions = (width: number, height: number) => sizeTargetRetainsAudio({
-      audioRequested: audioEnabled,
-      hasAudio: probe.hasAudio,
-      sizeLimitEnabled,
-      totalKbps,
-      codec: planningVideoCodec,
-      width,
-      height,
-      sourceFrameRate: probe.frameRate,
-      speed: speedNum,
-      frameRateCapFps:
-        Number.isFinite(requestedFrameRateCap) && requestedFrameRateCap > 0
-          ? requestedFrameRateCap
-          : null,
-    });
-    let audioIncluded = planAudioForDimensions(w, h);
+    const audioIncluded = audioEnabled && probe.hasAudio;
     const sourceAudioCopyCompatibleForPlanning =
       format === "mp4"
         ? probe.audioCodec === "aac"
@@ -1558,7 +1728,6 @@ function App() {
       const audioFallbackDimensions = encodedOutputDimensions(w, h, true);
       w = audioFallbackDimensions.width;
       h = audioFallbackDimensions.height;
-      audioIncluded = planAudioForDimensions(w, h);
     }
 
     return { durationS, totalKbps, sizeLimitEnabled, audioIncluded, w, h, videoCodec: planningVideoCodec };
@@ -1592,6 +1761,7 @@ function App() {
     advancedAudioChannels,
     normalizeAudio,
     audioEnabled,
+    subtitlePath,
     encodeCapabilities,
   ]);
 
@@ -1806,6 +1976,7 @@ function App() {
   const cropFilterPlanned = Boolean(
     cropEnabled && cropPixelRect && probe && !isFullFramePixelCrop(cropPixelRect, probe.width, probe.height),
   );
+  const externalSubtitleActive = Boolean(subtitlePath);
   const hasVideoEditTransforms =
     trimIsActive ||
     cropFilterPlanned ||
@@ -1817,7 +1988,8 @@ function App() {
     !colorIsDefault(brightness, contrast, saturation) ||
     (format !== "mp3" && perturbFirstFrame) ||
     (format !== "mp3" && colorPolicy === "standardSdr") ||
-    (format !== "mp3" && hasNonSquarePixels(probe));
+    (format !== "mp3" && hasNonSquarePixels(probe)) ||
+    (format !== "mp3" && externalSubtitleActive);
   const advancedForcesReencode =
     format !== "mp3" &&
     (advancedVideoCodec !== "auto" ||
@@ -1830,6 +2002,8 @@ function App() {
   const encodeModeSummary =
     format === "mp3"
       ? "Audio-only re-encode"
+      : externalSubtitleActive
+        ? "Force re-encode to burn external subtitles"
       : advancedForcesReencode
         ? "Force re-encode because overrides are active"
         : sizeLimitEnabled
@@ -1853,6 +2027,8 @@ function App() {
       audioEnabled: reusableAudioEnabled,
       normalizeAudio,
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
+      strictFit,
+      strictFitAllowAudioRemoval,
       advanced: {
         videoCodec: advancedVideoCodec,
         audioBitrateKbps: advancedAudioBitrateRequest,
@@ -1873,6 +2049,8 @@ function App() {
       reusableAudioEnabled,
       normalizeAudio,
       perturbFirstFrame,
+      strictFit,
+      strictFitAllowAudioRemoval,
       advancedVideoCodec,
       advancedAudioBitrateRequest,
       advancedVideoQuality,
@@ -1900,6 +2078,8 @@ function App() {
       `audio ${canonicalCurrentRecipeSettings.audioEnabled ? "included" : "removed"}`,
       `normalization ${canonicalCurrentRecipeSettings.normalizeAudio ? "on" : "off"}`,
       `first-frame uniqueness ${canonicalCurrentRecipeSettings.perturbFirstFrame ? "on" : "off"}`,
+      `Strict Fit ${canonicalCurrentRecipeSettings.strictFit ? "on" : "off"}`,
+      `Strict Fit audio removal ${canonicalCurrentRecipeSettings.strictFitAllowAudioRemoval ? "allowed" : "not allowed"}`,
       `video codec ${VIDEO_CODEC_LABELS[advanced.videoCodec]}`,
       `quality ${VIDEO_QUALITY_LABELS[advanced.videoQuality]}`,
       `encode speed ${ENCODE_SPEED_LABELS[advanced.encodeSpeed]}`,
@@ -1967,6 +2147,15 @@ function App() {
       ? `${label} is unavailable because FFmpeg is missing ${missing.join(", ")}.`
       : `${label} is unavailable in the active FFmpeg build.`;
   };
+  const externalSubtitleCapability = featureCapability("externalSubtitles");
+  const subtitlePickerBlockingReason = (() => {
+    if (format === "mp3") return "External subtitles can be burned into MP4 or WebM video only.";
+    if (encodeCapabilitiesError) return `Subtitle capability inspection failed: ${encodeCapabilitiesError}`;
+    if (!encodeCapabilities) return "Checking whether the active FFmpeg build can burn external subtitles.";
+    if (externalSubtitleCapability?.available === true) return null;
+    return describeMissingFeature("externalSubtitles", "External subtitles", { filters: ["subtitles"] });
+  })();
+  const externalSubtitleBlockingReason = externalSubtitleActive ? subtitlePickerBlockingReason : null;
   const colorBlockingReason = (() => {
     if (format === "mp3" || colorSource.kind === "standard") return null;
     if (colorSource.kind === "unsupported") return colorSource.reason;
@@ -2139,6 +2328,17 @@ function App() {
     plannedEncodeSummary,
     currentPlanRequiresVideoEncoder,
   ]);
+  const strictFitPolicySummary = summarizeStrictFitPolicy({
+    strictFit: format !== "mp3" && sizeLimitEnabled && strictFit,
+    strictFitAllowAudioRemoval:
+      format !== "mp3" && sizeLimitEnabled && strictFit && audioEnabled && strictFitAllowAudioRemoval,
+    audioEnabled: format !== "mp3" && audioEnabled && probe?.hasAudio !== false,
+  });
+  const subtitlePlanSummary = subtitlePath && subtitleInspection
+    ? `${basename(subtitlePath)}, ${subtitleInspection.cueCount} cue${subtitleInspection.cueCount === 1 ? "" : "s"}, source time ${formatClock(subtitleInspection.firstCueStartS)} to ${formatClock(subtitleInspection.lastCueEndS)}`
+    : subtitlePath
+      ? "External subtitle validation is incomplete."
+      : "No external subtitles";
   const autoVideoCodecBlockingReason =
     currentPlanRequiresVideoEncoder &&
     advancedVideoCodec === "auto" &&
@@ -2272,6 +2472,7 @@ function App() {
       ? "That output path is already reserved by an item in the export queue. Choose another destination or remove the queued item."
       : null;
   const exportBlockingReason =
+    sizeTargetExactnessBlockingReason ??
     capabilityInspectionBlockingReason ??
     rotationBlockingReason ??
     sourceDimensionBlockingReason ??
@@ -2280,6 +2481,8 @@ function App() {
     coreCapabilityBlockingReason ??
     transformCapabilityBlockingReason ??
     transformMemoryBlockingReason ??
+    (subtitleInspecting ? "Wait for external subtitle validation to finish." : null) ??
+    externalSubtitleBlockingReason ??
     autoVideoCodecBlockingReason ??
     queueOutputBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting." : null);
@@ -2348,6 +2551,8 @@ function App() {
     if (normalizeAudioApplies) chips.push("Normalized audio");
     if (format !== "mp3" && colorPolicy === "standardSdr") chips.push("Standard SDR");
     if (format !== "mp3" && hasNonSquarePixels(probe)) chips.push("Square pixels");
+    if (format !== "mp3" && externalSubtitleActive) chips.push("External subtitles");
+    if (format !== "mp3" && sizeLimitEnabled && strictFit) chips.push("Strict Fit");
 
     return chips;
   }, [
@@ -2376,14 +2581,40 @@ function App() {
     advancedAudioChannels,
     normalizeAudioApplies,
     colorPolicy,
+    externalSubtitleActive,
+    sizeLimitEnabled,
+    strictFit,
   ]);
 
   const lastExportSizeText = lastExport?.outputSizeBytes ? `${(lastExport.outputSizeBytes / 1_000_000).toFixed(2)} MB` : null;
   const lastExportDurationText = lastExport?.durationS ? formatClock(lastExport.durationS) : null;
+  const lastTargetData = lastExport?.targetResult
+    ? targetResultFormatData(lastExport.targetResult)
+    : null;
+  const lastCorrectiveActions = useMemo(
+    () => lastExport?.targetResult?.status === "missed"
+      ? strictFitCorrectiveActions({
+          targetResult: lastExport.targetResult,
+          ...lastExport.correctiveContext,
+        })
+      : [],
+    [lastExport],
+  );
+  const currentTargetBytesCandidate = exactTargetBytesFromMegabytes(Number(sizeLimitMb));
+  const currentExactTargetBytes = currentTargetBytesCandidate !== null && currentTargetBytesCandidate > 0
+    ? currentTargetBytesCandidate
+    : null;
+  const correctiveActionsMatchCurrentPlan = Boolean(
+    lastExport?.targetResult &&
+    lastExport.correctiveContext.sourcePathIdentity === queuePathIdentity(inputPath) &&
+    lastExport.correctiveContext.format === format &&
+    lastExport.targetResult.targetBytes === currentExactTargetBytes,
+  );
   const progressUi = getActiveProgressUi(progress, jobId !== null);
   const attemptUi = deriveEncodeAttemptPresentation(latestAttempt);
-  const encodeBusy = attemptUi.isActive || queueRunning || queuePreparationBusy || queueSnapshotApplying;
-  const lastExportIsCurrentOutcome = latestAttempt.kind === "succeeded";
+  const encodeBusy = attemptUi.isActive || queueRunning || queuePreparationBusy || queueSnapshotApplying || subtitleInspecting;
+  const lastExportIsCurrentOutcome =
+    latestAttempt.kind === "succeeded" || latestAttempt.kind === "target-missed";
   const latestAttemptOutputPath =
     "outputPath" in latestAttempt ? latestAttempt.outputPath ?? null : null;
   const displayedStatus =
@@ -2434,7 +2665,7 @@ function App() {
 
   const exportReady = Boolean(inputPath && outputPath && probe && !exportBlockingReason);
   const planHeroReady =
-    exportReady && !attemptUi.isActive && !attemptUi.isFailure && !attemptUi.isCancelled;
+    exportReady && !attemptUi.isActive && !attemptUi.isFailure && !attemptUi.isCancelled && !attemptUi.isTargetMissed;
   const queueCounts = useMemo(() => summarizeExportQueue(exportQueueState), [exportQueueState]);
   const activeQueuePosition = queueActiveItemId === null
     ? null
@@ -2442,6 +2673,8 @@ function App() {
   const planStatusText =
     attemptUi.isActive
       ? displayedStatus
+      : attemptUi.isTargetMissed
+        ? attemptUi.message ?? "The measured artifact is over the requested size target and remains available to open."
       : attemptUi.isFailure || attemptUi.isCancelled
         ? attemptUi.message ?? displayedStatus
       : !inputPath
@@ -2461,12 +2694,13 @@ function App() {
     if (!probe || !plannedEncodeSummary) return warnings;
 
     if (plannedEncodeSummary.sizeLimitEnabled) {
-      warnings.push("Size targets are best effort; tight budgets can reduce quality, remove audio, or finish above target.");
+      warnings.push(
+        strictFit
+          ? strictFitPolicySummary
+          : "Strict Fit is off. The requested dimensions and audio are preserved; if the measured output is over target, the artifact is published as a target miss with exact bytes.",
+      );
       if (plannedEncodeSummary.totalKbps !== null && plannedEncodeSummary.totalKbps < 160 && format !== "mp3") {
         warnings.push("This target leaves a very low bitrate for video. Lower output dimensions, trim shorter, or raise the size limit.");
-      }
-      if (format !== "mp3" && probe.hasAudio && audioEnabled && plannedEncodeSummary.totalKbps !== null && plannedEncodeSummary.totalKbps < 82) {
-        warnings.push("This target is too tight to keep audio; export may remove it to prioritize a playable video.");
       }
       if (
         plannedEncodeSummary.totalKbps !== null &&
@@ -2481,6 +2715,14 @@ function App() {
 
     if (format === "mp3" && !probe.hasAudio) {
       warnings.push("MP3 export needs an input with an audio stream.");
+    }
+
+    if (externalSubtitleActive) {
+      warnings.push(
+        format === "mp3"
+          ? "External subtitles cannot be burned into MP3. Choose MP4 or WebM, or remove the subtitle file."
+          : "External subtitles will be burned into the video after final geometry and color handling, using source-timeline timing. This forces video re-encoding.",
+      );
     }
 
     if (selectedVideoCodecUnavailable) {
@@ -2562,6 +2804,9 @@ function App() {
     transformMemoryEstimate,
     capabilityInspectionBlockingReason,
     encodeCapabilitiesError,
+    strictFit,
+    strictFitPolicySummary,
+    externalSubtitleActive,
   ]);
 
   const handleDroppedPaths = useEffectEvent(async (paths: string[]) => {
@@ -2573,7 +2818,8 @@ function App() {
         pendingEncodeRef.current !== null ||
         exportQueueStateRef.current.autoRun ||
         queuePreparationCountRef.current > 0 ||
-        queueSnapshotApplyingRef.current,
+        queueSnapshotApplyingRef.current ||
+        subtitleInspecting,
       queueCapacity: exportQueueRemainingCapacity(exportQueueStateRef.current),
     });
 
@@ -2817,6 +3063,23 @@ function App() {
       return;
     }
 
+    if (smokeConfig.subtitlePath) {
+      if (smokeConfig.format === "mp3") {
+        void reportSmokeFailure("Packaged app smoke cannot combine external subtitles with MP3 output.");
+        return;
+      }
+      if (subtitleError) {
+        void reportSmokeFailure(`Packaged app smoke subtitle validation failed: ${subtitleError}`);
+        return;
+      }
+      if (subtitleInspecting || subtitlePath !== smokeConfig.subtitlePath || !subtitleInspection) return;
+      if (!encodeCapabilities && !encodeCapabilitiesError) return;
+      if (externalSubtitleCapability?.available !== true) {
+        void reportSmokeFailure(subtitlePickerBlockingReason ?? "Packaged app smoke requires external subtitle support.");
+        return;
+      }
+    }
+
     if (inputPath !== smokeConfig.inputPath || !probe) return;
 
     void reportSmokeStatus("probe-ready", {
@@ -2927,6 +3190,12 @@ function App() {
     jobId,
     trimTimeline,
     status,
+    subtitlePath,
+    subtitleInspection,
+    subtitleInspecting,
+    subtitleError,
+    encodeCapabilities,
+    encodeCapabilitiesError,
   ]);
 
   useEffect(() => {
@@ -2977,6 +3246,9 @@ function App() {
               trimStartS: smokeMetrics?.trimStartS ?? null,
               trimEndS: smokeMetrics?.trimEndS ?? null,
               expectedDurationS: smokeMetrics?.expectedDurationS ?? completedContext.durationS,
+              targetResult: p.targetResult ?? null,
+              diagnostics: p.diagnostics ?? null,
+              queueOutcomeKind: p.targetResult?.status === "missed" ? "target-missed" : "done",
             });
           }
         }
@@ -3021,12 +3293,25 @@ function App() {
           });
         }
 
+        const targetData = p.targetResult ? targetResultFormatData(p.targetResult) : null;
+        const targetMissed = p.targetResult?.status === "missed";
+        const exactEvidenceConsistent = !p.targetResult || Boolean(
+          targetData &&
+          p.outputSizeBytes === targetData.actualBytes &&
+          p.diagnostics?.actualSizeBytes === targetData.actualBytes &&
+          p.diagnostics?.requestedSizeBytes === targetData.targetBytes,
+        );
         const sizeMb = p.outputSizeBytes ? p.outputSizeBytes / 1_000_000 : null;
         const suffix = sizeMb !== null ? ` (${sizeMb.toFixed(2)} MB)` : "";
-        setStatus(`Done${suffix}.`);
-        if (p.message) {
-          setStatus(`Done${suffix}. ${p.message}`);
+        const exactTargetSummary = p.targetResult ? summarizeTargetResult(p.targetResult) : null;
+        if (!exactEvidenceConsistent) {
+          setStatus("Export completed with inconsistent exact-byte target evidence. The artifact was not reclassified in the app.");
+        } else if (targetMissed) {
+          setStatus(exactTargetSummary ?? "Target missed. The measured artifact is available to open.");
+        } else {
+          setStatus(`Done${suffix}.${exactTargetSummary ? ` ${exactTargetSummary}` : p.message ? ` ${p.message}` : ""}`);
         }
+        const selectedPlan = p.targetResult?.plans.find((plan) => plan.selected) ?? null;
         setLastExport({
           outputPath: p.outputPath ?? completedContext.outputPath,
           outputSizeBytes: p.outputSizeBytes ?? null,
@@ -3034,8 +3319,21 @@ function App() {
           format: completedContext.format,
           message: p.message ?? null,
           diagnostics: p.diagnostics ?? null,
+          targetResult: p.targetResult ?? null,
+          correctiveContext: {
+            ...completedContext.correctiveContext,
+            width: selectedPlan?.width ?? completedContext.correctiveContext.width,
+            height: selectedPlan?.height ?? completedContext.correctiveContext.height,
+            hasAudio:
+              selectedPlan
+                ? selectedPlan.audioAction !== null &&
+                  selectedPlan.audioAction !== undefined &&
+                  selectedPlan.audioAction !== "drop"
+                : completedContext.correctiveContext.hasAudio,
+          },
           completedAtMs,
         });
+        setAppliedCorrectiveKinds([]);
         let shouldContinueQueue = false;
         if (completedQueueItemId !== null && completedQueueRunId !== null) {
           const nextQueue = dispatchExportQueue({
@@ -3043,10 +3341,11 @@ function App() {
             itemId: completedQueueItemId,
             runId: completedQueueRunId,
             outcome: {
-              kind: "done",
-              message: p.message ?? null,
+              kind: targetMissed ? "target-missed" : "done",
+              message: targetMissed ? exactTargetSummary ?? p.message ?? "Target missed." : p.message ?? null,
               outputPath: p.outputPath ?? completedContext.outputPath,
               outputSizeBytes: p.outputSizeBytes ?? null,
+              targetResult: p.targetResult ?? null,
               diagnostics: p.diagnostics ?? null,
               completedAtMs,
             },
@@ -3108,6 +3407,60 @@ function App() {
       console.error("Dialog open failed:", e);
       setStatus(msg);
     }
+  }
+
+  async function pickExternalSubtitle() {
+    if (
+      encodeBusy ||
+      !inputPath ||
+      subtitlePickerBlockingReason
+    ) return;
+
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        title: "Select external subtitles",
+        filters: [{ name: "SubRip subtitles", extensions: ["srt"] }],
+      });
+      if (typeof selected !== "string") return;
+      if (formatRef.current === "mp3") {
+        setSubtitleError("External subtitles require MP4 or WebM video output.");
+        return;
+      }
+
+      const token = subtitleInspectionTokenRef.current + 1;
+      subtitleInspectionTokenRef.current = token;
+      const sourceAtSelection = inputPathRef.current;
+      const formatAtSelection = formatRef.current;
+      setSubtitleInspecting(true);
+      setSubtitleError(null);
+      try {
+        const inspection = await invoke<SubtitleInspection>("inspect_srt", { path: selected });
+        if (
+          subtitleInspectionTokenRef.current !== token ||
+          inputPathRef.current !== sourceAtSelection ||
+          formatRef.current !== formatAtSelection
+        ) return;
+        setSubtitlePath(selected);
+        setSubtitleInspection(inspection);
+        setSubtitleStatus(
+          `${basename(selected)} selected, ${inspection.cueCount} cue${inspection.cueCount === 1 ? "" : "s"} validated.`,
+        );
+      } catch (error) {
+        if (subtitleInspectionTokenRef.current !== token) return;
+        setSubtitleError(safeSubtitleError(error, selected));
+      } finally {
+        if (subtitleInspectionTokenRef.current === token) setSubtitleInspecting(false);
+      }
+    } catch (error) {
+      setSubtitleError(safeSubtitleError(error));
+    }
+  }
+
+  function removeExternalSubtitle() {
+    if (!subtitlePath || encodeBusy) return;
+    clearExternalSubtitle("External subtitles removed. No export started.", true);
   }
 
   async function pickOutput() {
@@ -3294,7 +3647,9 @@ function App() {
   function buildSettingsOnlyRequest(nextInputPath: string, nextOutputPath: string): EncodeRequest {
     const size = parseNum("Size limit (MB)", sizeLimitMb, { min: 0 });
     if (size !== 0 && size < 0.1) throw new Error("Size limit must be >= 0.1 MB (or 0/empty to disable).");
+    if (exactTargetBytesFromMegabytes(size) === null) throw new Error(SIZE_TARGET_EXACTNESS_ERROR);
     const resizeRequest = buildResizeRequest();
+    const requestStrictFit = format !== "mp3" && size > 0 && strictFit;
 
     return {
       inputPath: nextInputPath,
@@ -3319,6 +3674,11 @@ function App() {
       color: null,
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       loopVideo: false,
+      strictFit: requestStrictFit,
+      strictFitAllowAudioRemoval:
+        requestStrictFit && (audioEnabled || autoMutedRef.current) && strictFitAllowAudioRemoval,
+      // Same-settings batches intentionally exclude clip-scoped subtitles.
+      subtitlePath: null,
     };
   }
 
@@ -3326,12 +3686,19 @@ function App() {
     if (!inputPath) throw new Error("Pick an input file first.");
     if (!outputPath) throw new Error("Pick an output path first.");
     if (!probe) throw new Error("Probe not ready yet.");
+    if (subtitleInspecting) throw new Error("Wait for external subtitle validation to finish.");
     if (format === "mp3" && !probe.hasAudio) throw new Error("Input has no audio stream (can't export MP3).");
+    if (format === "mp3" && subtitlePath) throw new Error("External subtitles require MP4 or WebM video output.");
+    if (subtitlePath && (!subtitleInspection || subtitlePickerBlockingReason)) {
+      throw new Error(subtitlePickerBlockingReason ?? "Validate the selected subtitle file before exporting.");
+    }
 
     const size = parseNum("Size limit (MB)", sizeLimitMb, { min: 0 });
     if (size !== 0 && size < 0.1) throw new Error("Size limit must be >= 0.1 MB (or 0/empty to disable).");
+    if (exactTargetBytesFromMegabytes(size) === null) throw new Error(SIZE_TARGET_EXACTNESS_ERROR);
     const s = parseNum("Speed", speed, { min: 0.05, max: 16 });
     const resizeRequest = buildResizeRequest();
+    const requestStrictFit = format !== "mp3" && size > 0 && strictFit;
 
     const b = brightness.trim() === "" ? 0 : parseNum("Brightness", brightness, { min: -1, max: 1 });
     const c = contrast.trim() === "" ? 1 : parseNum("Contrast", contrast, { min: 0, max: 2 });
@@ -3377,6 +3744,10 @@ function App() {
       color,
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       loopVideo: format === "mp3" ? false : loopVideo,
+      strictFit: requestStrictFit,
+      strictFitAllowAudioRemoval:
+        requestStrictFit && audioEnabled && probe.hasAudio && strictFitAllowAudioRemoval,
+      subtitlePath: subtitlePath || null,
     };
   }
 
@@ -3514,7 +3885,12 @@ function App() {
     });
   }
 
-  function applyQueueRequestToWorkbench(request: EncodeRequest, sourceProbe: VideoProbe, nextOutputPath: string) {
+  function applyQueueRequestToWorkbench(
+    request: EncodeRequest,
+    sourceProbe: VideoProbe,
+    nextOutputPath: string,
+    inspectedSubtitle: SubtitleInspection | null,
+  ) {
     const resize = request.resize ?? {
       mode: request.maxEdgePx ? "maxEdge" as const : "source" as const,
       maxEdgePx: request.maxEdgePx ?? null,
@@ -3538,6 +3914,21 @@ function App() {
     setAudioEnabled(requestedAudio && sourceProbe.hasAudio);
     setNormalizeAudio(request.normalizeAudio);
     setPerturbFirstFrame(request.format === "mp3" ? false : request.perturbFirstFrame);
+    setStrictFit(request.format !== "mp3" && request.sizeLimitMb > 0 && request.strictFit === true);
+    setStrictFitAllowAudioRemoval(
+      request.format !== "mp3" && request.sizeLimitMb > 0 && request.strictFit === true &&
+      request.audioEnabled && request.strictFitAllowAudioRemoval === true,
+    );
+    subtitleInspectionTokenRef.current += 1;
+    setSubtitlePath(request.subtitlePath ?? "");
+    setSubtitleInspection(inspectedSubtitle);
+    setSubtitleInspecting(false);
+    setSubtitleError(null);
+    setSubtitleStatus(
+      request.subtitlePath && inspectedSubtitle
+        ? `${basename(request.subtitlePath)} selected, ${inspectedSubtitle.cueCount} cue${inspectedSubtitle.cueCount === 1 ? "" : "s"} validated.`
+        : "No external subtitles selected.",
+    );
     setColorPolicy(request.format === "mp3" ? "auto" : request.colorPolicy);
     setStripMetadata(request.stripMetadata);
     setAdvancedVideoCodec((advanced.videoCodec ?? "auto") as VideoCodecPreference);
@@ -3583,14 +3974,14 @@ function App() {
     const resumeIntent = captureQueueResumeIntent();
     await serializeQueuePreparation(async () => {
       const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
-      if (!item || (item.status !== "failed" && item.status !== "cancelled")) return;
+      if (!item || (item.status !== "target-missed" && item.status !== "failed" && item.status !== "cancelled")) return;
       const previousOutputPath = item.outputPath;
       const takenPaths = claimedOutputPathsForPreparation();
       const nextOutputPath = await suggestedOutputForInput(item.inputPath, item.format, takenPaths);
       const currentItem = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
       if (
         !currentItem ||
-        (currentItem.status !== "failed" && currentItem.status !== "cancelled") ||
+        (currentItem.status !== "target-missed" && currentItem.status !== "failed" && currentItem.status !== "cancelled") ||
         currentItem.outputPath !== previousOutputPath
       ) return;
       const nextRequest = { ...cloneEncodeRequest(item.request), outputPath: nextOutputPath };
@@ -3655,14 +4046,25 @@ function App() {
     queueSnapshotApplyingRef.current = true;
     setQueueSnapshotApplying(true);
     window.setTimeout(focusQueueAfterMutation, 0);
+    let snapshotSubtitlePath: string | null = null;
     try {
       await serializeQueuePreparation(async () => {
         const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
         if (!item || item.status === "running") return;
+        snapshotSubtitlePath = item.request.subtitlePath ?? null;
+        if (item.format === "mp3" && item.request.subtitlePath) {
+          throw new Error("That queue snapshot combines MP3 with external subtitles. Choose MP4 or WebM first.");
+        }
+        if (item.request.subtitlePath && externalSubtitleCapability?.available !== true) {
+          throw new Error(subtitlePickerBlockingReason ?? "External subtitles are unavailable in the active FFmpeg build.");
+        }
         const requestFingerprint = JSON.stringify(item.request);
-        const [sourceProbe, nextOutputPath] = await Promise.all([
+        const [sourceProbe, nextOutputPath, inspectedSubtitle] = await Promise.all([
           invoke<VideoProbe>("probe_video", { path: item.inputPath }),
           suggestedOutputForInput(item.inputPath, item.format, claimedOutputPathsForPreparation()),
+          item.request.subtitlePath
+            ? invoke<SubtitleInspection>("inspect_srt", { path: item.request.subtitlePath })
+            : Promise.resolve(null),
         ]);
         if (queueSnapshotApplyTokenRef.current !== token) return;
         if (item.format === "mp3" && !sourceProbe.hasAudio) {
@@ -3686,7 +4088,7 @@ function App() {
               announce: true,
             }
           : null;
-        applyQueueRequestToWorkbench(request, sourceProbe, nextOutputPath);
+        applyQueueRequestToWorkbench(request, sourceProbe, nextOutputPath, inspectedSubtitle);
         if (inputChanged) setInputPath(item.inputPath);
         setProbe(sourceProbe);
         setProbeError(null);
@@ -3695,7 +4097,15 @@ function App() {
     } catch (error) {
       if (queueSnapshotApplyTokenRef.current === token) {
         pendingQueueSnapshotRef.current = null;
-        setStatus(coerceErrorMessage(error, "Could not apply the queue snapshot."));
+        const message = snapshotSubtitlePath
+          ? safeSubtitleError(error, snapshotSubtitlePath)
+          : coerceErrorMessage(error, "Could not apply the queue snapshot.");
+        if (snapshotSubtitlePath) {
+          setOpenCards((cards) => ({ ...cards, output: true }));
+          setSubtitleError(message);
+        } else {
+          setStatus(message);
+        }
       }
     } finally {
       if (queueSnapshotApplyTokenRef.current === token) {
@@ -3813,12 +4223,14 @@ function App() {
     const active = claimed.active;
     if (!nextItem || !active) {
       const counts = summarizeExportQueue(claimed);
-      const problems = counts.failed + counts.cancelled;
-      setStatus(
-        problems > 0
-          ? `Queue finished with ${counts.failed} failed and ${counts.cancelled} canceled. Review the item details or retry.`
-          : "Queue complete.",
-      );
+      const issueParts = [
+        counts.missed ? `${counts.missed} target miss${counts.missed === 1 ? "" : "es"}` : null,
+        counts.failed ? `${counts.failed} failed` : null,
+        counts.cancelled ? `${counts.cancelled} canceled` : null,
+      ].filter((part): part is string => Boolean(part));
+      setStatus(issueParts.length
+        ? `Queue finished with ${issueParts.join(", ")}. ${counts.missed ? "Measured target-miss artifacts remain available to open or adjust." : "Review the item details or retry."}`
+        : "Queue complete.");
       window.setTimeout(() => focusQueueAfterMutation(queueFallbackButtonRef), 0);
       return;
     }
@@ -3906,6 +4318,9 @@ function App() {
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
     reportAsSmokeResult?: boolean;
   }): Promise<StartEncodeResult> {
+    if (subtitleInspecting) {
+      return { ok: false, message: "Wait for external subtitle validation to finish." };
+    }
     if (pendingEncodeRef.current !== null) {
       return { ok: false, message: "An export is already starting or running." };
     }
@@ -3922,6 +4337,15 @@ function App() {
 
     try {
       const request = options?.request ?? buildRequest();
+      const requestUsesLoadedSource = request.inputPath === inputPath && probe !== null;
+      const sourceRate = requestUsesLoadedSource ? probe.frameRate ?? null : null;
+      const speedAdjustedRate = sourceRate === null ? null : sourceRate * request.speed;
+      const requestedRateCap = request.advanced?.frameRateCapFps ?? null;
+      const plannedFrameRateFps = speedAdjustedRate === null
+        ? null
+        : requestedRateCap && requestedRateCap > 0
+          ? Math.min(speedAdjustedRate, requestedRateCap)
+          : speedAdjustedRate;
       pendingEncodeRef.current = {
         attemptId,
         jobId: null,
@@ -3932,6 +4356,18 @@ function App() {
         queueItemId: options?.queueItemId ?? null,
         queueRunId: options?.queueRunId ?? null,
         sample: options?.sample ?? null,
+        correctiveContext: {
+          format: request.format,
+          sourcePathIdentity: queuePathIdentity(request.inputPath),
+          width: requestUsesLoadedSource ? plannedEncodeSummary?.w ?? null : null,
+          height: requestUsesLoadedSource ? plannedEncodeSummary?.h ?? null : null,
+          currentMaxEdgePx:
+            request.resize?.mode === "maxEdge" ? request.resize.maxEdgePx ?? null : null,
+          plannedFrameRateFps,
+          hasAudio: requestUsesLoadedSource ? probe.hasAudio : request.audioEnabled,
+          audioEnabled: request.audioEnabled,
+          strictFit: request.strictFit,
+        },
       };
       if (smokeConfigRef.current && options?.reportAsSmokeResult) {
         smokeAttemptIdRef.current = attemptId;
@@ -4091,6 +4527,28 @@ function App() {
     } catch (error) {
       console.warn("Failed to open external URL:", error);
     }
+  }
+
+  function applyStrictFitCorrectiveAction(action: StrictFitCorrectiveAction) {
+    if (
+      encodeBusy ||
+      !correctiveActionsMatchCurrentPlan ||
+      appliedCorrectiveKinds.includes(action.kind)
+    ) return;
+    if (action.kind === "reduceMaxEdge") {
+      setResizeMode("maxEdge");
+      setMaxEdgePx(String(action.maxEdgePx));
+    } else if (action.kind === "capFrameRate") {
+      setAdvancedFrameRateCapFps(String(action.frameRateCapFps));
+    } else if (action.kind === "removeAudio") {
+      autoMutedRef.current = false;
+      setAudioEnabled(false);
+      setStrictFitAllowAudioRemoval(false);
+    } else if (action.kind === "enableStrictFit") {
+      setStrictFit(true);
+    }
+    setAppliedCorrectiveKinds((current) => current.includes(action.kind) ? current : [...current, action.kind]);
+    setStatus(action.confirmation);
   }
 
   async function saveCurrentFrame() {
@@ -4394,6 +4852,7 @@ function App() {
     let smokeRecipeId = continuation?.recipeId ?? null;
     let workflowSucceeded = false;
     let workflowReloading = false;
+    const expectQueueTargetMiss = smokeConfig.workflowQueueExport && smokeConfig.g5QueueTargetMiss === true;
 
     function setMountedInputValue(input: HTMLInputElement, value: string) {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
@@ -4481,13 +4940,23 @@ function App() {
       const persistedRaw = localStorage.getItem(USER_RECIPE_STORAGE_KEY) ?? "";
       const escapedInputPath = JSON.stringify(smokeConfig.inputPath).slice(1, -1);
       const escapedOutputPath = JSON.stringify(smokeConfig.outputPath).slice(1, -1);
+      const subtitlePathToken = smokeConfig.subtitlePath ?? "";
+      const escapedSubtitlePath = subtitlePathToken ? JSON.stringify(subtitlePathToken).slice(1, -1) : "";
+      const subtitleBasename = subtitlePathToken ? basename(subtitlePathToken) : "";
       const forbiddenRecipeTokens = [
         smokeConfig.inputPath,
         smokeConfig.outputPath,
         escapedInputPath,
         escapedOutputPath,
+        subtitlePathToken,
+        escapedSubtitlePath,
+        subtitleBasename,
         '"inputPath"',
         '"outputPath"',
+        '"subtitlePath"',
+        '"subtitleInspection"',
+        '"subtitleCueCount"',
+        '"cueCount"',
         '"title"',
         '"trim"',
         '"crop"',
@@ -4650,6 +5119,8 @@ function App() {
         passes: 1,
         attempts: 1,
         audioRemovedForSizeTarget: false,
+        subtitleBurnedIn: false,
+        subtitleCueCount: null,
         commandPreview: "ffmpeg workflow smoke",
       };
       dispatchExportQueue({ type: "reset" });
@@ -4731,27 +5202,67 @@ function App() {
         });
         if (smokeConfig.skipPreviewInteractions) runQueueButton.click();
 
-        const realSuccessPassed = await waitForSmokeCondition(() => {
+        const realRetryPassed = await waitForSmokeCondition(() => {
           const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === failedItem.id);
+          if (!item || exportQueueStateRef.current.autoRun) return false;
+          const retainedFailure = item.history.some((attempt) => attempt.kind === "failed" && attempt.diagnostics);
+          if (expectQueueTargetMiss) {
+            return Boolean(
+              item.status === "target-missed" &&
+              item.lastOutcome?.kind === "target-missed" &&
+              item.lastOutcome.targetResult?.status === "missed" &&
+              item.lastOutcome.diagnostics &&
+              item.history.length >= 2 &&
+              retainedFailure &&
+              item.history.some(
+                (attempt) => attempt.kind === "target-missed" && attempt.targetResult?.status === "missed",
+              )
+            );
+          }
           return Boolean(
             item?.status === "done" &&
             item.lastOutcome?.kind === "done" &&
             item.lastOutcome.diagnostics &&
             item.history.length >= 2 &&
-            item.history.some((attempt) => attempt.kind === "failed" && attempt.diagnostics) &&
-            !exportQueueStateRef.current.autoRun,
+            retainedFailure
           );
         }, 60_000);
-        if (!realSuccessPassed) {
-          return { ok: false, message: "Workflow smoke did not complete the real queued retry with retained failure history." };
+        if (!realRetryPassed) {
+          return {
+            ok: false,
+            message: expectQueueTargetMiss
+              ? "Workflow smoke did not retain the real queued target miss and its prior failure history."
+              : "Workflow smoke did not complete the real queued retry with retained failure history.",
+          };
         }
-        const historyMounted = await waitForSmokeCondition(() => {
+        const recoveryEvidenceMounted = await waitForSmokeCondition(() => {
           const row = document.querySelector<HTMLElement>(`[data-queue-item-id="${failedItem.id}"]`);
-          return Boolean(row?.querySelector(".vfl-queue-history")?.textContent?.includes("Attempted output"));
+          const historyText = row?.querySelector(".vfl-queue-history")?.textContent ?? "";
+          if (!historyText.includes("Attempted output")) return false;
+          if (!expectQueueTargetMiss) return true;
+          const retryControl = row?.querySelector<HTMLButtonElement>('[data-queue-action="retry"]') ?? null;
+          const duplicateControl = row?.querySelector<HTMLButtonElement>('[data-queue-action="duplicate"]') ?? null;
+          return Boolean(
+            historyText.includes("Target missed") &&
+            historyText.includes("Result") &&
+            retryControl &&
+            !retryControl.disabled &&
+            duplicateControl &&
+            !duplicateControl.disabled
+          );
         });
-        if (!historyMounted) return { ok: false, message: "Workflow smoke could not inspect retained prior-attempt history after success." };
+        if (!recoveryEvidenceMounted) {
+          return {
+            ok: false,
+            message: expectQueueTargetMiss
+              ? "Workflow smoke could not inspect retained failure and target-miss history with mounted Retry and Duplicate actions."
+              : "Workflow smoke could not inspect retained prior-attempt history after success.",
+          };
+        }
         await reportSmokeStatus("workflow-queue-complete", {
-          message: "Real queued failure, retry, keyboard run, backend success, diagnostics, and history checks passed.",
+          message: expectQueueTargetMiss
+            ? "Real queued failure, retry, keyboard run, target miss, diagnostics, history, Retry, and Duplicate checks passed."
+            : "Real queued failure, retry, keyboard run, backend success, diagnostics, and history checks passed.",
         });
       }
 
@@ -5662,6 +6173,15 @@ function App() {
         </section>
 
         <aside className="vfl-rail">
+          <div
+            id="vfl-subtitle-live-status"
+            className="vfl-sr-only"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {subtitleStatus}
+          </div>
           {probeError ? <div className="vfl-error" role="alert">{probeError}</div> : null}
           <RailCard
             title="Source & destination"
@@ -5757,9 +6277,9 @@ function App() {
                 </button>
               </div>
               <div className="vfl-recipe-privacy vfl-recipe-privacy-compact">
-                Recipes save format, size, resize, audio, uniqueness, and encoder settings. They never save media or output paths,
-                title, trim, crop, transforms, color edits, HDR conversion choice, diagnostics, or queue and job state. Metadata privacy
-                stays separate.
+                Recipes save format, size, resize, audio, Strict Fit, uniqueness, and encoder settings. They never save media, output,
+                or external subtitle paths, title, trim, crop, transforms, color edits, HDR conversion choice, diagnostics, or queue and
+                job state. Metadata privacy stays separate.
               </div>
               {recipeStatus ? (
                 <div
@@ -5862,7 +6382,15 @@ function App() {
                   onChange={(e) => setSizeLimitMb(e.currentTarget.value)}
                   disabled={encodeBusy}
                   placeholder="0 or empty = no limit"
+                  aria-describedby="vfl-size-limit-hint"
+                  aria-invalid={sizeTargetExactnessBlockingReason ? true : undefined}
                 />
+                <div id="vfl-size-limit-hint" className="vfl-inline-hint">
+                  Target checks use exact bytes; values too large for exact byte tracking are rejected.
+                </div>
+                {sizeTargetExactnessBlockingReason ? (
+                  <div className="vfl-error" role="alert">{sizeTargetExactnessBlockingReason}</div>
+                ) : null}
                 <div className="vfl-chips" aria-label="Size presets">
                   <button
                     type="button"
@@ -5887,6 +6415,44 @@ function App() {
                       </button>
                     );
                   })}
+                </div>
+              </div>
+              <div className="vfl-field vfl-strict-fit-field">
+                <div className="vfl-field-label">Strict Fit</div>
+                <label className="vfl-check vfl-check-card">
+                  <input
+                    id="vfl-strict-fit"
+                    type="checkbox"
+                    checked={strictFit}
+                    onChange={(event) => {
+                      const enabled = event.currentTarget.checked;
+                      setStrictFit(enabled);
+                      if (!enabled) setStrictFitAllowAudioRemoval(false);
+                    }}
+                    disabled={encodeBusy || format === "mp3" || !sizeLimitEnabled}
+                  />
+                  <span>Try a bounded fallback plan when the requested plan misses</span>
+                </label>
+                <div className="vfl-inline-hint">{strictFitPolicySummary}</div>
+                <label className="vfl-check vfl-check-card vfl-nested-check">
+                  <input
+                    id="vfl-strict-fit-audio-removal"
+                    type="checkbox"
+                    checked={strictFitAllowAudioRemoval}
+                    onChange={(event) => setStrictFitAllowAudioRemoval(event.currentTarget.checked)}
+                    disabled={
+                      encodeBusy ||
+                      !strictFit ||
+                      !audioEnabled ||
+                      !probe?.hasAudio ||
+                      format === "mp3" ||
+                      !sizeLimitEnabled
+                    }
+                  />
+                  <span>Allow the final applicable plan to remove audio</span>
+                </label>
+                <div className="vfl-inline-hint">
+                  Off by default. Without this permission, every plan retains audio and the final audio fallback is 32 kbps.
                 </div>
               </div>
               <div className="vfl-field vfl-output-dimensions-field">
@@ -5979,6 +6545,41 @@ function App() {
                   )}
                 </div>
                 <div className="vfl-inline-hint">{outputDimensionsSummary}</div>
+              </div>
+              <div className="vfl-field vfl-subtitle-field">
+                <div className="vfl-field-label">External subtitles</div>
+                <div className="vfl-control-row">
+                  <button
+                    ref={subtitleBrowseButtonRef}
+                    type="button"
+                    onClick={() => void pickExternalSubtitle()}
+                    disabled={encodeBusy || !inputPath || subtitleInspecting || Boolean(subtitlePickerBlockingReason)}
+                    aria-busy={subtitleInspecting}
+                    aria-describedby="vfl-subtitle-status"
+                    title={subtitlePickerBlockingReason ?? "Select one validated SubRip subtitle file"}
+                  >
+                    {subtitleInspecting ? "Validating…" : subtitlePath ? "Replace SRT…" : "Choose SRT…"}
+                  </button>
+                  {subtitlePath ? (
+                    <button type="button" onClick={removeExternalSubtitle} disabled={encodeBusy || subtitleInspecting}>
+                      Remove subtitles
+                    </button>
+                  ) : null}
+                </div>
+                <div
+                  id="vfl-subtitle-status"
+                  className="vfl-inline-hint vfl-live-line"
+                >
+                  {subtitleStatus}
+                </div>
+                {subtitleError || externalSubtitleBlockingReason ? (
+                  <div className="vfl-error" role="alert">
+                    {subtitleError ?? externalSubtitleBlockingReason}
+                  </div>
+                ) : null}
+                <div className="vfl-inline-hint">
+                  One UTF-8 .srt file can be burned into MP4 or WebM. Cues use source timing and fixed bottom-centered white text with a black outline. Inline HTML or ASS styling tags are rejected. Selecting subtitles forces video re-encoding.
+                </div>
               </div>
               <div className="vfl-field">
                 <label htmlFor="vfl-title-metadata">Title metadata</label>
@@ -6579,7 +7180,7 @@ function App() {
                     </div>
                   </div>
                   {planWarnings.length ? (
-                    <div className="vfl-plan-warnings" role="status" aria-live="polite">
+                    <div className="vfl-plan-warnings">
                       {planWarnings.map((warning) => (
                         <div key={warning} className="vfl-plan-warning">
                           {warning}
@@ -6595,7 +7196,7 @@ function App() {
             open={openCards.plan}
             onToggle={() => toggleCard("plan")}
           >
-                  <div className={`vfl-plan-hero ${planHeroReady ? "is-ready" : ""} ${attemptUi.isActive ? "is-busy" : ""} ${attemptUi.isSuccess ? "is-done" : ""} ${attemptUi.isFailure ? "is-failed" : ""} ${attemptUi.isCancelled ? "is-cancelled" : ""}`}>
+                  <div className={`vfl-plan-hero ${planHeroReady ? "is-ready" : ""} ${attemptUi.isActive ? "is-busy" : ""} ${attemptUi.isSuccess ? "is-done" : ""} ${attemptUi.isTargetMissed ? "is-target-missed" : ""} ${attemptUi.isFailure ? "is-failed" : ""} ${attemptUi.isCancelled ? "is-cancelled" : ""}`}>
                     <div className="vfl-plan-hero-kicker">{footerKicker}</div>
                     <div className="vfl-plan-hero-copy">{planStatusText}</div>
                   </div>
@@ -6641,6 +7242,14 @@ function App() {
                       <div className="vfl-summary-value">{advancedPlanSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Strict Fit</div>
+                      <div className="vfl-summary-value">{strictFitPolicySummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Subtitles</div>
+                      <div className="vfl-summary-value">{subtitlePlanSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Active edits</div>
                       {activeEditChips.length ? (
                         <div className="vfl-chips vfl-chips-compact">
@@ -6665,13 +7274,20 @@ function App() {
                     </div>
                   ) : null}
                   {lastExport ? (
-                    <div className="vfl-export-result">
+                    <div className={`vfl-export-result ${lastTargetData?.missed ? "target-missed" : ""}`}>
                       <div className="vfl-export-result-head">
                         <div>
                           <div className="vfl-export-result-kicker">
-                            {lastExportIsCurrentOutcome ? "Last export" : "Previous successful export"}
+                            {lastExportIsCurrentOutcome
+                              ? "Last measured export"
+                              : lastExport.targetResult?.status === "missed"
+                                ? "Previous measured target-miss artifact"
+                                : "Previous successful export"}
                           </div>
-                          <div className="vfl-export-result-title">Done{lastExportSizeText ? ` (${lastExportSizeText})` : ""}</div>
+                          <div className="vfl-export-result-title">
+                            {lastTargetData?.missed ? "Target missed" : lastTargetData?.met ? "Target met" : "Done"}
+                            {lastExportSizeText ? ` (${lastExportSizeText})` : ""}
+                          </div>
                         </div>
                         <div className="vfl-chip active">{lastExport.format.toUpperCase()}</div>
                       </div>
@@ -6681,6 +7297,7 @@ function App() {
                       </div>
                       {lastExport.message ? <div className="vfl-export-result-note">{lastExport.message}</div> : null}
                       <div className="vfl-export-result-path">{lastExport.outputPath}</div>
+                      {lastExport.targetResult ? <TargetResultDetails targetResult={lastExport.targetResult} /> : null}
                       {lastExport.diagnostics ? (
                         <details className="vfl-export-diagnostics">
                           <summary>Export details</summary>
@@ -6755,9 +7372,17 @@ function App() {
                                 </strong>
                               </div>
                             ) : null}
+                            {lastExport.diagnostics.subtitleBurnedIn ? (
+                              <div>
+                                <span>External subtitles</span>
+                                <strong>
+                                  Burned in{lastExport.diagnostics.subtitleCueCount ? `, ${lastExport.diagnostics.subtitleCueCount} cues` : ""}
+                                </strong>
+                              </div>
+                            ) : null}
                           </div>
                           {lastExport.diagnostics.audioRemovedForSizeTarget ? (
-                            <div className="vfl-export-result-note">Audio was removed to fit the requested size target.</div>
+                            <div className="vfl-export-result-note">Audio was removed by the explicitly permitted final Strict Fit plan.</div>
                           ) : null}
                           {lastExport.diagnostics.copyFallbackReason ? (
                             <div className="vfl-export-result-note">
@@ -6766,6 +7391,31 @@ function App() {
                           ) : null}
                           <pre className="vfl-command-preview">{lastExport.diagnostics.commandPreview}</pre>
                         </details>
+                      ) : null}
+                      {lastTargetData?.missed ? (
+                        <section className="vfl-corrective-actions" aria-labelledby="vfl-corrective-actions-title">
+                          <div id="vfl-corrective-actions-title" className="vfl-field-label">Adjust settings</div>
+                          <div className="vfl-inline-hint">
+                            {correctiveActionsMatchCurrentPlan
+                              ? "These actions update controls only. No export starts until you choose Export."
+                              : "Apply the matching queue snapshot or restore this source, format, and exact target before using these controls. No export starts automatically."}
+                          </div>
+                          <div className="vfl-actions vfl-actions-wrap" role="group" aria-label="Target miss corrective actions">
+                            {lastCorrectiveActions.length ? lastCorrectiveActions.map((action) => {
+                              const applied = appliedCorrectiveKinds.includes(action.kind);
+                              return (
+                                <button
+                                  key={action.kind}
+                                  type="button"
+                                  onClick={() => applyStrictFitCorrectiveAction(action)}
+                                  disabled={encodeBusy || applied || !correctiveActionsMatchCurrentPlan}
+                                >
+                                  {applied ? `${action.label} applied` : action.label}
+                                </button>
+                              );
+                            }) : <span className="vfl-inline-hint">No additional automatic corrections apply to this plan.</span>}
+                          </div>
+                        </section>
                       ) : null}
                       <div className="vfl-actions vfl-actions-secondary">
                         <button onClick={() => void openOutputFile(lastExport.outputPath)}>Open file</button>
@@ -6816,7 +7466,7 @@ function App() {
               <button ref={queueStopButtonRef} type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
                 Stop after current
               </button>
-              <button type="button" onClick={clearCompletedQueueItems} disabled={queueCounts.done + queueCounts.failed + queueCounts.cancelled === 0}>
+              <button type="button" onClick={clearCompletedQueueItems} disabled={queueCounts.done + queueCounts.missed + queueCounts.failed + queueCounts.cancelled === 0}>
                 Clear finished
               </button>
             </div>
@@ -6824,6 +7474,7 @@ function App() {
               <span>{queueCounts.queued} queued</span>
               <span>{queueCounts.running} running</span>
               <span>{queueCounts.done} done</span>
+              <span>{queueCounts.missed} target missed</span>
               <span>{queueCounts.failed} failed</span>
               <span>{queueCounts.cancelled} canceled</span>
             </div>
@@ -6831,8 +7482,11 @@ function App() {
               <div className="vfl-queue-list" role="list" aria-label="Export queue items">
                 {exportQueue.map((item) => {
                   const outcome = item.lastOutcome;
-                  const actualOutputPath = outcome?.kind === "done" ? outcome.outputPath : null;
-                  const attemptedOutputPath = outcome && outcome.kind !== "done" ? outcome.outputPath : null;
+                  const outcomeHasArtifact = outcome?.kind === "done" || outcome?.kind === "target-missed";
+                  const doneOutputPath = outcome?.kind === "done" ? outcome.outputPath : null;
+                  const actualOutputPath = doneOutputPath ??
+                    (outcome?.kind === "target-missed" ? outcome.outputPath : null);
+                  const attemptedOutputPath = outcome && !outcomeHasArtifact ? outcome.outputPath : null;
                   const outcomeIsFailure = outcome?.kind === "failed" || outcome?.kind === "cancelled";
                   return (
                   <div
@@ -6859,13 +7513,14 @@ function App() {
                       {outcome?.message ? (
                         <div
                           className="vfl-queue-item-message"
-                          role={outcomeIsFailure ? "alert" : "status"}
-                          aria-live={outcomeIsFailure ? "assertive" : "polite"}
-                          aria-atomic="true"
+                          role={outcomeIsFailure ? "alert" : undefined}
+                          aria-live={outcomeIsFailure ? "assertive" : undefined}
+                          aria-atomic={outcomeIsFailure ? "true" : undefined}
                         >
                           {item.status === "queued" ? "Previous attempt: " : ""}{outcome.message}
                         </div>
                       ) : null}
+                      {outcome?.targetResult ? <TargetResultDetails targetResult={outcome.targetResult} /> : null}
                       {outcome ? <QueueDiagnosticsDetails outcome={outcome} summary="Latest diagnostics" /> : null}
                       {item.history.length > 1 ? (
                         <details className="vfl-queue-history">
@@ -6878,10 +7533,11 @@ function App() {
                                 </div>
                                 {attempt.outputPath ? (
                                   <div className="vfl-queue-item-meta">
-                                    {attempt.kind === "done" ? "Result" : "Attempted output"}: {attempt.outputPath}
+                                    {attempt.kind === "done" || attempt.kind === "target-missed" ? "Result" : "Attempted output"}: {attempt.outputPath}
                                   </div>
                                 ) : null}
                                 {attempt.message ? <div className="vfl-queue-item-message">{attempt.message}</div> : null}
+                                {attempt.targetResult ? <TargetResultDetails targetResult={attempt.targetResult} /> : null}
                                 <QueueDiagnosticsDetails outcome={attempt} summary={`Run ${attempt.runId} diagnostics`} />
                               </li>
                             ))}
@@ -6890,20 +7546,20 @@ function App() {
                       ) : null}
                     </div>
                     <div className="vfl-queue-item-actions">
-                      <span className={`vfl-chip ${item.status === "running" || item.status === "done" ? "active" : ""}`}>
+                      <span className={`vfl-chip ${item.status === "running" || item.status === "done" ? "active" : ""} ${item.status === "target-missed" ? "missed" : ""}`}>
                         {QUEUE_STATUS_LABELS[item.status]}
                       </span>
-                      {item.status === "done" && actualOutputPath ? (
+                      {outcomeHasArtifact && actualOutputPath ? (
                         <button type="button" onClick={() => void openOutputFile(actualOutputPath)}>
-                          Open file
+                          {item.status === "queued" ? "Open previous file" : "Open file"}
                         </button>
                       ) : null}
-                      {item.status === "done" && actualOutputPath ? (
+                      {outcomeHasArtifact && actualOutputPath ? (
                         <button type="button" onClick={() => void openFolderFor(actualOutputPath)}>
                           Open folder
                         </button>
                       ) : null}
-                      {item.status === "failed" || item.status === "cancelled" ? (
+                      {item.status === "target-missed" || item.status === "failed" || item.status === "cancelled" ? (
                         <button type="button" data-queue-action="retry" onClick={() => void retryQueueItem(item.id)}>
                           Retry
                         </button>

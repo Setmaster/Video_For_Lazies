@@ -14,6 +14,8 @@ export const EXPORT_RECIPES = [
         lockAspect: true,
       },
       audioEnabled: true,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: 128,
@@ -39,6 +41,8 @@ export const EXPORT_RECIPES = [
         lockAspect: true,
       },
       audioEnabled: true,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: 96,
@@ -64,6 +68,8 @@ export const EXPORT_RECIPES = [
         lockAspect: true,
       },
       audioEnabled: true,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: null,
@@ -101,6 +107,8 @@ export const EXPORT_RECIPES = [
         lockAspect: true,
       },
       audioEnabled: true,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: 192,
@@ -126,6 +134,8 @@ export const EXPORT_RECIPES = [
         lockAspect: true,
       },
       audioEnabled: true,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "vp9",
         audioBitrateKbps: null,
@@ -151,6 +161,8 @@ export const EXPORT_RECIPES = [
         lockAspect: true,
       },
       audioEnabled: true,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "auto",
         audioBitrateKbps: 192,
@@ -196,6 +208,21 @@ function normalizeAdvancedNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeStrictFitSettings(settings) {
+  const sizeLimitMb = normalizeTextSetting(settings?.sizeLimitMb);
+  const parsedSizeLimitMb = Number(sizeLimitMb);
+  const hasPositiveSizeTarget =
+    sizeLimitMb !== "" && Number.isFinite(parsedSizeLimitMb) && parsedSizeLimitMb > 0;
+  const strictFit =
+    settings?.format !== "mp3" && hasPositiveSizeTarget && settings?.strictFit === true;
+
+  return {
+    strictFit,
+    strictFitAllowAudioRemoval:
+      strictFit && Boolean(settings?.audioEnabled) && settings?.strictFitAllowAudioRemoval === true,
+  };
+}
+
 export function recipeMatchesSettings(recipe, settings) {
   if (!recipe || !settings) return false;
 
@@ -226,6 +253,19 @@ export function recipeMatchesSettings(recipe, settings) {
     ) {
       return false;
     }
+    const currentStrictFit = normalizeStrictFitSettings(settings);
+    if (
+      "strictFit" in partialSettings &&
+      currentStrictFit.strictFit !== Boolean(partialSettings.strictFit)
+    ) {
+      return false;
+    }
+    if (
+      "strictFitAllowAudioRemoval" in partialSettings &&
+      currentStrictFit.strictFitAllowAudioRemoval !== Boolean(partialSettings.strictFitAllowAudioRemoval)
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -234,6 +274,8 @@ export function recipeMatchesSettings(recipe, settings) {
   const currentAdvanced = settings.advanced ?? {};
   const recipeResize = normalizeRecipeResizeSettings(recipeSettings);
   const currentResize = normalizeRecipeResizeSettings(settings);
+  const recipeStrictFit = normalizeStrictFitSettings(recipeSettings);
+  const currentStrictFit = normalizeStrictFitSettings(settings);
 
   const resizeMatches =
     recipeResize.mode === currentResize.mode &&
@@ -251,6 +293,8 @@ export function recipeMatchesSettings(recipe, settings) {
     Boolean(settings.audioEnabled) === Boolean(recipeSettings.audioEnabled) &&
     Boolean(settings.normalizeAudio) === Boolean(recipeSettings.normalizeAudio) &&
     Boolean(settings.perturbFirstFrame) === Boolean(recipeSettings.perturbFirstFrame) &&
+    currentStrictFit.strictFit === recipeStrictFit.strictFit &&
+    currentStrictFit.strictFitAllowAudioRemoval === recipeStrictFit.strictFitAllowAudioRemoval &&
     (currentAdvanced.videoCodec ?? "auto") === (recipeAdvanced.videoCodec ?? "auto") &&
     normalizeAdvancedNumber(currentAdvanced.audioBitrateKbps) === normalizeAdvancedNumber(recipeAdvanced.audioBitrateKbps) &&
     (currentAdvanced.videoQuality ?? "auto") === (recipeAdvanced.videoQuality ?? "auto") &&

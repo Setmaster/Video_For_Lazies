@@ -274,6 +274,112 @@ test("claim and settle use exact item and run identity", () => {
   assert.equal(state.items[1].status, "running");
 });
 
+test("target-missed settlement retains the artifact and cloned target diagnostics", () => {
+  let state = beginNext(enqueue(createExportQueueState(), request("missed")));
+  const targetResult = {
+    status: "missed",
+    targetBytes: 1_000,
+    actualBytes: 1_125,
+    overshootBytes: 125,
+    strictFit: true,
+    selectedPlanNumber: 4,
+    plans: [{ planNumber: 4, status: "missed", actualSizeBytes: 1_125 }],
+  };
+  const diagnostics = {
+    mode: "Strict Fit",
+    commandPreview: "ffmpeg <input> <output>",
+    attempts: 4,
+  };
+
+  state = reduceExportQueue(state, {
+    type: "settled",
+    itemId: 1,
+    runId: 1,
+    outcome: {
+      kind: "target-missed",
+      message: "The smallest successful artifact is still 125 bytes over target.",
+      outputSizeBytes: 1_125,
+      targetResult,
+      diagnostics,
+      completedAtMs: 700,
+    },
+  });
+  targetResult.plans[0].actualSizeBytes = 9_999;
+  diagnostics.mode = "mutated";
+
+  assert.equal(state.active, null);
+  assert.equal(state.items[0].status, "target-missed");
+  assert.equal(state.items[0].lastOutcome.kind, "target-missed");
+  assert.equal(state.items[0].lastOutcome.outputPath, "/outputs/missed-2.mp4");
+  assert.equal(state.items[0].lastOutcome.outputSizeBytes, 1_125);
+  assert.equal(state.items[0].lastOutcome.targetResult.plans[0].actualSizeBytes, 1_125);
+  assert.equal(state.items[0].lastOutcome.diagnostics.mode, "Strict Fit");
+  assert.deepEqual(summarizeExportQueue(state), {
+    total: 1,
+    queued: 0,
+    running: 0,
+    done: 0,
+    missed: 1,
+    failed: 0,
+    cancelled: 0,
+  });
+
+  const cleared = reduceExportQueue(state, { type: "clear-terminal" });
+  assert.equal(cleared.items.length, 0);
+  assert.equal(cleared.pathRevision, state.pathRevision + 1);
+});
+
+test("target-missed items can retry or duplicate without accepting stale run settlement", () => {
+  let state = beginNext(enqueue(createExportQueueState(), request("missed-retry")));
+  state = reduceExportQueue(state, {
+    type: "settled",
+    itemId: 1,
+    runId: 1,
+    outcome: {
+      // Compatibility guard: a legacy caller cannot misclassify an exact miss as done.
+      kind: "done",
+      targetResult: {
+        status: "missed",
+        targetBytes: 1_000,
+        actualBytes: 1_125,
+        overshootBytes: 125,
+      },
+    },
+  });
+
+  state = reduceExportQueue(state, {
+    type: "duplicate-prepared",
+    sourceItemId: 1,
+    request: request("missed-copy", { outputPath: "/outputs/missed-copy.mp4" }),
+  });
+  assert.equal(state.items[1].status, "queued");
+  assert.equal(state.items[1].history.length, 0);
+  assert.equal(state.items[1].lastOutcome, null);
+
+  state = reduceExportQueue(state, {
+    type: "retry-prepared",
+    itemId: 1,
+    request: request("missed-retry", { outputPath: "/outputs/missed-retry-3.mp4" }),
+  });
+  assert.equal(state.items[0].status, "queued");
+  assert.equal(state.items[0].history.length, 1);
+  assert.equal(state.items[0].lastOutcome.kind, "target-missed");
+  assert.equal(state.items[0].lastOutcome.outputSizeBytes, 1_125);
+
+  state = reduceExportQueue(state, { type: "claim-next" });
+  assert.deepEqual(state.active, { itemId: 1, runId: 2 });
+  const currentRun = state;
+  assert.equal(
+    reduceExportQueue(state, {
+      type: "settled",
+      itemId: 1,
+      runId: 1,
+      outcome: { kind: "done" },
+    }),
+    currentRun,
+  );
+});
+
 test("stop after current preserves the active item and prevents another claim", () => {
   let state = beginNext(enqueue(createExportQueueState(), request("one"), request("two")));
   state = reduceExportQueue(state, { type: "stop-auto-run" });
@@ -402,6 +508,42 @@ test("retry history remains bounded while retaining the latest diagnostics", () 
   assert.equal(state.items[0].lastOutcome.diagnostics.mode, "attempt-15");
 });
 
+test("target-missed retry history uses the same per-item bound", () => {
+  let state = enqueue(createExportQueueState(), request("bounded-misses"));
+
+  for (let attempt = 1; attempt <= 12; attempt += 1) {
+    state = beginNext(state);
+    const active = state.active;
+    state = reduceExportQueue(state, { type: "stop-auto-run" });
+    state = reduceExportQueue(state, {
+      type: "settled",
+      itemId: active.itemId,
+      runId: active.runId,
+      outcome: {
+        kind: "target-missed",
+        outputSizeBytes: 1_000 + attempt,
+        targetResult: {
+          status: "missed",
+          targetBytes: 1_000,
+          actualBytes: 1_000 + attempt,
+          overshootBytes: attempt,
+        },
+      },
+    });
+    if (attempt < 12) {
+      state = reduceExportQueue(state, {
+        type: "retry-prepared",
+        itemId: active.itemId,
+        request: request("bounded-misses", { outputPath: `/outputs/miss-${attempt + 1}.mp4` }),
+      });
+    }
+  }
+
+  assert.equal(state.items[0].history.length, MAX_EXPORT_QUEUE_OUTCOMES_PER_ITEM);
+  assert.equal(state.items[0].history[0].targetResult.overshootBytes, 3);
+  assert.equal(state.items[0].lastOutcome.targetResult.overshootBytes, 12);
+});
+
 test("remove, clear, and reset preserve monotonic IDs and active safety", () => {
   let state = enqueue(createExportQueueState(), request("one"), request("two"), request("three"));
   state = beginNext(state);
@@ -443,4 +585,15 @@ test("invalid transitions and invalid prepared snapshots are no-ops", () => {
     initial,
   );
   assert.equal(reduceExportQueue(initial, { type: "retry-prepared", itemId: 1 }), initial);
+
+  const running = beginNext(enqueue(initial, request("invalid-target-miss")));
+  assert.equal(
+    reduceExportQueue(running, {
+      type: "settled",
+      itemId: 1,
+      runId: 1,
+      outcome: { kind: "target-missed" },
+    }),
+    running,
+  );
 });

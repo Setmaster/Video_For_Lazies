@@ -1,25 +1,45 @@
+import type { ExportDiagnostics, TargetResult } from "./types";
+
+export interface EncodeAttemptOutcomeDetails {
+  outputPath?: string;
+  outputSizeBytes?: number;
+  targetResult?: TargetResult;
+  diagnostics?: ExportDiagnostics;
+}
+
 export type EncodeAttemptState =
   | { kind: "idle" }
   | { kind: "starting"; attemptId: number }
   | { kind: "running"; attemptId: number; jobId: number }
   | { kind: "cancelling"; attemptId: number; jobId: number }
-  | { kind: "succeeded"; attemptId: number; jobId: number; completedAtMs: number; outputPath?: string }
-  | {
+  | ({
+      kind: "succeeded";
+      attemptId: number;
+      jobId: number;
+      completedAtMs: number;
+      message?: string;
+    } & EncodeAttemptOutcomeDetails)
+  | ({
+      kind: "target-missed";
+      attemptId: number;
+      jobId: number;
+      message: string;
+      completedAtMs: number;
+    } & EncodeAttemptOutcomeDetails)
+  | ({
       kind: "failed";
       attemptId: number;
       jobId: number | null;
       message: string;
       completedAtMs: number;
-      outputPath?: string;
-    }
-  | {
+    } & EncodeAttemptOutcomeDetails)
+  | ({
       kind: "cancelled";
       attemptId: number;
       jobId: number;
       message: string;
       completedAtMs: number;
-      outputPath?: string;
-    };
+    } & EncodeAttemptOutcomeDetails);
 
 export interface PendingEncodeIdentity {
   attemptId: number;
@@ -34,7 +54,11 @@ export interface EncodeEventIdentity {
 
 export interface EncodeFinishedIdentity extends EncodeEventIdentity {
   ok: boolean;
+  outputPath?: string | null;
+  outputSizeBytes?: number | null;
+  targetResult?: TargetResult | null;
   message?: string | null;
+  diagnostics?: ExportDiagnostics | null;
 }
 
 export interface EncodeAttemptPresentation {
@@ -42,6 +66,7 @@ export interface EncodeAttemptPresentation {
   isSuccess: boolean;
   isFailure: boolean;
   isCancelled: boolean;
+  isTargetMissed: boolean;
   kicker: string | null;
   summary: string | null;
   message: string | null;

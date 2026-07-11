@@ -168,7 +168,7 @@ const mediaDepthSmokeCases = Object.freeze([
     }),
   }),
   Object.freeze({
-    id: "size-target-drops-incompatible-audio-by-copy",
+    id: "size-target-preserves-incompatible-audio-by-encode",
     fixtureId: "tight-size-incompatible-audio",
     terminalStage: "success",
     colorPolicy: "auto",
@@ -181,9 +181,20 @@ const mediaDepthSmokeCases = Object.freeze([
       sampleAspectRatio: "1:1",
       durationMultiplier: 1,
       codecName: "h264",
-      audioStreamCount: 0,
+      audioCodecName: "aac",
+      audioSampleRate: 48_000,
+      audioChannels: 1,
+      audioStreamCount: 1,
       outputSizeMaximum: 100_000,
-      videoPacketPayloadsMatchInput: true,
+    }),
+    status: Object.freeze({
+      targetStatus: "met",
+      targetBytes: 100_000,
+      queueOutcomeKind: "done",
+      videoAction: "encode",
+      audioAction: "encode",
+      audioCodec: "aac",
+      audioRemovedForSizeTarget: false,
     }),
   }),
   Object.freeze({
@@ -656,7 +667,7 @@ function assertMediaDepthFixture(fixtureId, probe) {
       assertEqualFact(facts.video.codec_name, "h264", "tight-size fixture video codec");
       assertEqualFact(facts.audio.codec_name, "mp3", "tight-size fixture incompatible audio codec");
       if (Number(probe?.format?.size) <= 100_000) {
-        throw new Error("Tight-size fixture does not exceed its 100000-byte target before audio removal.");
+        throw new Error("Tight-size fixture does not exceed its 100000-byte target before export.");
       }
       break;
     case "tight-size-compatible-av":
@@ -1014,6 +1025,25 @@ async function assertMediaDepthOutput({ testCase, inputProbe, outputProbe, ffmpe
   }
 }
 
+function assertMediaDepthStatus(testCase, status, outputSizeBytes) {
+  const expected = testCase.status;
+  if (!expected) return;
+  assertEqualFact(status?.outputSizeBytes, outputSizeBytes, `${testCase.id} status output bytes`);
+  assertEqualFact(status?.targetResult?.status, expected.targetStatus, `${testCase.id} target status`);
+  assertEqualFact(status?.targetResult?.targetBytes, expected.targetBytes, `${testCase.id} target bytes`);
+  assertEqualFact(status?.targetResult?.actualBytes, outputSizeBytes, `${testCase.id} target actual bytes`);
+  assertEqualFact(status?.queueOutcomeKind, expected.queueOutcomeKind, `${testCase.id} queue outcome`);
+  assertEqualFact(status?.diagnostics?.actualSizeBytes, outputSizeBytes, `${testCase.id} diagnostic actual bytes`);
+  assertEqualFact(status?.diagnostics?.videoAction, expected.videoAction, `${testCase.id} diagnostic video action`);
+  assertEqualFact(status?.diagnostics?.audioAction, expected.audioAction, `${testCase.id} diagnostic audio action`);
+  assertEqualFact(status?.diagnostics?.audioCodec, expected.audioCodec, `${testCase.id} diagnostic audio codec`);
+  assertEqualFact(
+    status?.diagnostics?.audioRemovedForSizeTarget,
+    expected.audioRemovedForSizeTarget,
+    `${testCase.id} diagnostic audio-removal flag`,
+  );
+}
+
 async function runPortableMediaDepthSmoke({
   portableDir = process.env.VFL_PORTABLE_DIR || getPortableOutputDir(),
   platform = process.platform,
@@ -1104,6 +1134,7 @@ async function runPortableMediaDepthSmoke({
           }
           const stats = await fs.stat(outputPath);
           if (stats.size <= 0) throw new Error(`Portable media-depth smoke ${testCase.id} wrote an empty output.`);
+          assertMediaDepthStatus(testCase, status, stats.size);
           const outputProbe = await probeMedia(ffprobePath, outputPath);
           await assertMediaDepthOutput({
             testCase,

@@ -35,6 +35,8 @@ function baseSettings(overrides = {}) {
     audioEnabled: true,
     normalizeAudio: false,
     perturbFirstFrame: false,
+    strictFit: false,
+    strictFitAllowAudioRemoval: false,
     advanced: {
       videoCodec: "h264",
       audioBitrateKbps: 128,
@@ -106,10 +108,12 @@ test("recipe settings rebuild through the strict reusable allowlist", () => {
   }
 });
 
-test("EncodeRequest conversion keeps output settings and excludes request identity and clip state", () => {
+test("EncodeRequest conversion keeps reusable output settings and excludes subtitle, identity, and clip state", () => {
+  const subtitlePath = `C:\\Private\\字幕\\O'Brien,[draft]; "secret".srt`;
   const request = {
     inputPath: "/private/input.mov",
     outputPath: "/private/output.mp4",
+    subtitlePath,
     format: "mp4",
     title: "Secret",
     sizeLimitMb: 25,
@@ -133,6 +137,8 @@ test("EncodeRequest conversion keeps output settings and excludes request identi
     resize: { mode: "custom", widthPx: 1280, heightPx: 720 },
     color: { brightness: 0.1, contrast: 1, saturation: 1 },
     perturbFirstFrame: true,
+    strictFit: true,
+    strictFitAllowAudioRemoval: true,
     loopVideo: true,
   };
 
@@ -149,6 +155,8 @@ test("EncodeRequest conversion keeps output settings and excludes request identi
     audioEnabled: true,
     normalizeAudio: true,
     perturbFirstFrame: true,
+    strictFit: true,
+    strictFitAllowAudioRemoval: true,
     advanced: {
       videoCodec: "mpeg4",
       audioBitrateKbps: 192,
@@ -158,6 +166,11 @@ test("EncodeRequest conversion keeps output settings and excludes request identi
       audioChannels: "mono",
     },
   });
+
+  const reusableRaw = JSON.stringify(reusableSettingsFromEncodeRequest(request));
+  assert.equal(reusableRaw.includes(subtitlePath), false);
+  assert.equal(reusableRaw.includes(JSON.stringify(subtitlePath).slice(1, -1)), false);
+  assert.equal(reusableRaw.includes("subtitlePath"), false);
 });
 
 test("MP3 recipes canonicalize video-only settings and always retain audio", () => {
@@ -166,6 +179,8 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
       format: "mp3",
       audioEnabled: false,
       perturbFirstFrame: true,
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
       resize: {
         mode: "custom",
         maxEdgePx: "",
@@ -195,6 +210,8 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
       audioEnabled: true,
       normalizeAudio: false,
       perturbFirstFrame: false,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "auto",
         audioBitrateKbps: 192,
@@ -207,10 +224,59 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
   );
 });
 
+test("Strict Fit fields canonicalize against format, size target, and retained audio", () => {
+  assert.deepEqual(
+    normalizeUserRecipeSettings(baseSettings({
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
+    })),
+    baseSettings({
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
+    }),
+  );
+
+  assert.deepEqual(
+    normalizeUserRecipeSettings(baseSettings({
+      strictFit: false,
+      strictFitAllowAudioRemoval: true,
+    })),
+    baseSettings({
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
+    }),
+  );
+
+  assert.deepEqual(
+    normalizeUserRecipeSettings(baseSettings({
+      audioEnabled: false,
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
+    })),
+    baseSettings({
+      audioEnabled: false,
+      strictFit: true,
+      strictFitAllowAudioRemoval: false,
+    }),
+  );
+
+  for (const sizeLimitMb of ["", 0]) {
+    const normalized = normalizeUserRecipeSettings(baseSettings({
+      sizeLimitMb,
+      strictFit: true,
+      strictFitAllowAudioRemoval: true,
+    }));
+    assert.equal(normalized.strictFit, false);
+    assert.equal(normalized.strictFitAllowAudioRemoval, false);
+  }
+});
+
 test("invalid reusable values fail closed instead of becoming auto defaults", () => {
   assert.equal(normalizeUserRecipeSettings(baseSettings({ format: "avi" })), null);
   assert.equal(normalizeUserRecipeSettings(baseSettings({ sizeLimitMb: "not-a-number" })), null);
   assert.equal(normalizeUserRecipeSettings(baseSettings({ audioEnabled: "yes" })), null);
+  assert.equal(normalizeUserRecipeSettings(baseSettings({ strictFit: "yes" })), null);
+  assert.equal(normalizeUserRecipeSettings(baseSettings({ strictFitAllowAudioRemoval: 1 })), null);
   assert.equal(normalizeUserRecipeSettings(baseSettings({ advanced: "auto" })), null);
   assert.equal(
     normalizeUserRecipeSettings(baseSettings({
@@ -227,7 +293,7 @@ test("invalid reusable values fail closed instead of becoming auto defaults", ()
   );
 });
 
-test("schema v1 serialization has a stable exact shape and round trips", () => {
+test("schema v2 serialization has a stable exact shape and round trips", () => {
   const input = [recipe()];
   const raw = serializeUserRecipeStore(input);
   assert.equal(
@@ -240,16 +306,33 @@ test("schema v1 serialization has a stable exact shape and round trips", () => {
 
   const parsed = parseUserRecipeStore(raw);
   assert.deepEqual(parsed, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     recipes: input,
     warnings: [],
     migrated: false,
     readOnly: false,
-    sourceSchemaVersion: 1,
+    sourceSchemaVersion: 2,
   });
 });
 
-test("unversioned label/maxEdge records migrate to schema v1", () => {
+test("schema v1 records migrate to v2 with Strict Fit disabled", () => {
+  const schemaOneSettings = baseSettings();
+  delete schemaOneSettings.strictFit;
+  delete schemaOneSettings.strictFitAllowAudioRemoval;
+  const parsed = parseUserRecipeStore(JSON.stringify({
+    schemaVersion: 1,
+    recipes: [{ id: "user:old", name: "Old", settings: schemaOneSettings }],
+  }));
+
+  assert.equal(parsed.schemaVersion, 2);
+  assert.equal(parsed.sourceSchemaVersion, 1);
+  assert.equal(parsed.migrated, true);
+  assert.match(parsed.warnings[0], /migrated/);
+  assert.equal(parsed.recipes[0].settings.strictFit, false);
+  assert.equal(parsed.recipes[0].settings.strictFitAllowAudioRemoval, false);
+});
+
+test("unversioned label/maxEdge records migrate to schema v2", () => {
   const parsed = parseUserRecipeStore(JSON.stringify([
     {
       id: "legacy-one",
@@ -296,6 +379,8 @@ test("explicit schema zero objects migrate label and record-level maxEdge fields
           ...baseSettings(),
           resize: undefined,
           maxEdgePx: undefined,
+          strictFit: true,
+          strictFitAllowAudioRemoval: true,
         },
       },
     ],
@@ -304,11 +389,13 @@ test("explicit schema zero objects migrate label and record-level maxEdge fields
   assert.equal(parsed.migrated, true);
   assert.equal(parsed.recipes[0].settings.resize.mode, "maxEdge");
   assert.equal(parsed.recipes[0].settings.resize.maxEdgePx, "540");
+  assert.equal(parsed.recipes[0].settings.strictFit, false);
+  assert.equal(parsed.recipes[0].settings.strictFitAllowAudioRemoval, false);
 });
 
 test("supported stores salvage valid records and report invalid and duplicate records", () => {
   const parsed = parseUserRecipeStore(JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     recipes: [
       recipe("User:One", "Share"),
       { ...recipe("user:one", "Different"), name: "Different" },
@@ -332,7 +419,7 @@ test("malformed and structurally corrupt stores recover without throwing", () =>
   assert.match(malformed.warnings[0], /could not be read/);
   assert.equal(malformed.readOnly, false);
 
-  const missingList = parseUserRecipeStore(JSON.stringify({ schemaVersion: 1, recipes: {} }));
+  const missingList = parseUserRecipeStore(JSON.stringify({ schemaVersion: 2, recipes: {} }));
   assert.deepEqual(missingList.recipes, []);
   assert.match(missingList.warnings[0], /did not contain a recipe list/);
 
@@ -345,12 +432,12 @@ test("malformed and structurally corrupt stores recover without throwing", () =>
 });
 
 test("future schemas are read-only and persist never overwrites them", () => {
-  const raw = JSON.stringify({ schemaVersion: 2, recipes: [recipe()] });
+  const raw = JSON.stringify({ schemaVersion: 3, recipes: [recipe()] });
   const current = parseUserRecipeStore(raw);
   const storage = memoryStorage(new Map([[USER_RECIPE_STORAGE_KEY, raw]]));
 
   assert.equal(current.readOnly, true);
-  assert.equal(current.sourceSchemaVersion, 2);
+  assert.equal(current.sourceSchemaVersion, 3);
   assert.match(current.warnings[0], /newer app version/);
 
   const result = persistUserRecipeStore(storage, current, []);
@@ -396,7 +483,7 @@ test("serializer rejects invalid, duplicate, and oversized stores", () => {
 
 test("parser caps supported stores at 50 valid records with a warning", () => {
   const recipes = Array.from({ length: USER_RECIPE_MAX_COUNT + 2 }, (_, index) => recipe(`user:${index}`, `Recipe ${index}`));
-  const parsed = parseUserRecipeStore(JSON.stringify({ schemaVersion: 1, recipes }));
+  const parsed = parseUserRecipeStore(JSON.stringify({ schemaVersion: 2, recipes }));
 
   assert.equal(parsed.recipes.length, USER_RECIPE_MAX_COUNT);
   assert.match(parsed.warnings.at(-1), /first 50/);
@@ -469,6 +556,25 @@ test("exact matching uses normalized reusable settings only", () => {
   assert.equal(userRecipeMatchesSettings(recipes[0], withForbiddenExtras), true);
   assert.equal(findMatchingUserRecipe(recipes, withForbiddenExtras)?.id, "user:one");
   assert.equal(findMatchingUserRecipe(recipes, baseSettings({ sizeLimitMb: "25" })), null);
+});
+
+test("hostile raw and JSON-escaped subtitle paths never enter stores or matching fingerprints", () => {
+  const subtitlePath = `C:\\Private\\字幕\\O'Brien,[draft]; "secret".srt`;
+  const escapedSubtitlePath = JSON.stringify(subtitlePath).slice(1, -1);
+  const withRawSentinel = { ...baseSettings(), subtitlePath };
+  const withEscapedSentinel = { ...baseSettings(), subtitlePath: escapedSubtitlePath };
+
+  const created = createUserRecipe([], "Subtitle safe", withRawSentinel, { id: "user:subtitle-safe" });
+  assert.equal(created.ok, true);
+  assert.equal(userRecipeMatchesSettings(created.recipe, withEscapedSentinel), true);
+
+  const serializedStore = serializeUserRecipeStore(created.recipes);
+  const serializedFingerprintInput = JSON.stringify(normalizeUserRecipeSettings(withRawSentinel));
+  for (const raw of [serializedStore, serializedFingerprintInput]) {
+    assert.equal(raw.includes(subtitlePath), false);
+    assert.equal(raw.includes(escapedSubtitlePath), false);
+    assert.equal(raw.includes("subtitlePath"), false);
+  }
 });
 
 test("exact serialized recipe JSON cannot contain forbidden request sentinels", () => {

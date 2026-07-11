@@ -40,6 +40,100 @@ test("encode attempt follows starting, running, and succeeded states", () => {
   });
 });
 
+test("successful settlement retains its artifact, target result, message, and diagnostics", () => {
+  const running = bindEncodeAttempt(beginEncodeAttempt(201), 201, 21);
+  const targetResult = {
+    status: "met",
+    targetBytes: 1_000,
+    actualBytes: 990,
+    overshootBytes: 0,
+    strictFit: true,
+    selectedPlanNumber: 2,
+    plans: [{ planNumber: 2, status: "met", actualSizeBytes: 990 }],
+  };
+  const diagnostics = {
+    mode: "Strict Fit",
+    attempts: 2,
+    commandPreview: "ffmpeg <input> <output>",
+  };
+  const succeeded = finishEncodeAttempt(
+    running,
+    {
+      attemptId: 201,
+      jobId: 21,
+      ok: true,
+      outputPath: "/exports/met.mp4",
+      outputSizeBytes: 990,
+      targetResult,
+      message: "Fit confirmed by exact output bytes.",
+      diagnostics,
+    },
+    501,
+  );
+  targetResult.plans[0].actualSizeBytes = 5_000;
+  diagnostics.mode = "mutated";
+
+  assert.equal(succeeded.kind, "succeeded");
+  assert.equal(succeeded.outputPath, "/exports/met.mp4");
+  assert.equal(succeeded.outputSizeBytes, 990);
+  assert.equal(succeeded.message, "Fit confirmed by exact output bytes.");
+  assert.equal(succeeded.targetResult.plans[0].actualSizeBytes, 990);
+  assert.equal(succeeded.diagnostics.mode, "Strict Fit");
+});
+
+test("exact target miss is artifact-bearing but neither success nor execution failure", () => {
+  const pending = {
+    attemptId: 202,
+    jobId: 22,
+    outputPath: "/exports/requested-fallback.mp4",
+    queueItemId: 8,
+  };
+  const running = bindEncodeAttempt(beginEncodeAttempt(202), 202, 22);
+  const settlement = settleEncodeFinished(
+    pending,
+    running,
+    {
+      attemptId: 202,
+      jobId: 22,
+      ok: true,
+      outputPath: "/exports/smallest-successful.mp4",
+      targetResult: {
+        status: "missed",
+        targetBytes: 1_000,
+        actualBytes: 1_125,
+        overshootBytes: 125,
+      },
+      message: "The smallest successful artifact is still over target.",
+      diagnostics: {
+        mode: "Strict Fit",
+        attempts: 4,
+        commandPreview: "ffmpeg <input> <output>",
+      },
+    },
+    502,
+  );
+
+  assert.equal(settlement.accepted, true);
+  assert.equal(settlement.pending, null);
+  assert.equal(settlement.context.queueItemId, 8);
+  assert.equal(settlement.state.kind, "target-missed");
+  assert.equal(settlement.state.outputPath, "/exports/smallest-successful.mp4");
+  assert.equal(settlement.state.outputSizeBytes, 1_125);
+  assert.equal(settlement.state.targetResult.overshootBytes, 125);
+  assert.equal(settlement.state.diagnostics.attempts, 4);
+
+  assert.deepEqual(deriveEncodeAttemptPresentation(settlement.state), {
+    isActive: false,
+    isSuccess: false,
+    isFailure: false,
+    isCancelled: false,
+    isTargetMissed: true,
+    kicker: "Size target missed",
+    summary: "Target missed",
+    message: "The smallest successful artifact is still over target.",
+  });
+});
+
 test("start failure belongs only to the matching attempt", () => {
   const starting = beginEncodeAttempt(102);
   const stale = failEncodeAttemptStart(starting, 99, "stale", 1);
@@ -186,7 +280,18 @@ test("stale and duplicate finishes leave lifecycle unchanged", () => {
   );
   const staleJob = finishEncodeAttempt(
     running,
-    { attemptId: 107, jobId: 14, ok: false, message: "stale" },
+    {
+      attemptId: 107,
+      jobId: 14,
+      ok: true,
+      targetResult: {
+        status: "missed",
+        targetBytes: 1_000,
+        actualBytes: 1_100,
+        overshootBytes: 100,
+      },
+      message: "stale target miss",
+    },
     1,
   );
   const succeeded = finishEncodeAttempt(
@@ -227,6 +332,7 @@ test("presentation gives failure and cancellation precedence over prior success 
     isSuccess: false,
     isFailure: true,
     isCancelled: false,
+    isTargetMissed: false,
     kicker: "Export failed",
     summary: "Failed",
     message: "Failed to start.",
@@ -253,7 +359,7 @@ test("App routes both backend event types through attempt identity before effect
   assert.match(app, /invoke<number>\("start_encode", \{ request, attemptId \}\)/);
   assert.match(app, /bindStartedEncode\(/);
   assert.match(app, /settleEncodeFinished\(/);
-  assert.match(app, /const encodeBusy = attemptUi\.isActive \|\| queueRunning \|\| queuePreparationBusy \|\| queueSnapshotApplying;/);
+  assert.match(app, /const encodeBusy = attemptUi\.isActive \|\| queueRunning \|\| queuePreparationBusy \|\| queueSnapshotApplying \|\| subtitleInspecting;/);
   assert.match(app, /latestAttempt\.kind === "starting" \? \(/);
   assert.match(app, /disabled=\{!exportReady \|\| encodeBusy\}/);
   assert.match(app, /Previous successful export/);

@@ -1,8 +1,8 @@
 export const MAX_EXPORT_QUEUE_ITEMS = 100;
 export const MAX_EXPORT_QUEUE_OUTCOMES_PER_ITEM = 10;
 
-const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
-const OUTCOME_KINDS = new Set(["done", "failed", "cancelled"]);
+const TERMINAL_STATUSES = new Set(["done", "target-missed", "failed", "cancelled"]);
+const OUTCOME_KINDS = new Set(["done", "target-missed", "failed", "cancelled"]);
 
 function positiveSafeInteger(value, fallback) {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
@@ -113,13 +113,18 @@ export function summarizeExportQueue(state) {
     queued: 0,
     running: 0,
     done: 0,
+    missed: 0,
     failed: 0,
     cancelled: 0,
   };
 
   for (const item of state?.items ?? []) {
     counts.total += 1;
-    if (Object.hasOwn(counts, item?.status)) counts[item.status] += 1;
+    if (item?.status === "target-missed") {
+      counts.missed += 1;
+    } else if (Object.hasOwn(counts, item?.status)) {
+      counts[item.status] += 1;
+    }
   }
   return counts;
 }
@@ -171,24 +176,35 @@ function replaceItemRequest(item, request, durationS) {
 function normalizeOutcome(outcome, runId, request) {
   if (!outcome || !OUTCOME_KINDS.has(outcome.kind)) return null;
 
+  const targetResult = outcome.targetResult === null || outcome.targetResult === undefined
+    ? null
+    : cloneJson(outcome.targetResult);
+  const kind = outcome.kind === "done" && targetResult?.status === "missed"
+    ? "target-missed"
+    : outcome.kind;
+  if (kind === "target-missed" && targetResult?.status !== "missed") return null;
+
   const outputPath = typeof outcome.outputPath === "string" && outcome.outputPath.length > 0
     ? outcome.outputPath
-    : outcome.kind === "done"
+    : kind === "done" || kind === "target-missed"
       ? request.outputPath
       : null;
   const outputSizeBytes = Number.isFinite(outcome.outputSizeBytes) && outcome.outputSizeBytes >= 0
     ? outcome.outputSizeBytes
-    : null;
+    : Number.isFinite(targetResult?.actualBytes) && targetResult.actualBytes >= 0
+      ? targetResult.actualBytes
+      : null;
   const completedAtMs = Number.isFinite(outcome.completedAtMs) && outcome.completedAtMs >= 0
     ? outcome.completedAtMs
     : null;
 
   return {
     runId,
-    kind: outcome.kind,
+    kind,
     message: typeof outcome.message === "string" && outcome.message.length > 0 ? outcome.message : null,
     outputPath,
     outputSizeBytes,
+    targetResult,
     diagnostics: outcome.diagnostics === null || outcome.diagnostics === undefined
       ? null
       : cloneJson(outcome.diagnostics),
@@ -316,7 +332,10 @@ export function reduceExportQueue(state, action) {
 
     case "retry-prepared": {
       const item = state.items.find((candidate) => candidate.id === action.itemId);
-      if (!item || (item.status !== "failed" && item.status !== "cancelled")) return state;
+      if (
+        !item ||
+        (item.status !== "target-missed" && item.status !== "failed" && item.status !== "cancelled")
+      ) return state;
       const replacement = replaceItemRequest(
         item,
         action.request ?? item.request,

@@ -61,6 +61,13 @@
         "reverse",
         "split"
       ]
+    },
+    "externalSubtitles": {
+      "releaseRequired": true,
+      "encoders": [],
+      "filters": [
+        "subtitles"
+      ]
     }
   }
 }

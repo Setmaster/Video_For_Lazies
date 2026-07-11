@@ -1,5 +1,5 @@
 export const USER_RECIPE_STORAGE_KEY = "vfl:user-recipes";
-export const USER_RECIPE_SCHEMA_VERSION = 1;
+export const USER_RECIPE_SCHEMA_VERSION = 2;
 export const USER_RECIPE_MAX_COUNT = 50;
 export const USER_RECIPE_NAME_MAX_LENGTH = 64;
 
@@ -185,19 +185,38 @@ export function normalizeUserRecipeSettings(value, options = {}) {
   if (typeof value.audioEnabled !== "boolean") return null;
   if (value.normalizeAudio !== undefined && typeof value.normalizeAudio !== "boolean") return null;
   if (value.perturbFirstFrame !== undefined && typeof value.perturbFirstFrame !== "boolean") return null;
+  if (value.strictFit !== undefined && typeof value.strictFit !== "boolean") return null;
+  if (
+    value.strictFitAllowAudioRemoval !== undefined &&
+    typeof value.strictFitAllowAudioRemoval !== "boolean"
+  ) {
+    return null;
+  }
+
+  const audioEnabled = format === "mp3" ? true : value.audioEnabled;
+  const hasPositiveSizeTarget = Number(sizeLimitMb) > 0;
+  const strictFit = format !== "mp3" && hasPositiveSizeTarget && value.strictFit === true;
+  const strictFitAllowAudioRemoval =
+    strictFit && audioEnabled && value.strictFitAllowAudioRemoval === true;
 
   return {
     format,
     sizeLimitMb,
     resize,
-    audioEnabled: format === "mp3" ? true : value.audioEnabled,
+    audioEnabled,
     normalizeAudio: value.normalizeAudio === true,
     perturbFirstFrame: format === "mp3" ? false : value.perturbFirstFrame === true,
+    strictFit,
+    strictFitAllowAudioRemoval,
     advanced,
   };
 }
 
-/** Convert a full backend request into the same privacy-safe recipe allowlist. */
+/**
+ * Convert a full backend request into the same privacy-safe recipe allowlist.
+ * subtitlePath and all other path, clip, metadata, and diagnostic fields are
+ * deliberately not read here.
+ */
 export function reusableSettingsFromEncodeRequest(request) {
   if (!isRecord(request)) return null;
   const rawResize = isRecord(request.resize) ? request.resize : {};
@@ -215,6 +234,8 @@ export function reusableSettingsFromEncodeRequest(request) {
     audioEnabled: request.audioEnabled,
     normalizeAudio: request.normalizeAudio,
     perturbFirstFrame: request.perturbFirstFrame,
+    strictFit: request.strictFit,
+    strictFitAllowAudioRemoval: request.strictFitAllowAudioRemoval,
     advanced: request.advanced,
   });
 }
@@ -240,12 +261,32 @@ function migrateSchemaZeroRecipe(value, index) {
   const name = normalizeName(value.label ?? value.name);
   const rawSettings = isRecord(value.settings) ? value.settings : value;
   const legacyMaxEdgePx = rawSettings.maxEdgePx ?? value.maxEdgePx;
-  const settings = normalizeUserRecipeSettings(rawSettings, { legacyMaxEdgePx });
+  const settings = normalizeUserRecipeSettings(
+    {
+      ...rawSettings,
+      strictFit: false,
+      strictFitAllowAudioRemoval: false,
+    },
+    { legacyMaxEdgePx },
+  );
   if (!name || !settings) return null;
   return { id, name, settings };
 }
 
-function normalizeSchemaOneRecipe(value) {
+function migrateSchemaOneRecipe(value) {
+  if (!isRecord(value) || !isRecord(value.settings)) return null;
+  const id = normalizeId(value.id);
+  const name = normalizeName(value.name);
+  const settings = normalizeUserRecipeSettings({
+    ...value.settings,
+    strictFit: false,
+    strictFitAllowAudioRemoval: false,
+  });
+  if (!id || !name || !settings) return null;
+  return { id, name, settings };
+}
+
+function normalizeSchemaTwoRecipe(value) {
   if (!isRecord(value)) return null;
   const id = normalizeId(value.id);
   const name = normalizeName(value.name);
@@ -322,7 +363,11 @@ export function parseUserRecipeStore(raw) {
     });
   }
 
-  if (sourceSchemaVersion !== 0 && sourceSchemaVersion !== USER_RECIPE_SCHEMA_VERSION) {
+  if (
+    sourceSchemaVersion !== 0 &&
+    sourceSchemaVersion !== 1 &&
+    sourceSchemaVersion !== USER_RECIPE_SCHEMA_VERSION
+  ) {
     return makeStore([], {
       warnings: ["Saved recipe data used an unsupported schema and was ignored."],
       sourceSchemaVersion: Number.isInteger(sourceSchemaVersion) ? sourceSchemaVersion : null,
@@ -330,14 +375,19 @@ export function parseUserRecipeStore(raw) {
   }
 
   const values = isUnversionedArray ? parsed : parsed.recipes;
-  const legacy = sourceSchemaVersion === 0;
-  const salvaged = salvageRecipes(values, legacy ? migrateSchemaZeroRecipe : normalizeSchemaOneRecipe);
-  if (legacy) {
+  const migrating = sourceSchemaVersion === 0 || sourceSchemaVersion === 1;
+  const normalizeRecipe = sourceSchemaVersion === 0
+    ? migrateSchemaZeroRecipe
+    : sourceSchemaVersion === 1
+      ? migrateSchemaOneRecipe
+      : normalizeSchemaTwoRecipe;
+  const salvaged = salvageRecipes(values, normalizeRecipe);
+  if (migrating) {
     salvaged.warnings.unshift("Saved recipes were migrated to the current format.");
   }
   return makeStore(salvaged.recipes, {
     warnings: salvaged.warnings,
-    migrated: legacy,
+    migrated: migrating,
     sourceSchemaVersion,
   });
 }
@@ -362,7 +412,7 @@ function normalizeRecipeListForWrite(recipes) {
   const ids = new Set();
   const names = new Set();
   for (const value of recipes) {
-    const recipe = normalizeSchemaOneRecipe(value);
+    const recipe = normalizeSchemaTwoRecipe(value);
     if (!recipe) throw new TypeError("A recipe contains invalid data.");
     const idKey = recipe.id.toLowerCase();
     const nameKey = recipe.name.toLowerCase();

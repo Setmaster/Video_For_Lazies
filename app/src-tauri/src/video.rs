@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -17,6 +17,7 @@ use tauri::{Emitter, Window};
 use tempfile::{Builder as TempFileBuilder, TempDir, TempPath};
 
 const MB_BYTES: u64 = 1_000_000;
+const JS_MAX_SAFE_INTEGER_BYTES: u64 = 9_007_199_254_740_991;
 const PROGRESS_EMIT_EVERY: Duration = Duration::from_millis(200);
 const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,6 +27,13 @@ const ENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const ENCODE_INITIAL_BUFFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SIZE_COPY_MONITOR_HEADROOM_BYTES: u64 = 1024 * 1024;
 const FFMPEG_SIDECAR_DIR: &str = "ffmpeg-sidecar";
+const EXTERNAL_SUBTITLE_FILE_NAME: &str = "vfl_external.srt";
+const EXTERNAL_SUBTITLE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const EXTERNAL_SUBTITLE_MAX_CUES: usize = 10_000;
+const EXTERNAL_SUBTITLE_MAX_LINE_CHARS: usize = 10_000;
+const STRICT_FIT_MAX_PLANS: u32 = 4;
+const STRICT_FIT_REDUCED_AUDIO_KBPS: u32 = 32;
+const STRICT_FIT_MAX_EDGE_TIERS: &[u32] = &[1280, 960, 720, 540, 360];
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -269,6 +277,12 @@ pub struct EncodeRequest {
     pub size_limit_mb: f64,
     pub audio_enabled: bool,
     #[serde(default)]
+    pub strict_fit: bool,
+    #[serde(default)]
+    pub strict_fit_allow_audio_removal: bool,
+    #[serde(default)]
+    pub subtitle_path: Option<String>,
+    #[serde(default)]
     pub normalize_audio: bool,
     #[serde(default)]
     pub strip_metadata: bool,
@@ -323,11 +337,56 @@ pub struct EncodeFinishedPayload {
     pub ok: bool,
     pub output_path: Option<String>,
     pub output_size_bytes: Option<u64>,
+    pub target_result: Option<TargetResult>,
     pub message: Option<String>,
     pub diagnostics: Option<ExportDiagnostics>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SizeTargetStatus {
+    Met,
+    Missed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FitPlanResult {
+    pub plan_number: u32,
+    pub label: String,
+    pub mutations: Vec<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub video_bitrate_kbps: Option<u32>,
+    pub audio_action: Option<StreamAction>,
+    pub audio_bitrate_kbps: Option<u32>,
+    pub actual_size_bytes: u64,
+    pub status: SizeTargetStatus,
+    pub ffmpeg_invocations: u32,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetResult {
+    pub status: SizeTargetStatus,
+    pub target_bytes: u64,
+    pub actual_bytes: u64,
+    pub overshoot_bytes: u64,
+    pub strict_fit: bool,
+    pub selected_plan_number: u32,
+    pub plans: Vec<FitPlanResult>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleInspection {
+    pub cue_count: u32,
+    pub first_cue_start_s: f64,
+    pub last_cue_end_s: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportDiagnostics {
     pub mode: String,
@@ -345,6 +404,8 @@ pub struct ExportDiagnostics {
     pub passes: u8,
     pub attempts: u32,
     pub audio_removed_for_size_target: bool,
+    pub subtitle_burned_in: bool,
+    pub subtitle_cue_count: Option<u32>,
     pub copy_fallback_reason: Option<String>,
     pub color_action: String,
     pub sar_action: String,
@@ -355,9 +416,22 @@ pub struct ExportDiagnostics {
     pub command_preview: String,
 }
 
+fn target_bytes_from_size_limit_mb(size_limit_mb: f64) -> Option<u64> {
+    if !size_limit_mb.is_finite() || size_limit_mb <= 0.0 {
+        return None;
+    }
+    let target_bytes = size_limit_mb * MB_BYTES as f64;
+    if !target_bytes.is_finite()
+        || target_bytes < 1.0
+        || target_bytes > JS_MAX_SAFE_INTEGER_BYTES as f64
+    {
+        return None;
+    }
+    Some(target_bytes.trunc() as u64)
+}
+
 pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> ExportDiagnostics {
-    let requested_size_bytes = (request.size_limit_mb.is_finite() && request.size_limit_mb > 0.0)
-        .then_some((request.size_limit_mb * MB_BYTES as f64) as u64);
+    let requested_size_bytes = target_bytes_from_size_limit_mb(request.size_limit_mb);
     let redacted_reason = safe_failure_diagnostic_reason(request, reason);
     ExportDiagnostics {
         mode: "failed".to_string(),
@@ -375,6 +449,8 @@ pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> Expor
         passes: 0,
         attempts: 0,
         audio_removed_for_size_target: false,
+        subtitle_burned_in: false,
+        subtitle_cue_count: None,
         copy_fallback_reason: None,
         color_action: "Not completed".to_string(),
         sar_action: "Not completed".to_string(),
@@ -451,6 +527,23 @@ fn safe_failure_diagnostic_reason(request: &EncodeRequest, reason: &str) -> Stri
         }
     }
 
+    if let Some(subtitle_path) = request
+        .subtitle_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let subtitle_path_buf = PathBuf::from(subtitle_path);
+        add_path_redaction(&mut redactions, subtitle_path, "<subtitle>");
+        if let Ok(canonical_subtitle) = subtitle_path_buf.canonicalize() {
+            add_path_redaction(
+                &mut redactions,
+                canonical_subtitle.to_string_lossy(),
+                "<subtitle>",
+            );
+        }
+    }
+
     redactions.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
     let mut redacted = first_line.to_string();
     for (path, replacement) in redactions {
@@ -471,6 +564,256 @@ fn safe_failure_diagnostic_reason(request: &EncodeRequest, reason: &str) -> Stri
 }
 
 #[derive(Debug, Clone)]
+struct ValidatedSubtitle {
+    normalized_text: String,
+    inspection: SubtitleInspection,
+}
+
+#[derive(Debug)]
+struct PreparedSubtitle {
+    temp_dir: TempDir,
+    inspection: SubtitleInspection,
+}
+
+impl PreparedSubtitle {
+    fn working_dir(&self) -> &Path {
+        self.temp_dir.path()
+    }
+}
+
+fn parse_srt_timestamp_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let mut time_parts = value.split(':');
+    let hours = time_parts.next()?.parse::<u64>().ok()?;
+    let minutes = time_parts.next()?.parse::<u64>().ok()?;
+    let seconds_and_millis = time_parts.next()?;
+    if time_parts.next().is_some() || minutes >= 60 {
+        return None;
+    }
+    let (seconds, millis) = seconds_and_millis
+        .split_once(',')
+        .or_else(|| seconds_and_millis.split_once('.'))?;
+    if seconds.len() != 2
+        || millis.len() != 3
+        || !seconds.chars().all(|character| character.is_ascii_digit())
+        || !millis.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let seconds = seconds.parse::<u64>().ok()?;
+    let millis = millis.parse::<u64>().ok()?;
+    if seconds >= 60 || millis >= 1_000 {
+        return None;
+    }
+    hours
+        .checked_mul(3_600_000)?
+        .checked_add(minutes.checked_mul(60_000)?)?
+        .checked_add(seconds.checked_mul(1_000)?)?
+        .checked_add(millis)
+}
+
+fn contains_subtitle_style_markup(line: &str) -> bool {
+    let mut remainder = line;
+    while let Some(start) = remainder.find('<') {
+        let after_start = &remainder[start + 1..];
+        let Some(end) = after_start.find('>') else {
+            break;
+        };
+        let tag = after_start[..end]
+            .trim_start()
+            .strip_prefix('/')
+            .unwrap_or(after_start[..end].trim_start())
+            .trim_start();
+        if tag.starts_with(|character: char| character.is_ascii_alphabetic()) {
+            return true;
+        }
+        remainder = &after_start[end + 1..];
+    }
+
+    let mut remainder = line;
+    while let Some(start) = remainder.find('{') {
+        let after_start = remainder[start + 1..].trim_start();
+        if after_start.starts_with('\\') {
+            return true;
+        }
+        remainder = &remainder[start + 1..];
+    }
+    false
+}
+
+fn validate_external_srt_text(text: &str) -> Result<ValidatedSubtitle, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if text.contains('\0') {
+        return Err("The selected SRT contains an unsupported NUL character.".to_string());
+    }
+    let normalized_text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized_text.trim().is_empty() {
+        return Err("The selected SRT is empty.".to_string());
+    }
+    if normalized_text
+        .lines()
+        .any(|line| line.chars().count() > EXTERNAL_SUBTITLE_MAX_LINE_CHARS)
+    {
+        return Err("The selected SRT contains a line that is too long.".to_string());
+    }
+    if normalized_text.lines().any(contains_subtitle_style_markup) {
+        return Err(
+            "The selected SRT contains inline styling markup. Remove HTML or ASS styling tags; Video For Lazies applies one fixed subtitle style."
+                .to_string(),
+        );
+    }
+
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut current = Vec::new();
+    for line in normalized_text.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                if blocks.len() >= EXTERNAL_SUBTITLE_MAX_CUES {
+                    return Err(format!(
+                        "The selected SRT has more than {EXTERNAL_SUBTITLE_MAX_CUES} cues."
+                    ));
+                }
+                blocks.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        if blocks.len() >= EXTERNAL_SUBTITLE_MAX_CUES {
+            return Err(format!(
+                "The selected SRT has more than {EXTERNAL_SUBTITLE_MAX_CUES} cues."
+            ));
+        }
+        blocks.push(current);
+    }
+    if blocks.is_empty() {
+        return Err("The selected SRT has no subtitle cues.".to_string());
+    }
+    let mut first_cue_start_ms = u64::MAX;
+    let mut last_cue_end_ms = 0u64;
+    for (index, block) in blocks.iter().enumerate() {
+        let timing_index = if block.first().is_some_and(|line| {
+            line.trim()
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        }) {
+            1
+        } else {
+            0
+        };
+        let timing_line = block
+            .get(timing_index)
+            .ok_or_else(|| format!("Subtitle cue {} is missing its timing line.", index + 1))?;
+        let (start, end_and_settings) = timing_line
+            .split_once("-->")
+            .ok_or_else(|| format!("Subtitle cue {} has an invalid timing line.", index + 1))?;
+        let mut end_fields = end_and_settings.split_whitespace();
+        let end = end_fields
+            .next()
+            .ok_or_else(|| format!("Subtitle cue {} has no end time.", index + 1))?;
+        if end_fields.next().is_some() {
+            return Err(format!(
+                "Subtitle cue {} contains timing-line settings that can override the fixed subtitle position. Remove all text after the cue end timestamp.",
+                index + 1
+            ));
+        }
+        let start_ms = parse_srt_timestamp_ms(start)
+            .ok_or_else(|| format!("Subtitle cue {} has an invalid start time.", index + 1))?;
+        let end_ms = parse_srt_timestamp_ms(end)
+            .ok_or_else(|| format!("Subtitle cue {} has an invalid end time.", index + 1))?;
+        if end_ms <= start_ms {
+            return Err(format!(
+                "Subtitle cue {} must end after it starts.",
+                index + 1
+            ));
+        }
+        if !block
+            .iter()
+            .skip(timing_index + 1)
+            .any(|line| !line.trim().is_empty())
+        {
+            return Err(format!("Subtitle cue {} has no text.", index + 1));
+        }
+        first_cue_start_ms = first_cue_start_ms.min(start_ms);
+        last_cue_end_ms = last_cue_end_ms.max(end_ms);
+    }
+
+    let mut normalized_text = normalized_text.trim_matches('\n').to_string();
+    normalized_text.push('\n');
+    Ok(ValidatedSubtitle {
+        normalized_text,
+        inspection: SubtitleInspection {
+            cue_count: blocks.len() as u32,
+            first_cue_start_s: first_cue_start_ms as f64 / 1_000.0,
+            last_cue_end_s: last_cue_end_ms as f64 / 1_000.0,
+        },
+    })
+}
+
+fn validate_external_srt_path(path: &Path) -> Result<ValidatedSubtitle, String> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("srt"))
+    {
+        return Err("Choose a file with the .srt extension.".to_string());
+    }
+    let file =
+        fs::File::open(path).map_err(|_| "The selected SRT could not be read.".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "The selected SRT could not be read.".to_string())?;
+    if !metadata.is_file() {
+        return Err("The selected SRT path must point to a regular file.".to_string());
+    }
+    if metadata.len() == 0 {
+        return Err("The selected SRT is empty.".to_string());
+    }
+    if metadata.len() > EXTERNAL_SUBTITLE_MAX_BYTES {
+        return Err(format!(
+            "The selected SRT is larger than {} MiB.",
+            EXTERNAL_SUBTITLE_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(EXTERNAL_SUBTITLE_MAX_BYTES) as usize);
+    file.take(EXTERNAL_SUBTITLE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "The selected SRT could not be read.".to_string())?;
+    if bytes.is_empty() {
+        return Err("The selected SRT is empty.".to_string());
+    }
+    if bytes.len() as u64 > EXTERNAL_SUBTITLE_MAX_BYTES {
+        return Err(format!(
+            "The selected SRT is larger than {} MiB.",
+            EXTERNAL_SUBTITLE_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "The selected SRT must be UTF-8 text.".to_string())?;
+    validate_external_srt_text(text)
+}
+
+pub fn inspect_srt(path: String) -> Result<SubtitleInspection, String> {
+    validate_external_srt_path(Path::new(path.trim())).map(|validated| validated.inspection)
+}
+
+fn prepare_external_subtitle(path: &Path) -> Result<PreparedSubtitle, String> {
+    let validated = validate_external_srt_path(path)?;
+    let temp_dir = TempDir::new()
+        .map_err(|_| "Could not create private subtitle staging storage.".to_string())?;
+    fs::write(
+        temp_dir.path().join(EXTERNAL_SUBTITLE_FILE_NAME),
+        validated.normalized_text.as_bytes(),
+    )
+    .map_err(|_| "Could not stage the selected SRT for FFmpeg.".to_string())?;
+    Ok(PreparedSubtitle {
+        temp_dir,
+        inspection: validated.inspection,
+    })
+}
+
+#[derive(Debug, Clone)]
 struct EncodePlan {
     video_bitrate_kbps: u32,
     audio_bitrate_kbps: u32,
@@ -483,7 +826,36 @@ struct SizeLimitedEncodeContract {
     planned_height: u32,
     min_video_kbps: u32,
     plan: EncodePlan,
-    audio_removed_for_size_target: bool,
+}
+
+struct SizeCandidateOutput {
+    temp_output: TempPath,
+    actual_size_bytes: u64,
+    plan_number: u32,
+    command_plan: EncodeCommandPlan,
+    video_bitrate_kbps: Option<u32>,
+    audio_bitrate_kbps: Option<u32>,
+    audio_action: StreamAction,
+    passes: u8,
+    command_preview: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrictFitNextStage {
+    BitrateCorrection,
+    LowerMaxEdge,
+    AudioFallback,
+    Exhausted,
+}
+
+impl StrictFitNextStage {
+    fn successor(self) -> Self {
+        match self {
+            Self::BitrateCorrection => Self::LowerMaxEdge,
+            Self::LowerMaxEdge => Self::AudioFallback,
+            Self::AudioFallback | Self::Exhausted => Self::Exhausted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,7 +960,7 @@ struct CodecSelection {
     quality_mode: Option<QualityMode>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamAction {
     Copy,
@@ -638,6 +1010,7 @@ enum PlanReason {
     AudioOnlyOutput,
     ColorConversion,
     SampleAspectRatio,
+    SubtitleBurnIn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,6 +1207,41 @@ struct FfmpegRuntimeCapabilities {
     version: String,
     encoder_names: HashSet<String>,
     filter_names: HashSet<String>,
+}
+
+fn apply_smoke_capability_mask(
+    mut runtime: FfmpegRuntimeCapabilities,
+    env: &HashMap<String, String>,
+) -> Result<FfmpegRuntimeCapabilities, String> {
+    let smoke_active = ["VFL_SMOKE_INPUT", "VFL_SMOKE_STATUS"].iter().all(|key| {
+        env.get(*key)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    });
+    if !smoke_active {
+        return Ok(runtime);
+    }
+    let Some(raw) = env
+        .get("VFL_SMOKE_MISSING_CAPABILITY_FILTERS")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(runtime);
+    };
+
+    for filter in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if filter != "subtitles" {
+            return Err(format!(
+                "VFL_SMOKE_MISSING_CAPABILITY_FILTERS cannot mask non-allowlisted filter: {filter}."
+            ));
+        }
+        runtime.filter_names.remove(filter);
+    }
+    Ok(runtime)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1280,7 +1688,16 @@ fn full_reencode_fallback(plan: &EncodeCommandPlan) -> Result<EncodeCommandPlan,
     Ok(fallback)
 }
 
+fn ensure_output_destination_available(output_path: &Path) -> Result<(), String> {
+    if output_path.exists() {
+        Err("Output file already exists. Choose a new filename.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn create_temp_output(output_path: &Path, job_id: u64, label: &str) -> Result<TempPath, String> {
+    ensure_output_destination_available(output_path)?;
     let parent = output_path
         .parent()
         .ok_or_else(|| "Output path must include a folder.".to_string())?;
@@ -1452,7 +1869,10 @@ fn cached_ffmpeg_capabilities(ffmpeg_bin: &str) -> Result<FfmpegRuntimeCapabilit
     if let Ok(guard) = cache.lock()
         && let Some(existing) = guard.get(ffmpeg_bin)
     {
-        return Ok(existing.clone());
+        return apply_smoke_capability_mask(
+            existing.clone(),
+            &std::env::vars().collect::<HashMap<_, _>>(),
+        );
     }
 
     let encoder_output =
@@ -1469,7 +1889,7 @@ fn cached_ffmpeg_capabilities(ffmpeg_bin: &str) -> Result<FfmpegRuntimeCapabilit
     if let Ok(mut guard) = cache.lock() {
         guard.insert(ffmpeg_bin.to_string(), parsed.clone());
     }
-    Ok(parsed)
+    apply_smoke_capability_mask(parsed, &std::env::vars().collect::<HashMap<_, _>>())
 }
 
 fn cached_ffmpeg_pixel_formats(
@@ -1550,7 +1970,13 @@ fn parse_ffmpeg_capability_contract(raw: &str) -> Result<FfmpegCapabilityContrac
             &format!("FFmpeg capability feature {name}.filters"),
         )?;
     }
-    for required_name in ["coreExport", "hdrToSdr", "sarNormalize", "reverseLoop"] {
+    for required_name in [
+        "coreExport",
+        "externalSubtitles",
+        "hdrToSdr",
+        "sarNormalize",
+        "reverseLoop",
+    ] {
         if !contract.features.contains_key(required_name) {
             return Err(format!(
                 "Bundled FFmpeg capability contract is missing feature: {required_name}."
@@ -1592,7 +2018,6 @@ fn feature_capability(
     }
 }
 
-#[cfg(test)]
 fn require_ffmpeg_feature(
     name: &str,
     contract: &FfmpegCapabilityContract,
@@ -2171,7 +2596,8 @@ fn video_transform_requires_encode(request: &EncodeRequest) -> Result<bool, Stri
         || request.rotate_deg != 0
         || !matches!(requested_resize(request)?, ResizePlan::Source)
         || !color_is_noop(&request.color)
-        || request.perturb_first_frame)
+        || request.perturb_first_frame
+        || request.subtitle_path.is_some())
 }
 
 fn color_metadata_is_complete(probe: &VideoProbe) -> bool {
@@ -2557,6 +2983,10 @@ fn build_encode_command_plan(
         } else {
             PlanReason::VideoTransform
         });
+    }
+    if request.subtitle_path.is_some() {
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::SubtitleBurnIn);
     }
     if media_policy.color_action.converts_to_standard_sdr() {
         natural_video_action = StreamAction::Encode;
@@ -4373,7 +4803,8 @@ fn plan_bitrates(
         return Err("Duration must be > 0.".to_string());
     }
 
-    let target_size_bytes = (target_size_mb * MB_BYTES as f64) as u64;
+    let target_size_bytes = target_bytes_from_size_limit_mb(target_size_mb)
+        .ok_or_else(|| "Size limit is too large to report in exact bytes.".to_string())?;
     let target_bits = (target_size_bytes as f64) * 8.0 * margin;
     let total_kbps_budget = (target_bits / duration_s / 1000.0).floor().max(10.0) as u32;
 
@@ -4385,29 +4816,21 @@ fn plan_bitrates(
         });
     }
 
-    let mut audio_kbps = preferred_audio_kbps.max(min_audio_kbps);
-    audio_kbps = audio_kbps.min(total_kbps_budget);
-    let audio_bits = (audio_kbps as f64) * 1000.0 * duration_s;
-    let mut video_bits = target_bits - audio_bits;
-    let mut video_kbps = (video_bits / duration_s / 1000.0).floor() as i64;
-
-    if video_kbps < min_video_kbps as i64 {
-        let audio_kbps_max = total_kbps_budget.saturating_sub(min_video_kbps);
-        if audio_kbps_max < min_audio_kbps {
-            return Ok(EncodePlan {
-                video_bitrate_kbps: total_kbps_budget.max(min_video_kbps),
-                audio_bitrate_kbps: 0,
-                include_audio: false,
-            });
-        }
-        audio_kbps = audio_kbps.clamp(min_audio_kbps, audio_kbps_max);
-        let audio_bits = (audio_kbps as f64) * 1000.0 * duration_s;
-        video_bits = target_bits - audio_bits;
-        video_kbps = (video_bits / duration_s / 1000.0).floor() as i64;
-    }
+    // Audio presence is a user choice. A tight target may force both streams
+    // to their practical floors and therefore produce a measured miss, but it
+    // must never silently turn an audio-enabled request into video-only output.
+    let audio_kbps_max = total_kbps_budget.saturating_sub(min_video_kbps);
+    let audio_kbps = if audio_kbps_max >= min_audio_kbps {
+        preferred_audio_kbps.max(min_audio_kbps).min(audio_kbps_max)
+    } else {
+        min_audio_kbps
+    };
+    let video_kbps = total_kbps_budget
+        .saturating_sub(audio_kbps)
+        .max(min_video_kbps);
 
     Ok(EncodePlan {
-        video_bitrate_kbps: (video_kbps.max(min_video_kbps as i64) as u32),
+        video_bitrate_kbps: video_kbps,
         audio_bitrate_kbps: audio_kbps,
         include_audio: true,
     })
@@ -4427,7 +4850,8 @@ fn plan_audio_only_kbps(
         return Err("Duration must be > 0.".to_string());
     }
 
-    let target_size_bytes = (target_size_mb * MB_BYTES as f64) as u64;
+    let target_size_bytes = target_bytes_from_size_limit_mb(target_size_mb)
+        .ok_or_else(|| "Size limit is too large to report in exact bytes.".to_string())?;
     let target_bits = (target_size_bytes as f64) * 8.0 * margin;
     let kbps_budget = (target_bits / duration_s / 1000.0).floor().max(8.0) as u32;
     Ok(kbps_budget.clamp(min_audio_kbps, max_audio_kbps))
@@ -4500,6 +4924,8 @@ fn build_video_filters_with_policy(
     media_policy: MediaPolicyPlan,
 ) -> Result<Option<String>, String> {
     let mut filters: Vec<String> = Vec::new();
+    let mut deferred_trim_filters: Vec<String> = Vec::new();
+    let subtitle_active = req.subtitle_path.is_some();
 
     if let Some(t) = &req.trim {
         let start = t.start_s.max(0.0);
@@ -4507,8 +4933,15 @@ fn build_video_filters_with_policy(
         if end <= start {
             return Err("Trim end must be greater than start.".to_string());
         }
-        filters.push(format!("trim=start={start}:end={end}"));
-        filters.push("setpts=PTS-STARTPTS".to_string());
+        let trim_filters = [
+            format!("trim=start={start}:end={end}"),
+            "setpts=PTS-STARTPTS".to_string(),
+        ];
+        if subtitle_active {
+            deferred_trim_filters.extend(trim_filters);
+        } else {
+            filters.extend(trim_filters);
+        }
     }
 
     if let Some(c) = &req.crop {
@@ -4592,6 +5025,17 @@ fn build_video_filters_with_policy(
                 c.brightness, c.contrast, c.saturation
             ));
         }
+    }
+
+    if let Some(subtitle_path) = req.subtitle_path.as_deref() {
+        if subtitle_path != EXTERNAL_SUBTITLE_FILE_NAME {
+            return Err("Internal subtitle staging path was not normalized.".to_string());
+        }
+        filters.push(
+            "subtitles=filename=vfl_external.srt:force_style='FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginL=24,MarginR=24,MarginV=24'"
+                .to_string(),
+        );
+        filters.append(&mut deferred_trim_filters);
     }
 
     if req.reverse {
@@ -4789,6 +5233,7 @@ fn run_ffmpeg_with_progress(
     job_id: u64,
     ffmpeg_bin: &str,
     args: &[String],
+    working_dir: Option<&Path>,
     pass: u8,
     total_passes: u8,
     duration_us: u64,
@@ -4802,6 +5247,9 @@ fn run_ffmpeg_with_progress(
 
     let mut cmd = command_no_window(ffmpeg_bin);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(working_dir) = working_dir {
+        cmd.current_dir(working_dir);
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -5096,39 +5544,91 @@ fn build_size_limited_encode_contract(
         min_video_kbps,
         0.95,
     )?;
-    let audio_removed_for_size_target = include_audio && !plan.include_audio;
-
     Ok(SizeLimitedEncodeContract {
         planned_width,
         planned_height,
         min_video_kbps,
         plan,
-        audio_removed_for_size_target,
     })
 }
 
-fn size_limited_completion_message(
-    met_target: bool,
-    selected_video_codec: VideoCodec,
-    video_bitrate_kbps: u32,
+fn target_status(actual_bytes: u64, target_bytes: u64) -> SizeTargetStatus {
+    if actual_bytes <= target_bytes {
+        SizeTargetStatus::Met
+    } else {
+        SizeTargetStatus::Missed
+    }
+}
+
+fn should_replace_measured_candidate(best_bytes: Option<u64>, candidate_bytes: u64) -> bool {
+    best_bytes
+        .map(|best| candidate_bytes < best)
+        .unwrap_or(true)
+}
+
+fn corrected_video_bitrate_kbps(
+    current_video_kbps: u32,
     min_video_kbps: u32,
-    audio_removed_for_size_target: bool,
-) -> Option<String> {
-    let mut messages = Vec::new();
+    actual_bytes: u64,
+    target_bytes: u64,
+) -> Option<u32> {
+    if actual_bytes <= target_bytes || actual_bytes == 0 {
+        return None;
+    }
+    let reduction_factor = (target_bytes as f64 / actual_bytes as f64) * 0.95;
+    let corrected = ((current_video_kbps as f64) * reduction_factor).floor() as u32;
+    let corrected = corrected.max(min_video_kbps);
+    (corrected < current_video_kbps).then_some(corrected)
+}
 
-    if !met_target {
-        if selected_video_codec == VideoCodec::Mpeg4 && video_bitrate_kbps <= min_video_kbps {
-            messages.push("Still above size limit. The bundled MP4 fallback codec cannot go lower at this resolution. Try a larger size limit, WebM, or smaller output dimensions.");
-        } else {
-            messages.push("Still above size limit.");
+fn next_strict_fit_max_edge(width: u32, height: u32) -> Option<u32> {
+    let current_long_edge = width.max(height);
+    STRICT_FIT_MAX_EDGE_TIERS
+        .iter()
+        .copied()
+        .find(|tier| *tier < current_long_edge)
+}
+
+fn exact_target_message(status: SizeTargetStatus, actual_bytes: u64, target_bytes: u64) -> String {
+    match status {
+        SizeTargetStatus::Met => {
+            format!("Target met by exact output bytes: {actual_bytes} of {target_bytes} bytes.")
         }
+        SizeTargetStatus::Missed => format!(
+            "Target missed by {} exact bytes. The smallest measured output was published at {actual_bytes} bytes for a {target_bytes} byte target.",
+            actual_bytes.saturating_sub(target_bytes)
+        ),
     }
+}
 
-    if audio_removed_for_size_target {
-        messages.push("Audio was removed to fit the size target.");
+fn validate_strict_fit_options(
+    strict_fit: bool,
+    allow_audio_removal: bool,
+    size_limit_enabled: bool,
+    format: OutputFormat,
+) -> Result<(), String> {
+    if allow_audio_removal && !strict_fit {
+        return Err("Audio-removal permission requires Strict Fit.".to_string());
     }
+    if strict_fit && (!size_limit_enabled || format == OutputFormat::Mp3) {
+        return Err("Strict Fit requires an MP4 or WebM size target.".to_string());
+    }
+    Ok(())
+}
 
-    (!messages.is_empty()).then(|| messages.join(" "))
+fn build_mutated_size_reencode_plan(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    codec_selection: CodecSelection,
+    resolved_perturb_seed: Option<u32>,
+) -> Result<EncodeCommandPlan, String> {
+    let initial =
+        build_encode_command_plan(request, probe, codec_selection, resolved_perturb_seed)?;
+    if initial.size_contract.is_some() {
+        Ok(initial)
+    } else {
+        build_size_reencode_fallback_plan(request, probe, &initial)
+    }
 }
 
 pub fn run_encode_job(
@@ -5137,7 +5637,7 @@ pub fn run_encode_job(
     job_id: u64,
     cancel: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
-    request: EncodeRequest,
+    mut request: EncodeRequest,
 ) -> Result<EncodeFinishedPayload, String> {
     let input_path = PathBuf::from(request.input_path.trim());
     if !input_path.exists() {
@@ -5159,7 +5659,21 @@ pub fn run_encode_job(
     if size_limit_enabled && request.size_limit_mb < 0.1 {
         return Err("Size limit must be >= 0.1 MB (or 0 to disable).".to_string());
     }
-    let target_bytes = (request.size_limit_mb * MB_BYTES as f64) as u64;
+    validate_strict_fit_options(
+        request.strict_fit,
+        request.strict_fit_allow_audio_removal,
+        size_limit_enabled,
+        request.format,
+    )?;
+    if request.format == OutputFormat::Mp3 && request.subtitle_path.is_some() {
+        return Err("External subtitles require MP4 or WebM video output.".to_string());
+    }
+    let target_bytes = if size_limit_enabled {
+        target_bytes_from_size_limit_mb(request.size_limit_mb)
+            .ok_or_else(|| "Size limit is too large to report in exact bytes.".to_string())?
+    } else {
+        0
+    };
 
     let output_path = validate_output_path(
         &input_path,
@@ -5167,12 +5681,51 @@ pub fn run_encode_job(
         output_extension(request.format),
     )?;
 
+    let input_path = input_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve input file: {error}"))?;
     let input_str = input_path.to_string_lossy().to_string();
 
-    let ffmpeg_bin = default_ffmpeg();
+    let mut ffmpeg_bin = default_ffmpeg();
     let probe = probe_video(input_path.to_string_lossy().to_string())?;
     let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
     let capability_contract = ffmpeg_capability_contract()?;
+    let prepared_subtitle = if let Some(subtitle_path) = request
+        .subtitle_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        require_ffmpeg_feature(
+            "externalSubtitles",
+            &capability_contract,
+            &runtime_capabilities,
+        )?;
+        let prepared = prepare_external_subtitle(Path::new(subtitle_path))?;
+        request.subtitle_path = Some(EXTERNAL_SUBTITLE_FILE_NAME.to_string());
+        Some(prepared)
+    } else {
+        request.subtitle_path = None;
+        None
+    };
+    if prepared_subtitle.is_some() {
+        let binary_path = Path::new(&ffmpeg_bin);
+        if binary_path.components().count() > 1 && binary_path.is_relative() {
+            ffmpeg_bin = std::env::current_dir()
+                .map_err(|error| format!("Could not resolve the FFmpeg working folder: {error}"))?
+                .join(binary_path)
+                .canonicalize()
+                .map_err(|error| format!("Could not resolve the configured FFmpeg path: {error}"))?
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    let subtitle_working_dir = prepared_subtitle
+        .as_ref()
+        .map(PreparedSubtitle::working_dir);
+    let subtitle_inspection = prepared_subtitle
+        .as_ref()
+        .map(|prepared| prepared.inspection.clone());
     let codec_selection = select_codec_plan(
         request.format,
         &runtime_capabilities.encoder_names,
@@ -5249,6 +5802,7 @@ pub fn run_encode_job(
             job_id,
             &ffmpeg_bin,
             &args,
+            subtitle_working_dir,
             1,
             1,
             duration_us,
@@ -5260,6 +5814,31 @@ pub fn run_encode_job(
         let out_size = fs::metadata(&temp_path)
             .map_err(|e| format!("Failed to stat output file: {e}"))?
             .len();
+        let mp3_target_result = size_limit_enabled.then(|| {
+            let status = target_status(out_size, target_bytes);
+            TargetResult {
+                status,
+                target_bytes,
+                actual_bytes: out_size,
+                overshoot_bytes: out_size.saturating_sub(target_bytes),
+                strict_fit: false,
+                selected_plan_number: 1,
+                plans: vec![FitPlanResult {
+                    plan_number: 1,
+                    label: "Requested audio encode".to_string(),
+                    mutations: Vec::new(),
+                    width: None,
+                    height: None,
+                    video_bitrate_kbps: None,
+                    audio_action: Some(StreamAction::Encode),
+                    audio_bitrate_kbps: selected_audio_bitrate_kbps,
+                    actual_size_bytes: out_size,
+                    status,
+                    ffmpeg_invocations: 1,
+                    selected: true,
+                }],
+            }
+        });
         if cancel.load(Ordering::Relaxed) {
             return Err("Canceled.".to_string());
         }
@@ -5271,7 +5850,10 @@ pub fn run_encode_job(
             ok: true,
             output_path: Some(output_path.to_string_lossy().to_string()),
             output_size_bytes: Some(out_size),
-            message: None,
+            target_result: mp3_target_result.clone(),
+            message: mp3_target_result
+                .as_ref()
+                .map(|result| exact_target_message(result.status, out_size, target_bytes)),
             diagnostics: Some(ExportDiagnostics {
                 mode: command_plan.mode.label().to_string(),
                 video_action: None,
@@ -5288,6 +5870,10 @@ pub fn run_encode_job(
                 passes: 1,
                 attempts: 1,
                 audio_removed_for_size_target: false,
+                subtitle_burned_in: subtitle_inspection.is_some(),
+                subtitle_cue_count: subtitle_inspection
+                    .as_ref()
+                    .map(|inspection| inspection.cue_count),
                 copy_fallback_reason: None,
                 color_action: command_plan
                     .media_policy
@@ -5312,111 +5898,167 @@ pub fn run_encode_job(
     }
 
     let mut size_copy_fallback_reason: Option<String> = None;
-    for (candidate_index, candidate) in command_plan.size_copy_candidates.iter().enumerate() {
-        let mut args = build_copy_candidate_args(&input_str, &request, candidate);
-        let label = format!("size-copy-{}", candidate_index + 1);
-        let temp_path = create_temp_output(&output_path, job_id, &label)?;
-        args.push(temp_path.to_string_lossy().to_string());
-        let temp_str = temp_path.to_string_lossy().to_string();
-        let command_preview =
-            ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
+    let mut fit_plan_history: Vec<FitPlanResult> = Vec::new();
+    let mut best_output: Option<SizeCandidateOutput> = None;
+    if !request.strict_fit {
+        for (candidate_index, candidate) in command_plan.size_copy_candidates.iter().enumerate() {
+            let mut args = build_copy_candidate_args(&input_str, &request, candidate);
+            let label = format!("size-copy-{}", candidate_index + 1);
+            let temp_path = create_temp_output(&output_path, job_id, &label)?;
+            args.push(temp_path.to_string_lossy().to_string());
+            let temp_str = temp_path.to_string_lossy().to_string();
+            let command_preview =
+                ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
-        match run_ffmpeg_with_progress(
-            window,
-            attempt_id,
-            job_id,
-            &ffmpeg_bin,
-            &args,
-            1,
-            1,
-            duration_us,
-            size_copy_run_limits(target_bytes, temp_path.as_ref()),
-            cancel.as_ref(),
-            child_slot,
-        ) {
-            Ok(()) => {
-                let out_size = fs::metadata(&temp_path)
-                    .map_err(|error| format!("Failed to stat output file: {error}"))?
-                    .len();
-                if out_size <= target_bytes {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err("Canceled.".to_string());
+            match run_ffmpeg_with_progress(
+                window,
+                attempt_id,
+                job_id,
+                &ffmpeg_bin,
+                &args,
+                subtitle_working_dir,
+                1,
+                1,
+                duration_us,
+                size_copy_run_limits(target_bytes, temp_path.as_ref()),
+                cancel.as_ref(),
+                child_slot,
+            ) {
+                Ok(()) => {
+                    let out_size = fs::metadata(&temp_path)
+                        .map_err(|error| format!("Failed to stat output file: {error}"))?
+                        .len();
+                    let met_target = out_size <= target_bytes;
+                    let plan_number = fit_plan_history.len() as u32 + 1;
+                    fit_plan_history.push(FitPlanResult {
+                        plan_number,
+                        label: "Compatible stream copy".to_string(),
+                        mutations: Vec::new(),
+                        width: Some(probe.width),
+                        height: Some(probe.height),
+                        video_bitrate_kbps: None,
+                        audio_action: probe.has_audio.then_some(candidate.audio_action),
+                        audio_bitrate_kbps: None,
+                        actual_size_bytes: out_size,
+                        status: if met_target {
+                            SizeTargetStatus::Met
+                        } else {
+                            SizeTargetStatus::Missed
+                        },
+                        ffmpeg_invocations: 1,
+                        selected: met_target,
+                    });
+                    if met_target {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("Canceled.".to_string());
+                        }
+                        let audio_removed_for_size_target = request.audio_enabled
+                            && probe.has_audio
+                            && candidate.audio_action == StreamAction::Drop;
+                        let target_result = TargetResult {
+                            status: SizeTargetStatus::Met,
+                            target_bytes,
+                            actual_bytes: out_size,
+                            overshoot_bytes: 0,
+                            strict_fit: false,
+                            selected_plan_number: plan_number,
+                            plans: fit_plan_history.clone(),
+                        };
+                        publish_output_file(temp_path, &output_path)?;
+                        return Ok(EncodeFinishedPayload {
+                            attempt_id,
+                            job_id,
+                            ok: true,
+                            output_path: Some(output_path.to_string_lossy().to_string()),
+                            output_size_bytes: Some(out_size),
+                            target_result: Some(target_result),
+                            message: Some("Fit confirmed by exact output bytes.".to_string()),
+                            diagnostics: Some(ExportDiagnostics {
+                                mode: EncodeMode::Remux.label().to_string(),
+                                video_action: Some(StreamAction::Copy),
+                                audio_action: Some(candidate.audio_action),
+                                source_format: probe.source_format.clone(),
+                                source_video_codec: probe.video_codec.clone(),
+                                source_audio_codec: probe.audio_codec.clone(),
+                                video_codec: probe.video_codec.clone(),
+                                audio_codec: (candidate.audio_action == StreamAction::Copy)
+                                    .then(|| probe.audio_codec.clone())
+                                    .flatten(),
+                                video_bitrate_kbps: None,
+                                audio_bitrate_kbps: None,
+                                requested_size_bytes: Some(target_bytes),
+                                actual_size_bytes: Some(out_size),
+                                passes: 1,
+                                attempts: (candidate_index + 1) as u32,
+                                audio_removed_for_size_target,
+                                subtitle_burned_in: subtitle_inspection.is_some(),
+                                subtitle_cue_count: subtitle_inspection
+                                    .as_ref()
+                                    .map(|inspection| inspection.cue_count),
+                                copy_fallback_reason: size_copy_fallback_reason.clone(),
+                                color_action: command_plan
+                                    .media_policy
+                                    .color_action
+                                    .diagnostic()
+                                    .to_string(),
+                                sar_action: command_plan
+                                    .media_policy
+                                    .sar_action
+                                    .diagnostic(probe.sample_aspect_ratio),
+                                reverse_buffer_estimate_bytes: command_plan
+                                    .reverse_buffer_estimate
+                                    .map(|estimate| estimate.bytes),
+                                reverse_buffer_action: command_plan
+                                    .reverse_buffer_estimate
+                                    .map(|estimate| estimate.action.diagnostic().to_string()),
+                                failure_stage: None,
+                                failure_reason: None,
+                                command_preview,
+                            }),
+                        });
                     }
-                    let audio_removed_for_size_target = request.audio_enabled
-                        && probe.has_audio
-                        && candidate.audio_action == StreamAction::Drop;
-                    publish_output_file(temp_path, &output_path)?;
-                    return Ok(EncodeFinishedPayload {
-                        attempt_id,
-                        job_id,
-                        ok: true,
-                        output_path: Some(output_path.to_string_lossy().to_string()),
-                        output_size_bytes: Some(out_size),
-                        message: audio_removed_for_size_target
-                            .then(|| "Audio was removed to fit the size target.".to_string()),
-                        diagnostics: Some(ExportDiagnostics {
-                            mode: EncodeMode::Remux.label().to_string(),
-                            video_action: Some(StreamAction::Copy),
-                            audio_action: Some(candidate.audio_action),
-                            source_format: probe.source_format.clone(),
-                            source_video_codec: probe.video_codec.clone(),
-                            source_audio_codec: probe.audio_codec.clone(),
-                            video_codec: probe.video_codec.clone(),
-                            audio_codec: (candidate.audio_action == StreamAction::Copy)
-                                .then(|| probe.audio_codec.clone())
-                                .flatten(),
-                            video_bitrate_kbps: None,
-                            audio_bitrate_kbps: None,
-                            requested_size_bytes: Some(target_bytes),
-                            actual_size_bytes: Some(out_size),
-                            passes: 1,
-                            attempts: (candidate_index + 1) as u32,
-                            audio_removed_for_size_target,
-                            copy_fallback_reason: size_copy_fallback_reason.clone(),
-                            color_action: command_plan
-                                .media_policy
-                                .color_action
-                                .diagnostic()
-                                .to_string(),
-                            sar_action: command_plan
-                                .media_policy
-                                .sar_action
-                                .diagnostic(probe.sample_aspect_ratio),
-                            reverse_buffer_estimate_bytes: command_plan
-                                .reverse_buffer_estimate
-                                .map(|estimate| estimate.bytes),
-                            reverse_buffer_action: command_plan
-                                .reverse_buffer_estimate
-                                .map(|estimate| estimate.action.diagnostic().to_string()),
-                            failure_stage: None,
-                            failure_reason: None,
-                            command_preview,
-                        }),
+                    let copy_candidate = SizeCandidateOutput {
+                        temp_output: temp_path,
+                        actual_size_bytes: out_size,
+                        plan_number,
+                        command_plan: command_plan.clone(),
+                        video_bitrate_kbps: None,
+                        audio_bitrate_kbps: None,
+                        audio_action: candidate.audio_action,
+                        passes: 1,
+                        command_preview,
+                    };
+                    let replace_best = should_replace_measured_candidate(
+                        best_output.as_ref().map(|best| best.actual_size_bytes),
+                        out_size,
+                    );
+                    if replace_best {
+                        best_output = Some(copy_candidate);
+                    }
+                    let detail = if candidate.audio_action == StreamAction::Copy {
+                        "Compatible A/V copy exceeded the size target."
+                    } else {
+                        "Compatible video-only copy exceeded the size target."
+                    };
+                    size_copy_fallback_reason = Some(match size_copy_fallback_reason {
+                        Some(previous) => format!("{previous} {detail}"),
+                        None => detail.to_string(),
                     });
                 }
-                let detail = if candidate.audio_action == StreamAction::Copy {
-                    "Compatible A/V copy exceeded the size target."
-                } else {
-                    "Compatible video-only copy exceeded the size target."
-                };
-                size_copy_fallback_reason = Some(match size_copy_fallback_reason {
-                    Some(previous) => format!("{previous} {detail}"),
-                    None => detail.to_string(),
-                });
-            }
-            Err(error) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(error);
+                Err(error) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(error);
+                    }
+                    let detail = if candidate.audio_action == StreamAction::Copy {
+                        "Compatible A/V copy was rejected by FFmpeg."
+                    } else {
+                        "Compatible video-only copy was rejected by FFmpeg."
+                    };
+                    size_copy_fallback_reason = Some(match size_copy_fallback_reason {
+                        Some(previous) => format!("{previous} {detail}"),
+                        None => detail.to_string(),
+                    });
                 }
-                let detail = if candidate.audio_action == StreamAction::Copy {
-                    "Compatible A/V copy was rejected by FFmpeg."
-                } else {
-                    "Compatible video-only copy was rejected by FFmpeg."
-                };
-                size_copy_fallback_reason = Some(match size_copy_fallback_reason {
-                    Some(previous) => format!("{previous} {detail}"),
-                    None => detail.to_string(),
-                });
             }
         }
     }
@@ -5458,6 +6100,7 @@ pub fn run_encode_job(
                 job_id,
                 &ffmpeg_bin,
                 &args,
+                subtitle_working_dir,
                 1,
                 1,
                 duration_us,
@@ -5489,6 +6132,7 @@ pub fn run_encode_job(
                         ok: true,
                         output_path: Some(output_path.to_string_lossy().to_string()),
                         output_size_bytes: Some(out_size),
+                        target_result: None,
                         message: None,
                         diagnostics: Some(ExportDiagnostics {
                             mode: executed_plan.mode.label().to_string(),
@@ -5506,6 +6150,10 @@ pub fn run_encode_job(
                             passes: 1,
                             attempts: execution_attempts,
                             audio_removed_for_size_target: false,
+                            subtitle_burned_in: subtitle_inspection.is_some(),
+                            subtitle_cue_count: subtitle_inspection
+                                .as_ref()
+                                .map(|inspection| inspection.cue_count),
                             copy_fallback_reason,
                             color_action: executed_plan
                                 .media_policy
@@ -5562,38 +6210,50 @@ pub fn run_encode_job(
         }
     }
 
-    let selected_video_codec = command_plan
-        .video_encoder
-        .ok_or_else(|| "Missing video codec selection.".to_string())?;
-    let contract = command_plan
+    let mut active_request = request.clone();
+    let mut active_command_plan = command_plan;
+    let mut active_contract = active_command_plan
         .size_contract
         .clone()
         .ok_or_else(|| "Missing size-target encode contract.".to_string())?;
-    let planned_width = contract.planned_width;
-    let planned_height = contract.planned_height;
-    let min_video_kbps = contract.min_video_kbps;
-    let audio_removed_for_size_target = contract.audio_removed_for_size_target;
-    let mut plan = contract.plan;
+    let mut active_plan = active_contract.plan.clone();
+    let mut current_label = "Requested encode".to_string();
+    let mut current_mutations: Vec<String> = Vec::new();
+    let mut next_strict_stage = StrictFitNextStage::BitrateCorrection;
+    let mut reencode_attempt = 0u32;
 
-    let video_codec = selected_video_codec.as_ffmpeg_name();
-    let audio_encoder = command_plan.audio_encoder.unwrap_or(AudioCodec::Aac);
-    let audio_codec = audio_encoder.as_ffmpeg_name();
-    let encode_speed_preference = command_plan.encode_speed;
-
-    let mut attempt: u32 = 0;
-    let max_attempts: u32 = 3;
     loop {
-        attempt += 1;
-
+        if request.strict_fit && fit_plan_history.len() as u32 >= STRICT_FIT_MAX_PLANS {
+            break;
+        }
+        // A newly claimed destination makes every remaining candidate
+        // unpublishable. Stop before advancing the ladder or running pass 1.
+        ensure_output_destination_available(&output_path)?;
+        reencode_attempt += 1;
         if cancel.load(Ordering::Relaxed) {
             return Err("Canceled.".to_string());
         }
 
-        let temp_dir = temp_dir_for_job(job_id, attempt)?;
+        let selected_video_codec = active_command_plan
+            .video_encoder
+            .ok_or_else(|| "Missing video codec selection.".to_string())?;
+        let video_codec = selected_video_codec.as_ffmpeg_name();
+        let planned_width = active_contract.planned_width;
+        let planned_height = active_contract.planned_height;
+        let min_video_kbps = active_contract.min_video_kbps;
+        let video_bitrate_kbps = active_plan.video_bitrate_kbps.max(min_video_kbps);
+        let encode_speed_preference = active_command_plan.encode_speed;
+        let temp_dir = temp_dir_for_job(job_id, reencode_attempt)?;
         let passlog_prefix = temp_dir.path().join("ffmpeg2pass");
         let passlog_str = passlog_prefix.to_string_lossy().to_string();
+        let plan_number = fit_plan_history.len() as u32 + 1;
+        let (progress_pass_1, progress_pass_2, progress_total) = if request.strict_fit {
+            let first = ((plan_number - 1) * 2 + 1) as u8;
+            (first, first + 1, (STRICT_FIT_MAX_PLANS * 2) as u8)
+        } else {
+            (1, 2, 2)
+        };
 
-        // Pass 1
         let mut pass1 = vec![
             "-y".to_string(),
             "-hide_banner".to_string(),
@@ -5609,7 +6269,7 @@ pub fn run_encode_job(
             "-c:v".to_string(),
             video_codec.to_string(),
             "-b:v".to_string(),
-            format!("{}k", plan.video_bitrate_kbps.max(min_video_kbps)),
+            format!("{video_bitrate_kbps}k"),
             "-pass".to_string(),
             "1".to_string(),
             "-passlogfile".to_string(),
@@ -5620,14 +6280,13 @@ pub fn run_encode_job(
             selected_video_codec,
             encode_speed_preference,
         ));
-        if let Some(vf) = &command_plan.video_filters {
+        if let Some(vf) = &active_command_plan.video_filters {
             pass1.push("-vf".to_string());
             pass1.push(vf.clone());
         }
-        if request.format == OutputFormat::Mp4 {
-            push_encoded_video_format_args(&mut pass1, command_plan.media_policy);
+        if active_request.format == OutputFormat::Mp4 {
+            push_encoded_video_format_args(&mut pass1, active_command_plan.media_policy);
         }
-
         pass1.push("-f".to_string());
         pass1.push("null".to_string());
         pass1.push(null_sink().to_string());
@@ -5638,24 +6297,24 @@ pub fn run_encode_job(
             job_id,
             &ffmpeg_bin,
             &pass1,
-            1,
-            2,
+            subtitle_working_dir,
+            progress_pass_1,
+            progress_total,
             duration_us,
-            ffmpeg_run_limits(request.reverse),
+            ffmpeg_run_limits(active_request.reverse),
             cancel.as_ref(),
             child_slot,
         ) {
             return Err(map_mpeg4_size_limit_error(
-                request.format,
+                active_request.format,
                 selected_video_codec,
-                request.size_limit_mb,
+                active_request.size_limit_mb,
                 planned_width,
                 planned_height,
                 error,
             ));
         }
 
-        // Pass 2
         let mut pass2 = vec![
             "-y".to_string(),
             "-hide_banner".to_string(),
@@ -5671,7 +6330,7 @@ pub fn run_encode_job(
             "-c:v".to_string(),
             video_codec.to_string(),
             "-b:v".to_string(),
-            format!("{}k", plan.video_bitrate_kbps.max(min_video_kbps)),
+            format!("{video_bitrate_kbps}k"),
             "-pass".to_string(),
             "2".to_string(),
             "-passlogfile".to_string(),
@@ -5681,49 +6340,60 @@ pub fn run_encode_job(
             selected_video_codec,
             encode_speed_preference,
         ));
-
-        if let Some(vf) = &command_plan.video_filters {
+        if let Some(vf) = &active_command_plan.video_filters {
             pass2.push("-vf".to_string());
             pass2.push(vf.clone());
         }
 
         let pass2_audio_bitrate_kbps =
-            if plan.include_audio && probe.has_audio && request.audio_enabled {
-                Some(plan.audio_bitrate_kbps.max(32))
+            if active_plan.include_audio && probe.has_audio && active_request.audio_enabled {
+                Some(
+                    active_plan
+                        .audio_bitrate_kbps
+                        .max(STRICT_FIT_REDUCED_AUDIO_KBPS),
+                )
             } else {
                 None
             };
-
-        if pass2_audio_bitrate_kbps.is_some() {
+        let audio_action = if pass2_audio_bitrate_kbps.is_some() {
             let audio_stream_index = probe
                 .audio_stream_index
                 .ok_or_else(|| "Missing selected audio stream index.".to_string())?;
+            let audio_encoder = active_command_plan.audio_encoder.ok_or_else(|| {
+                "Missing audio encoder for the selected size-targeted plan.".to_string()
+            })?;
             push_absolute_map(&mut pass2, audio_stream_index);
-            pass2.extend(["-c:a", audio_codec].into_iter().map(|s| s.to_string()));
-            if let Some(channels) = command_plan.audio_channels {
+            pass2.extend(
+                ["-c:a", audio_encoder.as_ffmpeg_name()]
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            if let Some(channels) = active_command_plan.audio_channels {
                 pass2.push("-ac".to_string());
                 pass2.push(channels.to_string());
             }
             pass2.push("-b:a".to_string());
             pass2.push(format!("{}k", pass2_audio_bitrate_kbps.unwrap_or(32)));
-            if let Some(af) = &command_plan.audio_filters {
+            if let Some(af) = &active_command_plan.audio_filters {
                 pass2.push("-af".to_string());
                 pass2.push(af.clone());
             }
+            StreamAction::Encode
         } else {
             pass2.push("-an".to_string());
-        }
+            StreamAction::Drop
+        };
 
-        push_metadata_args(&mut pass2, &request);
-
+        push_metadata_args(&mut pass2, &active_request);
         push_video_output_policy_args(
             &mut pass2,
-            request.format,
+            active_request.format,
             StreamAction::Encode,
-            command_plan.media_policy,
+            active_command_plan.media_policy,
         );
 
-        let temp_output = create_temp_output(&output_path, job_id, &format!("pass2-{attempt}"))?;
+        let temp_output =
+            create_temp_output(&output_path, job_id, &format!("pass2-{reencode_attempt}"))?;
         pass2.push(temp_output.to_string_lossy().to_string());
         let temp_output_str = temp_output.to_string_lossy().to_string();
         let command_preview = ffmpeg_command_preview(
@@ -5741,17 +6411,18 @@ pub fn run_encode_job(
             job_id,
             &ffmpeg_bin,
             &pass2,
-            2,
-            2,
+            subtitle_working_dir,
+            progress_pass_2,
+            progress_total,
             duration_us,
-            ffmpeg_run_limits(request.reverse),
+            ffmpeg_run_limits(active_request.reverse),
             cancel.as_ref(),
             child_slot,
         ) {
             return Err(map_mpeg4_size_limit_error(
-                request.format,
+                active_request.format,
                 selected_video_codec,
-                request.size_limit_mb,
+                active_request.size_limit_mb,
                 planned_width,
                 planned_height,
                 error,
@@ -5759,142 +6430,270 @@ pub fn run_encode_job(
         }
 
         let out_size = fs::metadata(&temp_output)
-            .map_err(|e| format!("Failed to stat output file: {e}"))?
+            .map_err(|error| format!("Failed to stat output file: {error}"))?
             .len();
-
-        let met_target = out_size <= target_bytes;
         drop(temp_dir);
-
-        if met_target || attempt >= max_attempts {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Canceled.".to_string());
-            }
-            publish_output_file(temp_output, &output_path)?;
-            return Ok(EncodeFinishedPayload {
-                attempt_id,
-                job_id,
-                ok: true,
-                output_path: Some(output_path.to_string_lossy().to_string()),
-                output_size_bytes: Some(out_size),
-                message: size_limited_completion_message(
-                    met_target,
-                    selected_video_codec,
-                    plan.video_bitrate_kbps,
-                    min_video_kbps,
-                    audio_removed_for_size_target,
-                ),
-                diagnostics: Some(ExportDiagnostics {
-                    mode: command_plan.mode.label().to_string(),
-                    video_action: Some(StreamAction::Encode),
-                    audio_action: Some(if pass2_audio_bitrate_kbps.is_some() {
-                        StreamAction::Encode
-                    } else {
-                        StreamAction::Drop
-                    }),
-                    source_format: probe.source_format.clone(),
-                    source_video_codec: probe.video_codec.clone(),
-                    source_audio_codec: probe.audio_codec.clone(),
-                    video_codec: Some(selected_video_codec.as_codec_name().to_string()),
-                    audio_codec: pass2_audio_bitrate_kbps
-                        .map(|_| audio_encoder.as_codec_name().to_string()),
-                    video_bitrate_kbps: Some(plan.video_bitrate_kbps.max(min_video_kbps)),
-                    audio_bitrate_kbps: pass2_audio_bitrate_kbps,
-                    requested_size_bytes: Some(target_bytes),
-                    actual_size_bytes: Some(out_size),
-                    passes: 2,
-                    attempts: attempt,
-                    audio_removed_for_size_target,
-                    copy_fallback_reason: size_copy_fallback_reason.clone(),
-                    color_action: command_plan
-                        .media_policy
-                        .color_action
-                        .diagnostic()
-                        .to_string(),
-                    sar_action: command_plan
-                        .media_policy
-                        .sar_action
-                        .diagnostic(probe.sample_aspect_ratio),
-                    reverse_buffer_estimate_bytes: command_plan
-                        .reverse_buffer_estimate
-                        .map(|estimate| estimate.bytes),
-                    reverse_buffer_action: command_plan
-                        .reverse_buffer_estimate
-                        .map(|estimate| estimate.action.diagnostic().to_string()),
-                    failure_stage: None,
-                    failure_reason: None,
-                    command_preview,
-                }),
-            });
+        let status = target_status(out_size, target_bytes);
+        fit_plan_history.push(FitPlanResult {
+            plan_number,
+            label: current_label.clone(),
+            mutations: current_mutations.clone(),
+            width: Some(planned_width),
+            height: Some(planned_height),
+            video_bitrate_kbps: Some(video_bitrate_kbps),
+            audio_action: probe.has_audio.then_some(audio_action),
+            audio_bitrate_kbps: pass2_audio_bitrate_kbps,
+            actual_size_bytes: out_size,
+            status,
+            ffmpeg_invocations: 2,
+            selected: false,
+        });
+        let candidate = SizeCandidateOutput {
+            temp_output,
+            actual_size_bytes: out_size,
+            plan_number,
+            command_plan: active_command_plan.clone(),
+            video_bitrate_kbps: Some(video_bitrate_kbps),
+            audio_bitrate_kbps: pass2_audio_bitrate_kbps,
+            audio_action,
+            passes: 2,
+            command_preview,
+        };
+        if status == SizeTargetStatus::Met {
+            best_output = Some(candidate);
+            break;
+        }
+        let replace_best = should_replace_measured_candidate(
+            best_output.as_ref().map(|best| best.actual_size_bytes),
+            out_size,
+        );
+        if replace_best {
+            best_output = Some(candidate);
         }
 
-        // Adjust bitrate and retry.
-        let reduction_factor = (target_bytes as f64 / out_size as f64) * 0.95;
-        let new_video_kbps = ((plan.video_bitrate_kbps as f64) * reduction_factor).floor() as u32;
-        let next_video_kbps = new_video_kbps.max(min_video_kbps);
-        if next_video_kbps >= plan.video_bitrate_kbps {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Canceled.".to_string());
+        if !request.strict_fit {
+            if reencode_attempt >= 3 {
+                break;
             }
-            publish_output_file(temp_output, &output_path)?;
-            return Ok(EncodeFinishedPayload {
-                attempt_id,
-                job_id,
-                ok: true,
-                output_path: Some(output_path.to_string_lossy().to_string()),
-                output_size_bytes: Some(out_size),
-                message: size_limited_completion_message(
-                    false,
-                    selected_video_codec,
-                    plan.video_bitrate_kbps,
-                    min_video_kbps,
-                    audio_removed_for_size_target,
-                ),
-                diagnostics: Some(ExportDiagnostics {
-                    mode: command_plan.mode.label().to_string(),
-                    video_action: Some(StreamAction::Encode),
-                    audio_action: Some(if pass2_audio_bitrate_kbps.is_some() {
-                        StreamAction::Encode
-                    } else {
-                        StreamAction::Drop
-                    }),
-                    source_format: probe.source_format.clone(),
-                    source_video_codec: probe.video_codec.clone(),
-                    source_audio_codec: probe.audio_codec.clone(),
-                    video_codec: Some(selected_video_codec.as_codec_name().to_string()),
-                    audio_codec: pass2_audio_bitrate_kbps
-                        .map(|_| audio_encoder.as_codec_name().to_string()),
-                    video_bitrate_kbps: Some(plan.video_bitrate_kbps.max(min_video_kbps)),
-                    audio_bitrate_kbps: pass2_audio_bitrate_kbps,
-                    requested_size_bytes: Some(target_bytes),
-                    actual_size_bytes: Some(out_size),
-                    passes: 2,
-                    attempts: attempt,
-                    audio_removed_for_size_target,
-                    copy_fallback_reason: size_copy_fallback_reason.clone(),
-                    color_action: command_plan
-                        .media_policy
-                        .color_action
-                        .diagnostic()
-                        .to_string(),
-                    sar_action: command_plan
-                        .media_policy
-                        .sar_action
-                        .diagnostic(probe.sample_aspect_ratio),
-                    reverse_buffer_estimate_bytes: command_plan
-                        .reverse_buffer_estimate
-                        .map(|estimate| estimate.bytes),
-                    reverse_buffer_action: command_plan
-                        .reverse_buffer_estimate
-                        .map(|estimate| estimate.action.diagnostic().to_string()),
-                    failure_stage: None,
-                    failure_reason: None,
-                    command_preview,
-                }),
-            });
+            let Some(next_video_kbps) = corrected_video_bitrate_kbps(
+                video_bitrate_kbps,
+                min_video_kbps,
+                out_size,
+                target_bytes,
+            ) else {
+                break;
+            };
+            current_label = "Bitrate correction".to_string();
+            current_mutations.push(format!(
+                "Video bitrate corrected from {video_bitrate_kbps} to {next_video_kbps} kbps after exact-byte measurement."
+            ));
+            active_plan.video_bitrate_kbps = next_video_kbps;
+            continue;
         }
-        drop(temp_output);
-        plan.video_bitrate_kbps = next_video_kbps;
+
+        let mut prepared_next_plan = false;
+        while !prepared_next_plan && next_strict_stage != StrictFitNextStage::Exhausted {
+            if fit_plan_history.len() as u32 >= STRICT_FIT_MAX_PLANS {
+                next_strict_stage = StrictFitNextStage::Exhausted;
+                break;
+            }
+            match next_strict_stage {
+                StrictFitNextStage::BitrateCorrection => {
+                    next_strict_stage = next_strict_stage.successor();
+                    let Some(next_video_kbps) = corrected_video_bitrate_kbps(
+                        video_bitrate_kbps,
+                        min_video_kbps,
+                        out_size,
+                        target_bytes,
+                    ) else {
+                        continue;
+                    };
+                    current_label = "Bitrate correction".to_string();
+                    current_mutations = vec![format!(
+                        "Video bitrate corrected from {video_bitrate_kbps} to {next_video_kbps} kbps after exact-byte measurement."
+                    )];
+                    active_plan.video_bitrate_kbps = next_video_kbps;
+                    prepared_next_plan = true;
+                }
+                StrictFitNextStage::LowerMaxEdge => {
+                    next_strict_stage = next_strict_stage.successor();
+                    let Some(max_edge_px) = next_strict_fit_max_edge(planned_width, planned_height)
+                    else {
+                        continue;
+                    };
+                    let mut next_request = active_request.clone();
+                    next_request.resize = Some(ResizeSettings {
+                        mode: ResizeMode::MaxEdge,
+                        max_edge_px: Some(max_edge_px),
+                        width_px: None,
+                        height_px: None,
+                    });
+                    next_request.max_edge_px = None;
+                    let next_command_plan = build_mutated_size_reencode_plan(
+                        &next_request,
+                        &probe,
+                        codec_selection,
+                        resolved_perturb_seed,
+                    )?;
+                    require_encode_plan_capabilities(
+                        &next_command_plan,
+                        &capability_contract,
+                        &runtime_capabilities,
+                    )?;
+                    let next_contract =
+                        next_command_plan.size_contract.clone().ok_or_else(|| {
+                            "Strict Fit max-edge plan has no size contract.".to_string()
+                        })?;
+                    if next_contract.planned_width == planned_width
+                        && next_contract.planned_height == planned_height
+                    {
+                        continue;
+                    }
+                    active_request = next_request;
+                    active_command_plan = next_command_plan;
+                    active_plan = next_contract.plan.clone();
+                    active_contract = next_contract;
+                    current_label = "Lower max edge".to_string();
+                    current_mutations =
+                        vec![format!("Maximum output edge reduced to {max_edge_px} px.")];
+                    prepared_next_plan = true;
+                }
+                StrictFitNextStage::AudioFallback => {
+                    next_strict_stage = next_strict_stage.successor();
+                    if !request.audio_enabled || !probe.has_audio || !active_request.audio_enabled {
+                        continue;
+                    }
+                    if request.strict_fit_allow_audio_removal {
+                        let mut next_request = active_request.clone();
+                        next_request.audio_enabled = false;
+                        let next_command_plan = build_mutated_size_reencode_plan(
+                            &next_request,
+                            &probe,
+                            codec_selection,
+                            resolved_perturb_seed,
+                        )?;
+                        require_encode_plan_capabilities(
+                            &next_command_plan,
+                            &capability_contract,
+                            &runtime_capabilities,
+                        )?;
+                        let next_contract =
+                            next_command_plan.size_contract.clone().ok_or_else(|| {
+                                "Strict Fit audio-removal plan has no size contract.".to_string()
+                            })?;
+                        active_request = next_request;
+                        active_command_plan = next_command_plan;
+                        active_plan = next_contract.plan.clone();
+                        active_contract = next_contract;
+                        current_label = "Permitted audio removal".to_string();
+                        current_mutations
+                            .push("Audio removed with explicit Strict Fit permission.".to_string());
+                        prepared_next_plan = true;
+                    } else if active_plan.include_audio
+                        && active_plan.audio_bitrate_kbps > STRICT_FIT_REDUCED_AUDIO_KBPS
+                    {
+                        let previous_audio_kbps = active_plan.audio_bitrate_kbps;
+                        active_plan.audio_bitrate_kbps = STRICT_FIT_REDUCED_AUDIO_KBPS;
+                        current_label = "Reduced audio bitrate".to_string();
+                        current_mutations.push(format!(
+                            "Audio bitrate reduced from {previous_audio_kbps} to {STRICT_FIT_REDUCED_AUDIO_KBPS} kbps; audio was preserved."
+                        ));
+                        prepared_next_plan = true;
+                    }
+                }
+                StrictFitNextStage::Exhausted => {}
+            }
+        }
+        if !prepared_next_plan {
+            break;
+        }
     }
+
+    let selected = best_output
+        .ok_or_else(|| "No size-targeted candidate completed successfully.".to_string())?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Canceled.".to_string());
+    }
+    for plan_result in &mut fit_plan_history {
+        plan_result.selected = plan_result.plan_number == selected.plan_number;
+    }
+    let final_status = target_status(selected.actual_size_bytes, target_bytes);
+    let target_result = TargetResult {
+        status: final_status,
+        target_bytes,
+        actual_bytes: selected.actual_size_bytes,
+        overshoot_bytes: selected.actual_size_bytes.saturating_sub(target_bytes),
+        strict_fit: request.strict_fit,
+        selected_plan_number: selected.plan_number,
+        plans: fit_plan_history,
+    };
+    let audio_removed_for_size_target =
+        request.audio_enabled && probe.has_audio && selected.audio_action == StreamAction::Drop;
+    let selected_audio_codec = selected
+        .audio_bitrate_kbps
+        .and(selected.command_plan.audio_encoder)
+        .map(|encoder| encoder.as_codec_name().to_string());
+    let message = exact_target_message(final_status, selected.actual_size_bytes, target_bytes);
+    let diagnostics = ExportDiagnostics {
+        mode: selected.command_plan.mode.label().to_string(),
+        video_action: Some(selected.command_plan.video_action),
+        audio_action: Some(selected.audio_action),
+        source_format: probe.source_format.clone(),
+        source_video_codec: probe.video_codec.clone(),
+        source_audio_codec: probe.audio_codec.clone(),
+        video_codec: selected.command_plan.output_video_codec.clone(),
+        audio_codec: match selected.audio_action {
+            StreamAction::Copy => probe.audio_codec.clone(),
+            StreamAction::Encode => selected_audio_codec,
+            StreamAction::Drop => None,
+        },
+        video_bitrate_kbps: selected.video_bitrate_kbps,
+        audio_bitrate_kbps: selected.audio_bitrate_kbps,
+        requested_size_bytes: Some(target_bytes),
+        actual_size_bytes: Some(selected.actual_size_bytes),
+        passes: selected.passes,
+        attempts: target_result.plans.len() as u32,
+        audio_removed_for_size_target,
+        subtitle_burned_in: subtitle_inspection.is_some(),
+        subtitle_cue_count: subtitle_inspection
+            .as_ref()
+            .map(|inspection| inspection.cue_count),
+        copy_fallback_reason: size_copy_fallback_reason,
+        color_action: selected
+            .command_plan
+            .media_policy
+            .color_action
+            .diagnostic()
+            .to_string(),
+        sar_action: selected
+            .command_plan
+            .media_policy
+            .sar_action
+            .diagnostic(probe.sample_aspect_ratio),
+        reverse_buffer_estimate_bytes: selected
+            .command_plan
+            .reverse_buffer_estimate
+            .map(|estimate| estimate.bytes),
+        reverse_buffer_action: selected
+            .command_plan
+            .reverse_buffer_estimate
+            .map(|estimate| estimate.action.diagnostic().to_string()),
+        failure_stage: None,
+        failure_reason: None,
+        command_preview: selected.command_preview,
+    };
+    let output_size_bytes = selected.actual_size_bytes;
+    publish_output_file(selected.temp_output, &output_path)?;
+    Ok(EncodeFinishedPayload {
+        attempt_id,
+        job_id,
+        ok: true,
+        output_path: Some(output_path.to_string_lossy().to_string()),
+        output_size_bytes: Some(output_size_bytes),
+        target_result: Some(target_result),
+        message: Some(message),
+        diagnostics: Some(diagnostics),
+    })
 }
 
 #[cfg(test)]
@@ -5909,6 +6708,9 @@ mod tests {
             title: None,
             size_limit_mb: 8.0,
             audio_enabled: true,
+            strict_fit: false,
+            strict_fit_allow_audio_removal: false,
+            subtitle_path: None,
             normalize_audio: false,
             strip_metadata: false,
             color_policy: ColorPolicy::Auto,
@@ -5968,6 +6770,169 @@ mod tests {
         assert_eq!(
             multiline_diagnostics.failure_reason.as_deref(),
             Some("ffmpeg failed (exit 1).")
+        );
+
+        request.subtitle_path = Some("/private/subtitles/café [draft].srt".to_string());
+        let subtitle_diagnostics = failed_encode_diagnostics(
+            &request,
+            "Could not open /private/subtitles/café [draft].srt",
+        );
+        assert_eq!(
+            subtitle_diagnostics.failure_reason.as_deref(),
+            Some("Could not open <subtitle>")
+        );
+        assert!(!subtitle_diagnostics.subtitle_burned_in);
+        assert!(
+            !serde_json::to_string(&subtitle_diagnostics)
+                .unwrap()
+                .contains("café")
+        );
+    }
+
+    #[test]
+    fn srt_timestamp_parser_is_strict_and_overflow_safe() {
+        assert_eq!(parse_srt_timestamp_ms("00:01:02,345"), Some(62_345));
+        assert_eq!(parse_srt_timestamp_ms("12:59:59.999"), Some(46_799_999));
+        assert_eq!(parse_srt_timestamp_ms("00:60:00,000"), None);
+        assert_eq!(parse_srt_timestamp_ms("00:00:60,000"), None);
+        assert_eq!(parse_srt_timestamp_ms("00:00:01,00"), None);
+        assert_eq!(parse_srt_timestamp_ms("x:00:01,000"), None);
+        assert_eq!(
+            parse_srt_timestamp_ms("18446744073709551615:00:00,000"),
+            None
+        );
+    }
+
+    #[test]
+    fn srt_validation_accepts_bom_crlf_unicode_and_optional_indices() {
+        let validated = validate_external_srt_text(
+            "\u{feff}1\r\n00:00:01,250 --> 00:00:02,500\r\nOlá, 世界 🌍\r\n\r\n00:01:00.000 --> 00:01:01.125\r\nSecond cue\r\n",
+        )
+        .unwrap();
+        assert_eq!(validated.inspection.cue_count, 2);
+        assert_eq!(validated.inspection.first_cue_start_s, 1.25);
+        assert_eq!(validated.inspection.last_cue_end_s, 61.125);
+        assert!(!validated.normalized_text.contains('\r'));
+        assert!(!validated.normalized_text.starts_with('\u{feff}'));
+        assert!(validated.normalized_text.ends_with('\n'));
+        assert!(validated.normalized_text.contains("世界"));
+    }
+
+    #[test]
+    fn srt_validation_rejects_malformed_or_unbounded_cues() {
+        for (raw, expected) in [
+            ("", "empty"),
+            ("1\n00:00:00,000 --> 00:00:01,000\n\0\n", "NUL"),
+            ("1\nnot timing\nText\n", "invalid timing"),
+            ("1\n00:00:02,000 --> 00:00:01,000\nText\n", "must end after"),
+            ("1\n00:00:00,000 --> 00:00:01,000\n", "no text"),
+        ] {
+            assert!(
+                validate_external_srt_text(raw)
+                    .unwrap_err()
+                    .contains(expected),
+                "expected {expected}"
+            );
+        }
+
+        let long_line = "x".repeat(EXTERNAL_SUBTITLE_MAX_LINE_CHARS + 1);
+        assert!(
+            validate_external_srt_text(&format!("1\n00:00:00,000 --> 00:00:01,000\n{long_line}\n"))
+                .unwrap_err()
+                .contains("too long")
+        );
+
+        let too_many = (0..=EXTERNAL_SUBTITLE_MAX_CUES)
+            .map(|index| format!("{}\n00:00:00,000 --> 00:00:01,000\ncue\n\n", index + 1))
+            .collect::<String>();
+        assert!(
+            validate_external_srt_text(&too_many)
+                .unwrap_err()
+                .contains("more than")
+        );
+    }
+
+    #[test]
+    fn srt_validation_rejects_inline_styling_but_allows_literal_punctuation() {
+        for text in [
+            "<font color=\"#ff0000\">red</font>",
+            "<b>bold</b>",
+            "{\\an8}top aligned",
+            "{   \\fs40}large",
+        ] {
+            let raw = format!("1\n00:00:00,000 --> 00:00:01,000\n{text}\n");
+            assert!(
+                validate_external_srt_text(&raw)
+                    .unwrap_err()
+                    .contains("inline styling"),
+                "expected inline styling rejection for {text:?}"
+            );
+        }
+
+        let validated =
+            validate_external_srt_text("1\n00:00:00,000 --> 00:00:01,000\n1 < 2 and {literal}\n")
+                .unwrap();
+        assert_eq!(validated.inspection.cue_count, 1);
+    }
+
+    #[test]
+    fn srt_validation_rejects_timing_line_position_overrides() {
+        for settings in ["align:start", "X1:40 X2:600 Y1:20 Y2:50"] {
+            let raw = format!("1\n00:00:00,000 --> 00:00:01,000 {settings}\nPlain subtitle\n");
+            assert!(
+                validate_external_srt_text(&raw)
+                    .unwrap_err()
+                    .contains("timing-line settings"),
+                "expected fixed-position rejection for {settings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn srt_path_validation_and_staging_are_private_and_fixed_name() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("café [source] 'quote'.srt");
+        fs::write(&source, "1\r\n00:00:00,000 --> 00:00:01,000\r\nHello\r\n").unwrap();
+        let inspection = inspect_srt(source.to_string_lossy().to_string()).unwrap();
+        assert_eq!(inspection.cue_count, 1);
+
+        let prepared = prepare_external_subtitle(&source).unwrap();
+        let working_dir = prepared.working_dir().to_path_buf();
+        let staged = working_dir.join(EXTERNAL_SUBTITLE_FILE_NAME);
+        assert!(staged.is_file());
+        assert!(!staged.to_string_lossy().contains("café"));
+        assert_eq!(
+            fs::read_to_string(&staged).unwrap(),
+            "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
+        );
+        drop(prepared);
+        assert!(!working_dir.exists());
+
+        let invalid_utf8 = root.path().join("invalid.srt");
+        fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        assert!(
+            inspect_srt(invalid_utf8.to_string_lossy().to_string())
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+        let wrong_extension = root.path().join("captions.txt");
+        fs::write(&wrong_extension, "caption").unwrap();
+        assert!(
+            inspect_srt(wrong_extension.to_string_lossy().to_string())
+                .unwrap_err()
+                .contains(".srt")
+        );
+
+        let oversized = root.path().join("oversized.srt");
+        fs::write(
+            &oversized,
+            vec![b'x'; EXTERNAL_SUBTITLE_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(
+            inspect_srt(oversized.to_string_lossy().to_string())
+                .unwrap_err()
+                .contains("larger than")
         );
     }
 
@@ -6184,6 +7149,26 @@ mod tests {
         assert!(!temp_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn candidate_boundary_stops_when_destination_becomes_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("output.mp4");
+        ensure_output_destination_available(&destination).unwrap();
+
+        fs::write(&destination, b"claimed by another writer").unwrap();
+        assert!(
+            ensure_output_destination_available(&destination)
+                .unwrap_err()
+                .contains("already exists")
+        );
+        assert!(
+            create_temp_output(&destination, 8, "next-rung")
+                .unwrap_err()
+                .contains("already exists")
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"claimed by another writer");
     }
 
     #[test]
@@ -6627,7 +7612,7 @@ Encoders:
     }
 
     #[test]
-    fn tight_size_target_drops_incompatible_audio_before_bounded_video_copy() {
+    fn tight_size_target_preserves_requested_audio_before_bounded_video_copy() {
         let mut request = base_request();
         request.size_limit_mb = 0.1;
         let compatible_plan = test_command_plan(&request, &probe_10s_1920x1080_audio(), 12_494);
@@ -6637,7 +7622,7 @@ Encoders:
                 .iter()
                 .map(|candidate| candidate.audio_action)
                 .collect::<Vec<_>>(),
-            [StreamAction::Copy, StreamAction::Drop]
+            [StreamAction::Copy]
         );
 
         let probe = VideoProbe {
@@ -6646,30 +7631,22 @@ Encoders:
         };
 
         let bundled_plan = test_command_plan(&request, &probe, 100_000);
-        let candidate = bundled_plan.size_copy_candidates.first().unwrap();
-        assert_eq!(bundled_plan.video_action, StreamAction::Copy);
-        assert_eq!(candidate.audio_action, StreamAction::Drop);
-        assert!(bundled_plan.size_contract.is_none());
-        let fallback = build_size_reencode_fallback_plan(&request, &probe, &bundled_plan).unwrap();
-        assert_eq!(fallback.video_action, StreamAction::Encode);
-        assert_eq!(fallback.audio_action, StreamAction::Drop);
+        assert!(bundled_plan.size_copy_candidates.is_empty());
+        assert_eq!(bundled_plan.video_action, StreamAction::Encode);
+        assert_eq!(bundled_plan.audio_action, StreamAction::Encode);
         assert!(
-            fallback
+            bundled_plan
                 .size_contract
                 .as_ref()
-                .is_some_and(|contract| contract.audio_removed_for_size_target)
+                .is_some_and(|contract| contract.plan.include_audio)
         );
 
         let no_encoders =
             select_codec_plan(request.format, &HashSet::new(), &request.advanced).unwrap();
-        let copy_only = build_encode_command_plan(&request, &probe, no_encoders, None).unwrap();
-        assert_eq!(copy_only.video_action, StreamAction::Copy);
-        assert_eq!(copy_only.audio_action, StreamAction::Drop);
-        assert!(!copy_only.size_copy_candidates.is_empty());
         assert!(
-            build_size_reencode_fallback_plan(&request, &probe, &copy_only)
+            build_encode_command_plan(&request, &probe, no_encoders, None)
                 .unwrap_err()
-                .contains("no compatible video encoder fallback")
+                .contains("No compatible video encoder")
         );
     }
 
@@ -6927,6 +7904,56 @@ Encoders:
         assert_eq!(
             filters,
             "trim=start=1:end=5,setpts=PTS-STARTPTS,crop=w=100:h=98:x=1:y=3:exact=1,transpose=1,reverse,setpts=PTS/2.000000000"
+        );
+    }
+
+    #[test]
+    fn subtitle_filter_uses_only_the_staged_name_and_source_timeline() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+        req.subtitle_path = Some(EXTERNAL_SUBTITLE_FILE_NAME.to_string());
+        req.trim = Some(Trim {
+            start_s: 5.0,
+            end_s: Some(9.0),
+        });
+        req.crop = Some(Crop {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        });
+        let probe = probe_10s_1920x1080_audio();
+        let filters = build_video_filters(&req, &probe).unwrap().unwrap();
+        let subtitle_index = filters.find("subtitles=filename=vfl_external.srt").unwrap();
+        let trim_index = filters.find("trim=start=5:end=9").unwrap();
+        assert!(filters.starts_with("crop=w=1280:h=720:x=0:y=0:exact=1"));
+        assert!(subtitle_index < trim_index);
+        assert!(filters.contains("FontName=Arial"));
+        assert!(!filters.contains("/"));
+        assert!(!filters.contains("\\"));
+
+        req.subtitle_path = Some("C:\\private\\captions [draft].srt".to_string());
+        assert!(
+            build_video_filters(&req, &probe)
+                .unwrap_err()
+                .contains("staging path")
+        );
+    }
+
+    #[test]
+    fn subtitle_burn_in_forces_video_encode_but_preserves_compatible_audio() {
+        let mut request = base_request();
+        request.size_limit_mb = 0.0;
+        request.subtitle_path = Some(EXTERNAL_SUBTITLE_FILE_NAME.to_string());
+        let plan = test_command_plan(&request, &probe_10s_1920x1080_audio(), 1_000_000);
+        assert_eq!(plan.mode, EncodeMode::VideoEncodeAudioCopy);
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert_eq!(plan.audio_action, StreamAction::Copy);
+        assert!(plan.video_reasons.contains(&PlanReason::SubtitleBurnIn));
+        assert!(
+            plan.video_filters
+                .as_deref()
+                .is_some_and(|filters| filters.contains("subtitles=filename=vfl_external.srt"))
         );
     }
 
@@ -7408,11 +8435,117 @@ Encoders:
     }
 
     #[test]
-    fn plan_bitrates_drops_audio_when_budget_too_low() {
+    fn exact_target_classification_and_messages_use_integer_bytes() {
+        assert_eq!(target_bytes_from_size_limit_mb(0.1), Some(100_000));
+        assert_eq!(
+            target_bytes_from_size_limit_mb(9_007_199_254.740_99),
+            Some(9_007_199_254_740_990)
+        );
+        assert_eq!(target_bytes_from_size_limit_mb(9_007_199_254.740_992), None);
+        assert_eq!(target_bytes_from_size_limit_mb(f64::MAX), None);
+        assert_eq!(target_bytes_from_size_limit_mb(0.0), None);
+        assert!(
+            plan_bitrates(9_007_199_254.740_992, 1.0, false, 96, 32, 50, 0.95,)
+                .unwrap_err()
+                .contains("exact bytes")
+        );
+        assert_eq!(target_status(999_999, 1_000_000), SizeTargetStatus::Met);
+        assert_eq!(target_status(1_000_000, 1_000_000), SizeTargetStatus::Met);
+        assert_eq!(
+            target_status(1_000_001, 1_000_000),
+            SizeTargetStatus::Missed
+        );
+        assert_eq!(
+            exact_target_message(SizeTargetStatus::Met, 1_000_000, 1_000_000),
+            "Target met by exact output bytes: 1000000 of 1000000 bytes."
+        );
+        assert!(
+            exact_target_message(SizeTargetStatus::Missed, 1_000_001, 1_000_000)
+                .contains("missed by 1 exact bytes")
+        );
+        assert!(should_replace_measured_candidate(None, 1_200_000));
+        assert!(should_replace_measured_candidate(
+            Some(1_200_000),
+            1_100_000
+        ));
+        assert!(!should_replace_measured_candidate(
+            Some(1_100_000),
+            1_100_000
+        ));
+        assert!(!should_replace_measured_candidate(
+            Some(1_100_000),
+            1_200_000
+        ));
+    }
+
+    #[test]
+    fn strict_fit_policy_has_one_bounded_non_nested_stage_sequence() {
+        assert_eq!(STRICT_FIT_MAX_PLANS, 4);
+        let mut stage = StrictFitNextStage::BitrateCorrection;
+        let mut sequence = Vec::new();
+        while stage != StrictFitNextStage::Exhausted {
+            sequence.push(stage);
+            stage = stage.successor();
+        }
+        assert_eq!(
+            sequence,
+            [
+                StrictFitNextStage::BitrateCorrection,
+                StrictFitNextStage::LowerMaxEdge,
+                StrictFitNextStage::AudioFallback,
+            ]
+        );
+        assert_eq!(stage.successor(), StrictFitNextStage::Exhausted);
+    }
+
+    #[test]
+    fn strict_fit_correction_and_edge_tiers_skip_no_ops() {
+        assert_eq!(
+            corrected_video_bitrate_kbps(1_000, 50, 2_000_000, 1_000_000),
+            Some(475)
+        );
+        assert_eq!(
+            corrected_video_bitrate_kbps(50, 50, 2_000_000, 1_000_000),
+            None
+        );
+        assert_eq!(
+            corrected_video_bitrate_kbps(1_000, 50, 1_000_000, 1_000_000),
+            None
+        );
+        assert_eq!(next_strict_fit_max_edge(1920, 1080), Some(1280));
+        assert_eq!(next_strict_fit_max_edge(1280, 720), Some(960));
+        assert_eq!(next_strict_fit_max_edge(800, 600), Some(720));
+        assert_eq!(next_strict_fit_max_edge(360, 360), None);
+    }
+
+    #[test]
+    fn strict_fit_flags_require_an_explicit_video_target() {
+        assert!(validate_strict_fit_options(false, false, false, OutputFormat::Mp4).is_ok());
+        assert!(validate_strict_fit_options(true, false, true, OutputFormat::Mp4).is_ok());
+        assert!(validate_strict_fit_options(true, true, true, OutputFormat::Webm).is_ok());
+        assert!(
+            validate_strict_fit_options(false, true, true, OutputFormat::Mp4)
+                .unwrap_err()
+                .contains("requires Strict Fit")
+        );
+        assert!(
+            validate_strict_fit_options(true, false, false, OutputFormat::Mp4)
+                .unwrap_err()
+                .contains("size target")
+        );
+        assert!(
+            validate_strict_fit_options(true, false, true, OutputFormat::Mp3)
+                .unwrap_err()
+                .contains("MP4 or WebM")
+        );
+    }
+
+    #[test]
+    fn plan_bitrates_preserves_audio_when_budget_is_too_low() {
         let plan = plan_bitrates(1.0, 600.0, true, 96, 32, 50, 0.95).unwrap();
-        assert!(!plan.include_audio);
-        assert_eq!(plan.audio_bitrate_kbps, 0);
-        assert!(plan.video_bitrate_kbps > 0);
+        assert!(plan.include_audio);
+        assert_eq!(plan.audio_bitrate_kbps, 32);
+        assert_eq!(plan.video_bitrate_kbps, 50);
     }
 
     #[test]
@@ -7432,15 +8565,15 @@ Encoders:
     }
 
     #[test]
-    fn plan_bitrates_drops_audio_when_remaining_budget_is_below_audio_minimum() {
+    fn plan_bitrates_uses_stream_floors_when_remaining_budget_is_too_low() {
         let plan = plan_bitrates(0.3, 60.0, true, 96, 32, 384, 0.95).unwrap();
-        assert!(!plan.include_audio);
-        assert_eq!(plan.audio_bitrate_kbps, 0);
+        assert!(plan.include_audio);
+        assert_eq!(plan.audio_bitrate_kbps, 32);
         assert_eq!(plan.video_bitrate_kbps, 384);
     }
 
     #[test]
-    fn size_limited_contract_records_audio_removal_for_tight_budget() {
+    fn size_limited_contract_preserves_audio_for_tight_budget() {
         let mut req = base_request();
         req.size_limit_mb = 0.3;
         req.trim = Some(Trim {
@@ -7458,9 +8591,8 @@ Encoders:
             build_size_limited_encode_contract(&req, &probe, VideoCodec::LibX264, 60.0, true)
                 .unwrap();
 
-        assert!(!contract.plan.include_audio);
-        assert!(contract.audio_removed_for_size_target);
-        assert_eq!(contract.plan.audio_bitrate_kbps, 0);
+        assert!(contract.plan.include_audio);
+        assert_eq!(contract.plan.audio_bitrate_kbps, 32);
         assert!(contract.plan.video_bitrate_kbps >= contract.min_video_kbps);
     }
 
@@ -7474,17 +8606,39 @@ Encoders:
                 .unwrap();
 
         assert!(contract.plan.include_audio);
-        assert!(!contract.audio_removed_for_size_target);
         assert!(contract.plan.audio_bitrate_kbps >= 32);
         assert!(contract.plan.video_bitrate_kbps >= contract.min_video_kbps);
     }
 
     #[test]
-    fn size_limited_completion_message_discloses_audio_removal() {
-        let message =
-            size_limited_completion_message(true, VideoCodec::LibX264, 50, 50, true).unwrap();
-        assert!(message.contains("Audio was removed"));
-        assert!(!message.contains("Still above"));
+    fn strict_fit_mutated_plans_rebuild_geometry_and_audio_contracts() {
+        let probe = probe_10s_1920x1080_audio();
+        let encoders = HashSet::from(["libx264".to_string(), "aac".to_string()]);
+        let mut request = base_request();
+        request.strict_fit = true;
+        request.resize = Some(ResizeSettings {
+            mode: ResizeMode::MaxEdge,
+            max_edge_px: Some(960),
+            width_px: None,
+            height_px: None,
+        });
+        let codecs = select_codec_plan(request.format, &encoders, &request.advanced).unwrap();
+        let resized = build_mutated_size_reencode_plan(&request, &probe, codecs, None).unwrap();
+        let resized_contract = resized.size_contract.as_ref().unwrap();
+        assert_eq!(
+            (
+                resized_contract.planned_width,
+                resized_contract.planned_height
+            ),
+            (960, 540)
+        );
+        assert!(resized_contract.plan.include_audio);
+        assert_eq!(resized.audio_action, StreamAction::Encode);
+
+        request.audio_enabled = false;
+        let silent = build_mutated_size_reencode_plan(&request, &probe, codecs, None).unwrap();
+        assert_eq!(silent.audio_action, StreamAction::Drop);
+        assert!(!silent.size_contract.unwrap().plan.include_audio);
     }
 
     #[test]
@@ -8459,7 +9613,7 @@ IO... xv36le                  3             36      12-12-12\n",
     }
 
     #[test]
-    fn size_target_audio_drop_excludes_unknown_audio_from_reverse_memory() {
+    fn size_target_preserved_audio_fails_closed_on_unknown_reverse_memory() {
         let mut request = base_request();
         request.size_limit_mb = 0.3;
         request.reverse = true;
@@ -8474,9 +9628,10 @@ IO... xv36le                  3             36      12-12-12\n",
             decoded_audio_bytes_per_sample: None,
             ..probe_10s_1920x1080_audio()
         };
-        let plan = test_command_plan(&request, &probe, 1_000_000);
-        assert_eq!(plan.audio_action, StreamAction::Drop);
-        assert!(plan.reverse_buffer_estimate.is_some());
+        let encoders = HashSet::from(["libx264".to_string(), "aac".to_string()]);
+        let codecs = select_codec_plan(request.format, &encoders, &request.advanced).unwrap();
+        let error = build_encode_command_plan(&request, &probe, codecs, None).unwrap_err();
+        assert!(error.contains("retained audio sample rate"));
     }
 
     #[test]
@@ -8604,6 +9759,59 @@ IO... xv36le                  3             36      12-12-12\n",
             )
             .unwrap_err()
             .contains("missing encoder missing-encoder")
+        );
+    }
+
+    #[test]
+    fn smoke_capability_mask_is_gated_allowlisted_and_non_persistent() {
+        let runtime = FfmpegRuntimeCapabilities {
+            version: "test".to_string(),
+            encoder_names: HashSet::from(["libx264".to_string()]),
+            filter_names: HashSet::from(["scale".to_string(), "subtitles".to_string()]),
+        };
+        let ungated = HashMap::from([(
+            "VFL_SMOKE_MISSING_CAPABILITY_FILTERS".to_string(),
+            "not-allowlisted".to_string(),
+        )]);
+        assert!(
+            apply_smoke_capability_mask(runtime.clone(), &ungated)
+                .unwrap()
+                .filter_names
+                .contains("subtitles")
+        );
+
+        let gated = HashMap::from([
+            ("VFL_SMOKE_INPUT".to_string(), "/tmp/input.mp4".to_string()),
+            (
+                "VFL_SMOKE_STATUS".to_string(),
+                "/tmp/status.json".to_string(),
+            ),
+            (
+                "VFL_SMOKE_MISSING_CAPABILITY_FILTERS".to_string(),
+                "subtitles, subtitles".to_string(),
+            ),
+        ]);
+        let masked = apply_smoke_capability_mask(runtime.clone(), &gated).unwrap();
+        assert!(!masked.filter_names.contains("subtitles"));
+        assert!(masked.filter_names.contains("scale"));
+        assert!(masked.encoder_names.contains("libx264"));
+        assert!(runtime.filter_names.contains("subtitles"));
+
+        let invalid = HashMap::from([
+            ("VFL_SMOKE_INPUT".to_string(), "/tmp/input.mp4".to_string()),
+            (
+                "VFL_SMOKE_STATUS".to_string(),
+                "/tmp/status.json".to_string(),
+            ),
+            (
+                "VFL_SMOKE_MISSING_CAPABILITY_FILTERS".to_string(),
+                "scale".to_string(),
+            ),
+        ]);
+        assert!(
+            apply_smoke_capability_mask(runtime, &invalid)
+                .unwrap_err()
+                .contains("non-allowlisted")
         );
     }
 

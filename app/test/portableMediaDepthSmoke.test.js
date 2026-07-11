@@ -32,7 +32,7 @@ test("packaged media-depth matrix covers policy, geometry, stream selection, and
       "arbitrary-rotation-refusal",
       "attached-picture-primary-selection",
       "size-target-preserves-compatible-av-copy",
-      "size-target-drops-incompatible-audio-by-copy",
+      "size-target-preserves-incompatible-audio-by-encode",
       "audio-packet-pathology-reverse",
       "reverse-loop-safe",
       "reverse-loop-hard-refusal",
@@ -165,7 +165,7 @@ test("packaged smoke environment exposes strict color and Reverse hooks", () => 
   assert.equal(convertedEnv.VFL_SMOKE_COLOR_POLICY, "standardSdr");
   assert.equal(convertedEnv.VFL_SMOKE_REVERSE, "0");
   assert.equal(convertedEnv.VFL_SMOKE_LOOP, "0");
-  const tightSizeCase = mediaDepthSmokeCases.find((candidate) => candidate.id === "size-target-drops-incompatible-audio-by-copy");
+  const tightSizeCase = mediaDepthSmokeCases.find((candidate) => candidate.id === "size-target-preserves-incompatible-audio-by-encode");
   const tightSizeEnv = buildMediaDepthSmokeEnvironment(tightSizeCase, {
     inputPath: "/tmp/tight.mp4",
     outputPath: "/tmp/tight-output.mp4",
@@ -173,8 +173,21 @@ test("packaged smoke environment exposes strict color and Reverse hooks", () => 
     baseEnv: {},
   });
   assert.equal(tightSizeEnv.VFL_SMOKE_SIZE_LIMIT_MB, "0.1");
-  assert.equal(tightSizeCase.output.audioStreamCount, 0);
-  assert.equal(tightSizeCase.output.videoPacketPayloadsMatchInput, true);
+  assert.equal(tightSizeCase.output.audioCodecName, "aac");
+  assert.equal(tightSizeCase.output.audioSampleRate, 48_000);
+  assert.equal(tightSizeCase.output.audioChannels, 1);
+  assert.equal(tightSizeCase.output.audioStreamCount, 1);
+  assert.equal(tightSizeCase.output.outputSizeMaximum, 100_000);
+  assert.equal(tightSizeCase.output.videoPacketPayloadsMatchInput, undefined);
+  assert.deepEqual(tightSizeCase.status, {
+    targetStatus: "met",
+    targetBytes: 100_000,
+    queueOutcomeKind: "done",
+    videoAction: "encode",
+    audioAction: "encode",
+    audioCodec: "aac",
+    audioRemovedForSizeTarget: false,
+  });
   const compatibleSizeCase = mediaDepthSmokeCases.find((candidate) => candidate.id === "size-target-preserves-compatible-av-copy");
   assert.equal(compatibleSizeCase.sizeLimitMb, 0.1);
   assert.equal(compatibleSizeCase.output.audioStreamCount, 1);

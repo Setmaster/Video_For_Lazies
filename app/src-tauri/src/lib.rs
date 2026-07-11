@@ -40,7 +40,11 @@ struct AppSmokeConfig {
     resize_height_px: Option<u32>,
     skip_preview_interactions: bool,
     workflow_queue_export: bool,
+    g5_queue_target_miss: bool,
     perturb_first_frame: bool,
+    strict_fit: bool,
+    strict_fit_allow_audio_removal: bool,
+    subtitle_path: Option<String>,
     color_policy: video::ColorPolicy,
     reverse: bool,
     loop_video: bool,
@@ -54,6 +58,9 @@ struct AppSmokeStatus {
     message: Option<String>,
     output_path: Option<String>,
     output_size_bytes: Option<u64>,
+    target_result: Option<video::TargetResult>,
+    diagnostics: Option<video::ExportDiagnostics>,
+    queue_outcome_kind: Option<String>,
     trim_start_s: Option<f64>,
     trim_end_s: Option<f64>,
     expected_duration_s: Option<f64>,
@@ -117,6 +124,9 @@ fn parse_smoke_f64(
         .trim()
         .parse::<f64>()
         .map_err(|_| format!("{key} must be a number."))?;
+    if !value.is_finite() {
+        return Err(format!("{key} must be a finite number."));
+    }
     Ok(Some(value))
 }
 
@@ -245,7 +255,16 @@ fn parse_smoke_config_from_env(
     let resize_height_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_HEIGHT_PX", None)?;
     let skip_preview_interactions = parse_smoke_bool(env, "VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS")?;
     let workflow_queue_export = parse_smoke_bool(env, "VFL_SMOKE_WORKFLOW_QUEUE")?;
+    let g5_queue_target_miss = parse_smoke_bool(env, "VFL_SMOKE_G5_QUEUE_TARGET_MISS")?;
     let perturb_first_frame = parse_smoke_bool(env, "VFL_SMOKE_PERTURB_FIRST_FRAME")?;
+    let strict_fit = parse_smoke_bool(env, "VFL_SMOKE_STRICT_FIT")?;
+    let strict_fit_allow_audio_removal =
+        parse_smoke_bool(env, "VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL")?;
+    let subtitle_path = env
+        .get("VFL_SMOKE_SUBTITLE_PATH")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let color_policy = parse_smoke_color_policy(
         env.get("VFL_SMOKE_COLOR_POLICY")
             .map(String::as_str)
@@ -256,6 +275,25 @@ fn parse_smoke_config_from_env(
 
     if size_limit_mb < 0.0 {
         return Err("VFL_SMOKE_SIZE_LIMIT_MB must be >= 0.".to_string());
+    }
+    if strict_fit_allow_audio_removal && !strict_fit {
+        return Err(
+            "VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL requires VFL_SMOKE_STRICT_FIT.".to_string(),
+        );
+    }
+    if strict_fit && (size_limit_mb <= 0.0 || format == video::OutputFormat::Mp3) {
+        return Err(
+            "VFL_SMOKE_STRICT_FIT requires a positive MP4 or WebM size target.".to_string(),
+        );
+    }
+    if subtitle_path.is_some() && format == video::OutputFormat::Mp3 {
+        return Err("VFL_SMOKE_SUBTITLE_PATH requires MP4 or WebM output.".to_string());
+    }
+    if g5_queue_target_miss && (!workflow_queue_export || size_limit_mb <= 0.0) {
+        return Err(
+            "VFL_SMOKE_G5_QUEUE_TARGET_MISS requires VFL_SMOKE_WORKFLOW_QUEUE and a positive size target."
+                .to_string(),
+        );
     }
     if trim_start_s < 0.0 {
         return Err("VFL_SMOKE_TRIM_START_S must be >= 0.".to_string());
@@ -298,7 +336,11 @@ fn parse_smoke_config_from_env(
         resize_height_px,
         skip_preview_interactions,
         workflow_queue_export,
+        g5_queue_target_miss,
         perturb_first_frame,
+        strict_fit,
+        strict_fit_allow_audio_removal,
+        subtitle_path,
         color_policy,
         reverse,
         loop_video,
@@ -378,6 +420,15 @@ fn merge_smoke_optional_fields(existing: Option<&AppSmokeStatus>, next: &mut App
     if next.output_size_bytes.is_none() {
         next.output_size_bytes = existing.output_size_bytes;
     }
+    if next.target_result.is_none() {
+        next.target_result = existing.target_result.clone();
+    }
+    if next.diagnostics.is_none() {
+        next.diagnostics = existing.diagnostics.clone();
+    }
+    if next.queue_outcome_kind.is_none() {
+        next.queue_outcome_kind = existing.queue_outcome_kind.clone();
+    }
     if next.trim_start_s.is_none() {
         next.trim_start_s = existing.trim_start_s;
     }
@@ -411,6 +462,11 @@ fn suggest_output_path(
 #[tauri::command]
 fn encode_capabilities() -> Result<video::EncodeCapabilities, String> {
     video::encode_capabilities()
+}
+
+#[tauri::command]
+fn inspect_srt(path: String) -> Result<video::SubtitleInspection, String> {
+    video::inspect_srt(path)
 }
 
 #[tauri::command]
@@ -529,6 +585,7 @@ fn start_encode(
                         ok: false,
                         output_path: None,
                         output_size_bytes: None,
+                        target_result: None,
                         message: Some(err),
                         diagnostics: Some(diagnostics),
                     },
@@ -591,6 +648,7 @@ pub fn run() {
             detect_crop,
             suggest_output_path,
             encode_capabilities,
+            inspect_srt,
             extract_frame,
             allow_preview_path,
             read_smoke_config,
@@ -694,7 +752,11 @@ mod tests {
                 resize_height_px: None,
                 skip_preview_interactions: false,
                 workflow_queue_export: false,
+                g5_queue_target_miss: false,
                 perturb_first_frame: false,
+                strict_fit: false,
+                strict_fit_allow_audio_removal: false,
+                subtitle_path: None,
                 color_policy: ColorPolicy::Auto,
                 reverse: false,
                 loop_video: false,
@@ -718,7 +780,11 @@ mod tests {
             ("VFL_SMOKE_RESIZE_HEIGHT_PX", "180"),
             ("VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS", "true"),
             ("VFL_SMOKE_WORKFLOW_QUEUE", "true"),
+            ("VFL_SMOKE_G5_QUEUE_TARGET_MISS", "true"),
             ("VFL_SMOKE_PERTURB_FIRST_FRAME", "true"),
+            ("VFL_SMOKE_STRICT_FIT", "true"),
+            ("VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL", "true"),
+            ("VFL_SMOKE_SUBTITLE_PATH", r"C:\tmp\captions 字幕.srt"),
             ("VFL_SMOKE_COLOR_POLICY", "standardSdr"),
             ("VFL_SMOKE_REVERSE", "true"),
             ("VFL_SMOKE_LOOP", "true"),
@@ -740,7 +806,11 @@ mod tests {
                 resize_height_px: Some(180),
                 skip_preview_interactions: true,
                 workflow_queue_export: true,
+                g5_queue_target_miss: true,
                 perturb_first_frame: true,
+                strict_fit: true,
+                strict_fit_allow_audio_removal: true,
+                subtitle_path: Some(r"C:\tmp\captions 字幕.srt".to_string()),
                 color_policy: ColorPolicy::StandardSdr,
                 reverse: true,
                 loop_video: true,
@@ -774,6 +844,31 @@ mod tests {
 
         let err = parse_smoke_config_from_env(&env).unwrap_err();
         assert!(err.contains("VFL_SMOKE_WORKFLOW_QUEUE"));
+    }
+
+    #[test]
+    fn parse_smoke_config_gates_g5_target_miss_queue_mode() {
+        let status_path = temp_smoke_status_path("g5-target-miss-without-queue");
+        let env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_SIZE_LIMIT_MB", "0.1"),
+            ("VFL_SMOKE_G5_QUEUE_TARGET_MISS", "true"),
+        ]);
+        let err = parse_smoke_config_from_env(&env).unwrap_err();
+        assert!(err.contains("VFL_SMOKE_WORKFLOW_QUEUE"));
+
+        let status_path = temp_smoke_status_path("g5-target-miss-without-target");
+        let env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_WORKFLOW_QUEUE", "true"),
+            ("VFL_SMOKE_G5_QUEUE_TARGET_MISS", "true"),
+        ]);
+        let err = parse_smoke_config_from_env(&env).unwrap_err();
+        assert!(err.contains("positive size target"));
     }
 
     #[test]
@@ -826,6 +921,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_smoke_config_rejects_non_finite_numbers() {
+        let status_path = temp_smoke_status_path("non-finite");
+        let base = [
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", status_path.as_str()),
+        ];
+        for key in [
+            "VFL_SMOKE_SIZE_LIMIT_MB",
+            "VFL_SMOKE_TRIM_START_S",
+            "VFL_SMOKE_TRIM_END_S",
+        ] {
+            for raw in ["NaN", "inf", "-inf"] {
+                let mut env = smoke_env(&base);
+                env.insert(key.to_string(), raw.to_string());
+                let err = parse_smoke_config_from_env(&env).unwrap_err();
+                assert!(
+                    err.contains(key) && err.contains("finite"),
+                    "expected finite-number rejection for {key}={raw}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_smoke_config_rejects_invalid_strict_fit_and_subtitle_combinations() {
+        let status_path = temp_smoke_status_path("g5-invalid");
+        let base = [
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", status_path.as_str()),
+        ];
+
+        let mut allow_without_strict = smoke_env(&base);
+        allow_without_strict.insert(
+            "VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL".to_string(),
+            "1".to_string(),
+        );
+        assert!(
+            parse_smoke_config_from_env(&allow_without_strict)
+                .unwrap_err()
+                .contains("requires VFL_SMOKE_STRICT_FIT")
+        );
+
+        let mut strict_without_target = smoke_env(&base);
+        strict_without_target.insert("VFL_SMOKE_STRICT_FIT".to_string(), "1".to_string());
+        assert!(
+            parse_smoke_config_from_env(&strict_without_target)
+                .unwrap_err()
+                .contains("positive MP4 or WebM size target")
+        );
+
+        let mut subtitle_mp3 = smoke_env(&base);
+        subtitle_mp3.insert("VFL_SMOKE_FORMAT".to_string(), "mp3".to_string());
+        subtitle_mp3.insert(
+            "VFL_SMOKE_SUBTITLE_PATH".to_string(),
+            r"C:\tmp\captions.srt".to_string(),
+        );
+        assert!(
+            parse_smoke_config_from_env(&subtitle_mp3)
+                .unwrap_err()
+                .contains("requires MP4 or WebM")
+        );
+    }
+
+    #[test]
     fn merge_smoke_stage_history_starts_with_current_stage() {
         assert_eq!(
             merge_smoke_stage_history(None, &[], "detected"),
@@ -841,6 +1002,9 @@ mod tests {
             message: None,
             output_path: None,
             output_size_bytes: None,
+            target_result: None,
+            diagnostics: None,
+            queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
             expected_duration_s: None,
@@ -872,6 +1036,9 @@ mod tests {
             message: None,
             output_path: None,
             output_size_bytes: None,
+            target_result: None,
+            diagnostics: None,
+            queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
             expected_duration_s: None,
@@ -892,6 +1059,9 @@ mod tests {
             message: None,
             output_path: None,
             output_size_bytes: None,
+            target_result: None,
+            diagnostics: None,
+            queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
             expected_duration_s: None,
@@ -926,6 +1096,9 @@ mod tests {
             message: Some("Trim metrics verified.".to_string()),
             output_path: None,
             output_size_bytes: None,
+            target_result: None,
+            diagnostics: None,
+            queue_outcome_kind: None,
             trim_start_s: Some(0.6),
             trim_end_s: Some(1.35),
             expected_duration_s: Some(0.75),
@@ -937,6 +1110,9 @@ mod tests {
             message: Some("Packaged app smoke export succeeded.".to_string()),
             output_path: Some("C:\\tmp\\output.mp4".to_string()),
             output_size_bytes: Some(1234),
+            target_result: None,
+            diagnostics: None,
+            queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
             expected_duration_s: None,

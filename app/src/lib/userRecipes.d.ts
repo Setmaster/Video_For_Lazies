@@ -8,7 +8,7 @@ export type UserRecipe = {
 };
 
 export type UserRecipeStore = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   recipes: UserRecipe[];
   warnings: string[];
   migrated: boolean;
@@ -25,7 +25,7 @@ export type UserRecipePersistResult =
   | { ok: false; error: string };
 
 export const USER_RECIPE_STORAGE_KEY: "vfl:user-recipes";
-export const USER_RECIPE_SCHEMA_VERSION: 1;
+export const USER_RECIPE_SCHEMA_VERSION: 2;
 export const USER_RECIPE_MAX_COUNT: 50;
 export const USER_RECIPE_NAME_MAX_LENGTH: 64;
 

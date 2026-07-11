@@ -23,6 +23,8 @@ export type ExportRecipeSettings = {
   audioEnabled: boolean;
   normalizeAudio?: boolean;
   perturbFirstFrame?: boolean;
+  strictFit: boolean;
+  strictFitAllowAudioRemoval: boolean;
   advanced: {
     videoCodec: VideoCodecPreference;
     audioBitrateKbps: number | null;
@@ -34,7 +36,7 @@ export type ExportRecipeSettings = {
 };
 
 export type PartialExportRecipeSettings = Partial<
-  Pick<ExportRecipeSettings, "format" | "sizeLimitMb" | "audioEnabled" | "normalizeAudio" | "perturbFirstFrame">
+  Pick<ExportRecipeSettings, "format" | "sizeLimitMb" | "audioEnabled" | "normalizeAudio" | "perturbFirstFrame" | "strictFit" | "strictFitAllowAudioRemoval">
 >;
 
 export type ExportRecipe =
