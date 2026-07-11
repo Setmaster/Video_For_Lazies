@@ -224,7 +224,9 @@ test("Fast Trim planning preserves odd copy dimensions and packaged smoke proves
     plannedSummary,
     /trimMode === "exact" && trimRequestIsActive\(\{ startS: startRaw, endS: endRaw, durationS: probe\.durationS \}\)/,
   );
-  assert.match(plannedSummary, /\n\s+trimMode,\n/);
+  const trimModeDependencyPattern = /\r?\n\s+trimMode,\r?\n/;
+  assert.match(plannedSummary, trimModeDependencyPattern);
+  assert.match(plannedSummary.replace(/\r?\n/g, "\r\n"), trimModeDependencyPattern);
   assert.match(types, /selectedAudioDispositions\?: StreamDispositions \| null;/);
   assert.match(types, /audioEnabled\?: boolean \| null;/);
   assert.match(types, /stripMetadata\?: boolean \| null;/);
