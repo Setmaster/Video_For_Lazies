@@ -49,3 +49,21 @@ test("ensureUniqueOutputPath bumps past queue-claimed paths", () => {
     "C:/Videos/clip-3.mp4",
   );
 });
+
+test("ensureUniqueOutputPath rejects equivalent Windows and UNC claims", () => {
+  assert.equal(
+    ensureUniqueOutputPath("C:/Videos/Clip-2.MP4", ["c:\\videos\\clip-2.mp4"]),
+    "C:/Videos/Clip-3.MP4",
+  );
+  assert.equal(
+    ensureUniqueOutputPath("//Server/Share/Clip-2.mp4", ["\\\\server\\share\\clip-2.MP4"]),
+    "//Server/Share/Clip-3.mp4",
+  );
+});
+
+test("ensureUniqueOutputPath preserves explicit POSIX case and double-slash identity", () => {
+  assert.equal(
+    ensureUniqueOutputPath("//Server/Share/Clip-2.mp4", ["//server/share/clip-2.mp4"], "posix"),
+    "//Server/Share/Clip-2.mp4",
+  );
+});

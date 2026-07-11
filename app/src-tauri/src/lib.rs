@@ -39,6 +39,7 @@ struct AppSmokeConfig {
     resize_width_px: Option<u32>,
     resize_height_px: Option<u32>,
     skip_preview_interactions: bool,
+    workflow_queue_export: bool,
     perturb_first_frame: bool,
     color_policy: video::ColorPolicy,
     reverse: bool,
@@ -243,6 +244,7 @@ fn parse_smoke_config_from_env(
     let resize_width_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_WIDTH_PX", None)?;
     let resize_height_px = parse_smoke_u32(env, "VFL_SMOKE_RESIZE_HEIGHT_PX", None)?;
     let skip_preview_interactions = parse_smoke_bool(env, "VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS")?;
+    let workflow_queue_export = parse_smoke_bool(env, "VFL_SMOKE_WORKFLOW_QUEUE")?;
     let perturb_first_frame = parse_smoke_bool(env, "VFL_SMOKE_PERTURB_FIRST_FRAME")?;
     let color_policy = parse_smoke_color_policy(
         env.get("VFL_SMOKE_COLOR_POLICY")
@@ -295,6 +297,7 @@ fn parse_smoke_config_from_env(
         resize_width_px,
         resize_height_px,
         skip_preview_interactions,
+        workflow_queue_export,
         perturb_first_frame,
         color_policy,
         reverse,
@@ -506,6 +509,7 @@ fn start_encode(
     drop(current);
 
     let app_handle = window.app_handle().clone();
+    let failure_request = request.clone();
 
     std::thread::spawn(move || {
         let result = video::run_encode_job(&window, attempt_id, job_id, &cancel, &child, request);
@@ -515,18 +519,21 @@ fn start_encode(
 
         let _ = match result {
             Ok(done) => window.emit("encode-finished", done),
-            Err(err) => window.emit(
-                "encode-finished",
-                video::EncodeFinishedPayload {
-                    attempt_id,
-                    job_id,
-                    ok: false,
-                    output_path: None,
-                    output_size_bytes: None,
-                    message: Some(err),
-                    diagnostics: None,
-                },
-            ),
+            Err(err) => {
+                let diagnostics = video::failed_encode_diagnostics(&failure_request, &err);
+                window.emit(
+                    "encode-finished",
+                    video::EncodeFinishedPayload {
+                        attempt_id,
+                        job_id,
+                        ok: false,
+                        output_path: None,
+                        output_size_bytes: None,
+                        message: Some(err),
+                        diagnostics: Some(diagnostics),
+                    },
+                )
+            }
         };
     });
 
@@ -686,6 +693,7 @@ mod tests {
                 resize_width_px: None,
                 resize_height_px: None,
                 skip_preview_interactions: false,
+                workflow_queue_export: false,
                 perturb_first_frame: false,
                 color_policy: ColorPolicy::Auto,
                 reverse: false,
@@ -709,6 +717,7 @@ mod tests {
             ("VFL_SMOKE_RESIZE_WIDTH_PX", "320"),
             ("VFL_SMOKE_RESIZE_HEIGHT_PX", "180"),
             ("VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS", "true"),
+            ("VFL_SMOKE_WORKFLOW_QUEUE", "true"),
             ("VFL_SMOKE_PERTURB_FIRST_FRAME", "true"),
             ("VFL_SMOKE_COLOR_POLICY", "standardSdr"),
             ("VFL_SMOKE_REVERSE", "true"),
@@ -730,6 +739,7 @@ mod tests {
                 resize_width_px: Some(320),
                 resize_height_px: Some(180),
                 skip_preview_interactions: true,
+                workflow_queue_export: true,
                 perturb_first_frame: true,
                 color_policy: ColorPolicy::StandardSdr,
                 reverse: true,
@@ -750,6 +760,20 @@ mod tests {
 
         let err = parse_smoke_config_from_env(&env).unwrap_err();
         assert!(err.contains("VFL_SMOKE_COLOR_POLICY"));
+    }
+
+    #[test]
+    fn parse_smoke_config_rejects_invalid_workflow_queue_flag() {
+        let status_path = temp_smoke_status_path("bad-workflow-queue");
+        let env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_WORKFLOW_QUEUE", "sometimes"),
+        ]);
+
+        let err = parse_smoke_config_from_env(&env).unwrap_err();
+        assert!(err.contains("VFL_SMOKE_WORKFLOW_QUEUE"));
     }
 
     #[test]

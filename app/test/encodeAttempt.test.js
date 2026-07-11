@@ -253,7 +253,7 @@ test("App routes both backend event types through attempt identity before effect
   assert.match(app, /invoke<number>\("start_encode", \{ request, attemptId \}\)/);
   assert.match(app, /bindStartedEncode\(/);
   assert.match(app, /settleEncodeFinished\(/);
-  assert.match(app, /const encodeBusy = attemptUi\.isActive;/);
+  assert.match(app, /const encodeBusy = attemptUi\.isActive \|\| queueRunning \|\| queuePreparationBusy \|\| queueSnapshotApplying;/);
   assert.match(app, /latestAttempt\.kind === "starting" \? \(/);
   assert.match(app, /disabled=\{!exportReady \|\| encodeBusy\}/);
   assert.match(app, /Previous successful export/);

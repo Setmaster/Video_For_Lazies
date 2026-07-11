@@ -1,3 +1,5 @@
+import { queuePathIdentity } from "./exportQueue.mjs";
+
 function lastSepIndex(p) {
   return Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
 }
@@ -57,17 +59,18 @@ export function suggestOutputPath(inputPath, formatExt) {
   return `${dir}${nextStem}.${ext}`;
 }
 
-export function ensureUniqueOutputPath(candidate, takenPaths) {
+export function ensureUniqueOutputPath(candidate, takenPaths, platform = "auto") {
   // Disk existence is the backend's job; this guards against paths already
   // claimed by queued export snapshots that have not been written yet.
   const taken = new Set();
   for (const path of takenPaths ?? []) {
-    if (typeof path === "string" && path) taken.add(path);
+    const identity = queuePathIdentity(path, platform);
+    if (identity !== null) taken.add(identity);
   }
 
   let next = candidate;
   let guard = 0;
-  while (taken.has(next) && guard < 10_000) {
+  while (taken.has(queuePathIdentity(next, platform)) && guard < 10_000) {
     const { dir } = splitPath(next);
     const bumpedStem = incrementSuffixNumber(stem(next));
     const ext = extname(next);

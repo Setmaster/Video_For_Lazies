@@ -197,8 +197,11 @@ $ScreenshotPath = [System.IO.Path]::GetFullPath($ScreenshotPath)
 $inputPath = Join-Path $SmokeRoot "smoke-input.webm"
 $outputPath = Join-Path $SmokeRoot ("smoke-output.{0}" -f $OutputFormat)
 $statusPath = Join-Path $SmokeRoot "smoke-status.json"
+$webViewDataRoot = Join-Path $SmokeRoot "webview2-user-data"
 
 Remove-Item $inputPath, $outputPath, $statusPath -Force -ErrorAction SilentlyContinue
+Remove-Item $webViewDataRoot -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $webViewDataRoot -Force | Out-Null
 
 & $ffmpegPath `
   -y `
@@ -232,6 +235,8 @@ $startInfo.EnvironmentVariables["VFL_SMOKE_FORMAT"] = $OutputFormat
 $startInfo.EnvironmentVariables["VFL_SMOKE_SIZE_LIMIT_MB"] = $SizeLimitMb.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_START_S"] = "0"
 $startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_END_S"] = $TrimEndSeconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+$startInfo.EnvironmentVariables["VFL_SMOKE_WORKFLOW_QUEUE"] = "1"
+$startInfo.EnvironmentVariables["WEBVIEW2_USER_DATA_FOLDER"] = $webViewDataRoot
 if ($ResizeMode) {
   $startInfo.EnvironmentVariables["VFL_SMOKE_RESIZE_MODE"] = $ResizeMode
 }
@@ -256,6 +261,11 @@ $sentKeyboardStages = @{}
 $requiredStages = @(
   "input-applied",
   "probe-ready",
+  "workflow-recipe-ready",
+  "workflow-recipe-saved",
+  "workflow-queue-ready",
+  "workflow-queue-complete",
+  "workflow-ready",
   "preview-ready",
   "keyboard-trim-ready",
   "keyboard-trim-incremented",
@@ -285,6 +295,14 @@ try {
       }
       if (-not $sentKeyboardStages.ContainsKey($status.stage)) {
         switch ($status.stage) {
+          "workflow-recipe-ready" {
+            $sentKeyboardStages[$status.stage] = $true
+            Send-SmokeKeySequence -Process $process -Keys @("{ENTER}")
+          }
+          "workflow-queue-ready" {
+            $sentKeyboardStages[$status.stage] = $true
+            Send-SmokeKeySequence -Process $process -Keys @("{ENTER}")
+          }
           "keyboard-trim-ready" {
             $sentKeyboardStages[$status.stage] = $true
             Send-SmokeKeySequence -Process $process -Keys @("{RIGHT}")
@@ -347,6 +365,10 @@ try {
   }
   if ($missingStages.Count -gt 0) {
     throw ("Portable export smoke missed required app stages: {0}. Saw: {1}" -f ($missingStages -join ", "), ($stageHistory -join " -> "))
+  }
+  $observedRequiredStages = @($stageHistory | Where-Object { $requiredStages -contains $_ })
+  if (($observedRequiredStages -join "|") -ne ($requiredStages -join "|")) {
+    throw ("Portable export smoke required app stages were out of order. Saw: {0}" -f ($stageHistory -join " -> "))
   }
 
   $outputItem = Get-Item $outputPath
@@ -420,6 +442,14 @@ try {
   throw
 } finally {
   if ($process -and -not $process.HasExited) {
-    Stop-Process -Id $process.Id -Force
+    try {
+      & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F 2>$null | Out-Null
+      $process.Refresh()
+    } catch {
+      # Fall through to the single-process fallback below.
+    }
+    if (-not $process.HasExited) {
+      Stop-Process -Id $process.Id -Force
+    }
   }
 }

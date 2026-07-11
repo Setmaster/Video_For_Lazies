@@ -148,7 +148,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   assert.doesNotMatch(portableScript, /\bcargo build\b/);
 });
 
-test("portable export smoke enforces the interaction-ready stage history", async () => {
+test("portable export smoke enforces ordered workflow and interaction stage history", async () => {
   const bundleConfigPath = path.resolve(__dirname, "../scripts/ffmpegBundle.mjs");
   const exportSmokeWrapperPath = path.resolve(__dirname, "../scripts/run-portable-export-smoke.mjs");
   const releaseRunnerPath = path.resolve(__dirname, "../scripts/run-release-portable.mjs");
@@ -159,10 +159,34 @@ test("portable export smoke enforces the interaction-ready stage history", async
   const releaseRaw = await fs.readFile(releaseRunnerPath, "utf8");
   const raw = await fs.readFile(exportSmokePowerShellPath, "utf8");
   const appRaw = await fs.readFile(appPath, "utf8");
+  const requiredWorkflowStages = [
+    "workflow-recipe-ready",
+    "workflow-recipe-saved",
+    "workflow-queue-ready",
+    "workflow-queue-complete",
+    "workflow-ready",
+  ];
+
+  for (const [label, source] of [["Linux wrapper", wrapperRaw], ["Windows runner", raw]]) {
+    let previousIndex = -1;
+    for (const stage of requiredWorkflowStages) {
+      const stageIndex = source.indexOf(`"${stage}"`);
+      assert.ok(stageIndex > previousIndex, `${label} must require ${stage} after the preceding workflow stage.`);
+      previousIndex = stageIndex;
+    }
+  }
 
   assert.match(raw, /interaction-ready/);
+  assert.match(raw, /workflow-ready/);
+  assert.match(raw, /VFL_SMOKE_WORKFLOW_QUEUE"\] = "1"/);
+  assert.match(raw, /WEBVIEW2_USER_DATA_FOLDER"\] = \$webViewDataRoot/);
+  assert.match(raw, /webview2-user-data/);
+  assert.match(raw, /taskkill\.exe" \/PID \$process\.Id \/T \/F/);
+  assert.match(raw, /"workflow-recipe-ready"\s*\{\s*\$sentKeyboardStages\[\$status\.stage\] = \$true\s*Send-SmokeKeySequence -Process \$process -Keys @\("\{ENTER\}"\)/);
+  assert.match(raw, /"workflow-queue-ready"\s*\{\s*\$sentKeyboardStages\[\$status\.stage\] = \$true\s*Send-SmokeKeySequence -Process \$process -Keys @\("\{ENTER\}"\)/);
   assert.match(raw, /stageHistory/);
   assert.match(raw, /missed required app stages/);
+  assert.match(raw, /required app stages were out of order/);
   assert.match(raw, /expectedDurationS/);
   assert.match(raw, /trimStartS/);
   assert.match(raw, /trimEndS/);
@@ -173,6 +197,17 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(raw, /VFL_SMOKE_FORMAT"\] = \$OutputFormat/);
   assert.match(bundleRaw, /variant: "win64-gpl-shared"/);
   assert.match(wrapperRaw, /-SizeLimitMb/);
+  assert.match(wrapperRaw, /"workflow-ready"/);
+  assert.match(wrapperRaw, /VFL_SMOKE_WORKFLOW_QUEUE:\s*"1"/);
+  assert.match(wrapperRaw, /XDG_DATA_HOME:\s*xdgDataHome/);
+  assert.match(wrapperRaw, /XDG_CONFIG_HOME:\s*xdgConfigHome/);
+  assert.match(wrapperRaw, /XDG_CACHE_HOME:\s*xdgCacheHome/);
+  assert.match(wrapperRaw, /app\.stdout\.log/);
+  assert.match(wrapperRaw, /app\.stderr\.log/);
+  assert.match(wrapperRaw, /stdio:\s*\["ignore", stdoutFileHandle\.fd, stderrFileHandle\.fd\]/);
+  assert.match(wrapperRaw, /required app stages were out of order/);
+  assert.match(wrapperRaw, /Portable export smoke evidence retained at/);
+  assert.match(wrapperRaw, /if \(succeeded\)[\s\S]*?fs\.rm\(smokeRoot/);
   assert.match(wrapperRaw, /-InputWidth/);
   assert.match(wrapperRaw, /-OutputFormat/);
   assert.match(wrapperRaw, /outputFormat = "mp4"/);
@@ -188,6 +223,7 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(releaseRaw, /runPortableCodecPlanSmoke\(\{ portableDir \}\)/);
   assert.match(releaseRaw, /getFfmpegSourceArchiveNames/);
   assert.match(appRaw, /smokeStatusWriteRef/);
+  assert.match(appRaw, /runSmokeWorkflowChecks/);
   assert.match(appRaw, /smokeStageHistoryRef/);
   assert.match(appRaw, /stageHistory: smokeStageHistoryRef\.current/);
   assert.match(appRaw, /trimStartS: extra\.trimStartS \?\? null/);

@@ -332,7 +332,7 @@ pub struct EncodeFinishedPayload {
 pub struct ExportDiagnostics {
     pub mode: String,
     pub video_action: Option<StreamAction>,
-    pub audio_action: StreamAction,
+    pub audio_action: Option<StreamAction>,
     pub source_format: Option<String>,
     pub source_video_codec: Option<String>,
     pub source_audio_codec: Option<String>,
@@ -350,7 +350,124 @@ pub struct ExportDiagnostics {
     pub sar_action: String,
     pub reverse_buffer_estimate_bytes: Option<u64>,
     pub reverse_buffer_action: Option<String>,
+    pub failure_stage: Option<String>,
+    pub failure_reason: Option<String>,
     pub command_preview: String,
+}
+
+pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> ExportDiagnostics {
+    let requested_size_bytes = (request.size_limit_mb.is_finite() && request.size_limit_mb > 0.0)
+        .then_some((request.size_limit_mb * MB_BYTES as f64) as u64);
+    let redacted_reason = safe_failure_diagnostic_reason(request, reason);
+    ExportDiagnostics {
+        mode: "failed".to_string(),
+        video_action: None,
+        audio_action: None,
+        source_format: None,
+        source_video_codec: None,
+        source_audio_codec: None,
+        video_codec: None,
+        audio_codec: None,
+        video_bitrate_kbps: None,
+        audio_bitrate_kbps: None,
+        requested_size_bytes,
+        actual_size_bytes: None,
+        passes: 0,
+        attempts: 0,
+        audio_removed_for_size_target: false,
+        copy_fallback_reason: None,
+        color_action: "Not completed".to_string(),
+        sar_action: "Not completed".to_string(),
+        reverse_buffer_estimate_bytes: None,
+        reverse_buffer_action: None,
+        failure_stage: Some("backend".to_string()),
+        failure_reason: Some(redacted_reason),
+        command_preview:
+            "No FFmpeg command evidence was retained because the export failed before completion."
+                .to_string(),
+    }
+}
+
+fn safe_failure_diagnostic_reason(request: &EncodeRequest, reason: &str) -> String {
+    let first_line = reason
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("Export failed.");
+    let mut redactions: Vec<(String, &'static str)> = Vec::new();
+
+    fn add_path_redaction(
+        redactions: &mut Vec<(String, &'static str)>,
+        path: impl AsRef<str>,
+        replacement: &'static str,
+    ) {
+        let path = path.as_ref().trim();
+        if path.is_empty() || matches!(path, "." | "/" | "\\") {
+            return;
+        }
+        for spelling in [
+            path.to_string(),
+            path.replace('\\', "/"),
+            path.replace('/', "\\"),
+        ] {
+            if !spelling.is_empty() && !redactions.iter().any(|(existing, _)| existing == &spelling)
+            {
+                redactions.push((spelling, replacement));
+            }
+        }
+    }
+
+    let input_path = PathBuf::from(request.input_path.trim());
+    add_path_redaction(&mut redactions, request.input_path.as_str(), "<input>");
+    if let Ok(canonical_input) = input_path.canonicalize() {
+        add_path_redaction(
+            &mut redactions,
+            canonical_input.to_string_lossy(),
+            "<input>",
+        );
+    }
+
+    let output_path = PathBuf::from(request.output_path.trim());
+    add_path_redaction(&mut redactions, request.output_path.as_str(), "<output>");
+    if let Some(output_parent) = output_path.parent() {
+        add_path_redaction(
+            &mut redactions,
+            output_parent.to_string_lossy(),
+            "<output-folder>",
+        );
+        if let Ok(canonical_parent) = output_parent.canonicalize() {
+            add_path_redaction(
+                &mut redactions,
+                canonical_parent.to_string_lossy(),
+                "<output-folder>",
+            );
+            if let Some(file_name) = output_path.file_name() {
+                add_path_redaction(
+                    &mut redactions,
+                    canonical_parent.join(file_name).to_string_lossy(),
+                    "<output>",
+                );
+            }
+        }
+    }
+
+    redactions.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+    let mut redacted = first_line.to_string();
+    for (path, replacement) in redactions {
+        redacted = redacted.replace(&path, replacement);
+    }
+
+    const MAX_FAILURE_REASON_CHARS: usize = 500;
+    if redacted.chars().count() > MAX_FAILURE_REASON_CHARS {
+        let mut truncated: String = redacted
+            .chars()
+            .take(MAX_FAILURE_REASON_CHARS - 3)
+            .collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        redacted
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3120,6 +3237,33 @@ fn split_sequence_stem(stem: &str) -> (String, u32) {
     (base.to_string(), n.saturating_add(1).max(2))
 }
 
+fn output_path_identity(path: &str) -> String {
+    let looks_windows = (path.as_bytes().get(1) == Some(&b':')
+        && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
+        || path.starts_with("\\\\")
+        || path.starts_with("//")
+        || path.contains('\\');
+    if !looks_windows {
+        return format!("posix:{path}");
+    }
+
+    let mut normalized = String::with_capacity(path.len());
+    let mut previous_was_slash = false;
+    for character in path.chars() {
+        let character = if character == '\\' { '/' } else { character };
+        if character == '/' {
+            if previous_was_slash {
+                continue;
+            }
+            previous_was_slash = true;
+        } else {
+            previous_was_slash = false;
+        }
+        normalized.extend(character.to_lowercase());
+    }
+    format!("windows:{normalized}")
+}
+
 pub fn suggest_output_path_unique(
     input_path: String,
     format: OutputFormat,
@@ -3139,14 +3283,17 @@ pub fn suggest_output_path_unique(
         .unwrap_or_else(|| std::path::Path::new(""));
     // Paths claimed by not-yet-written outputs (queued export snapshots), which
     // an on-disk existence check alone cannot see.
-    let taken: HashSet<&str> = taken_paths.iter().map(|p| p.as_str()).collect();
+    let taken: HashSet<String> = taken_paths
+        .iter()
+        .map(|path| output_path_identity(path))
+        .collect();
 
     let max_tries = 10_000u32;
     for i in start_n..start_n.saturating_add(max_tries) {
         let file = format!("{base}-{i}.{ext}");
         let candidate = parent.join(file);
         let candidate_str = candidate.to_string_lossy().to_string();
-        if !candidate.exists() && !taken.contains(candidate_str.as_str()) {
+        if !candidate.exists() && !taken.contains(&output_path_identity(&candidate_str)) {
             return Ok(candidate_str);
         }
     }
@@ -5128,7 +5275,7 @@ pub fn run_encode_job(
             diagnostics: Some(ExportDiagnostics {
                 mode: command_plan.mode.label().to_string(),
                 video_action: None,
-                audio_action: StreamAction::Encode,
+                audio_action: Some(StreamAction::Encode),
                 source_format: probe.source_format.clone(),
                 source_video_codec: probe.video_codec.clone(),
                 source_audio_codec: probe.audio_codec.clone(),
@@ -5157,6 +5304,8 @@ pub fn run_encode_job(
                 reverse_buffer_action: command_plan
                     .reverse_buffer_estimate
                     .map(|estimate| estimate.action.diagnostic().to_string()),
+                failure_stage: None,
+                failure_reason: None,
                 command_preview,
             }),
         });
@@ -5208,7 +5357,7 @@ pub fn run_encode_job(
                         diagnostics: Some(ExportDiagnostics {
                             mode: EncodeMode::Remux.label().to_string(),
                             video_action: Some(StreamAction::Copy),
-                            audio_action: candidate.audio_action,
+                            audio_action: Some(candidate.audio_action),
                             source_format: probe.source_format.clone(),
                             source_video_codec: probe.video_codec.clone(),
                             source_audio_codec: probe.audio_codec.clone(),
@@ -5239,6 +5388,8 @@ pub fn run_encode_job(
                             reverse_buffer_action: command_plan
                                 .reverse_buffer_estimate
                                 .map(|estimate| estimate.action.diagnostic().to_string()),
+                            failure_stage: None,
+                            failure_reason: None,
                             command_preview,
                         }),
                     });
@@ -5342,7 +5493,7 @@ pub fn run_encode_job(
                         diagnostics: Some(ExportDiagnostics {
                             mode: executed_plan.mode.label().to_string(),
                             video_action: Some(executed_plan.video_action),
-                            audio_action: executed_plan.audio_action,
+                            audio_action: Some(executed_plan.audio_action),
                             source_format: probe.source_format.clone(),
                             source_video_codec: executed_plan.source_video_codec.clone(),
                             source_audio_codec: executed_plan.source_audio_codec.clone(),
@@ -5371,6 +5522,8 @@ pub fn run_encode_job(
                             reverse_buffer_action: executed_plan
                                 .reverse_buffer_estimate
                                 .map(|estimate| estimate.action.diagnostic().to_string()),
+                            failure_stage: None,
+                            failure_reason: None,
                             command_preview,
                         }),
                     });
@@ -5633,11 +5786,11 @@ pub fn run_encode_job(
                 diagnostics: Some(ExportDiagnostics {
                     mode: command_plan.mode.label().to_string(),
                     video_action: Some(StreamAction::Encode),
-                    audio_action: if pass2_audio_bitrate_kbps.is_some() {
+                    audio_action: Some(if pass2_audio_bitrate_kbps.is_some() {
                         StreamAction::Encode
                     } else {
                         StreamAction::Drop
-                    },
+                    }),
                     source_format: probe.source_format.clone(),
                     source_video_codec: probe.video_codec.clone(),
                     source_audio_codec: probe.audio_codec.clone(),
@@ -5667,6 +5820,8 @@ pub fn run_encode_job(
                     reverse_buffer_action: command_plan
                         .reverse_buffer_estimate
                         .map(|estimate| estimate.action.diagnostic().to_string()),
+                    failure_stage: None,
+                    failure_reason: None,
                     command_preview,
                 }),
             });
@@ -5697,11 +5852,11 @@ pub fn run_encode_job(
                 diagnostics: Some(ExportDiagnostics {
                     mode: command_plan.mode.label().to_string(),
                     video_action: Some(StreamAction::Encode),
-                    audio_action: if pass2_audio_bitrate_kbps.is_some() {
+                    audio_action: Some(if pass2_audio_bitrate_kbps.is_some() {
                         StreamAction::Encode
                     } else {
                         StreamAction::Drop
-                    },
+                    }),
                     source_format: probe.source_format.clone(),
                     source_video_codec: probe.video_codec.clone(),
                     source_audio_codec: probe.audio_codec.clone(),
@@ -5731,6 +5886,8 @@ pub fn run_encode_job(
                     reverse_buffer_action: command_plan
                         .reverse_buffer_estimate
                         .map(|estimate| estimate.action.diagnostic().to_string()),
+                    failure_stage: None,
+                    failure_reason: None,
                     command_preview,
                 }),
             });
@@ -5768,6 +5925,50 @@ mod tests {
             perturb_seed: None,
             loop_video: false,
         }
+    }
+
+    #[test]
+    fn failed_encode_diagnostics_are_truthful_and_path_free() {
+        let mut request = base_request();
+        request.input_path = "/private/source.mp4".to_string();
+        request.output_path = "/private/result.mp4".to_string();
+        request.title = Some("Private title".to_string());
+        let reason = "File not found: /private/source.mp4";
+
+        let diagnostics = failed_encode_diagnostics(&request, reason);
+        assert_eq!(diagnostics.mode, "failed");
+        assert_eq!(diagnostics.video_action, None);
+        assert_eq!(diagnostics.audio_action, None);
+        assert_eq!(diagnostics.failure_stage.as_deref(), Some("backend"));
+        assert_eq!(diagnostics.attempts, 0);
+        assert_eq!(
+            diagnostics.failure_reason.as_deref(),
+            Some("File not found: <input>")
+        );
+        assert_eq!(diagnostics.requested_size_bytes, Some(8_000_000));
+        let serialized = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!serialized.contains("/private/"));
+        assert!(!serialized.contains("Private title"));
+        assert!(serialized.contains("No FFmpeg command evidence was retained"));
+
+        let temp_path_reason = "ffmpeg failed. Output #0, mp4, to '/private/.vfl-123-1-encode-AbCd.tmp.mp4': Permission denied";
+        let temp_path_diagnostics = failed_encode_diagnostics(&request, temp_path_reason);
+        let temp_path_serialized = serde_json::to_string(&temp_path_diagnostics).unwrap();
+        assert!(!temp_path_serialized.contains("/private/"));
+        assert!(
+            temp_path_diagnostics
+                .failure_reason
+                .as_deref()
+                .is_some_and(|failure| failure.contains("<output-folder>"))
+        );
+
+        let multiline_reason =
+            "ffmpeg failed (exit 1).\n\n/private/passlog-0.log: Permission denied";
+        let multiline_diagnostics = failed_encode_diagnostics(&request, multiline_reason);
+        assert_eq!(
+            multiline_diagnostics.failure_reason.as_deref(),
+            Some("ffmpeg failed (exit 1).")
+        );
     }
 
     fn probe_10s_1920x1080_audio() -> VideoProbe {
@@ -5851,6 +6052,22 @@ mod tests {
         let (base, n) = split_sequence_stem("movie-2024");
         assert_eq!(base, "movie-2024");
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn output_path_identity_matches_windows_and_unc_spellings() {
+        assert_eq!(
+            output_path_identity("C:\\Videos\\Clip-2.MP4"),
+            output_path_identity("c:/videos/clip-2.mp4")
+        );
+        assert_eq!(
+            output_path_identity("\\\\Server\\Share\\Clip-2.MP4"),
+            output_path_identity("//server/share/clip-2.mp4")
+        );
+        assert_ne!(
+            output_path_identity("/videos/Clip-2.mp4"),
+            output_path_identity("/videos/clip-2.mp4")
+        );
     }
 
     #[test]

@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  DEFAULT_QUEUE_FULL_DROP_MESSAGE,
   DEFAULT_UNSUPPORTED_DROP_MESSAGE,
   bindWindowFileDrop,
+  classifyDroppedVideoPaths,
   extractDroppedPathsFromDataTransfer,
   inferDroppedFormat,
   isFileDragTypeList,
@@ -100,6 +102,10 @@ test("resolveDroppedVideoAction applies the first supported dropped video", () =
     {
       kind: "applyInput",
       clearDragActive: true,
+      unsupportedCount: 1,
+      duplicateCount: 0,
+      invalidCount: 0,
+      overflowCount: 0,
       path: "C:\\\\Users\\\\Example\\\\Videos\\\\clip.webm",
       nextFormat: "webm",
     },
@@ -116,12 +122,16 @@ test("resolveDroppedVideoAction reports unsupported drops", () => {
     {
       kind: "status",
       clearDragActive: true,
+      unsupportedCount: 1,
+      duplicateCount: 0,
+      invalidCount: 0,
+      overflowCount: 0,
       message: DEFAULT_UNSUPPORTED_DROP_MESSAGE,
     },
   );
 });
 
-test("resolveDroppedVideoAction ignores drops while a job is running", () => {
+test("resolveDroppedVideoAction queues a drop while an export is busy", () => {
   assert.deepEqual(
     resolveDroppedVideoAction({
       paths: ["C:\\\\Users\\\\Example\\\\Videos\\\\clip.mp4"],
@@ -129,8 +139,119 @@ test("resolveDroppedVideoAction ignores drops while a job is running", () => {
       jobId: 42,
     }),
     {
+      kind: "queueInputs",
+      clearDragActive: true,
+      unsupportedCount: 0,
+      duplicateCount: 0,
+      invalidCount: 0,
+      overflowCount: 0,
+      paths: ["C:\\\\Users\\\\Example\\\\Videos\\\\clip.mp4"],
+      format: "mp4",
+      reason: "busy",
+    },
+  );
+});
+
+test("classifyDroppedVideoPaths preserves order and reports unsupported and duplicate paths", () => {
+  assert.deepEqual(
+    classifyDroppedVideoPaths([
+      "C:\\\\Videos\\\\First.MP4",
+      "c:/videos/first.mp4",
+      "C:\\\\Videos\\\\notes.txt",
+      "C:\\\\Videos\\\\Second.webm",
+      null,
+    ], { platform: "windows" }),
+    {
+      supportedPaths: ["C:\\\\Videos\\\\First.MP4", "C:\\\\Videos\\\\Second.webm"],
+      unsupportedPaths: ["C:\\\\Videos\\\\notes.txt"],
+      unsupportedCount: 2,
+      duplicateCount: 1,
+      invalidCount: 1,
+    },
+  );
+});
+
+test("idle multi-file drops queue accepted videos in first-occurrence order", () => {
+  assert.deepEqual(
+    resolveDroppedVideoAction({
+      paths: [
+        "C:\\\\Videos\\\\First.MP4",
+        "c:/videos/first.mp4",
+        "C:\\\\Videos\\\\notes.txt",
+        "C:\\\\Videos\\\\Second.webm",
+      ],
+      currentFormat: "mp3",
+      jobId: null,
+      queueCapacity: 10,
+      platform: "windows",
+    }),
+    {
+      kind: "queueInputs",
+      clearDragActive: true,
+      unsupportedCount: 1,
+      duplicateCount: 1,
+      invalidCount: 0,
+      overflowCount: 0,
+      paths: ["C:\\\\Videos\\\\First.MP4", "C:\\\\Videos\\\\Second.webm"],
+      format: "mp3",
+      reason: "multiple",
+    },
+  );
+});
+
+test("multi-file drop partially accepts the first paths that fit", () => {
+  assert.deepEqual(
+    resolveDroppedVideoAction({
+      paths: ["/videos/one.mp4", "/videos/two.webm", "/videos/three.mov"],
+      currentFormat: "mp4",
+      queueCapacity: 2,
+      platform: "posix",
+    }),
+    {
+      kind: "queueInputs",
+      clearDragActive: true,
+      unsupportedCount: 0,
+      duplicateCount: 0,
+      invalidCount: 0,
+      overflowCount: 1,
+      paths: ["/videos/one.mp4", "/videos/two.webm"],
+      format: "mp4",
+      reason: "multiple",
+    },
+  );
+});
+
+test("busy drops report a full queue instead of disappearing", () => {
+  assert.deepEqual(
+    resolveDroppedVideoAction({
+      paths: ["/videos/one.mp4"],
+      currentFormat: "mp4",
+      busy: true,
+      queueCapacity: 0,
+      platform: "posix",
+    }),
+    {
+      kind: "status",
+      clearDragActive: true,
+      unsupportedCount: 0,
+      duplicateCount: 0,
+      invalidCount: 0,
+      overflowCount: 1,
+      message: DEFAULT_QUEUE_FULL_DROP_MESSAGE,
+    },
+  );
+});
+
+test("empty drops remain an explicit no-op", () => {
+  assert.deepEqual(
+    resolveDroppedVideoAction({ paths: [], currentFormat: "mp4" }),
+    {
       kind: "ignore",
       clearDragActive: true,
+      unsupportedCount: 0,
+      duplicateCount: 0,
+      invalidCount: 0,
+      overflowCount: 0,
     },
   );
 });
@@ -176,6 +297,40 @@ test("extractDroppedPathsFromDataTransfer falls back to file URIs and de-dupes",
   assert.deepEqual(extractDroppedPathsFromDataTransfer(dataTransfer), [
     "C:/Example/Videos/clip-one.mp4",
     "C:/Example/Videos/clip-two.webm",
+  ]);
+});
+
+test("extractDroppedPathsFromDataTransfer de-dupes Windows slash and case variants", () => {
+  const dataTransfer = {
+    files: [{ path: "C:\\\\Example\\\\Videos\\\\Clip-One.mp4" }],
+    getData(type) {
+      if (type === "text/uri-list") {
+        return "file:///c:/example/videos/clip-one.mp4\nfile:///C:/Example/Videos/clip-two.webm";
+      }
+      return "";
+    },
+  };
+
+  assert.deepEqual(extractDroppedPathsFromDataTransfer(dataTransfer), [
+    "C:\\\\Example\\\\Videos\\\\Clip-One.mp4",
+    "C:/Example/Videos/clip-two.webm",
+  ]);
+});
+
+test("extractDroppedPathsFromDataTransfer de-dupes file URI and native UNC spellings", () => {
+  const dataTransfer = {
+    files: [{ path: "\\\\Server\\Share\\Clip.mp4" }],
+    getData(type) {
+      if (type === "text/uri-list") {
+        return "file://server/share/clip.mp4\nfile://server/share/second.webm";
+      }
+      return "";
+    },
+  };
+
+  assert.deepEqual(extractDroppedPathsFromDataTransfer(dataTransfer), [
+    "\\\\Server\\Share\\Clip.mp4",
+    "//server/share/second.webm",
   ]);
 });
 

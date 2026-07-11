@@ -125,7 +125,7 @@ test("crop, trim, modal, and live-status accessibility contracts are wired", asy
   assert.match(modal, /returnFocus\?\.isConnected/);
   assert.match(app, /role="alertdialog"/);
   assert.match(app, /closeOnBackdrop/);
-  assert.match(app, /const modalOpen = elevatedUpdateRun \|\| aboutOpen;/);
+  assert.match(app, /const modalOpen = elevatedUpdateRun \|\| aboutOpen \|\| recipeDialog !== null;/);
   assert.match(app, /!modalOpenRef\.current/);
 
   assert.match(app, /id="vfl-crop-detect-status"/);
@@ -150,8 +150,10 @@ test("portable Windows smoke requires mounted accessibility evidence", async () 
   assert.match(app, /document\.activeElement !== aboutTrigger/);
   assert.match(app, /lost modal focus when the focused update-check control became disabled/);
   assert.match(runner, /"accessibility-ready"/);
+  assert.match(runner, /"workflow-ready"/);
   assert.match(runner, /!stage\.startsWith\("keyboard-"\)/);
   assert.match(windows, /"accessibility-ready"/);
+  assert.match(windows, /"workflow-ready"/);
   assert.match(windows, /System\.Windows\.Forms\.SendKeys/);
   assert.match(windows, /"keyboard-trim-ready"/);
   assert.match(windows, /"keyboard-trim-incremented"/);

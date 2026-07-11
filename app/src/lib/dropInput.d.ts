@@ -1,7 +1,9 @@
 import type { OutputFormat } from "./types";
+import type { QueuePathPlatform } from "./exportQueue";
 
 export const SUPPORTED_INPUT_EXTENSIONS: string[];
 export const DEFAULT_UNSUPPORTED_DROP_MESSAGE: string;
+export const DEFAULT_QUEUE_FULL_DROP_MESSAGE: string;
 
 export function pickDroppedVideoPath(paths: string[]): string | null;
 export function inferDroppedFormat(path: string, currentFormat: OutputFormat): OutputFormat;
@@ -10,14 +12,41 @@ export function resolveDroppedVideo(
   currentFormat: OutputFormat,
 ): { path: string; nextFormat: OutputFormat } | null;
 export function isFileDragTypeList(types: Iterable<string> | ArrayLike<string> | null | undefined): boolean;
+export interface DroppedVideoPathClassification {
+  supportedPaths: string[];
+  unsupportedPaths: string[];
+  unsupportedCount: number;
+  duplicateCount: number;
+  invalidCount: number;
+}
+export interface DroppedVideoActionCounts {
+  clearDragActive: true;
+  unsupportedCount: number;
+  duplicateCount: number;
+  invalidCount: number;
+  overflowCount: number;
+}
 export type DroppedVideoAction =
-  | { kind: "ignore"; clearDragActive: true }
-  | { kind: "status"; clearDragActive: true; message: string }
-  | { kind: "applyInput"; clearDragActive: true; path: string; nextFormat: OutputFormat };
+  | ({ kind: "ignore" } & DroppedVideoActionCounts)
+  | ({ kind: "status"; message: string } & DroppedVideoActionCounts)
+  | ({ kind: "applyInput"; path: string; nextFormat: OutputFormat } & DroppedVideoActionCounts)
+  | ({
+      kind: "queueInputs";
+      paths: string[];
+      format: OutputFormat;
+      reason: "busy" | "multiple";
+    } & DroppedVideoActionCounts);
+export function classifyDroppedVideoPaths(
+  paths: Iterable<unknown> | null | undefined,
+  options?: { platform?: QueuePathPlatform },
+): DroppedVideoPathClassification;
 export function resolveDroppedVideoAction(args: {
   paths: string[];
   currentFormat: OutputFormat;
-  jobId: number | null;
+  jobId?: number | null;
+  busy?: boolean;
+  queueCapacity?: number;
+  platform?: QueuePathPlatform;
 }): DroppedVideoAction;
 export function parseDroppedUriList(raw: string): string[];
 export function extractDroppedPathsFromDataTransfer(dataTransfer: {

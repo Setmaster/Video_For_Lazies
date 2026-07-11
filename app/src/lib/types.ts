@@ -169,7 +169,7 @@ export interface EncodeFinishedPayload {
 export interface ExportDiagnostics {
   mode: string;
   videoAction?: StreamAction | null;
-  audioAction: StreamAction;
+  audioAction?: StreamAction | null;
   sourceFormat?: string | null;
   sourceVideoCodec?: string | null;
   sourceAudioCodec?: string | null;
@@ -187,6 +187,8 @@ export interface ExportDiagnostics {
   sarAction?: string | null;
   reverseBufferEstimateBytes?: number | null;
   reverseBufferAction?: string | null;
+  failureStage?: string | null;
+  failureReason?: string | null;
   commandPreview: string;
 }
 
@@ -203,6 +205,7 @@ export interface AppSmokeConfig {
   resizeWidthPx?: number | null;
   resizeHeightPx?: number | null;
   skipPreviewInteractions?: boolean | null;
+  workflowQueueExport?: boolean | null;
   perturbFirstFrame?: boolean | null;
   loopVideo?: boolean | null;
   colorPolicy?: ColorPolicy | null;

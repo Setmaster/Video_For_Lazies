@@ -8,6 +8,7 @@ import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
+import { UserRecipeDialog, type UserRecipeDialogState } from "./components/UserRecipeDialog";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
 import type {
   AppSmokeConfig,
@@ -36,6 +37,20 @@ import {
   resolveDroppedVideoAction,
   SUPPORTED_INPUT_EXTENSIONS,
 } from "./lib/dropInput";
+import {
+  createExportQueueState,
+  exportQueueClaimsOutputPath,
+  exportQueueOutputPaths,
+  exportQueueRemainingCapacity,
+  getActiveExportQueueItem,
+  queuePathIdentity,
+  reduceExportQueue,
+  summarizeExportQueue,
+  type ExportQueueAction,
+  type ExportQueueItem,
+  type ExportQueueOutcome,
+  type ExportQueueState,
+} from "./lib/exportQueue";
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
 import { basename, dirname, ensureUniqueOutputPath, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
 import { getActiveProgressUi } from "./lib/progress";
@@ -51,7 +66,28 @@ import {
   type EncodeAttemptState,
 } from "./lib/encodeAttempt";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
-import { EXPORT_RECIPES, findMatchingExportRecipe, normalizeRecipeResizeSettings, type ExportRecipe } from "./lib/exportRecipes";
+import {
+  EXPORT_RECIPES,
+  normalizeRecipeResizeSettings,
+  recipeMatchesSettings,
+  type ExportRecipe,
+  type ExportRecipeSettings,
+} from "./lib/exportRecipes";
+import {
+  USER_RECIPE_STORAGE_KEY,
+  cloneUserRecipeSettings,
+  createEmptyUserRecipeStore,
+  createUserRecipe,
+  deleteUserRecipe,
+  findMatchingUserRecipe,
+  loadUserRecipeStore,
+  parseUserRecipeStore,
+  persistUserRecipeStore,
+  renameUserRecipe,
+  reusableSettingsFromEncodeRequest,
+  type UserRecipe,
+  type UserRecipeStore,
+} from "./lib/userRecipes";
 import { buildPreviewColorFilter } from "./lib/previewFilter";
 import { alignCropRectForEncoding, cropRectToPixels, isFullFramePixelCrop } from "./lib/accessibility";
 import {
@@ -120,10 +156,16 @@ const TRIM_FINE_NUDGE_S = 0.1;
 const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
+const SMOKE_WORKFLOW_SESSION_KEY = "vfl:smoke-workflow:v1";
 const SMOKE_STAGE_ORDER = [
   "detected",
   "input-applied",
   "probe-ready",
+  "workflow-recipe-ready",
+  "workflow-recipe-saved",
+  "workflow-queue-ready",
+  "workflow-queue-complete",
+  "workflow-ready",
   "preview-ready",
   "keyboard-trim-ready",
   "keyboard-trim-incremented",
@@ -201,6 +243,8 @@ type SmokeAccessibilityResult =
   | { ok: true; message: string }
   | { ok: false; message: string };
 
+type SmokeWorkflowResult = SmokeAccessibilityResult;
+
 type SmokeInteractionResult =
   | { ok: false; message: string }
   | {
@@ -220,24 +264,12 @@ type LastExportResult = {
   diagnostics: ExportDiagnostics | null;
   completedAtMs: number;
 };
-type ExportQueueItemStatus = "queued" | "running" | "done" | "failed";
-type ExportQueueItem = {
-  id: number;
-  inputPath: string;
-  outputPath: string;
-  format: OutputFormat;
-  durationS: number | null;
-  request: EncodeRequest;
-  status: ExportQueueItemStatus;
-  message: string | null;
-  outputSizeBytes: number | null;
-};
-
-const QUEUE_STATUS_LABELS: Record<ExportQueueItemStatus, string> = {
+const QUEUE_STATUS_LABELS: Record<ExportQueueItem["status"], string> = {
   queued: "Queued",
   running: "Running",
   done: "Done",
   failed: "Failed",
+  cancelled: "Canceled",
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -355,6 +387,50 @@ function formatStreamAction(action: StreamAction | null | undefined) {
   if (action === "encode") return "re-encoded";
   if (action === "drop") return "removed";
   return "not present";
+}
+
+function QueueDiagnosticsDetails({
+  outcome,
+  summary = "Diagnostics",
+}: {
+  outcome: ExportQueueOutcome;
+  summary?: string;
+}) {
+  const diagnostics = outcome.diagnostics;
+  if (!diagnostics) return null;
+
+  return (
+    <details className="vfl-export-diagnostics vfl-queue-diagnostics">
+      <summary>{summary}</summary>
+      <div className="vfl-diagnostic-grid">
+        <div><span>Mode</span><strong>{diagnostics.mode}</strong></div>
+        <div><span>Video</span><strong>{diagnostics.videoCodec ?? "none"} ({formatStreamAction(diagnostics.videoAction)})</strong></div>
+        <div><span>Audio</span><strong>{diagnostics.audioCodec ?? "none"} ({formatStreamAction(diagnostics.audioAction)})</strong></div>
+        <div><span>Attempts</span><strong>{diagnostics.attempts}</strong></div>
+        <div><span>Target</span><strong>{formatByteSize(diagnostics.requestedSizeBytes)}</strong></div>
+        <div><span>Actual</span><strong>{formatByteSize(diagnostics.actualSizeBytes)}</strong></div>
+      </div>
+      {diagnostics.copyFallbackReason ? (
+        <div className="vfl-export-result-note">Copy fallback: {diagnostics.copyFallbackReason}</div>
+      ) : null}
+      {diagnostics.colorAction ? (
+        <div className="vfl-export-result-note">Color: {diagnostics.colorAction}</div>
+      ) : null}
+      {diagnostics.sarAction ? (
+        <div className="vfl-export-result-note">Display pixels: {diagnostics.sarAction}</div>
+      ) : null}
+      {diagnostics.reverseBufferAction ? (
+        <div className="vfl-export-result-note">Transform buffer: {diagnostics.reverseBufferAction}</div>
+      ) : null}
+      {diagnostics.failureStage ? (
+        <div className="vfl-export-result-note">Failure stage: {diagnostics.failureStage}</div>
+      ) : null}
+      {diagnostics.failureReason ? (
+        <div className="vfl-export-result-note">Failure: {diagnostics.failureReason}</div>
+      ) : null}
+      <pre className="vfl-command-preview">{diagnostics.commandPreview}</pre>
+    </details>
+  );
 }
 
 function colorIsDefault(brightness: string, contrast: string, saturation: string) {
@@ -485,9 +561,17 @@ function App() {
   const [previewMediaReady, setPreviewMediaReady] = useState(false);
   const [lastExport, setLastExport] = useState<LastExportResult | null>(null);
   const [latestAttempt, setLatestAttempt] = useState<EncodeAttemptState>(() => createIdleEncodeAttempt());
-  const [exportQueue, setExportQueue] = useState<ExportQueueItem[]>([]);
-  const [queueRunning, setQueueRunning] = useState(false);
-  const [queueActiveItemId, setQueueActiveItemId] = useState<number | null>(null);
+  const [exportQueueState, setExportQueueState] = useState<ExportQueueState>(() => createExportQueueState());
+  const [queuePreparationBusy, setQueuePreparationBusy] = useState(false);
+  const [queueSnapshotApplying, setQueueSnapshotApplying] = useState(false);
+  const exportQueue = exportQueueState.items;
+  const queueRunning = exportQueueState.autoRun;
+  const queueActiveItemId = exportQueueState.active?.itemId ?? null;
+  const [userRecipeStore, setUserRecipeStore] = useState<UserRecipeStore>(() => createEmptyUserRecipeStore());
+  const [recipeDialog, setRecipeDialog] = useState<UserRecipeDialogState | null>(null);
+  const [recipeNameDraft, setRecipeNameDraft] = useState("");
+  const [recipeDialogError, setRecipeDialogError] = useState<string | null>(null);
+  const [recipeStatus, setRecipeStatus] = useState<string | null>(null);
   const [updateNotice, setUpdateNotice] = useState<UpdateCheckResponse | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
@@ -497,7 +581,7 @@ function App() {
   // update; the app applies it immediately and restarts on its own.
   const [elevatedUpdateRun, setElevatedUpdateRun] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const modalOpen = elevatedUpdateRun || aboutOpen;
+  const modalOpen = elevatedUpdateRun || aboutOpen || recipeDialog !== null;
 
   const jobIdRef = useRef<number | null>(null);
   const attemptIdRef = useRef(Math.floor(Date.now() * 1000));
@@ -510,11 +594,23 @@ function App() {
   const cropperRef = useRef<VideoCropperHandle | null>(null);
   const trimTimelineTrackRef = useRef<HTMLDivElement | null>(null);
   const trimDragCleanupRef = useRef<(() => void) | null>(null);
-  const exportQueueRef = useRef<ExportQueueItem[]>([]);
-  const queueRunningRef = useRef(false);
-  const queueActiveItemIdRef = useRef<number | null>(null);
+  const exportQueueStateRef = useRef<ExportQueueState>(exportQueueState);
+  const queuePreparationRef = useRef<Promise<void>>(Promise.resolve());
+  const queuePreparationCountRef = useRef(0);
+  const queueStopRevisionRef = useRef(0);
+  const queueSnapshotApplyTokenRef = useRef(0);
+  const queueSnapshotApplyingRef = useRef(false);
+  const pendingQueueSnapshotRef = useRef<{
+    token: number;
+    inputPath: string;
+    announce: boolean;
+  } | null>(null);
+  const recipeSaveButtonRef = useRef<HTMLButtonElement | null>(null);
+  const queueFallbackButtonRef = useRef<HTMLButtonElement | null>(null);
+  const queueRunButtonRef = useRef<HTMLButtonElement | null>(null);
+  const queueStopButtonRef = useRef<HTMLButtonElement | null>(null);
+  const queueRegionRef = useRef<HTMLDivElement | null>(null);
   const modalOpenRef = useRef(false);
-  const queueIdRef = useRef(1);
   const smokeConfigRef = useRef<AppSmokeConfig | null>(null);
   const smokeStageRef = useRef<string | null>(null);
   const smokeStageHistoryRef = useRef<string[]>([]);
@@ -525,6 +621,8 @@ function App() {
   const smokeMetricsRef = useRef<{ trimStartS: number | null; trimEndS: number | null; expectedDurationS: number | null } | null>(null);
   const smokeInteractionRunningRef = useRef(false);
   const smokeInteractionDoneRef = useRef(false);
+  const smokeWorkflowRunningRef = useRef(false);
+  const smokeWorkflowDoneRef = useRef(false);
   const previewTimeRef = useRef(0);
   const previewSelectionTimeRef = useRef(0);
   const previewPlayingRef = useRef(false);
@@ -538,12 +636,80 @@ function App() {
     durationS: number | null;
     format: OutputFormat;
     queueItemId: number | null;
+    queueRunId: number | null;
     sample: { outputDurationS: number; fullDurationS: number | null } | null;
   } | null>(null);
 
   function updateLatestAttempt(next: EncodeAttemptState) {
     latestAttemptRef.current = next;
     setLatestAttempt(next);
+  }
+
+  function dispatchExportQueue(action: ExportQueueAction) {
+    const next = reduceExportQueue(exportQueueStateRef.current, action);
+    if (next !== exportQueueStateRef.current) {
+      exportQueueStateRef.current = next;
+      setExportQueueState(next);
+    }
+    return next;
+  }
+
+  function supersedeQueueSnapshotApply() {
+    queueSnapshotApplyTokenRef.current += 1;
+    queueSnapshotApplyingRef.current = false;
+    pendingQueueSnapshotRef.current = null;
+    setQueueSnapshotApplying(false);
+  }
+
+  function preservePendingSnapshotCropWithoutAnnouncement() {
+    if (pendingQueueSnapshotRef.current) {
+      pendingQueueSnapshotRef.current = {
+        ...pendingQueueSnapshotRef.current,
+        announce: false,
+      };
+    }
+  }
+
+  function focusButtonWhenAvailable(
+    ref: { current: HTMLButtonElement | null },
+    remainingAttempts = 25,
+  ) {
+    const button = ref.current;
+    if (button?.isConnected && !button.disabled) {
+      button.focus();
+      return;
+    }
+    if (remainingAttempts <= 0) return;
+    window.setTimeout(() => focusButtonWhenAvailable(ref, remainingAttempts - 1), 40);
+  }
+
+  function focusQueueAfterMutation(
+    preferred?: { current: HTMLButtonElement | null },
+    remainingAttempts = 25,
+  ) {
+    const preferredButton = preferred?.current ?? null;
+    if (preferredButton?.isConnected && !preferredButton.disabled) {
+      preferredButton.focus();
+      return;
+    }
+    if (preferred && remainingAttempts > 0) {
+      window.setTimeout(
+        () => focusQueueAfterMutation(preferred, remainingAttempts - 1),
+        40,
+      );
+      return;
+    }
+
+    const target = [
+      queueRunButtonRef.current,
+      queueFallbackButtonRef.current,
+      queueStopButtonRef.current,
+    ].find((button) => button?.isConnected && !button.disabled);
+    if (target) {
+      target.focus();
+      return;
+    }
+    if (queueRegionRef.current?.isConnected) queueRegionRef.current.focus();
   }
 
   async function reportSmokeStatus(stage: string, extra: Omit<AppSmokeStatus, "stage"> = {}) {
@@ -597,18 +763,6 @@ function App() {
   useEffect(() => {
     outputAutoRef.current = outputAuto;
   }, [outputAuto]);
-
-  useEffect(() => {
-    exportQueueRef.current = exportQueue;
-  }, [exportQueue]);
-
-  useEffect(() => {
-    queueRunningRef.current = queueRunning;
-  }, [queueRunning]);
-
-  useEffect(() => {
-    queueActiveItemIdRef.current = queueActiveItemId;
-  }, [queueActiveItemId]);
 
   useEffect(() => {
     smokeConfigRef.current = smokeConfig;
@@ -752,16 +906,19 @@ function App() {
     void (async () => {
       try {
         const handle = await getCurrentWindow().onCloseRequested(async (event) => {
-          const queuedCount = exportQueueRef.current.filter((item) => item.status === "queued").length;
+          const queuedCount = summarizeExportQueue(exportQueueStateRef.current).queued;
           const encoding = jobIdRef.current !== null || pendingEncodeRef.current !== null;
-          if (!encoding && queuedCount === 0) return;
+          const preparing = queuePreparationCountRef.current > 0;
+          if (!encoding && queuedCount === 0 && !preparing) return;
 
-          const queuedText = `${queuedCount} queued export${queuedCount === 1 ? "" : "s"}`;
-          const summary = encoding
-            ? queuedCount > 0
-              ? `An export is still running and ${queuedText} have not started.`
-              : "An export is still running."
-            : `${queuedText} have not started.`;
+          const unfinished = [
+            encoding ? "an export is still running" : null,
+            queuedCount > 0
+              ? `${queuedCount} queued export${queuedCount === 1 ? " has" : "s have"} not started`
+              : null,
+            preparing ? "selected queue files are still being prepared" : null,
+          ].filter((part): part is string => Boolean(part));
+          const summary = `${unfinished.join(", and ")}.`;
           const ok = await confirmDialog(`${summary} Close anyway?`, {
             title: "Video For Lazies",
             kind: "warning",
@@ -825,6 +982,14 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const loaded = loadUserRecipeStore(localStorage);
+    setUserRecipeStore(loaded);
+    if (loaded.warnings.length) {
+      setRecipeStatus(loaded.warnings.join(" "));
+    }
+  }, []);
+
+  useEffect(() => {
     if (!settingsReady) return;
     try {
       localStorage.setItem(
@@ -875,6 +1040,8 @@ function App() {
         smokeAppliedRef.current = false;
         smokeStartRef.current = false;
         smokeAttemptIdRef.current = null;
+        smokeWorkflowRunningRef.current = false;
+        smokeWorkflowDoneRef.current = false;
         smokeConfigRef.current = config;
         setSmokeConfig(config);
         await reportSmokeStatus("detected", { message: "Packaged app smoke mode detected." });
@@ -889,7 +1056,13 @@ function App() {
   }, [settingsReady]);
 
   function applyNewInput(path: string, nextFormat: OutputFormat) {
-    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queueSnapshotApplyingRef.current
+    ) return;
+    supersedeQueueSnapshotApply();
     setOutputAuto(true);
     setOutputPath("");
     setColorPolicy("auto");
@@ -900,7 +1073,13 @@ function App() {
   }
 
   function resetAllSettings() {
-    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queueSnapshotApplyingRef.current
+    ) return;
+    supersedeQueueSnapshotApply();
     setFormat(DEFAULT_OUTPUT_FORMAT);
     setTitle("");
     setSizeLimitMb(DEFAULT_SIZE_LIMIT_MB);
@@ -943,25 +1122,17 @@ function App() {
     setSaturation("1");
   }
 
-  function applyExportRecipe(recipe: ExportRecipe) {
-    if (recipe.partial) {
-      // Partial recipes change only the settings they list and leave the rest
-      // of the current configuration (including the output path) untouched.
-      const partialSettings = recipe.settings;
-      if (partialSettings.format !== undefined) setFormat(partialSettings.format);
-      if (partialSettings.sizeLimitMb !== undefined) setSizeLimitMb(partialSettings.sizeLimitMb);
-      if (partialSettings.audioEnabled !== undefined) {
-        setAudioEnabled(format === "mp3" ? true : partialSettings.audioEnabled);
-      }
-      if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
-      if (partialSettings.perturbFirstFrame !== undefined) setPerturbFirstFrame(partialSettings.perturbFirstFrame);
-      setStatus(`Applied ${recipe.label}.`);
-      return;
-    }
-
-    const recipeSettings = recipe.settings;
+  function applyFullRecipeSettings(
+    recipeSettings: ExportRecipeSettings,
+    label: string,
+    options: { resetOutput: boolean },
+  ) {
+    if (queueSnapshotApplyingRef.current) return;
+    preservePendingSnapshotCropWithoutAnnouncement();
     const recipeAdvanced = recipeSettings.advanced;
     const recipeResize = normalizeRecipeResizeSettings(recipeSettings);
+    const recipeWantsAudio = recipeSettings.format === "mp3" || recipeSettings.audioEnabled;
+    const sourceHasAudio = probe ? probe.hasAudio : true;
 
     setFormat(recipeSettings.format);
     setSizeLimitMb(recipeSettings.sizeLimitMb);
@@ -970,11 +1141,8 @@ function App() {
     setCustomWidthPx(recipeResize.widthPx);
     setCustomHeightPx(recipeResize.heightPx);
     setOutputAspectLocked(recipeResize.lockAspect);
-    setAudioEnabled(
-      recipeSettings.format === "mp3"
-        ? true
-        : recipeSettings.audioEnabled && (probe ? probe.hasAudio : true),
-    );
+    autoMutedRef.current = recipeWantsAudio && !sourceHasAudio;
+    setAudioEnabled(recipeWantsAudio && sourceHasAudio);
     setNormalizeAudio(Boolean(recipeSettings.normalizeAudio));
     setPerturbFirstFrame(Boolean(recipeSettings.perturbFirstFrame));
     setAdvancedVideoCodec(recipeAdvanced.videoCodec);
@@ -983,10 +1151,157 @@ function App() {
     setAdvancedEncodeSpeed(recipeAdvanced.encodeSpeed);
     setAdvancedFrameRateCapFps(recipeAdvanced.frameRateCapFps === null ? "auto" : String(recipeAdvanced.frameRateCapFps));
     setAdvancedAudioChannels(recipeAdvanced.audioChannels);
-    setOutputAuto(true);
-    setOutputPath("");
-    setOutputSuggestNonce((n) => n + 1);
-    setStatus(`Applied ${recipe.label}.`);
+    if (options.resetOutput) {
+      setOutputAuto(true);
+      setOutputPath("");
+      setOutputSuggestNonce((nonce) => nonce + 1);
+    }
+    setStatus(`Applied ${label}.`);
+    setRecipeStatus(
+      options.resetOutput
+        ? `Applied ${label}. A fresh output path will be suggested; clip edits, color consent, and metadata privacy were unchanged.`
+        : `Applied ${label}. Clip edits, color consent, and metadata privacy were unchanged. The output extension may follow the recipe format.`,
+    );
+  }
+
+  function applyExportRecipe(recipe: ExportRecipe) {
+    if (queueSnapshotApplyingRef.current) return;
+    if (recipe.partial) {
+      if (format === "mp3") {
+        setStatus(`${recipe.label} is available only for MP4 or WebM video exports.`);
+        return;
+      }
+      preservePendingSnapshotCropWithoutAnnouncement();
+      // Partial recipes change only the settings they list and leave the rest
+      // of the current configuration (including the output path) untouched.
+      const partialSettings = recipe.settings;
+      const nextFormat = partialSettings.format ?? format;
+      if (partialSettings.format !== undefined) setFormat(partialSettings.format);
+      if (partialSettings.sizeLimitMb !== undefined) setSizeLimitMb(partialSettings.sizeLimitMb);
+      if (partialSettings.audioEnabled !== undefined) {
+        const requestedAudio = nextFormat === "mp3" || partialSettings.audioEnabled;
+        const sourceHasAudio = probe ? probe.hasAudio : true;
+        autoMutedRef.current = requestedAudio && !sourceHasAudio;
+        setAudioEnabled(requestedAudio && sourceHasAudio);
+      }
+      if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
+      if (partialSettings.perturbFirstFrame !== undefined) setPerturbFirstFrame(partialSettings.perturbFirstFrame);
+      setStatus(`Applied ${recipe.label}.`);
+      return;
+    }
+    applyFullRecipeSettings(recipe.settings, recipe.label, { resetOutput: true });
+  }
+
+  function applyUserRecipe(recipe: UserRecipe) {
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queueSnapshotApplyingRef.current
+    ) return;
+    applyFullRecipeSettings(recipe.settings, recipe.name, { resetOutput: false });
+  }
+
+  function openSaveRecipeDialog() {
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queueSnapshotApplyingRef.current
+    ) return;
+    if (userRecipeStore.readOnly) {
+      setRecipeStatus("Saved recipes were created by a newer app version and cannot be changed here.");
+      return;
+    }
+    setAboutOpen(false);
+    setRecipeNameDraft(`Custom recipe ${userRecipeStore.recipes.length + 1}`);
+    setRecipeDialogError(null);
+    setRecipeDialog({ kind: "save" });
+  }
+
+  function openRenameRecipeDialog(recipe: UserRecipe) {
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queueSnapshotApplyingRef.current ||
+      userRecipeStore.readOnly
+    ) return;
+    setAboutOpen(false);
+    setRecipeNameDraft(recipe.name);
+    setRecipeDialogError(null);
+    setRecipeDialog({ kind: "rename", recipeId: recipe.id, recipeName: recipe.name });
+  }
+
+  function openDeleteRecipeDialog(recipe: UserRecipe) {
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queueSnapshotApplyingRef.current ||
+      userRecipeStore.readOnly
+    ) return;
+    setAboutOpen(false);
+    setRecipeNameDraft("");
+    setRecipeDialogError(null);
+    setRecipeDialog({ kind: "delete", recipeId: recipe.id, recipeName: recipe.name });
+  }
+
+  function closeRecipeDialog() {
+    setRecipeDialog(null);
+    setRecipeDialogError(null);
+  }
+
+  function persistRecipeMutation(
+    nextRecipes: UserRecipe[],
+    successMessage: string,
+    options: { focusSaveButton?: boolean } = {},
+  ) {
+    const persisted = persistUserRecipeStore(localStorage, userRecipeStore, nextRecipes);
+    if (!persisted.ok) {
+      setRecipeDialogError(persisted.error);
+      setRecipeStatus(persisted.error);
+      return false;
+    }
+    setUserRecipeStore(persisted.store);
+    setRecipeStatus(successMessage);
+    setStatus(successMessage);
+    closeRecipeDialog();
+    if (options.focusSaveButton) {
+      window.setTimeout(() => focusButtonWhenAvailable(recipeSaveButtonRef), 0);
+    }
+    return true;
+  }
+
+  function confirmRecipeDialog() {
+    if (!recipeDialog) return;
+
+    if (recipeDialog.kind === "save") {
+      const created = createUserRecipe(userRecipeStore.recipes, recipeNameDraft, currentRecipeSettings);
+      if (!created.ok) {
+        setRecipeDialogError(created.error);
+        return;
+      }
+      persistRecipeMutation(created.recipes, `Saved ${created.recipe.name}.`);
+      return;
+    }
+
+    if (recipeDialog.kind === "rename") {
+      const renamed = renameUserRecipe(userRecipeStore.recipes, recipeDialog.recipeId, recipeNameDraft);
+      if (!renamed.ok) {
+        setRecipeDialogError(renamed.error);
+        return;
+      }
+      persistRecipeMutation(renamed.recipes, `Renamed recipe to ${renamed.recipe.name}.`);
+      return;
+    }
+
+    const removed = deleteUserRecipe(userRecipeStore.recipes, recipeDialog.recipeId);
+    if (!removed.ok) {
+      setRecipeDialogError(removed.error);
+      return;
+    }
+    persistRecipeMutation(removed.recipes, `Deleted ${removed.recipe.name}.`, { focusSaveButton: true });
   }
 
   useEffect(() => {
@@ -1523,6 +1838,7 @@ function App() {
             ? "Re-encode for edits"
             : "Auto stream copy when safe";
   const advancedPlanSummary = `${encodeModeSummary} • ${advancedCodecSummary}`;
+  const reusableAudioEnabled = audioEnabled || autoMutedRef.current;
   const currentRecipeSettings = useMemo(
     () => ({
       format,
@@ -1534,7 +1850,7 @@ function App() {
         heightPx: customHeightPx,
         lockAspect: outputAspectLocked,
       },
-      audioEnabled,
+      audioEnabled: reusableAudioEnabled,
       normalizeAudio,
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       advanced: {
@@ -1554,7 +1870,7 @@ function App() {
       customWidthPx,
       customHeightPx,
       outputAspectLocked,
-      audioEnabled,
+      reusableAudioEnabled,
       normalizeAudio,
       perturbFirstFrame,
       advancedVideoCodec,
@@ -1565,7 +1881,46 @@ function App() {
       advancedAudioChannels,
     ],
   );
-  const matchingRecipe = useMemo(() => findMatchingExportRecipe(currentRecipeSettings), [currentRecipeSettings]);
+  const canonicalCurrentRecipeSettings = useMemo(
+    () => cloneUserRecipeSettings(currentRecipeSettings) ?? currentRecipeSettings,
+    [currentRecipeSettings],
+  );
+  const currentRecipeSettingsSummary = useMemo(() => {
+    const resize = canonicalCurrentRecipeSettings.resize;
+    const resizeSummary = resize.mode === "source"
+      ? "source size"
+      : resize.mode === "maxEdge"
+        ? `max edge ${resize.maxEdgePx}px`
+        : `${resize.widthPx}x${resize.heightPx}, aspect ${resize.lockAspect ? "locked" : "unlocked"}`;
+    const advanced = canonicalCurrentRecipeSettings.advanced;
+    return [
+      `format ${canonicalCurrentRecipeSettings.format.toUpperCase()}`,
+      `size ${canonicalCurrentRecipeSettings.sizeLimitMb ? `${canonicalCurrentRecipeSettings.sizeLimitMb} MB` : "no limit"}`,
+      `resize ${resizeSummary}`,
+      `audio ${canonicalCurrentRecipeSettings.audioEnabled ? "included" : "removed"}`,
+      `normalization ${canonicalCurrentRecipeSettings.normalizeAudio ? "on" : "off"}`,
+      `first-frame uniqueness ${canonicalCurrentRecipeSettings.perturbFirstFrame ? "on" : "off"}`,
+      `video codec ${VIDEO_CODEC_LABELS[advanced.videoCodec]}`,
+      `quality ${VIDEO_QUALITY_LABELS[advanced.videoQuality]}`,
+      `encode speed ${ENCODE_SPEED_LABELS[advanced.encodeSpeed]}`,
+      `frame-rate cap ${advanced.frameRateCapFps ? `${advanced.frameRateCapFps} fps` : "auto"}`,
+      `audio bitrate ${advanced.audioBitrateKbps ? `${advanced.audioBitrateKbps} kbps` : "auto"}`,
+      `channels ${AUDIO_CHANNEL_LABELS[advanced.audioChannels]}`,
+    ].join("; ");
+  }, [canonicalCurrentRecipeSettings]);
+  const matchingFullBuiltInRecipe = useMemo(
+    () => EXPORT_RECIPES.find((recipe) => !recipe.partial && recipeMatchesSettings(recipe, currentRecipeSettings)) ?? null,
+    [currentRecipeSettings],
+  );
+  const matchingUserRecipe = useMemo(
+    () => findMatchingUserRecipe(userRecipeStore.recipes, currentRecipeSettings),
+    [currentRecipeSettings, userRecipeStore.recipes],
+  );
+  const matchingPartialBuiltInRecipe = useMemo(
+    () => EXPORT_RECIPES.find((recipe) => recipe.partial && recipeMatchesSettings(recipe, currentRecipeSettings)) ?? null,
+    [currentRecipeSettings],
+  );
+  const matchingRecipeLabel = matchingFullBuiltInRecipe?.label ?? matchingUserRecipe?.name ?? matchingPartialBuiltInRecipe?.label ?? null;
   const videoCodecCapabilitiesForFormat = useMemo(
     () => encodeCapabilities?.videoCodecs.filter((codec) => codec.format === format) ?? [],
     [encodeCapabilities, format],
@@ -1912,6 +2267,10 @@ function App() {
   const transformMemoryBlockingReason = transformMemoryEstimate.severity === "blocked"
     ? transformMemoryEstimate.reason ?? "Reverse or Loop exceeds the decoded-memory safety limit."
     : null;
+  const queueOutputBlockingReason =
+    outputPath && exportQueueClaimsOutputPath(exportQueueState, outputPath)
+      ? "That output path is already reserved by an item in the export queue. Choose another destination or remove the queued item."
+      : null;
   const exportBlockingReason =
     capabilityInspectionBlockingReason ??
     rotationBlockingReason ??
@@ -1922,6 +2281,7 @@ function App() {
     transformCapabilityBlockingReason ??
     transformMemoryBlockingReason ??
     autoVideoCodecBlockingReason ??
+    queueOutputBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting." : null);
   const colorHandlingSummary = format === "mp3"
     ? "Video color is not included in MP3 output"
@@ -2022,7 +2382,7 @@ function App() {
   const lastExportDurationText = lastExport?.durationS ? formatClock(lastExport.durationS) : null;
   const progressUi = getActiveProgressUi(progress, jobId !== null);
   const attemptUi = deriveEncodeAttemptPresentation(latestAttempt);
-  const encodeBusy = attemptUi.isActive;
+  const encodeBusy = attemptUi.isActive || queueRunning || queuePreparationBusy || queueSnapshotApplying;
   const lastExportIsCurrentOutcome = latestAttempt.kind === "succeeded";
   const latestAttemptOutputPath =
     "outputPath" in latestAttempt ? latestAttempt.outputPath ?? null : null;
@@ -2075,15 +2435,10 @@ function App() {
   const exportReady = Boolean(inputPath && outputPath && probe && !exportBlockingReason);
   const planHeroReady =
     exportReady && !attemptUi.isActive && !attemptUi.isFailure && !attemptUi.isCancelled;
-  const queueCounts = useMemo(
-    () => ({
-      queued: exportQueue.filter((item) => item.status === "queued").length,
-      running: exportQueue.filter((item) => item.status === "running").length,
-      done: exportQueue.filter((item) => item.status === "done").length,
-      failed: exportQueue.filter((item) => item.status === "failed").length,
-    }),
-    [exportQueue],
-  );
+  const queueCounts = useMemo(() => summarizeExportQueue(exportQueueState), [exportQueueState]);
+  const activeQueuePosition = queueActiveItemId === null
+    ? null
+    : exportQueue.findIndex((item) => item.id === queueActiveItemId) + 1;
   const planStatusText =
     attemptUi.isActive
       ? displayedStatus
@@ -2209,11 +2564,17 @@ function App() {
     encodeCapabilitiesError,
   ]);
 
-  function handleDroppedPaths(paths: string[]) {
+  const handleDroppedPaths = useEffectEvent(async (paths: string[]) => {
     const action = resolveDroppedVideoAction({
       paths,
       currentFormat: formatRef.current,
-      jobId: jobIdRef.current,
+      busy:
+        jobIdRef.current !== null ||
+        pendingEncodeRef.current !== null ||
+        exportQueueStateRef.current.autoRun ||
+        queuePreparationCountRef.current > 0 ||
+        queueSnapshotApplyingRef.current,
+      queueCapacity: exportQueueRemainingCapacity(exportQueueStateRef.current),
     });
 
     if (action.clearDragActive) {
@@ -2227,10 +2588,22 @@ function App() {
 
     if (action.kind === "applyInput") {
       applyNewInput(action.path, action.nextFormat);
+      const ignored = action.unsupportedCount + action.duplicateCount;
+      if (ignored > 0) {
+        setStatus(`Probing ${basename(action.path)}. ${ignored} other dropped file${ignored === 1 ? " was" : "s were"} ignored.`);
+      }
+    }
+
+    if (action.kind === "queueInputs") {
+      try {
+        await enqueueInputPaths(action.paths, action);
+      } catch (error) {
+        setStatus(coerceErrorMessage(error, "Could not add the dropped files to the queue."));
+      }
     }
 
     return action;
-  }
+  });
 
   useEffect(() => {
     let stop = false;
@@ -2241,7 +2614,7 @@ function App() {
       }
       if (!outputAuto) return;
 
-      const takenPaths = exportQueueRef.current.map((item) => item.request.outputPath);
+      const takenPaths = exportQueueOutputPaths(exportQueueStateRef.current);
       try {
         const suggested = await invoke<string>("suggest_output_path", { inputPath, format, takenPaths });
         if (stop) return;
@@ -2255,7 +2628,7 @@ function App() {
     return () => {
       stop = true;
     };
-  }, [inputPath, format, outputAuto, outputSuggestNonce]);
+  }, [inputPath, format, outputAuto, outputSuggestNonce, exportQueueState.pathRevision]);
 
   useEffect(() => {
     if (!inputPath) return;
@@ -2270,10 +2643,10 @@ function App() {
     if (!hasTauriRuntime()) return;
 
     const cleanupWindowDrop = bindWindowFileDrop(window, {
-      isDropAllowed: () => !modalOpenRef.current && jobIdRef.current === null && pendingEncodeRef.current === null,
+      isDropAllowed: () => !modalOpenRef.current,
       onDragActiveChange: setDragActive,
       onPathsDropped: (paths) => {
-        if (!modalOpenRef.current) handleDroppedPaths(paths);
+        if (!modalOpenRef.current) void handleDroppedPaths(paths);
       },
     });
 
@@ -2286,7 +2659,7 @@ function App() {
         unlisten = await getCurrentWebviewWindow().onDragDropEvent((event) => {
           const p = event.payload;
           if (p.type === "enter" || p.type === "over") {
-            if (!modalOpenRef.current && jobIdRef.current === null && pendingEncodeRef.current === null) {
+            if (!modalOpenRef.current) {
               setDragActive(true);
             }
             return;
@@ -2296,7 +2669,7 @@ function App() {
             return;
           }
           if (p.type !== "drop") return;
-          if (!modalOpenRef.current) handleDroppedPaths(p.paths);
+          if (!modalOpenRef.current) void handleDroppedPaths(p.paths);
         });
       } catch (e) {
         console.warn("Failed to register drag-drop handler:", e);
@@ -2385,7 +2758,16 @@ function App() {
         const p = await invoke<VideoProbe>("probe_video", { path: inputPath });
         if (stop) return;
         setProbe(p);
-        if (!p.hasAudio) {
+        const pendingSnapshot = pendingQueueSnapshotRef.current;
+        const preservesAppliedSnapshot =
+          pendingSnapshot?.inputPath === inputPath &&
+          pendingSnapshot.token === queueSnapshotApplyTokenRef.current;
+        if (preservesAppliedSnapshot) {
+          pendingQueueSnapshotRef.current = null;
+          if (pendingSnapshot?.announce) {
+            setStatus(`Applied the full queue snapshot for ${basename(inputPath)} with a fresh output path.`);
+          }
+        } else if (!p.hasAudio) {
           // Remember that the mute was automatic so the next input with audio
           // does not silently inherit it.
           if (audioEnabledRef.current) autoMutedRef.current = true;
@@ -2397,11 +2779,18 @@ function App() {
         if (!p.hasAudio && formatRef.current === "mp3") {
           setFormat("mp4");
         }
-        setCropRect({ x: 0, y: 0, w: 1, h: 1 });
+        if (!preservesAppliedSnapshot) {
+          setCropRect({ x: 0, y: 0, w: 1, h: 1 });
+        }
         setCropDetectHint(null);
-        setStatus("Ready.");
+        if (!preservesAppliedSnapshot) {
+          setStatus("Ready.");
+        }
       } catch (e) {
         if (stop) return;
+        if (pendingQueueSnapshotRef.current?.inputPath === inputPath) {
+          pendingQueueSnapshotRef.current = null;
+        }
         const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "Failed to probe video.";
         setProbe(null);
         setProbeError(msg);
@@ -2433,6 +2822,23 @@ function App() {
     void reportSmokeStatus("probe-ready", {
       message: `Source probed: ${probe.width}x${probe.height}, ${formatClock(probe.durationS)}`,
     });
+
+    if (!smokeWorkflowDoneRef.current) {
+      if (smokeWorkflowRunningRef.current) return;
+      smokeWorkflowRunningRef.current = true;
+      void (async () => {
+        const result = await runSmokeWorkflowChecks();
+        smokeWorkflowRunningRef.current = false;
+        if (!result.ok) {
+          await reportSmokeFailure(result.message);
+          return;
+        }
+        smokeWorkflowDoneRef.current = true;
+        await reportSmokeStatus("workflow-ready", { message: result.message });
+        setStatus("Smoke: queue and recipe workflow checks passed.");
+      })();
+      return;
+    }
 
     if (smokeConfig.skipPreviewInteractions) {
       if (!smokeInteractionDoneRef.current) {
@@ -2504,7 +2910,7 @@ function App() {
         trimEndS: smokeMetrics?.trimEndS ?? null,
         expectedDurationS: smokeMetrics?.expectedDurationS ?? null,
       });
-      const result = await startEncode();
+      const result = await startEncode({ reportAsSmokeResult: true });
       if (!result.ok) {
         await reportSmokeFailure(`Packaged app smoke encode failed to start: ${result.message}`);
         return;
@@ -2550,6 +2956,7 @@ function App() {
         if (!settlement.accepted || !settlement.context) return;
         const completedContext = settlement.context;
         const completedQueueItemId = completedContext.queueItemId;
+        const completedQueueRunId = completedContext.queueRunId;
         updateLatestAttempt(settlement.state);
         pendingEncodeRef.current = settlement.pending;
         setJobId(null);
@@ -2577,20 +2984,28 @@ function App() {
         if (!p.ok) {
           const failureMessage =
             settlement.state.kind === "cancelled" ? "Export canceled." : p.message || "Encode failed.";
-          if (completedQueueItemId !== null) {
-            updateExportQueue((items) =>
-              items.map((item) =>
-                item.id === completedQueueItemId
-                  ? { ...item, status: "failed", message: failureMessage, outputSizeBytes: null }
-                  : item,
-              ),
-            );
-            queueActiveItemIdRef.current = null;
-            setQueueActiveItemId(null);
+          let shouldContinueQueue = false;
+          if (completedQueueItemId !== null && completedQueueRunId !== null) {
+            const nextQueue = dispatchExportQueue({
+              type: "settled",
+              itemId: completedQueueItemId,
+              runId: completedQueueRunId,
+              outcome: {
+                kind: settlement.state.kind === "cancelled" ? "cancelled" : "failed",
+                message: failureMessage,
+                outputPath: p.outputPath ?? completedContext.outputPath,
+                outputSizeBytes: p.outputSizeBytes ?? null,
+                diagnostics: p.diagnostics ?? null,
+                completedAtMs,
+              },
+            });
+            shouldContinueQueue = nextQueue.autoRun && nextQueue.active === null;
           }
           setStatus(failureMessage);
-          if (completedQueueItemId !== null && queueRunningRef.current) {
+          if (shouldContinueQueue) {
             window.setTimeout(() => void startNextQueuedItem(), 0);
+          } else if (completedQueueItemId !== null) {
+            window.setTimeout(() => focusQueueAfterMutation(queueFallbackButtonRef), 0);
           }
           return;
         }
@@ -2621,26 +3036,27 @@ function App() {
           diagnostics: p.diagnostics ?? null,
           completedAtMs,
         });
-        if (completedQueueItemId !== null) {
-          updateExportQueue((items) =>
-            items.map((item) =>
-              item.id === completedQueueItemId
-                ? {
-                    ...item,
-                    status: "done",
-                    message: p.message ?? null,
-                    outputSizeBytes: p.outputSizeBytes ?? null,
-                  }
-                : item,
-            ),
-          );
-          queueActiveItemIdRef.current = null;
-          setQueueActiveItemId(null);
+        let shouldContinueQueue = false;
+        if (completedQueueItemId !== null && completedQueueRunId !== null) {
+          const nextQueue = dispatchExportQueue({
+            type: "settled",
+            itemId: completedQueueItemId,
+            runId: completedQueueRunId,
+            outcome: {
+              kind: "done",
+              message: p.message ?? null,
+              outputPath: p.outputPath ?? completedContext.outputPath,
+              outputSizeBytes: p.outputSizeBytes ?? null,
+              diagnostics: p.diagnostics ?? null,
+              completedAtMs,
+            },
+          });
+          shouldContinueQueue = nextQueue.autoRun && nextQueue.active === null;
         }
         if (outputAutoRef.current) {
           setOutputSuggestNonce((n) => n + 1);
         }
-        if (completedQueueItemId !== null && queueRunningRef.current) {
+        if (shouldContinueQueue) {
           window.setTimeout(() => void startNextQueuedItem(), 0);
         }
       });
@@ -2653,7 +3069,13 @@ function App() {
   }, []);
 
   async function pickInput() {
-    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queuePreparationCountRef.current > 0 ||
+      queueSnapshotApplyingRef.current
+    ) return;
     try {
       const selected = await openDialog({
         multiple: false,
@@ -2663,10 +3085,16 @@ function App() {
       });
 
       if (typeof selected === "string") {
-        if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
+        if (
+          jobIdRef.current !== null ||
+          pendingEncodeRef.current !== null ||
+          exportQueueStateRef.current.autoRun ||
+          queuePreparationCountRef.current > 0 ||
+          queueSnapshotApplyingRef.current
+        ) return;
         const pickedExt = extname(selected).toLowerCase();
         const nextFormat: OutputFormat =
-          pickedExt === "mp4" || pickedExt === "webm" ? (pickedExt as OutputFormat) : format;
+          pickedExt === "mp4" || pickedExt === "webm" ? (pickedExt as OutputFormat) : formatRef.current;
 
         applyNewInput(selected, nextFormat);
       }
@@ -2683,7 +3111,13 @@ function App() {
   }
 
   async function pickOutput() {
-    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queuePreparationCountRef.current > 0 ||
+      queueSnapshotApplyingRef.current
+    ) return;
     const ext = format;
     const defaultPath = outputPath || (inputPath ? suggestOutputPath(inputPath, ext) : `output.${ext}`);
 
@@ -2695,7 +3129,13 @@ function App() {
       });
 
       if (typeof selected === "string") {
-        if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
+        if (
+          jobIdRef.current !== null ||
+          pendingEncodeRef.current !== null ||
+          exportQueueStateRef.current.autoRun ||
+          queuePreparationCountRef.current > 0 ||
+          queueSnapshotApplyingRef.current
+        ) return;
         setOutputAuto(false);
         setOutputPath(replaceExtension(selected, format));
       }
@@ -2862,7 +3302,7 @@ function App() {
       format,
       title: null,
       sizeLimitMb: size,
-      audioEnabled: format === "mp3" ? true : audioEnabled,
+      audioEnabled: format === "mp3" ? true : audioEnabled || autoMutedRef.current,
       normalizeAudio,
       stripMetadata,
       // Consent to reinterpret a source's color is source-specific. Files
@@ -2940,38 +3380,18 @@ function App() {
     };
   }
 
-  function updateExportQueue(updater: (items: ExportQueueItem[]) => ExportQueueItem[]) {
-    const next = updater(exportQueueRef.current);
-    exportQueueRef.current = next;
-    setExportQueue(next);
-    return next;
-  }
-
-  function createQueueItem(request: EncodeRequest, durationS: number | null): ExportQueueItem {
-    const id = queueIdRef.current;
-    queueIdRef.current += 1;
-    return {
-      id,
-      inputPath: request.inputPath,
-      outputPath: request.outputPath,
-      format: request.format,
-      durationS,
-      request: cloneEncodeRequest(request),
-      status: "queued",
-      message: null,
-      outputSizeBytes: null,
-    };
-  }
-
-  function enqueueItems(items: ExportQueueItem[]) {
-    if (!items.length) return;
-    updateExportQueue((current) => [...current, ...items]);
-    const label = items.length === 1 ? basename(items[0].inputPath) : `${items.length} files`;
-    setStatus(`Queued ${label}.`);
-  }
-
-  function queuedOutputPaths(): string[] {
-    return exportQueueRef.current.map((item) => item.request.outputPath);
+  function claimedOutputPathsForPreparation(): string[] {
+    const paths = exportQueueOutputPaths(exportQueueStateRef.current);
+    const pendingOutputPath = pendingEncodeRef.current?.outputPath ?? null;
+    const pendingIdentity = pendingOutputPath ? queuePathIdentity(pendingOutputPath) : null;
+    if (
+      pendingOutputPath &&
+      pendingIdentity &&
+      !paths.some((path) => queuePathIdentity(path) === pendingIdentity)
+    ) {
+      paths.push(pendingOutputPath);
+    }
+    return paths;
   }
 
   async function suggestedOutputForInput(nextInputPath: string, nextFormat: OutputFormat, takenPaths: string[]) {
@@ -2986,26 +3406,342 @@ function App() {
     }
   }
 
-  async function addCurrentPlanToQueue() {
-    if (!exportReady) return;
+  function serializeQueuePreparation<T>(task: () => Promise<T>): Promise<T> {
+    queuePreparationCountRef.current += 1;
+    setQueuePreparationBusy(true);
+    const run = queuePreparationRef.current.then(task, task);
+    queuePreparationRef.current = run.then(() => undefined, () => undefined);
+    return run.finally(() => {
+      queuePreparationCountRef.current = Math.max(0, queuePreparationCountRef.current - 1);
+      if (queuePreparationCountRef.current === 0) {
+        setQueuePreparationBusy(false);
+        const state = exportQueueStateRef.current;
+        if (
+          state.autoRun &&
+          state.active === null &&
+          !queueSnapshotApplyingRef.current &&
+          state.items.some((item) => item.status === "queued")
+        ) {
+          window.setTimeout(() => void startNextQueuedItem(), 0);
+        }
+      }
+    });
+  }
+
+  function captureQueueResumeIntent() {
+    return {
+      resume: exportQueueStateRef.current.autoRun,
+      stopRevision: queueStopRevisionRef.current,
+    };
+  }
+
+  function resumeQueueAfterPreparation(
+    state: ExportQueueState,
+    intent: { resume: boolean; stopRevision: number },
+  ) {
+    let next = state;
+    const hasQueuedItems = () => next.items.some((item) => item.status === "queued");
+    if (
+      intent.resume &&
+      intent.stopRevision === queueStopRevisionRef.current &&
+      !next.autoRun &&
+      next.active === null &&
+      !queueSnapshotApplyingRef.current &&
+      hasQueuedItems()
+    ) {
+      next = dispatchExportQueue({ type: "start-auto-run" });
+    }
+    if (next.autoRun && next.active === null && hasQueuedItems()) {
+      window.setTimeout(() => void startNextQueuedItem(), 0);
+    }
+    return next;
+  }
+
+  function describeQueueIngestion(
+    acceptedCount: number,
+    counts: { unsupportedCount?: number; duplicateCount?: number; overflowCount?: number },
+  ) {
+    const parts = [
+      counts.unsupportedCount ? `${counts.unsupportedCount} unsupported ignored` : null,
+      counts.duplicateCount ? `${counts.duplicateCount} duplicate ignored` : null,
+      counts.overflowCount ? `${counts.overflowCount} skipped because the queue is full` : null,
+    ].filter(Boolean);
+    const accepted = acceptedCount === 1 ? "Queued 1 file." : `Queued ${acceptedCount} files.`;
+    return parts.length ? `${accepted} ${parts.join("; ")}.` : accepted;
+  }
+
+  async function enqueueInputPaths(
+    paths: string[],
+    counts: { unsupportedCount?: number; duplicateCount?: number; overflowCount?: number } = {},
+  ) {
+    if (!paths.length) return 0;
+    const requestTemplate = buildSettingsOnlyRequest(
+      paths[0],
+      `${dirname(paths[0])}${stem(paths[0])}-batch.${format}`,
+    );
+    const batchFormat = requestTemplate.format;
+    const resumeIntent = captureQueueResumeIntent();
+    return serializeQueuePreparation(async () => {
+      const capacity = exportQueueRemainingCapacity(exportQueueStateRef.current);
+      const acceptedPaths = paths.slice(0, capacity);
+      const overflowCount = (counts.overflowCount ?? 0) + Math.max(0, paths.length - acceptedPaths.length);
+      if (!acceptedPaths.length) {
+        setStatus(describeQueueIngestion(0, { ...counts, overflowCount }));
+        return 0;
+      }
+
+      const takenPaths = claimedOutputPathsForPreparation();
+      const prepared: { request: EncodeRequest; durationS: null }[] = [];
+      for (const nextInputPath of acceptedPaths) {
+        const nextOutputPath = await suggestedOutputForInput(nextInputPath, batchFormat, takenPaths);
+        takenPaths.push(nextOutputPath);
+        prepared.push({
+          request: {
+            ...cloneEncodeRequest(requestTemplate),
+            inputPath: nextInputPath,
+            outputPath: nextOutputPath,
+          },
+          durationS: null,
+        });
+      }
+
+      const beforeCount = exportQueueStateRef.current.items.length;
+      const next = dispatchExportQueue({ type: "enqueue-prepared", items: prepared });
+      const acceptedCount = next.items.length - beforeCount;
+      resumeQueueAfterPreparation(next, resumeIntent);
+      setStatus(describeQueueIngestion(acceptedCount, { ...counts, overflowCount }));
+      return acceptedCount;
+    });
+  }
+
+  function applyQueueRequestToWorkbench(request: EncodeRequest, sourceProbe: VideoProbe, nextOutputPath: string) {
+    const resize = request.resize ?? {
+      mode: request.maxEdgePx ? "maxEdge" as const : "source" as const,
+      maxEdgePx: request.maxEdgePx ?? null,
+      widthPx: null,
+      heightPx: null,
+    };
+    const advanced = request.advanced ?? {};
+    const crop = request.crop ?? null;
+    const color = request.color ?? null;
+
+    setFormat(request.format);
+    setTitle(request.title ?? "");
+    setSizeLimitMb(request.sizeLimitMb > 0 ? String(request.sizeLimitMb) : "");
+    setResizeMode(request.format === "mp3" ? "source" : resize.mode);
+    setMaxEdgePx(resize.mode === "maxEdge" && resize.maxEdgePx ? String(resize.maxEdgePx) : "");
+    setCustomWidthPx(resize.mode === "custom" && resize.widthPx ? String(resize.widthPx) : "");
+    setCustomHeightPx(resize.mode === "custom" && resize.heightPx ? String(resize.heightPx) : "");
+    setOutputAspectLocked(true);
+    const requestedAudio = request.format === "mp3" || request.audioEnabled;
+    autoMutedRef.current = requestedAudio && !sourceProbe.hasAudio;
+    setAudioEnabled(requestedAudio && sourceProbe.hasAudio);
+    setNormalizeAudio(request.normalizeAudio);
+    setPerturbFirstFrame(request.format === "mp3" ? false : request.perturbFirstFrame);
+    setColorPolicy(request.format === "mp3" ? "auto" : request.colorPolicy);
+    setStripMetadata(request.stripMetadata);
+    setAdvancedVideoCodec((advanced.videoCodec ?? "auto") as VideoCodecPreference);
+    setAdvancedAudioBitrateKbps(advanced.audioBitrateKbps == null ? "auto" : String(advanced.audioBitrateKbps));
+    setAdvancedVideoQuality((advanced.videoQuality ?? "auto") as VideoQualityPreference);
+    setAdvancedEncodeSpeed((advanced.encodeSpeed ?? "auto") as EncodeSpeedPreference);
+    setAdvancedFrameRateCapFps(advanced.frameRateCapFps == null ? "auto" : String(advanced.frameRateCapFps));
+    setAdvancedAudioChannels((advanced.audioChannels ?? "auto") as AudioChannelPreference);
+
+    setTrimStart(request.trim?.startS ? String(request.trim.startS) : "0");
+    setTrimEnd(request.trim?.endS == null ? "" : String(request.trim.endS));
+    setTrimDragSnapS("0");
+    setReverse(request.reverse);
+    setLoopVideo(request.format === "mp3" ? false : request.loopVideo);
+    setSpeed(String(request.speed));
+    setRotateDeg(request.rotateDeg);
+
+    setCropEnabled(Boolean(crop));
+    setCropRect(crop
+      ? {
+          x: clamp(crop.x / sourceProbe.width, 0, 1),
+          y: clamp(crop.y / sourceProbe.height, 0, 1),
+          w: clamp(crop.width / sourceProbe.width, 0, 1),
+          h: clamp(crop.height / sourceProbe.height, 0, 1),
+        }
+      : { x: 0, y: 0, w: 1, h: 1 });
+    setAspectLocked(false);
+    setAspectPreset("free");
+    setCropDetectHint(null);
+
+    setBrightness(String(color?.brightness ?? 0));
+    setContrast(String(color?.contrast ?? 1));
+    setSaturation(String(color?.saturation ?? 1));
+    setSampleEstimate(null);
+    // The snapshot preparer already allocated this collision-free path. Keep
+    // it fixed so a later automatic suggestion cannot replace it while the
+    // newly applied source is probing.
+    setOutputAuto(false);
+    setOutputPath(nextOutputPath);
+  }
+
+  async function retryQueueItem(itemId: number) {
+    const resumeIntent = captureQueueResumeIntent();
+    await serializeQueuePreparation(async () => {
+      const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
+      if (!item || (item.status !== "failed" && item.status !== "cancelled")) return;
+      const previousOutputPath = item.outputPath;
+      const takenPaths = claimedOutputPathsForPreparation();
+      const nextOutputPath = await suggestedOutputForInput(item.inputPath, item.format, takenPaths);
+      const currentItem = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
+      if (
+        !currentItem ||
+        (currentItem.status !== "failed" && currentItem.status !== "cancelled") ||
+        currentItem.outputPath !== previousOutputPath
+      ) return;
+      const nextRequest = { ...cloneEncodeRequest(item.request), outputPath: nextOutputPath };
+      const next = dispatchExportQueue({
+        type: "retry-prepared",
+        itemId,
+        request: nextRequest,
+        durationS: item.durationS,
+      });
+      const retried = next.items.find((candidate) => candidate.id === itemId);
+      if (!retried || retried.status !== "queued" || retried.outputPath !== nextOutputPath) return;
+      setStatus(`Queued a retry for ${basename(item.inputPath)} with a fresh output path.`);
+      const resumed = resumeQueueAfterPreparation(next, resumeIntent);
+      const preferredFocus = resumed.autoRun ? queueStopButtonRef : queueRunButtonRef;
+      window.setTimeout(() => focusQueueAfterMutation(preferredFocus), 0);
+    });
+  }
+
+  async function duplicateQueueItem(itemId: number) {
+    const resumeIntent = captureQueueResumeIntent();
+    await serializeQueuePreparation(async () => {
+      const state = exportQueueStateRef.current;
+      const item = state.items.find((candidate) => candidate.id === itemId);
+      if (!item || item.status === "running") return;
+      if (exportQueueRemainingCapacity(state) === 0) {
+        setStatus("The export queue is full. Clear finished items before duplicating another plan.");
+        return;
+      }
+      const sourceOutputPath = item.outputPath;
+      const takenPaths = claimedOutputPathsForPreparation();
+      const nextOutputPath = await suggestedOutputForInput(item.inputPath, item.format, takenPaths);
+      const currentItem = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
+      if (!currentItem || currentItem.status === "running" || currentItem.outputPath !== sourceOutputPath) return;
+      const beforeCount = exportQueueStateRef.current.items.length;
+      const next = dispatchExportQueue({
+        type: "duplicate-prepared",
+        sourceItemId: itemId,
+        request: { ...cloneEncodeRequest(item.request), outputPath: nextOutputPath },
+        durationS: item.durationS,
+      });
+      if (next.items.length !== beforeCount + 1) return;
+      setStatus(`Duplicated ${basename(item.inputPath)} with a fresh output path.`);
+      const resumed = resumeQueueAfterPreparation(next, resumeIntent);
+      if (exportQueueRemainingCapacity(resumed) === 0) {
+        const preferredFocus = resumed.autoRun ? queueStopButtonRef : queueRunButtonRef;
+        window.setTimeout(() => focusQueueAfterMutation(preferredFocus), 0);
+      }
+    });
+  }
+
+  async function applyQueueItemSnapshot(itemId: number) {
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queueSnapshotApplyingRef.current ||
+      queuePreparationCountRef.current > 0
+    ) return;
+
+    const token = queueSnapshotApplyTokenRef.current + 1;
+    queueSnapshotApplyTokenRef.current = token;
+    queueSnapshotApplyingRef.current = true;
+    setQueueSnapshotApplying(true);
+    window.setTimeout(focusQueueAfterMutation, 0);
     try {
-      const request = buildRequest();
-      // Earlier queue snapshots may already claim this suggested path even
-      // though nothing exists on disk yet.
-      const outputPath = ensureUniqueOutputPath(request.outputPath, queuedOutputPaths());
-      enqueueItems([
-        createQueueItem(
-          outputPath === request.outputPath ? request : { ...request, outputPath },
-          plannedSummary?.durationS ?? null,
-        ),
-      ]);
-    } catch (e) {
-      setStatus(coerceErrorMessage(e, "Failed to queue current export."));
+      await serializeQueuePreparation(async () => {
+        const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
+        if (!item || item.status === "running") return;
+        const requestFingerprint = JSON.stringify(item.request);
+        const [sourceProbe, nextOutputPath] = await Promise.all([
+          invoke<VideoProbe>("probe_video", { path: item.inputPath }),
+          suggestedOutputForInput(item.inputPath, item.format, claimedOutputPathsForPreparation()),
+        ]);
+        if (queueSnapshotApplyTokenRef.current !== token) return;
+        if (item.format === "mp3" && !sourceProbe.hasAudio) {
+          throw new Error("That queue snapshot requests MP3, but the source has no audio stream.");
+        }
+        if (
+          jobIdRef.current !== null ||
+          pendingEncodeRef.current !== null ||
+          exportQueueStateRef.current.autoRun ||
+          !queueSnapshotApplyingRef.current
+        ) return;
+        const currentItem = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
+        if (!currentItem || currentItem.status === "running" || JSON.stringify(currentItem.request) !== requestFingerprint) return;
+
+        const request = { ...cloneEncodeRequest(item.request), outputPath: nextOutputPath };
+        const inputChanged = inputPathRef.current !== item.inputPath;
+        pendingQueueSnapshotRef.current = inputChanged
+          ? {
+              token,
+              inputPath: item.inputPath,
+              announce: true,
+            }
+          : null;
+        applyQueueRequestToWorkbench(request, sourceProbe, nextOutputPath);
+        if (inputChanged) setInputPath(item.inputPath);
+        setProbe(sourceProbe);
+        setProbeError(null);
+        setStatus(`Applied the full queue snapshot for ${basename(item.inputPath)} with a fresh output path.`);
+      });
+    } catch (error) {
+      if (queueSnapshotApplyTokenRef.current === token) {
+        pendingQueueSnapshotRef.current = null;
+        setStatus(coerceErrorMessage(error, "Could not apply the queue snapshot."));
+      }
+    } finally {
+      if (queueSnapshotApplyTokenRef.current === token) {
+        queueSnapshotApplyingRef.current = false;
+        setQueueSnapshotApplying(false);
+      }
     }
   }
 
+  async function addCurrentPlanToQueue() {
+    if (!exportReady) return;
+    let capturedRequest: EncodeRequest;
+    try {
+      capturedRequest = buildRequest();
+    } catch (error) {
+      setStatus(coerceErrorMessage(error, "Failed to capture the current export plan."));
+      return;
+    }
+    const capturedDurationS = plannedSummary?.durationS ?? null;
+    await serializeQueuePreparation(async () => {
+      try {
+        if (exportQueueRemainingCapacity(exportQueueStateRef.current) === 0) {
+          setStatus("The export queue is full. Clear finished items before adding another plan.");
+          return;
+        }
+        // Earlier queue snapshots may already claim this suggested path even
+        // though nothing exists on disk yet.
+        const outputPath = ensureUniqueOutputPath(capturedRequest.outputPath, claimedOutputPathsForPreparation());
+        dispatchExportQueue({
+          type: "enqueue-prepared",
+          items: [{
+            request: outputPath === capturedRequest.outputPath
+              ? cloneEncodeRequest(capturedRequest)
+              : { ...cloneEncodeRequest(capturedRequest), outputPath },
+            durationS: capturedDurationS,
+          }],
+        });
+        setOutputSuggestNonce((nonce) => nonce + 1);
+        setStatus(`Queued ${basename(capturedRequest.inputPath)}.`);
+      } catch (e) {
+        setStatus(coerceErrorMessage(e, "Failed to queue current export."));
+      }
+    });
+  }
+
   async function addFilesToQueue() {
-    if (jobId !== null || pendingEncodeRef.current !== null) return;
     try {
       const selected = await openDialog({
         multiple: true,
@@ -3014,91 +3750,119 @@ function App() {
         filters: [{ name: "Video", extensions: SUPPORTED_INPUT_EXTENSIONS }],
       });
       const picked = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
-      const paths = [...new Set(picked)].filter(Boolean);
-      if (!paths.length) return;
-
-      const items: ExportQueueItem[] = [];
-      const takenPaths = queuedOutputPaths();
-      for (const nextInputPath of paths) {
-        const nextOutputPath = await suggestedOutputForInput(nextInputPath, format, takenPaths);
-        takenPaths.push(nextOutputPath);
-        const request = buildSettingsOnlyRequest(nextInputPath, nextOutputPath);
-        items.push(createQueueItem(request, null));
+      const action = resolveDroppedVideoAction({
+        paths: picked,
+        currentFormat: formatRef.current,
+        busy: true,
+        queueCapacity: exportQueueRemainingCapacity(exportQueueStateRef.current),
+      });
+      if (action.kind === "queueInputs") {
+        const acceptedCount = await enqueueInputPaths(action.paths, action);
+        const state = exportQueueStateRef.current;
+        if (acceptedCount > 0 && exportQueueRemainingCapacity(state) === 0) {
+          const preferredFocus = state.autoRun ? queueStopButtonRef : queueRunButtonRef;
+          window.setTimeout(() => focusQueueAfterMutation(preferredFocus), 0);
+        }
+      } else if (action.kind === "status") {
+        setStatus(action.message);
       }
-      enqueueItems(items);
     } catch (e) {
       setStatus(coerceErrorMessage(e, "Failed to add files to the queue."));
     }
   }
 
   function removeQueueItem(id: number) {
-    updateExportQueue((items) => items.filter((item) => item.id !== id || item.status === "running"));
+    const before = exportQueueStateRef.current;
+    const next = dispatchExportQueue({ type: "remove", itemId: id });
+    if (next !== before && !next.items.some((item) => item.id === id)) {
+      window.setTimeout(() => focusQueueAfterMutation(queueFallbackButtonRef), 0);
+    }
   }
 
   function clearCompletedQueueItems() {
-    updateExportQueue((items) => items.filter((item) => item.status === "queued" || item.status === "running"));
+    dispatchExportQueue({ type: "clear-terminal" });
+    window.setTimeout(() => focusQueueAfterMutation(queueFallbackButtonRef), 0);
+  }
+
+  function recordQueueStopIntent() {
+    queueStopRevisionRef.current += 1;
+    dispatchExportQueue({ type: "stop-auto-run" });
   }
 
   function stopQueueAfterCurrent() {
-    queueRunningRef.current = false;
-    setQueueRunning(false);
-    setStatus(jobIdRef.current === null ? "Queue stopped." : "Queue will stop after the current export.");
+    const hasActiveQueueItem =
+      exportQueueStateRef.current.active !== null ||
+      pendingEncodeRef.current?.queueItemId != null;
+    recordQueueStopIntent();
+    setStatus(hasActiveQueueItem ? "Queue will stop after the current export." : "Queue stopped.");
+    window.setTimeout(() => focusQueueAfterMutation(queueFallbackButtonRef), 0);
   }
 
   async function startNextQueuedItem() {
-    if (!queueRunningRef.current || jobIdRef.current !== null) return;
+    const current = exportQueueStateRef.current;
+    if (
+      !current.autoRun ||
+      current.active !== null ||
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      queuePreparationCountRef.current > 0
+    ) return;
 
-    const nextItem = exportQueueRef.current.find((item) => item.status === "queued");
-    if (!nextItem) {
-      queueRunningRef.current = false;
-      setQueueRunning(false);
-      queueActiveItemIdRef.current = null;
-      setQueueActiveItemId(null);
-      setStatus("Queue complete.");
+    const claimed = dispatchExportQueue({ type: "claim-next" });
+    const nextItem = getActiveExportQueueItem(claimed);
+    const active = claimed.active;
+    if (!nextItem || !active) {
+      const counts = summarizeExportQueue(claimed);
+      const problems = counts.failed + counts.cancelled;
+      setStatus(
+        problems > 0
+          ? `Queue finished with ${counts.failed} failed and ${counts.cancelled} canceled. Review the item details or retry.`
+          : "Queue complete.",
+      );
+      window.setTimeout(() => focusQueueAfterMutation(queueFallbackButtonRef), 0);
       return;
     }
 
-    queueActiveItemIdRef.current = nextItem.id;
-    setQueueActiveItemId(nextItem.id);
-    updateExportQueue((items) =>
-      items.map((item) =>
-        item.id === nextItem.id
-          ? { ...item, status: "running", message: null, outputSizeBytes: null }
-          : item,
-      ),
-    );
-
-    const queuedCount = exportQueueRef.current.filter((item) => item.status === "queued").length + 1;
+    const queuedCount = summarizeExportQueue(claimed).queued + 1;
     const result = await startEncode({
       request: cloneEncodeRequest(nextItem.request),
       durationS: nextItem.durationS,
       startingStatus: `Starting queued export (${queuedCount} remaining)…`,
       queueItemId: nextItem.id,
+      queueRunId: active.runId,
     });
 
     if (!result.ok) {
-      updateExportQueue((items) =>
-        items.map((item) =>
-          item.id === nextItem.id
-            ? { ...item, status: "failed", message: result.message, outputSizeBytes: null }
-            : item,
-        ),
-      );
-      queueActiveItemIdRef.current = null;
-      setQueueActiveItemId(null);
-      window.setTimeout(() => void startNextQueuedItem(), 0);
+      const next = dispatchExportQueue({
+        type: "start-failed",
+        itemId: nextItem.id,
+        runId: active.runId,
+        message: result.message,
+        outputPath: nextItem.request.outputPath,
+        completedAtMs: Date.now(),
+      });
+      if (next.autoRun && next.active === null) {
+        window.setTimeout(() => void startNextQueuedItem(), 0);
+      }
     }
   }
 
   function runQueue() {
-    if (jobId !== null || pendingEncodeRef.current !== null || queueRunningRef.current) return;
-    const hasQueuedItems = exportQueueRef.current.some((item) => item.status === "queued");
+    const state = exportQueueStateRef.current;
+    if (
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      queuePreparationCountRef.current > 0 ||
+      state.autoRun ||
+      state.active !== null
+    ) return;
+    const hasQueuedItems = state.items.some((item) => item.status === "queued");
     if (!hasQueuedItems) {
       setStatus("Queue is empty.");
       return;
     }
-    queueRunningRef.current = true;
-    setQueueRunning(true);
+    dispatchExportQueue({ type: "start-auto-run" });
+    window.setTimeout(() => focusQueueAfterMutation(queueStopButtonRef), 0);
     void startNextQueuedItem();
   }
 
@@ -3138,10 +3902,18 @@ function App() {
     durationS?: number | null;
     startingStatus?: string;
     queueItemId?: number | null;
+    queueRunId?: number | null;
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
+    reportAsSmokeResult?: boolean;
   }): Promise<StartEncodeResult> {
     if (pendingEncodeRef.current !== null) {
       return { ok: false, message: "An export is already starting or running." };
+    }
+    if (queuePreparationCountRef.current > 0) {
+      return { ok: false, message: "Wait for queue preparation to finish before starting an export." };
+    }
+    if ((options?.queueItemId ?? null) === null && exportQueueStateRef.current.autoRun) {
+      return { ok: false, message: "Stop the queue before starting a separate export." };
     }
 
     attemptIdRef.current += 1;
@@ -3158,9 +3930,10 @@ function App() {
         durationS: options?.durationS ?? plannedSummary?.durationS ?? null,
         format: request.format,
         queueItemId: options?.queueItemId ?? null,
+        queueRunId: options?.queueRunId ?? null,
         sample: options?.sample ?? null,
       };
-      if (smokeConfigRef.current) {
+      if (smokeConfigRef.current && options?.reportAsSmokeResult) {
         smokeAttemptIdRef.current = attemptId;
       }
       setStatus(options?.startingStatus ?? "Starting…");
@@ -3269,9 +4042,8 @@ function App() {
         ),
       );
     }
-    if (queueActiveItemIdRef.current !== null) {
-      queueRunningRef.current = false;
-      setQueueRunning(false);
+    if (exportQueueStateRef.current.active !== null) {
+      recordQueueStopIntent();
       setStatus("Canceling queued export…");
     } else {
       setStatus("Canceling…");
@@ -3577,6 +4349,446 @@ function App() {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [handleComposeShortcutKeydown]);
+
+  async function runSmokeWorkflowChecks(): Promise<SmokeWorkflowResult> {
+    if (!smokeConfig || !probe || inputPath !== smokeConfig.inputPath) {
+      return { ok: false, message: "Workflow smoke ran before its source was ready." };
+    }
+    if (exportQueueStateRef.current.items.length !== 0 || exportQueueStateRef.current.active !== null) {
+      return { ok: false, message: "Workflow smoke expected a fresh empty queue." };
+    }
+
+    let continuation: {
+      recipeId: string;
+      recipeName: string;
+      originalRecipeRaw: string | null;
+    } | null = null;
+    try {
+      const raw = sessionStorage.getItem(SMOKE_WORKFLOW_SESSION_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (
+          typeof parsed.recipeId !== "string" ||
+          typeof parsed.recipeName !== "string" ||
+          (parsed.originalRecipeRaw !== null && typeof parsed.originalRecipeRaw !== "string")
+        ) {
+          throw new Error("Workflow smoke continuation data was invalid.");
+        }
+        continuation = {
+          recipeId: parsed.recipeId,
+          recipeName: parsed.recipeName,
+          originalRecipeRaw: parsed.originalRecipeRaw,
+        };
+      }
+    } catch (error) {
+      return { ok: false, message: coerceErrorMessage(error, "Workflow smoke continuation data could not be read.") };
+    }
+
+    const originalRecipeRaw = continuation
+      ? continuation.originalRecipeRaw
+      : localStorage.getItem(USER_RECIPE_STORAGE_KEY);
+    const originalRecipeStore = parseUserRecipeStore(originalRecipeRaw);
+    const originalRecipeStatus = recipeStatus;
+    const smokeRecipeName = continuation?.recipeName ?? `Workflow smoke ${Date.now()}`;
+    const renamedSmokeRecipeName = `${smokeRecipeName} renamed`;
+    let smokeRecipeId = continuation?.recipeId ?? null;
+    let workflowSucceeded = false;
+    let workflowReloading = false;
+
+    function setMountedInputValue(input: HTMLInputElement, value: string) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      if (!setter) throw new Error("Workflow smoke could not access the mounted input value setter.");
+      setter.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+
+    try {
+      setOpenCards((cards) => ({ ...cards, recipes: true, queue: true }));
+      await waitMs(180);
+
+      if (!continuation) {
+        const saveRecipeButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="save-current-recipe"]');
+        if (!saveRecipeButton) return { ok: false, message: "Workflow smoke could not find Save current settings." };
+        saveRecipeButton.focus();
+        if (smokeConfig.workflowQueueExport) {
+          await reportSmokeStatus("workflow-recipe-ready", {
+            message: "Waiting for packaged recipe activation on Save current settings.",
+          });
+        }
+        if (!smokeConfig.workflowQueueExport || smokeConfig.skipPreviewInteractions) {
+          saveRecipeButton.click();
+        }
+
+        const saveDialogMounted = await waitForSmokeCondition(() => {
+          const dialog = document.querySelector<HTMLElement>('.vfl-recipe-modal[role="dialog"]');
+          const input = document.getElementById("vfl-user-recipe-name");
+          return Boolean(dialog && input instanceof HTMLInputElement && document.activeElement === input);
+        });
+        const saveDialog = document.querySelector<HTMLElement>('.vfl-recipe-modal[role="dialog"]');
+        const saveNameInput = document.getElementById("vfl-user-recipe-name");
+        const privacySummary = document.getElementById("vfl-recipe-privacy-summary");
+        const valuesSummary = document.getElementById("vfl-recipe-values-summary");
+        if (
+          !saveDialogMounted ||
+          !saveDialog ||
+          !(saveNameInput instanceof HTMLInputElement) ||
+          !valuesSummary?.textContent?.includes("Current values:") ||
+          !privacySummary?.textContent?.includes("Never saved:") ||
+          !privacySummary.textContent.includes("Metadata privacy remains a separate global setting")
+        ) {
+          return { ok: false, message: "Workflow smoke found incomplete save-recipe values, dialog semantics, or privacy copy." };
+        }
+        setMountedInputValue(saveNameInput, smokeRecipeName);
+        const saveConfirm = document.querySelector<HTMLButtonElement>('[data-smoke-id="user-recipe-confirm"]');
+        if (!saveConfirm) return { ok: false, message: "Workflow smoke could not find the mounted Save recipe action." };
+        saveConfirm.click();
+        const savePassed = await waitForSmokeCondition(
+          () => loadUserRecipeStore(localStorage).recipes.some((recipe) => recipe.name === smokeRecipeName),
+        );
+        if (!savePassed) return { ok: false, message: "Workflow smoke did not persist through the mounted Save recipe action." };
+        const savedRecipe = loadUserRecipeStore(localStorage).recipes.find((recipe) => recipe.name === smokeRecipeName);
+        if (!savedRecipe) return { ok: false, message: "Workflow smoke could not recover the saved recipe identity." };
+        smokeRecipeId = savedRecipe.id;
+
+        if (smokeConfig.workflowQueueExport) {
+          sessionStorage.setItem(SMOKE_WORKFLOW_SESSION_KEY, JSON.stringify({
+            recipeId: savedRecipe.id,
+            recipeName: savedRecipe.name,
+            originalRecipeRaw,
+          }));
+          await reportSmokeStatus("workflow-recipe-saved", {
+            message: "Mounted Save persisted the recipe; reloading the packaged WebView to verify restoration.",
+          });
+          workflowReloading = true;
+          window.location.reload();
+          await waitMs(60_000);
+          return { ok: false, message: "Workflow smoke reload did not replace the current document." };
+        }
+      }
+
+      if (!smokeRecipeId) return { ok: false, message: "Workflow smoke had no saved recipe identity." };
+      const restoredRecipe = loadUserRecipeStore(localStorage).recipes.find(
+        (recipe) => recipe.id === smokeRecipeId && recipe.name === smokeRecipeName,
+      );
+      const restoredMounted = await waitForSmokeCondition(
+        () => document.querySelector(`[data-user-recipe-id="${smokeRecipeId}"]`) !== null,
+      );
+      if (!restoredRecipe || !restoredMounted) {
+        return { ok: false, message: "Workflow smoke did not restore the saved recipe after packaged startup." };
+      }
+
+      const persistedRaw = localStorage.getItem(USER_RECIPE_STORAGE_KEY) ?? "";
+      const escapedInputPath = JSON.stringify(smokeConfig.inputPath).slice(1, -1);
+      const escapedOutputPath = JSON.stringify(smokeConfig.outputPath).slice(1, -1);
+      const forbiddenRecipeTokens = [
+        smokeConfig.inputPath,
+        smokeConfig.outputPath,
+        escapedInputPath,
+        escapedOutputPath,
+        '"inputPath"',
+        '"outputPath"',
+        '"title"',
+        '"trim"',
+        '"crop"',
+        '"colorPolicy"',
+        '"stripMetadata"',
+        '"diagnostics"',
+        '"jobId"',
+      ];
+      if (forbiddenRecipeTokens.some((token) => token && persistedRaw.includes(token))) {
+        return { ok: false, message: "Workflow smoke found forbidden clip, path, metadata, diagnostic, or identity data in a saved recipe." };
+      }
+
+      let recipeRow = document.querySelector<HTMLElement>(`[data-user-recipe-id="${smokeRecipeId}"]`);
+      const applyRecipeButton = recipeRow
+        ? Array.from(recipeRow.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.getAttribute("aria-label") === `Apply ${smokeRecipeName}`)
+        : null;
+      const renameRecipeButton = recipeRow
+        ? Array.from(recipeRow.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.getAttribute("aria-label") === `Rename ${smokeRecipeName}`)
+        : null;
+      if (!applyRecipeButton || !renameRecipeButton) {
+        return { ok: false, message: "Workflow smoke could not find mounted Apply and Rename recipe actions." };
+      }
+      applyRecipeButton.click();
+      await waitMs(100);
+      renameRecipeButton.click();
+      await waitMs(160);
+
+      const renameInput = document.getElementById("vfl-user-recipe-name");
+      if (!(renameInput instanceof HTMLInputElement)) {
+        return { ok: false, message: "Workflow smoke could not find the mounted rename field." };
+      }
+      setMountedInputValue(renameInput, renamedSmokeRecipeName);
+      await waitMs(120);
+      const renameConfirm = document.querySelector<HTMLButtonElement>('[data-smoke-id="user-recipe-confirm"]');
+      if (!renameConfirm) return { ok: false, message: "Workflow smoke could not find the Rename recipe action." };
+      renameConfirm.click();
+      const renamePassed = await waitForSmokeCondition(
+        () => loadUserRecipeStore(localStorage).recipes.some((recipe) => recipe.name === renamedSmokeRecipeName),
+      );
+      if (!renamePassed) return { ok: false, message: "Workflow smoke did not persist the renamed recipe." };
+
+      const getDeleteRecipeButton = () => {
+        recipeRow = document.querySelector<HTMLElement>(`[data-user-recipe-id="${smokeRecipeId}"]`);
+        return recipeRow
+          ? Array.from(recipeRow.querySelectorAll<HTMLButtonElement>("button")).find(
+              (button) => button.getAttribute("aria-label") === `Delete ${renamedSmokeRecipeName}`,
+            ) ?? null
+          : null;
+      };
+      const deleteMounted = await waitForSmokeCondition(() => getDeleteRecipeButton() !== null);
+      const deleteRecipeButton = getDeleteRecipeButton();
+      if (!deleteMounted || !deleteRecipeButton) {
+        return { ok: false, message: "Workflow smoke could not find the mounted Delete recipe action." };
+      }
+      deleteRecipeButton.click();
+      await waitMs(160);
+      const deleteDialog = document.querySelector<HTMLElement>('.vfl-recipe-modal[role="alertdialog"]');
+      const deleteCancel = deleteDialog?.querySelector<HTMLButtonElement>("button");
+      const deleteConfirm = Array.from(deleteDialog?.querySelectorAll<HTMLButtonElement>("button") ?? []).find(
+        (button) => button.textContent?.trim() === "Delete recipe",
+      );
+      if (!deleteDialog || !deleteCancel || document.activeElement !== deleteCancel || !deleteConfirm) {
+        return { ok: false, message: "Workflow smoke found incomplete delete-recipe alert dialog focus semantics." };
+      }
+      deleteConfirm.click();
+      const deletePassed = await waitForSmokeCondition(
+        () =>
+          !loadUserRecipeStore(localStorage).recipes.some((recipe) => recipe.id === smokeRecipeId) &&
+          document.activeElement === recipeSaveButtonRef.current,
+      );
+      if (!deletePassed) return { ok: false, message: "Workflow smoke did not delete the recipe and restore focus to Save current settings." };
+
+      const sourceExtension = extname(smokeConfig.inputPath);
+      const secondInputPath = `${dirname(smokeConfig.inputPath)}${stem(smokeConfig.inputPath)}-workflow-smoke.${sourceExtension}`;
+      const dropAction = await handleDroppedPaths([smokeConfig.inputPath, secondInputPath]);
+      if (dropAction.kind !== "queueInputs") {
+        return { ok: false, message: "Workflow smoke did not route a multi-file drop into the queue." };
+      }
+      const multiDropPassed = await waitForSmokeCondition(() => exportQueueStateRef.current.items.length === 2);
+      if (!multiDropPassed) return { ok: false, message: "Workflow smoke did not enqueue both dropped paths." };
+      const multiDropItems = exportQueueStateRef.current.items;
+      if (
+        multiDropItems[0].inputPath !== smokeConfig.inputPath ||
+        multiDropItems[1].inputPath !== secondInputPath ||
+        multiDropItems[0].outputPath === multiDropItems[1].outputPath
+      ) {
+        return { ok: false, message: "Workflow smoke found unstable drop ordering or colliding output previews." };
+      }
+
+      const getDuplicateButton = () => {
+        const firstRow = document.querySelector<HTMLElement>(`[data-queue-item-id="${multiDropItems[0].id}"]`);
+        return firstRow?.querySelector<HTMLButtonElement>('[data-queue-action="duplicate"]') ?? null;
+      };
+      const duplicateMounted = await waitForSmokeCondition(() => getDuplicateButton() !== null);
+      const duplicateButton = getDuplicateButton();
+      if (!duplicateMounted || !duplicateButton) {
+        return { ok: false, message: "Workflow smoke could not find the mounted Duplicate action." };
+      }
+      duplicateButton.click();
+      const duplicatePassed = await waitForSmokeCondition(() => exportQueueStateRef.current.items.length === 3);
+      if (!duplicatePassed) return { ok: false, message: "Workflow smoke did not duplicate the queue snapshot." };
+      const duplicatedItems = exportQueueStateRef.current.items;
+      const duplicatedItem = duplicatedItems[duplicatedItems.length - 1];
+      const duplicatedRow = duplicatedItem
+        ? document.querySelector<HTMLElement>(`[data-queue-item-id="${duplicatedItem.id}"]`)
+        : null;
+      const removeDuplicateButton = duplicatedRow?.querySelector<HTMLButtonElement>('[data-queue-action="remove"]');
+      if (!duplicatedItem || !removeDuplicateButton) {
+        return { ok: false, message: "Workflow smoke could not find the duplicated item's Remove action." };
+      }
+      removeDuplicateButton.focus();
+      removeDuplicateButton.click();
+      const removeFocused = await waitForSmokeCondition(
+        () =>
+          !exportQueueStateRef.current.items.some((item) => item.id === duplicatedItem.id) &&
+          document.activeElement === queueFallbackButtonRef.current,
+      );
+      if (!removeFocused) return { ok: false, message: "Workflow smoke did not restore focus after queue removal." };
+
+      const currentRequest = buildRequest();
+      const snapshotOutputPath = await suggestedOutputForInput(
+        currentRequest.inputPath,
+        currentRequest.format,
+        claimedOutputPathsForPreparation(),
+      );
+      const beforeSnapshotCount = exportQueueStateRef.current.items.length;
+      const snapshotState = dispatchExportQueue({
+        type: "enqueue-prepared",
+        items: [{
+          request: { ...currentRequest, outputPath: snapshotOutputPath },
+          durationS: plannedSummary?.durationS ?? null,
+        }],
+      });
+      const snapshotItem = snapshotState.items[beforeSnapshotCount];
+      const getApplySnapshotButton = () => {
+        const snapshotRow = document.querySelector<HTMLElement>(`[data-queue-item-id="${snapshotItem.id}"]`);
+        return snapshotRow?.querySelector<HTMLButtonElement>('[data-queue-action="apply-snapshot"]') ?? null;
+      };
+      const snapshotMounted = await waitForSmokeCondition(() => getApplySnapshotButton() !== null);
+      const applySnapshotButton = getApplySnapshotButton();
+      if (!snapshotMounted || !applySnapshotButton) {
+        return { ok: false, message: "Workflow smoke could not find the mounted Apply snapshot action." };
+      }
+      applySnapshotButton.click();
+      const snapshotApplied = await waitForSmokeCondition(
+        () =>
+          document.querySelector(".vfl-footer-status")?.textContent?.includes("Applied the full queue snapshot") === true &&
+          !queueSnapshotApplyingRef.current,
+      );
+      if (!snapshotApplied) return { ok: false, message: "Workflow smoke did not apply the full queue snapshot." };
+      setOutputAuto(false);
+      setOutputPath(smokeConfig.outputPath);
+
+      const smokeDiagnostics: ExportDiagnostics = {
+        mode: "workflow-smoke",
+        videoAction: "encode",
+        audioAction: "copy",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        passes: 1,
+        attempts: 1,
+        audioRemovedForSizeTarget: false,
+        commandPreview: "ffmpeg workflow smoke",
+      };
+      dispatchExportQueue({ type: "reset" });
+      const failureRequest = {
+        ...buildRequest(),
+        outputPath: smokeConfig.inputPath,
+      };
+      const failureQueue = dispatchExportQueue({
+        type: "enqueue-prepared",
+        items: [{ request: failureRequest, durationS: plannedSummary?.durationS ?? null }],
+      });
+      const failedItem = failureQueue.items[0];
+      if (!failedItem) return { ok: false, message: "Workflow smoke could not enqueue the deterministic failure." };
+
+      if (smokeConfig.workflowQueueExport) {
+        runQueue();
+        const realFailurePassed = await waitForSmokeCondition(() => {
+          const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === failedItem.id);
+          return Boolean(item?.status === "failed" && item.lastOutcome?.diagnostics && !exportQueueStateRef.current.autoRun);
+        }, 60_000);
+        if (!realFailurePassed) {
+          return { ok: false, message: "Workflow smoke did not retain diagnostics from the real queued backend failure." };
+        }
+      } else {
+        let failureState = dispatchExportQueue({ type: "start-auto-run" });
+        failureState = dispatchExportQueue({ type: "claim-next" });
+        const failedActive = failureState.active;
+        if (!failedActive) return { ok: false, message: "Workflow smoke could not claim a queue item." };
+        dispatchExportQueue({ type: "stop-auto-run" });
+        dispatchExportQueue({
+          type: "settled",
+          itemId: failedActive.itemId,
+          runId: failedActive.runId,
+          outcome: {
+            kind: "failed",
+            message: "Workflow smoke retained failure.",
+            outputPath: failedItem.outputPath,
+            diagnostics: smokeDiagnostics,
+            completedAtMs: Date.now(),
+          },
+        });
+      }
+      const getFailureControls = () => {
+        const failedRow = document.querySelector<HTMLElement>(`[data-queue-item-id="${failedItem.id}"]`);
+        return {
+          retryButton: failedRow?.querySelector<HTMLButtonElement>('[data-queue-action="retry"]') ?? null,
+          diagnostics: failedRow?.querySelector(".vfl-queue-diagnostics") ?? null,
+        };
+      };
+      const failureMounted = await waitForSmokeCondition(() => {
+        const controls = getFailureControls();
+        return controls.retryButton !== null && controls.diagnostics !== null;
+      });
+      const { retryButton, diagnostics } = getFailureControls();
+      if (!failureMounted || !retryButton || !diagnostics) {
+        return { ok: false, message: "Workflow smoke did not retain mounted failure diagnostics and Retry." };
+      }
+      const failedOutputPath = failedItem.outputPath;
+      retryButton.focus();
+      retryButton.click();
+      const retryPassed = await waitForSmokeCondition(() => {
+        const retried = exportQueueStateRef.current.items.find((item) => item.id === failedItem.id);
+        return Boolean(
+          retried &&
+          retried.status === "queued" &&
+          retried.outputPath !== failedOutputPath &&
+          retried.lastOutcome?.diagnostics !== null &&
+          document.activeElement === queueRunButtonRef.current,
+        );
+      });
+      if (!retryPassed) return { ok: false, message: "Workflow smoke did not retry with a fresh path and retained diagnostics." };
+
+      if (smokeConfig.workflowQueueExport) {
+        const runQueueButton = queueRunButtonRef.current;
+        if (!runQueueButton) return { ok: false, message: "Workflow smoke could not find Run queue after retry." };
+        runQueueButton.focus();
+        await reportSmokeStatus("workflow-queue-ready", {
+          message: "Waiting for packaged keyboard activation on Run queue after a real failure and retry.",
+        });
+        if (smokeConfig.skipPreviewInteractions) runQueueButton.click();
+
+        const realSuccessPassed = await waitForSmokeCondition(() => {
+          const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === failedItem.id);
+          return Boolean(
+            item?.status === "done" &&
+            item.lastOutcome?.kind === "done" &&
+            item.lastOutcome.diagnostics &&
+            item.history.length >= 2 &&
+            item.history.some((attempt) => attempt.kind === "failed" && attempt.diagnostics) &&
+            !exportQueueStateRef.current.autoRun,
+          );
+        }, 60_000);
+        if (!realSuccessPassed) {
+          return { ok: false, message: "Workflow smoke did not complete the real queued retry with retained failure history." };
+        }
+        const historyMounted = await waitForSmokeCondition(() => {
+          const row = document.querySelector<HTMLElement>(`[data-queue-item-id="${failedItem.id}"]`);
+          return Boolean(row?.querySelector(".vfl-queue-history")?.textContent?.includes("Attempted output"));
+        });
+        if (!historyMounted) return { ok: false, message: "Workflow smoke could not inspect retained prior-attempt history after success." };
+        await reportSmokeStatus("workflow-queue-complete", {
+          message: "Real queued failure, retry, keyboard run, backend success, diagnostics, and history checks passed.",
+        });
+      }
+
+      const reusable = reusableSettingsFromEncodeRequest(failedItem.request);
+      const reusableRaw = JSON.stringify(reusable);
+      if (!reusable || reusableRaw.includes(smokeConfig.inputPath) || reusableRaw.includes("inputPath")) {
+        return { ok: false, message: "Workflow smoke found a media path in the reusable queue settings boundary." };
+      }
+
+      dispatchExportQueue({ type: "reset" });
+      if (exportQueueStateRef.current.items.length !== 0) {
+        return { ok: false, message: "Workflow smoke could not restore an empty queue." };
+      }
+      workflowSucceeded = true;
+      return {
+        ok: true,
+        message: "Packaged recipe restoration, queue recovery, multi-file routing, snapshot, diagnostics, focus, and retry checks passed.",
+      };
+    } catch (error) {
+      return { ok: false, message: coerceErrorMessage(error, "Packaged workflow checks failed.") };
+    } finally {
+      const shouldRestore = workflowSucceeded || (!smokeConfig.workflowQueueExport && !workflowReloading);
+      if (shouldRestore) {
+        closeRecipeDialog();
+        dispatchExportQueue({ type: "reset" });
+        try {
+          if (originalRecipeRaw === null) localStorage.removeItem(USER_RECIPE_STORAGE_KEY);
+          else localStorage.setItem(USER_RECIPE_STORAGE_KEY, originalRecipeRaw);
+          sessionStorage.removeItem(SMOKE_WORKFLOW_SESSION_KEY);
+        } catch {
+          // The returned failure will identify persistence problems in the main path.
+        }
+        setUserRecipeStore(originalRecipeStore);
+        setRecipeStatus(originalRecipeStatus);
+      }
+    }
+  }
 
   async function runSmokeAccessibilityChecks(): Promise<SmokeAccessibilityResult> {
     if (!probe || !previewReady || !previewMediaReady) {
@@ -4057,9 +5269,11 @@ function App() {
 
   return (
     <div className="vfl-app">
-      {dragActive && jobId === null && !modalOpen ? (
+      {dragActive && !modalOpen ? (
         <div className="vfl-drop-overlay" aria-hidden="true">
-          <div className="vfl-drop-overlay-card">Drop a video to open</div>
+          <div className="vfl-drop-overlay-card">
+            {encodeBusy ? "Drop files to add them after the current export" : "Drop one file to open, or several to queue"}
+          </div>
         </div>
       ) : null}
       {elevatedUpdateRun ? (
@@ -4138,6 +5352,19 @@ function App() {
               </button>
             </div>
         </ModalDialog>
+      ) : recipeDialog ? (
+        <UserRecipeDialog
+          state={recipeDialog}
+          nameDraft={recipeNameDraft}
+          currentSettingsSummary={currentRecipeSettingsSummary}
+          error={recipeDialogError}
+          onNameDraftChange={(name) => {
+            setRecipeNameDraft(name);
+            setRecipeDialogError(null);
+          }}
+          onConfirm={confirmRecipeDialog}
+          onCancel={closeRecipeDialog}
+        />
       ) : null}
       <header className="vfl-header">
         {updateNotice ? (
@@ -4483,7 +5710,7 @@ function App() {
 
           <RailCard
             title="Recipes"
-            summary={matchingRecipe ? matchingRecipe.label : "Custom settings"}
+            summary={matchingRecipeLabel ?? "Custom settings"}
             open={openCards.recipes}
             onToggle={() => toggleCard("recipes")}
           >
@@ -4492,8 +5719,12 @@ function App() {
             </div>
             <div className="vfl-recipe-grid">
               {EXPORT_RECIPES.map((recipe) => {
-                const isActive = matchingRecipe?.id === recipe.id;
-                const isDisabled = encodeBusy || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
+                const isActive = matchingFullBuiltInRecipe?.id === recipe.id ||
+                  (matchingFullBuiltInRecipe === null && matchingUserRecipe === null && matchingPartialBuiltInRecipe?.id === recipe.id);
+                const isDisabled =
+                  encodeBusy ||
+                  (recipe.partial && format === "mp3") ||
+                  (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
                 return (
                   <button
                     key={recipe.id}
@@ -4509,6 +5740,86 @@ function App() {
                 );
               })}
             </div>
+            <section className="vfl-user-recipes" aria-labelledby="vfl-user-recipes-title">
+              <div className="vfl-user-recipes-head">
+                <div>
+                  <div className="vfl-field-label" id="vfl-user-recipes-title">Your recipes</div>
+                  <div className="vfl-inline-hint">Saved only in this app on this device.</div>
+                </div>
+                <button
+                  ref={recipeSaveButtonRef}
+                  type="button"
+                  data-smoke-id="save-current-recipe"
+                  onClick={openSaveRecipeDialog}
+                  disabled={encodeBusy || userRecipeStore.readOnly}
+                >
+                  Save current settings
+                </button>
+              </div>
+              <div className="vfl-recipe-privacy vfl-recipe-privacy-compact">
+                Recipes save format, size, resize, audio, uniqueness, and encoder settings. They never save media or output paths,
+                title, trim, crop, transforms, color edits, HDR conversion choice, diagnostics, or queue and job state. Metadata privacy
+                stays separate.
+              </div>
+              {recipeStatus ? (
+                <div
+                  className={userRecipeStore.readOnly ? "vfl-error" : "vfl-inline-hint"}
+                  role={userRecipeStore.readOnly ? "alert" : "status"}
+                  aria-live={userRecipeStore.readOnly ? "assertive" : "polite"}
+                  aria-atomic="true"
+                  data-smoke-id="user-recipe-status"
+                >
+                  {recipeStatus}
+                </div>
+              ) : null}
+              {userRecipeStore.recipes.length ? (
+                <div className="vfl-user-recipe-list">
+                  {userRecipeStore.recipes.map((recipe) => {
+                    const isActive = matchingFullBuiltInRecipe === null && matchingUserRecipe?.id === recipe.id;
+                    const unavailable = encodeBusy || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
+                    const resize = normalizeRecipeResizeSettings(recipe.settings);
+                    const recipeSummary = `${recipe.settings.format.toUpperCase()} • ${recipe.settings.sizeLimitMb || "no size cap"} • ${resize.mode === "source" ? "source size" : resize.mode === "maxEdge" ? `max ${resize.maxEdgePx}px` : `${resize.widthPx}x${resize.heightPx}`}`;
+                    return (
+                      <div key={recipe.id} className={`vfl-user-recipe ${isActive ? "active" : ""}`} data-user-recipe-id={recipe.id}>
+                        <div className="vfl-user-recipe-copy">
+                          <div className="vfl-recipe-option-title">{recipe.name}</div>
+                          <div className="vfl-recipe-option-copy">{recipeSummary}</div>
+                        </div>
+                        <div className="vfl-user-recipe-actions">
+                          <button
+                            type="button"
+                            aria-label={`Apply ${recipe.name}`}
+                            aria-pressed={isActive}
+                            onClick={() => applyUserRecipe(recipe)}
+                            disabled={unavailable}
+                          >
+                            Apply
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Rename ${recipe.name}`}
+                            onClick={() => openRenameRecipeDialog(recipe)}
+                            disabled={encodeBusy || userRecipeStore.readOnly}
+                          >
+                            Rename
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Delete ${recipe.name}`}
+                            onClick={() => openDeleteRecipeDialog(recipe)}
+                            disabled={encodeBusy || userRecipeStore.readOnly}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="vfl-inline-hint">No user recipes saved yet.</div>
+              )}
+            </section>
           </RailCard>
 
           <RailCard
@@ -5323,7 +6634,7 @@ function App() {
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Recipe</div>
-                      <div className="vfl-summary-value">{matchingRecipe ? matchingRecipe.label : "Custom settings"}</div>
+                      <div className="vfl-summary-value">{matchingRecipeLabel ?? "Custom settings"}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Advanced</div>
@@ -5475,8 +6786,8 @@ function App() {
             title="Queue"
             summary={
               exportQueue.length
-                ? queueActiveItemId !== null
-                  ? `Item ${queueCounts.done + queueCounts.failed + 1} of ${exportQueue.length}`
+                ? activeQueuePosition
+                  ? `Item ${activeQueuePosition} of ${exportQueue.length}`
                   : `${queueCounts.queued} queued`
                 : "Empty"
             }
@@ -5486,20 +6797,26 @@ function App() {
             <div className="vfl-muted vfl-section-caption">
               Add exports as snapshots and run them one after another with no parallel FFmpeg jobs.
             </div>
-            <div className="vfl-actions vfl-actions-wrap vfl-queue-actions">
+            <div
+              ref={queueRegionRef}
+              className="vfl-actions vfl-actions-wrap vfl-queue-actions"
+              role="group"
+              tabIndex={-1}
+              aria-label="Export queue controls"
+            >
               <button type="button" onClick={() => void addCurrentPlanToQueue()} disabled={!exportReady || encodeBusy}>
                 Add current plan
               </button>
-              <button type="button" onClick={() => void addFilesToQueue()} disabled={encodeBusy}>
+              <button ref={queueFallbackButtonRef} type="button" onClick={() => void addFilesToQueue()} disabled={exportQueueRemainingCapacity(exportQueueState) === 0}>
                 Add files
               </button>
-              <button type="button" className="primary" onClick={runQueue} disabled={encodeBusy || queueRunning || queueCounts.queued === 0}>
+              <button ref={queueRunButtonRef} data-smoke-id="run-export-queue" type="button" className="primary" onClick={runQueue} disabled={encodeBusy || queueRunning || queueCounts.queued === 0}>
                 Run queue
               </button>
-              <button type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
+              <button ref={queueStopButtonRef} type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
                 Stop after current
               </button>
-              <button type="button" onClick={clearCompletedQueueItems} disabled={queueCounts.done + queueCounts.failed === 0}>
+              <button type="button" onClick={clearCompletedQueueItems} disabled={queueCounts.done + queueCounts.failed + queueCounts.cancelled === 0}>
                 Clear finished
               </button>
             </div>
@@ -5508,34 +6825,112 @@ function App() {
               <span>{queueCounts.running} running</span>
               <span>{queueCounts.done} done</span>
               <span>{queueCounts.failed} failed</span>
+              <span>{queueCounts.cancelled} canceled</span>
             </div>
             {exportQueue.length ? (
-              <div className="vfl-queue-list">
-                {exportQueue.map((item) => (
-                  <div key={item.id} className={`vfl-queue-item ${item.status} ${queueActiveItemId === item.id ? "active" : ""}`}>
+              <div className="vfl-queue-list" role="list" aria-label="Export queue items">
+                {exportQueue.map((item) => {
+                  const outcome = item.lastOutcome;
+                  const actualOutputPath = outcome?.kind === "done" ? outcome.outputPath : null;
+                  const attemptedOutputPath = outcome && outcome.kind !== "done" ? outcome.outputPath : null;
+                  const outcomeIsFailure = outcome?.kind === "failed" || outcome?.kind === "cancelled";
+                  return (
+                  <div
+                    key={item.id}
+                    role="listitem"
+                    aria-label={`${basename(item.inputPath)}, ${QUEUE_STATUS_LABELS[item.status]}`}
+                    className={`vfl-queue-item ${item.status} ${queueActiveItemId === item.id ? "active" : ""}`}
+                    data-queue-item-id={item.id}
+                  >
                     <div className="vfl-queue-item-main">
                       <div className="vfl-queue-item-title">{basename(item.inputPath)}</div>
                       <div className="vfl-queue-item-meta">
                         {item.format.toUpperCase()} {"->"} {basename(item.outputPath)}
-                        {item.outputSizeBytes ? ` • ${formatByteSize(item.outputSizeBytes)}` : ""}
+                        {outcome?.outputSizeBytes ? ` • ${formatByteSize(outcome.outputSizeBytes)}` : ""}
                       </div>
-                      {item.message ? <div className="vfl-queue-item-message">{item.message}</div> : null}
+                      {actualOutputPath && actualOutputPath !== item.outputPath ? (
+                        <div className="vfl-queue-item-meta">Actual result: {actualOutputPath}</div>
+                      ) : null}
+                      {attemptedOutputPath ? (
+                        <div className="vfl-queue-item-meta">
+                          {item.status === "queued" ? "Previous attempted output" : "Attempted output"}: {attemptedOutputPath}
+                        </div>
+                      ) : null}
+                      {outcome?.message ? (
+                        <div
+                          className="vfl-queue-item-message"
+                          role={outcomeIsFailure ? "alert" : "status"}
+                          aria-live={outcomeIsFailure ? "assertive" : "polite"}
+                          aria-atomic="true"
+                        >
+                          {item.status === "queued" ? "Previous attempt: " : ""}{outcome.message}
+                        </div>
+                      ) : null}
+                      {outcome ? <QueueDiagnosticsDetails outcome={outcome} summary="Latest diagnostics" /> : null}
+                      {item.history.length > 1 ? (
+                        <details className="vfl-queue-history">
+                          <summary>Recent attempt history ({item.history.length} retained)</summary>
+                          <ol>
+                            {item.history.map((attempt) => (
+                              <li key={attempt.runId} data-queue-run-id={attempt.runId}>
+                                <div className="vfl-queue-history-title">
+                                  Run {attempt.runId}: {QUEUE_STATUS_LABELS[attempt.kind]}
+                                </div>
+                                {attempt.outputPath ? (
+                                  <div className="vfl-queue-item-meta">
+                                    {attempt.kind === "done" ? "Result" : "Attempted output"}: {attempt.outputPath}
+                                  </div>
+                                ) : null}
+                                {attempt.message ? <div className="vfl-queue-item-message">{attempt.message}</div> : null}
+                                <QueueDiagnosticsDetails outcome={attempt} summary={`Run ${attempt.runId} diagnostics`} />
+                              </li>
+                            ))}
+                          </ol>
+                        </details>
+                      ) : null}
                     </div>
                     <div className="vfl-queue-item-actions">
                       <span className={`vfl-chip ${item.status === "running" || item.status === "done" ? "active" : ""}`}>
                         {QUEUE_STATUS_LABELS[item.status]}
                       </span>
-                      {item.status === "done" ? (
-                        <button type="button" onClick={() => void openFolderFor(item.outputPath)}>
+                      {item.status === "done" && actualOutputPath ? (
+                        <button type="button" onClick={() => void openOutputFile(actualOutputPath)}>
+                          Open file
+                        </button>
+                      ) : null}
+                      {item.status === "done" && actualOutputPath ? (
+                        <button type="button" onClick={() => void openFolderFor(actualOutputPath)}>
                           Open folder
                         </button>
                       ) : null}
-                      <button type="button" onClick={() => removeQueueItem(item.id)} disabled={item.status === "running"}>
+                      {item.status === "failed" || item.status === "cancelled" ? (
+                        <button type="button" data-queue-action="retry" onClick={() => void retryQueueItem(item.id)}>
+                          Retry
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        data-queue-action="duplicate"
+                        onClick={() => void duplicateQueueItem(item.id)}
+                        disabled={item.status === "running" || exportQueueRemainingCapacity(exportQueueState) === 0}
+                      >
+                        Duplicate
+                      </button>
+                      <button
+                        type="button"
+                        data-queue-action="apply-snapshot"
+                        onClick={() => void applyQueueItemSnapshot(item.id)}
+                        disabled={encodeBusy || item.status === "running"}
+                      >
+                        Apply snapshot
+                      </button>
+                      <button data-queue-action="remove" type="button" onClick={() => removeQueueItem(item.id)} disabled={item.status === "running" || queueSnapshotApplying}>
                         Remove
                       </button>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="vfl-inline-hint">
@@ -5546,7 +6941,7 @@ function App() {
         </aside>
       </div>
 
-      <footer className={`vfl-footer ${attemptUi.isActive ? "is-active" : "is-idle"}`}>
+      <footer className={`vfl-footer ${attemptUi.isActive || queueRunning ? "is-active" : "is-idle"}`}>
         <div className="vfl-footer-main">
           <div className="vfl-footer-copy">
             <div className="vfl-footer-kicker">{footerKicker}</div>
@@ -5571,15 +6966,15 @@ function App() {
                 Cancel
               </button>
             ) : (
-              <button className="primary vfl-export-button" onClick={() => void startEncode()} disabled={!exportReady}>
+              <button className="primary vfl-export-button" onClick={() => void startEncode()} disabled={!exportReady || encodeBusy}>
                 Export
               </button>
             )}
           </div>
         </div>
-        {queueActiveItemId !== null && exportQueue.length ? (
+        {activeQueuePosition && exportQueue.length ? (
           <div className="vfl-footer-queue" aria-live="polite">
-            Queue: item {queueCounts.done + queueCounts.failed + 1} of {exportQueue.length}
+            Queue: item {activeQueuePosition} of {exportQueue.length}
           </div>
         ) : null}
         {jobId !== null ? (

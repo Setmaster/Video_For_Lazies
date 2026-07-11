@@ -11,6 +11,11 @@ const __filename = url.fileURLToPath(import.meta.url);
 const requiredSmokeStages = [
   "input-applied",
   "probe-ready",
+  "workflow-recipe-ready",
+  "workflow-recipe-saved",
+  "workflow-queue-ready",
+  "workflow-queue-complete",
+  "workflow-ready",
   "preview-ready",
   "keyboard-trim-ready",
   "keyboard-trim-incremented",
@@ -383,9 +388,25 @@ async function runLinuxPortableExportSmoke({
   const inputPath = path.resolve(smokeRoot, `smoke-input.${fixture.extension}`);
   const outputPath = path.resolve(smokeRoot, `smoke-output.${outputFormat}`);
   const statusPath = path.resolve(smokeRoot, "smoke-status.json");
+  const xdgDataHome = path.resolve(smokeRoot, "xdg-data");
+  const xdgConfigHome = path.resolve(smokeRoot, "xdg-config");
+  const xdgCacheHome = path.resolve(smokeRoot, "xdg-cache");
+  const stdoutPath = path.resolve(smokeRoot, "app.stdout.log");
+  const stderrPath = path.resolve(smokeRoot, "app.stderr.log");
   let child = null;
+  let stdoutFileHandle = null;
+  let stderrFileHandle = null;
+  let succeeded = false;
 
   try {
+    await Promise.all([
+      fs.mkdir(xdgDataHome, { recursive: true }),
+      fs.mkdir(xdgConfigHome, { recursive: true }),
+      fs.mkdir(xdgCacheHome, { recursive: true }),
+    ]);
+    stdoutFileHandle = await fs.open(stdoutPath, "w");
+    stderrFileHandle = await fs.open(stderrPath, "w");
+
     await runChecked(ffmpegPath, [
       "-y",
       "-hide_banner",
@@ -423,12 +444,16 @@ async function runLinuxPortableExportSmoke({
         VFL_SMOKE_TRIM_START_S: "0",
         ...(useFullDuration ? {} : { VFL_SMOKE_TRIM_END_S: String(trimEndSeconds) }),
         VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS: "1",
+        VFL_SMOKE_WORKFLOW_QUEUE: "1",
+        XDG_DATA_HOME: xdgDataHome,
+        XDG_CONFIG_HOME: xdgConfigHome,
+        XDG_CACHE_HOME: xdgCacheHome,
         ...(resizeMode ? { VFL_SMOKE_RESIZE_MODE: String(resizeMode) } : {}),
         ...(resizeMaxEdgePx === undefined || resizeMaxEdgePx === null ? {} : { VFL_SMOKE_RESIZE_MAX_EDGE_PX: String(resizeMaxEdgePx) }),
         ...(resizeWidthPx === undefined || resizeWidthPx === null ? {} : { VFL_SMOKE_RESIZE_WIDTH_PX: String(resizeWidthPx) }),
         ...(resizeHeightPx === undefined || resizeHeightPx === null ? {} : { VFL_SMOKE_RESIZE_HEIGHT_PX: String(resizeHeightPx) }),
       },
-      stdio: "ignore",
+      stdio: ["ignore", stdoutFileHandle.fd, stderrFileHandle.fd],
     });
 
     const status = await waitForLinuxSmokeSuccess(child, statusPath, timeoutSeconds);
@@ -447,6 +472,10 @@ async function runLinuxPortableExportSmoke({
     const missingStages = linuxRequiredSmokeStages.filter((stage) => !stageHistory.includes(stage));
     if (missingStages.length > 0) {
       throw new Error(`Portable export smoke missed required app stages: ${missingStages.join(", ")}. Saw: ${stageHistory.join(" -> ")}`);
+    }
+    const observedRequiredStages = stageHistory.filter((stage) => linuxRequiredSmokeStages.includes(stage));
+    if (JSON.stringify(observedRequiredStages) !== JSON.stringify(linuxRequiredSmokeStages)) {
+      throw new Error(`Portable export smoke required app stages were out of order. Saw: ${stageHistory.join(" -> ")}`);
     }
 
     const outputStats = await fs.stat(outputPath);
@@ -505,11 +534,23 @@ async function runLinuxPortableExportSmoke({
     }
 
     console.log(`Portable export smoke passed. fixture=${codecFixture} input=${selectedCodec(inputProbe, "video")}/${selectedCodec(inputProbe, "audio")} output=${actualVideoCodec}/${actualAudioCodec} output_path=${outputPath} size_bytes=${outputStats.size} duration_s=${outputDurationS.toFixed(3)} trim=${trimStartS.toFixed(3)}-${trimEndS.toFixed(3)} status=${statusPath} stages=${stageHistory.join(" -> ")}`);
+    succeeded = true;
   } finally {
-    if (child) {
-      await terminateLinuxSmokeProcess(child);
+    try {
+      if (child) {
+        await terminateLinuxSmokeProcess(child);
+      }
+    } finally {
+      await Promise.allSettled([
+        stdoutFileHandle?.close(),
+        stderrFileHandle?.close(),
+      ]);
+      if (succeeded) {
+        await fs.rm(smokeRoot, { recursive: true, force: true });
+      } else {
+        console.error(`Portable export smoke evidence retained at ${smokeRoot}`);
+      }
     }
-    await fs.rm(smokeRoot, { recursive: true, force: true });
   }
 }
 
