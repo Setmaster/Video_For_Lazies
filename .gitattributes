@@ -1,1 +1,2 @@
 app/ffmpeg-capabilities.json text eol=lf
+app/src-tauri/assets/DEJAVU_FONT_LICENSE.txt text eol=lf whitespace=-blank-at-eol

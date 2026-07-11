@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,9 @@ import {
   MALFORMED_SUBTITLE_TEXT,
   REQUIRED_G5_SMOKE_STAGES,
   STAGED_EXTERNAL_SRT_FILE_NAME,
+  STAGED_EXTERNAL_SUBTITLE_FONT_DIR_NAME,
+  STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME,
+  SUBTITLE_FONT_SHA256,
   VALID_SUBTITLE_FILE_NAME,
   VALID_SUBTITLE_TEXT,
   assertPrivacySafeStatusRaw,
@@ -28,7 +32,11 @@ import {
   getPortableG5Paths,
   grayFrameStats,
   normalizeMissingCapabilityFilters,
+  portablePathIdentity,
+  portablePathsReferToSameFile,
   resolveG5SmokeCases,
+  retainSubtitleFontPreflightFailure,
+  sanitizeSubtitleFontPreflightLog,
   subtitleFixturePath,
   targetResultQueueOutcomeKind,
   validateTargetResultEvidence,
@@ -134,7 +142,7 @@ test("G5 packaged corpus is bounded and covers exact targets plus external SRT f
   assert.match(VALID_SUBTITLE_FILE_NAME, /字幕/);
   assert.match(VALID_SUBTITLE_FILE_NAME, /O'Brien,\[x\]; café\.srt$/);
   assert.match(VALID_SUBTITLE_TEXT, /00:00:04,000 --> 00:00:05,000/);
-  assert.match(VALID_SUBTITLE_TEXT, /字幕 café Olá مرحبا/);
+  assert.match(VALID_SUBTITLE_TEXT, /café Olá Καλημέρα Привет مرحبا/);
   assert.match(MALFORMED_SUBTITLE_FILE_NAME, /字幕/);
   assert.match(MALFORMED_SUBTITLE_TEXT, /not-a-time/);
   for (const caseId of ["external-srt-malformed-rejected", "external-srt-missing-capability"]) {
@@ -276,6 +284,28 @@ test("portable G5 path and launch helpers preserve native Windows/Linux runtime 
     args: [],
   });
   assert.throws(() => getPortableG5Paths("/tmp/VFL", { platform: "darwin" }), /only Windows and Linux/i);
+});
+
+test("portable output identity accepts Windows extended paths and existing aliases", async () => {
+  assert.equal(
+    portablePathIdentity("\\\\?\\C:\\Users\\runneradmin\\AppData\\Local\\Temp\\clip.mp4", { platform: "win32" }),
+    portablePathIdentity("C:\\Users\\runneradmin\\AppData\\Local\\Temp\\clip.mp4", { platform: "win32" }),
+  );
+  assert.equal(
+    portablePathIdentity("\\\\?\\UNC\\server\\share\\clip.mp4", { platform: "win32" }),
+    portablePathIdentity("\\\\server\\share\\clip.mp4", { platform: "win32" }),
+  );
+
+  const root = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-g5-path-alias-"));
+  try {
+    const original = path.resolve(root, "original.mp4");
+    const alias = path.resolve(root, "alias.mp4");
+    await fs.writeFile(original, "same file");
+    await fs.link(original, alias);
+    assert.equal(await portablePathsReferToSameFile(original, alias, { platform: process.platform }), true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("exact target evidence agrees with filesystem bytes, plan history, and queue outcome", () => {
@@ -424,7 +454,7 @@ test("status privacy rejects raw and JSON-escaped subtitle paths or text", () =>
   const escapedSubtitlePath = JSON.stringify(subtitlePath).slice(1, -1);
   assert.doesNotThrow(() => assertPrivacySafeStatusRaw(
     JSON.stringify({ stage: "success", diagnostics: { subtitleBurnedIn: true, subtitleCueCount: 1 } }),
-    [subtitlePath, VALID_SUBTITLE_FILE_NAME, "字幕 café Olá مرحبا"],
+    [subtitlePath, VALID_SUBTITLE_FILE_NAME, "café Olá Καλημέρα Привет مرحبا"],
   ));
   assert.throws(
     () => assertPrivacySafeStatusRaw(JSON.stringify({ message: subtitlePath }), [subtitlePath]),
@@ -435,7 +465,7 @@ test("status privacy rejects raw and JSON-escaped subtitle paths or text", () =>
     /leaked private subtitle source material/i,
   );
   assert.throws(
-    () => assertPrivacySafeStatusRaw(JSON.stringify({ message: "字幕 café Olá مرحبا" }), ["字幕 café Olá مرحبا"]),
+    () => assertPrivacySafeStatusRaw(JSON.stringify({ message: "café Olá Καλημέρα Привет مرحبا" }), ["café Olá Καλημέρα Привет مرحبا"]),
     /leaked private subtitle source material/i,
   );
   assert.throws(
@@ -466,22 +496,59 @@ test("subtitle timing evidence requires a high-contrast cue only in the source-t
 
 test("Unicode subtitle font preflight uses the backend fixed style and rejects glyph/font warnings", async () => {
   const videoSource = await fs.readFile(path.resolve(__dirname, "../src-tauri/src/video.rs"), "utf8");
+  const fontBytes = await fs.readFile(path.resolve(__dirname, "../src-tauri/assets/DejaVuSans.ttf"));
   assert.equal(STAGED_EXTERNAL_SRT_FILE_NAME, "vfl_external.srt");
+  assert.equal(STAGED_EXTERNAL_SUBTITLE_FONT_DIR_NAME, "fonts");
+  assert.equal(STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME, "DejaVuSans.ttf");
+  assert.equal(crypto.createHash("sha256").update(fontBytes).digest("hex"), SUBTITLE_FONT_SHA256);
   assert.equal(
     EXTERNAL_SRT_FILTER,
-    `subtitles=filename=${STAGED_EXTERNAL_SRT_FILE_NAME}:force_style='${EXTERNAL_SRT_FORCE_STYLE}'`,
+    `subtitles=filename=${STAGED_EXTERNAL_SRT_FILE_NAME}:fontsdir=${STAGED_EXTERNAL_SUBTITLE_FONT_DIR_NAME}:force_style='${EXTERNAL_SRT_FORCE_STYLE}'`,
   );
   assert.ok(
     videoSource.includes(`"${EXTERNAL_SRT_FILTER}"`),
     "packaged warning preflight must use the exact backend staged filename and fixed style",
   );
+  assert.match(videoSource, /include_bytes!\("\.\.\/assets\/DejaVuSans\.ttf"\)/);
+  assert.match(videoSource, /EXTERNAL_SUBTITLE_FONT_FILE_NAME/);
+  assert.match(EXTERNAL_SRT_FORCE_STYLE, /FontName=DejaVu Sans/);
   assert.equal(countFontGlyphWarnings(""), 0);
   assert.equal(countFontGlyphWarnings("unrelated muxer warning\n"), 0);
   assert.equal(countFontGlyphWarnings([
-    "Glyph 0x5B57 not found, selecting one more font for (Arial, 400, 0)",
+    "Glyph 0x5B57 not found, selecting one more font for (DejaVu Sans, 400, 0)",
     "fontselect: failed to find any fallback with glyph 0x5B57",
-    "Could not load font Arial",
-  ].join("\n")), 3);
+    "Could not load font DejaVu Sans",
+    "[Parsed_subtitles_0] Error opening memory font 'vfl_external.srt'",
+  ].join("\n")), 4);
+});
+
+test("subtitle font preflight failures retain bounded path-free diagnostics", async () => {
+  const root = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-g5-font-failure-"));
+  try {
+    const raw = [
+      "café Olá Καλημέρα Привет مرحبا",
+      "[Parsed_subtitles_0] Error opening memory font 'vfl_external.srt'",
+    ].join("\n");
+    assert.doesNotMatch(sanitizeSubtitleFontPreflightLog(raw), /Καλημέρα|Привет|مرحبا/);
+    const sidecar = await retainSubtitleFontPreflightFailure(root, {
+      stderr: Buffer.from(raw),
+      exitCode: 1,
+      signal: null,
+    });
+    const [stderrLog, jsonRaw] = await Promise.all([
+      fs.readFile(path.resolve(root, "subtitle-font-preflight.stderr.log"), "utf8"),
+      fs.readFile(path.resolve(root, "subtitle-font-preflight.failure.json"), "utf8"),
+    ]);
+    const json = JSON.parse(jsonRaw);
+    assert.equal(sidecar.fontGlyphWarningCount, 1);
+    assert.equal(json.fontGlyphWarningCount, 1);
+    assert.equal(json.sha256, SUBTITLE_FONT_SHA256);
+    assert.equal(json.exitCode, 1);
+    assert.doesNotMatch(stderrLog, /Καλημέρα|Привет|مرحبا/);
+    assert.match(stderrLog, /Error opening memory font/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("G5 corpus is wired into extracted portable verification without changing version", async () => {

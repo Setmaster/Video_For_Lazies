@@ -23,6 +23,11 @@ import { getProjectVersion } from "./versioning.mjs";
 
 const GENERATED_DOCS_DIR = path.resolve(repoRoot, "release", "generated-docs");
 const PROJECT_URL = "https://github.com/Setmaster/Video_For_Lazies";
+const SUBTITLE_FONT_LICENSE_PATH = path.resolve(appRoot, "src-tauri", "assets", "DEJAVU_FONT_LICENSE.txt");
+const SUBTITLE_FONT_SOURCE_ARCHIVE_URL = "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip";
+const SUBTITLE_FONT_SOURCE_ARCHIVE_SHA256 = "7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a";
+const SUBTITLE_FONT_SHA256 = "7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954";
+const SUBTITLE_FONT_LICENSE_SHA256 = "7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93";
 
 async function pathExists(targetPath) {
   try {
@@ -164,7 +169,13 @@ function renderDependencyTable(dependencies, columns) {
   return [header, divider, ...rows].join("\n");
 }
 
-export function renderThirdPartyNotices({ npmDependencies, cargoDependencies, version, commitSha } = {}) {
+export function renderThirdPartyNotices({
+  npmDependencies,
+  cargoDependencies,
+  version,
+  commitSha,
+  subtitleFontLicense = "",
+} = {}) {
   const windowsBundle = FFMPEG_BUNDLE.windowsX64;
   const linuxBundle = FFMPEG_BUNDLE.linuxX64;
   return [
@@ -200,6 +211,20 @@ export function renderThirdPartyNotices({ npmDependencies, cargoDependencies, ve
     `- x264 source archive: \`${linuxX264SourceArchiveName}\``,
     "",
     "Each portable folder includes upstream FFmpeg license text, bundle notices, and the source/provenance archives under `ffmpeg-sidecar/source/`.",
+    "",
+    "## Embedded Subtitle Font",
+    "",
+    "External SRT burn-in uses DejaVu Sans 2.37, embedded in the application and staged privately for FFmpeg/libass so the fixed base face is available on every supported platform. Glyphs outside DejaVu Sans coverage may still require platform fallback.",
+    "",
+    `- Source archive: ${SUBTITLE_FONT_SOURCE_ARCHIVE_URL}`,
+    `- Source archive SHA256: \`${SUBTITLE_FONT_SOURCE_ARCHIVE_SHA256}\``,
+    `- Embedded \`DejaVuSans.ttf\` SHA256: \`${SUBTITLE_FONT_SHA256}\``,
+    `- License file SHA256: \`${SUBTITLE_FONT_LICENSE_SHA256}\``,
+    "- License: DejaVu Fonts license, reproduced below.",
+    "",
+    "```text",
+    subtitleFontLicense.trim(),
+    "```",
     "",
     "## npm Dependency Inventory",
     "",
@@ -289,13 +314,14 @@ export async function generatePortableDocs({ outputDir = GENERATED_DOCS_DIR } = 
   const context = await getGitSourceContext();
   const npmDependencies = await collectNpmDependencies();
   const cargoDependencies = await collectCargoDependencies();
+  const subtitleFontLicense = await fs.readFile(SUBTITLE_FONT_LICENSE_PATH, "utf8");
   const thirdPartyNoticesPath = path.resolve(outputDir, "THIRD_PARTY_NOTICES.md");
   const sourceNoticePath = path.resolve(outputDir, "SOURCE.md");
 
   await fs.mkdir(outputDir, { recursive: true });
   await fs.writeFile(
     thirdPartyNoticesPath,
-    renderThirdPartyNotices({ ...context, npmDependencies, cargoDependencies }),
+    renderThirdPartyNotices({ ...context, npmDependencies, cargoDependencies, subtitleFontLicense }),
   );
   await fs.writeFile(sourceNoticePath, renderSourceNotice(context));
 

@@ -28,6 +28,9 @@ const ENCODE_INITIAL_BUFFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SIZE_COPY_MONITOR_HEADROOM_BYTES: u64 = 1024 * 1024;
 const FFMPEG_SIDECAR_DIR: &str = "ffmpeg-sidecar";
 const EXTERNAL_SUBTITLE_FILE_NAME: &str = "vfl_external.srt";
+const EXTERNAL_SUBTITLE_FONT_DIR_NAME: &str = "fonts";
+const EXTERNAL_SUBTITLE_FONT_FILE_NAME: &str = "DejaVuSans.ttf";
+const EXTERNAL_SUBTITLE_FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 const EXTERNAL_SUBTITLE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const EXTERNAL_SUBTITLE_MAX_CUES: usize = 10_000;
 const EXTERNAL_SUBTITLE_MAX_LINE_CHARS: usize = 10_000;
@@ -807,6 +810,14 @@ fn prepare_external_subtitle(path: &Path) -> Result<PreparedSubtitle, String> {
         validated.normalized_text.as_bytes(),
     )
     .map_err(|_| "Could not stage the selected SRT for FFmpeg.".to_string())?;
+    let font_dir = temp_dir.path().join(EXTERNAL_SUBTITLE_FONT_DIR_NAME);
+    fs::create_dir(&font_dir)
+        .map_err(|_| "Could not create private subtitle font staging storage.".to_string())?;
+    fs::write(
+        font_dir.join(EXTERNAL_SUBTITLE_FONT_FILE_NAME),
+        EXTERNAL_SUBTITLE_FONT_BYTES,
+    )
+    .map_err(|_| "Could not stage the fixed subtitle font for FFmpeg.".to_string())?;
     Ok(PreparedSubtitle {
         temp_dir,
         inspection: validated.inspection,
@@ -5032,7 +5043,7 @@ fn build_video_filters_with_policy(
             return Err("Internal subtitle staging path was not normalized.".to_string());
         }
         filters.push(
-            "subtitles=filename=vfl_external.srt:force_style='FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginL=24,MarginR=24,MarginV=24'"
+            "subtitles=filename=vfl_external.srt:fontsdir=fonts:force_style='FontName=DejaVu Sans,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginL=24,MarginR=24,MarginV=24'"
                 .to_string(),
         );
         filters.append(&mut deferred_trim_filters);
@@ -6899,7 +6910,15 @@ mod tests {
         let prepared = prepare_external_subtitle(&source).unwrap();
         let working_dir = prepared.working_dir().to_path_buf();
         let staged = working_dir.join(EXTERNAL_SUBTITLE_FILE_NAME);
+        let staged_font = working_dir
+            .join(EXTERNAL_SUBTITLE_FONT_DIR_NAME)
+            .join(EXTERNAL_SUBTITLE_FONT_FILE_NAME);
         assert!(staged.is_file());
+        assert!(staged_font.is_file());
+        assert_eq!(
+            fs::read(&staged_font).unwrap(),
+            EXTERNAL_SUBTITLE_FONT_BYTES
+        );
         assert!(!staged.to_string_lossy().contains("café"));
         assert_eq!(
             fs::read_to_string(&staged).unwrap(),
@@ -7928,7 +7947,8 @@ Encoders:
         let trim_index = filters.find("trim=start=5:end=9").unwrap();
         assert!(filters.starts_with("crop=w=1280:h=720:x=0:y=0:exact=1"));
         assert!(subtitle_index < trim_index);
-        assert!(filters.contains("FontName=Arial"));
+        assert!(filters.contains("fontsdir=fonts"));
+        assert!(filters.contains("FontName=DejaVu Sans"));
         assert!(!filters.contains("/"));
         assert!(!filters.contains("\\"));
 

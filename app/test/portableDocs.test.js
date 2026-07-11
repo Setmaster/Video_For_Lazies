@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -61,6 +62,7 @@ test("portable third-party notices include dependency inventories and bundled si
         repository: "https://github.com/serde-rs/serde",
       },
     ],
+    subtitleFontLicense: "Permission is hereby granted for this test font license.",
   });
 
   assert.match(notice, /FFmpeg Sidecars/);
@@ -68,10 +70,34 @@ test("portable third-party notices include dependency inventories and bundled si
   assert.match(notice, /Linux x64/);
   assert.match(notice, /BtbN build recipe archive/);
   assert.match(notice, /x264 source archive/);
+  assert.match(notice, /Embedded Subtitle Font/);
+  assert.match(notice, /DejaVu Sans 2\.37/);
+  assert.match(notice, /dejavu-fonts-ttf-2\.37\.zip/);
+  assert.match(notice, /7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954/);
+  assert.match(notice, /7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93/);
+  assert.match(notice, /Permission is hereby granted for this test font license\./);
   assert.match(notice, /\| react \| 19\.2\.4 \| MIT \| runtime \|/);
   assert.match(notice, /\| serde \| 1\.0\.0 \| MIT OR Apache-2\.0 \| crates\.io \|/);
   assert.doesNotMatch(notice, /\/home\//);
   assert.doesNotMatch(notice, /C:\\Users\\/);
+});
+
+test("embedded subtitle font and license match the pinned DejaVu 2.37 provenance", () => {
+  const fontPath = path.resolve(repoRoot, "app", "src-tauri", "assets", "DejaVuSans.ttf");
+  const licensePath = path.resolve(repoRoot, "app", "src-tauri", "assets", "DEJAVU_FONT_LICENSE.txt");
+  const fontSha256 = crypto.createHash("sha256").update(fs.readFileSync(fontPath)).digest("hex");
+  const licenseBytes = fs.readFileSync(licensePath);
+  const licenseSha256 = crypto.createHash("sha256").update(licenseBytes).digest("hex");
+  const license = licenseBytes.toString("utf8");
+  const notices = fs.readFileSync(path.resolve(repoRoot, "THIRD_PARTY_NOTICES.md"), "utf8");
+
+  assert.equal(fontSha256, "7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954");
+  assert.equal(licenseSha256, "7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93");
+  assert.match(license, /Copyright \(c\) 2003 by Bitstream, Inc\./);
+  assert.match(license, /Permission is hereby granted, free of charge/);
+  assert.match(notices, new RegExp(fontSha256));
+  assert.match(notices, /7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a/);
+  assert.match(notices, /7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93/);
 });
 
 test("checked-in FFmpeg bundling doc matches pinned bundle config", () => {

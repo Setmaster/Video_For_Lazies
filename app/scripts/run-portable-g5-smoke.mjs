@@ -9,6 +9,7 @@ import { ffmpegSidecarResourceTarget, getPortableOutputDir } from "./ffmpegBundl
 import { getPortableExecutableName } from "./portableRelease.mjs";
 
 const __filename = url.fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const G5_EVIDENCE_SCHEMA_VERSION = 1;
 const G5_MAX_FIT_PLANS = 4;
@@ -27,17 +28,22 @@ const MALFORMED_SUBTITLE_FILE_NAME = "malformed 字幕 O'Brien,[x]; café.srt";
 const VALID_SUBTITLE_TEXT = [
   "\uFEFF1",
   "00:00:04,000 --> 00:00:05,000",
-  "字幕 café Olá مرحبا",
+  "café Olá Καλημέρα Привет مرحبا",
   "",
 ].join("\n");
 const STAGED_EXTERNAL_SRT_FILE_NAME = "vfl_external.srt";
-const EXTERNAL_SRT_FORCE_STYLE = "FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginL=24,MarginR=24,MarginV=24";
-const EXTERNAL_SRT_FILTER = `subtitles=filename=${STAGED_EXTERNAL_SRT_FILE_NAME}:force_style='${EXTERNAL_SRT_FORCE_STYLE}'`;
+const STAGED_EXTERNAL_SUBTITLE_FONT_DIR_NAME = "fonts";
+const STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME = "DejaVuSans.ttf";
+const SUBTITLE_FONT_SOURCE_PATH = path.resolve(__dirname, "../src-tauri/assets/DejaVuSans.ttf");
+const SUBTITLE_FONT_SHA256 = "7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954";
+const EXTERNAL_SRT_FORCE_STYLE = "FontName=DejaVu Sans,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginL=24,MarginR=24,MarginV=24";
+const EXTERNAL_SRT_FILTER = `subtitles=filename=${STAGED_EXTERNAL_SRT_FILE_NAME}:fontsdir=${STAGED_EXTERNAL_SUBTITLE_FONT_DIR_NAME}:force_style='${EXTERNAL_SRT_FORCE_STYLE}'`;
 const FONT_GLYPH_WARNING_PATTERNS = Object.freeze([
   /\bglyph\b.*\b(?:not found|missing|unavailable)\b/i,
   /\bmissing\b.*\bglyph\b/i,
   /\bfontselect\b.*\b(?:failed|unable|not found)\b/i,
   /\b(?:could not|cannot|failed to|unable to)\b.*\b(?:load|find|open)\b.*\bfont\b/i,
+  /\berror\b.*\bopen(?:ing)?\b.*\bfont\b/i,
   /\bno usable fonts?\b/i,
   /\bfontconfig\b.*\b(?:error|failed|failure)\b/i,
 ]);
@@ -379,6 +385,40 @@ function assertPositiveSafeInteger(value, label) {
   }
 }
 
+function portablePathIdentity(value, { platform = process.platform } = {}) {
+  const raw = String(value ?? "");
+  if (platform !== "win32") return path.resolve(raw);
+  let normalized = path.win32.normalize(raw);
+  if (normalized.toLowerCase().startsWith("\\\\?\\unc\\")) {
+    normalized = `\\\\${normalized.slice(8)}`;
+  } else if (normalized.startsWith("\\\\?\\")) {
+    normalized = normalized.slice(4);
+  }
+  return path.win32.normalize(normalized).toLowerCase();
+}
+
+async function portablePathsReferToSameFile(firstPath, secondPath, { platform = process.platform } = {}) {
+  if (portablePathIdentity(firstPath, { platform }) === portablePathIdentity(secondPath, { platform })) {
+    return true;
+  }
+  try {
+    const [firstRealPath, secondRealPath] = await Promise.all([
+      fs.realpath(firstPath),
+      fs.realpath(secondPath),
+    ]);
+    if (portablePathIdentity(firstRealPath, { platform }) === portablePathIdentity(secondRealPath, { platform })) {
+      return true;
+    }
+    const [firstStats, secondStats] = await Promise.all([
+      fs.stat(firstRealPath),
+      fs.stat(secondRealPath),
+    ]);
+    return firstStats.dev === secondStats.dev && firstStats.ino !== 0 && firstStats.ino === secondStats.ino;
+  } catch {
+    return false;
+  }
+}
+
 function validateTargetResultEvidence(testCase, status, outputSizeBytes) {
   if (!(testCase.sizeLimitMb > 0)) {
     if (status?.targetResult !== undefined && status.targetResult !== null) {
@@ -616,11 +656,17 @@ async function runBounded(command, args, {
         return;
       }
       const detail = stderrBuffer.toString("utf8").trim();
-      reject(new Error(
+      const error = new Error(
         timedOut
           ? `${command} timed out after ${timeoutMs} ms.`
           : `${command} exited with code ${code} signal ${signal ?? "none"}${detail ? `\n${detail}` : ""}`,
-      ));
+      );
+      error.stdout = stdoutBuffer;
+      error.stderr = stderrBuffer;
+      error.timedOut = timedOut;
+      error.exitCode = code;
+      error.signal = signal;
+      reject(error);
     }));
   });
 }
@@ -632,38 +678,136 @@ function countFontGlyphWarnings(rawStderr) {
     .length;
 }
 
+function sanitizeSubtitleFontPreflightLog(rawStderr) {
+  let sanitized = String(rawStderr ?? "");
+  for (const sensitive of [
+    VALID_SUBTITLE_TEXT.trim(),
+    MALFORMED_SUBTITLE_TEXT.trim(),
+    "café Olá Καλημέρα Привет مرحبا",
+    "private malformed subtitle sentinel",
+  ]) {
+    sanitized = sanitized.split(sensitive).join("<subtitle text>");
+  }
+  return sanitized.slice(0, 50_000);
+}
+
+async function retainSubtitleFontPreflightFailure(caseRoot, {
+  stderr,
+  timedOut = false,
+  exitCode = null,
+  signal = null,
+} = {}) {
+  const sanitizedStderr = sanitizeSubtitleFontPreflightLog(stderr);
+  assertPrivacySafeStatusRaw(
+    sanitizedStderr,
+    [VALID_SUBTITLE_TEXT.trim(), MALFORMED_SUBTITLE_TEXT.trim(), "café Olá Καλημέρα Привет مرحبا"],
+    "Portable G5 subtitle font preflight diagnostics",
+  );
+  const matchingLines = sanitizedStderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && FONT_GLYPH_WARNING_PATTERNS.some((pattern) => pattern.test(line)));
+  const sidecar = Object.freeze({
+    schemaVersion: 1,
+    family: "DejaVu Sans",
+    fileName: STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME,
+    sha256: SUBTITLE_FONT_SHA256,
+    timedOut: Boolean(timedOut),
+    exitCode: Number.isInteger(exitCode) ? exitCode : null,
+    signal: typeof signal === "string" ? signal : null,
+    fontGlyphWarningCount: matchingLines.length,
+    uniqueMatchedWarningLines: Object.freeze([...new Set(matchingLines)].slice(0, 50)),
+  });
+  await Promise.all([
+    fs.writeFile(
+      path.resolve(caseRoot, "subtitle-font-preflight.stderr.log"),
+      sanitizedStderr || "No FFmpeg stderr was captured.\n",
+      "utf8",
+    ),
+    fs.writeFile(
+      path.resolve(caseRoot, "subtitle-font-preflight.failure.json"),
+      `${JSON.stringify(sidecar, null, 2)}\n`,
+      "utf8",
+    ),
+  ]);
+  return sidecar;
+}
+
 async function runSubtitleFontGlyphPreflight(ffmpegPath, inputPath, subtitlePath, caseRoot) {
   const preflightRoot = path.resolve(caseRoot, "subtitle-font-preflight");
   const stagedSubtitlePath = path.resolve(preflightRoot, STAGED_EXTERNAL_SRT_FILE_NAME);
-  await fs.mkdir(preflightRoot, { recursive: true });
+  const stagedFontDir = path.resolve(preflightRoot, STAGED_EXTERNAL_SUBTITLE_FONT_DIR_NAME);
+  const stagedFontPath = path.resolve(stagedFontDir, STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME);
+  await Promise.all([
+    fs.mkdir(preflightRoot, { recursive: true }),
+    fs.mkdir(stagedFontDir, { recursive: true }),
+  ]);
   try {
-    await fs.copyFile(subtitlePath, stagedSubtitlePath);
-    const result = await runBounded(ffmpegPath, [
-      "-nostdin", "-hide_banner", "-loglevel", "warning",
-      "-i", inputPath,
-      "-map", "0:v:0",
-      "-vf", EXTERNAL_SRT_FILTER,
-      "-an", "-t", "6",
-      "-f", "null", "-",
-    ], {
-      cwd: preflightRoot,
-      capture: true,
-      timeoutMs: 60_000,
-    });
+    await Promise.all([
+      fs.copyFile(subtitlePath, stagedSubtitlePath),
+      fs.copyFile(SUBTITLE_FONT_SOURCE_PATH, stagedFontPath),
+    ]);
+    let result;
+    try {
+      result = await runBounded(ffmpegPath, [
+        "-nostdin", "-hide_banner", "-loglevel", "warning",
+        "-i", inputPath,
+        "-map", "0:v:0",
+        "-vf", EXTERNAL_SRT_FILTER,
+        "-an", "-t", "6",
+        "-f", "null", "-",
+      ], {
+        cwd: preflightRoot,
+        capture: true,
+        timeoutMs: 60_000,
+      });
+    } catch (error) {
+      await retainSubtitleFontPreflightFailure(caseRoot, {
+        stderr: error?.stderr,
+        timedOut: error?.timedOut,
+        exitCode: error?.exitCode,
+        signal: error?.signal,
+      });
+      throw error;
+    }
     const stderr = result.stderr.toString("utf8");
     const warningLineCount = stderr.split(/\r?\n/).filter((line) => line.trim()).length;
     const fontGlyphWarningCount = countFontGlyphWarnings(stderr);
     if (fontGlyphWarningCount > 0) {
+      await retainSubtitleFontPreflightFailure(caseRoot, { stderr, exitCode: 0 });
       throw new Error(`Portable G5 smoke subtitle font preflight reported ${fontGlyphWarningCount} font/glyph warnings.`);
     }
     return Object.freeze({
       passed: true,
+      family: "DejaVu Sans",
+      fileName: STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME,
+      sha256: SUBTITLE_FONT_SHA256,
       warningLineCount,
       fontGlyphWarningCount,
     });
   } finally {
     await fs.rm(preflightRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
+}
+
+async function verifyEmbeddedSubtitleFont(appPath) {
+  const [appBytes, fontBytes] = await Promise.all([
+    fs.readFile(appPath),
+    fs.readFile(SUBTITLE_FONT_SOURCE_PATH),
+  ]);
+  const actualSha256 = crypto.createHash("sha256").update(fontBytes).digest("hex");
+  if (actualSha256 !== SUBTITLE_FONT_SHA256) {
+    throw new Error(`Portable G5 subtitle font source SHA256 mismatch. expected=${SUBTITLE_FONT_SHA256} actual=${actualSha256}`);
+  }
+  if (appBytes.indexOf(fontBytes) < 0) {
+    throw new Error("Portable G5 app binary does not contain the fixed DejaVu Sans subtitle font bytes.");
+  }
+  return Object.freeze({
+    family: "DejaVu Sans",
+    fileName: STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME,
+    sha256: actualSha256,
+    embeddedInApp: true,
+  });
 }
 
 async function probeMedia(ffprobePath, mediaPath) {
@@ -834,13 +978,17 @@ async function verifySuccessfulCase({
   ffmpegPath,
   ffprobePath,
   caseRoot,
+  embeddedSubtitleFont,
 }) {
   if (!(await exists(outputPath))) {
     throw new Error(`Portable G5 smoke ${testCase.id} reported success without an output.`);
   }
   const outputStats = await fs.stat(outputPath);
   assertPositiveSafeInteger(outputStats.size, `${testCase.id} filesystem output size`);
-  if (typeof status.outputPath !== "string" || path.resolve(status.outputPath) !== path.resolve(outputPath)) {
+  if (
+    typeof status.outputPath !== "string" ||
+    !(await portablePathsReferToSameFile(status.outputPath, outputPath))
+  ) {
     throw new Error(`Portable G5 smoke ${testCase.id} status outputPath did not identify the published artifact.`);
   }
   if (status.ok !== true || status.outputSizeBytes !== outputStats.size) {
@@ -892,6 +1040,10 @@ async function verifySuccessfulCase({
     if (diagnostics.videoAction !== "encode") {
       throw new Error(`Portable G5 smoke ${testCase.id} did not report forced video re-encode.`);
     }
+    const normalizedCommandPreview = String(diagnostics.commandPreview ?? "").replaceAll("'\\''", "'");
+    if (!normalizedCommandPreview.includes(EXTERNAL_SRT_FILTER)) {
+      throw new Error(`Portable G5 smoke ${testCase.id} did not execute the exact fixed subtitle font/filter contract.`);
+    }
     if (subtitleStreamCount !== 0) {
       throw new Error(`Portable G5 smoke ${testCase.id} muxed a subtitle stream instead of burning pixels.`);
     }
@@ -902,13 +1054,19 @@ async function verifySuccessfulCase({
     if (inputHashes.length === 0 || outputHashes.length === 0 || JSON.stringify(inputHashes) === JSON.stringify(outputHashes)) {
       throw new Error(`Portable G5 smoke ${testCase.id} did not prove video packet re-encoding.`);
     }
+    subtitleTiming = await collectSubtitleTimingEvidence(ffmpegPath, outputPath, caseRoot);
     subtitleFontPreflight = await runSubtitleFontGlyphPreflight(
       ffmpegPath,
       inputPath,
       subtitlePath,
       caseRoot,
     );
-    subtitleTiming = await collectSubtitleTimingEvidence(ffmpegPath, outputPath, caseRoot);
+    if (
+      embeddedSubtitleFont?.embeddedInApp !== true ||
+      embeddedSubtitleFont.sha256 !== subtitleFontPreflight.sha256
+    ) {
+      throw new Error(`Portable G5 smoke ${testCase.id} did not prove the preflight font is embedded in the packaged app.`);
+    }
   } else if (diagnostics.subtitleBurnedIn !== false) {
     throw new Error(`Portable G5 smoke ${testCase.id} reported an unexpected subtitle burn-in.`);
   }
@@ -998,6 +1156,7 @@ async function runPortableG5Smoke({
       throw new Error(`Portable G5 smoke could not find required extracted payload file: ${requiredPath}`);
     }
   }
+  const embeddedSubtitleFont = await verifyEmbeddedSubtitleFont(appPath);
 
   const smokeRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-portable-g5-"));
   const fixtureRoot = path.resolve(smokeRoot, "fixtures");
@@ -1073,7 +1232,7 @@ async function runPortableG5Smoke({
         assertStageHistory(testCase, status);
         const rawStatus = await fs.readFile(statusPath, "utf8");
         const subtitleSensitiveValues = subtitlePath
-          ? [subtitlePath, path.basename(subtitlePath), VALID_SUBTITLE_TEXT.trim(), MALFORMED_SUBTITLE_TEXT.trim(), "字幕 café Olá مرحبا", "private malformed subtitle sentinel"]
+          ? [subtitlePath, path.basename(subtitlePath), VALID_SUBTITLE_TEXT.trim(), MALFORMED_SUBTITLE_TEXT.trim(), "café Olá Καλημέρα Привет مرحبا", "private malformed subtitle sentinel"]
           : [];
         assertPrivacySafeStatusRaw(rawStatus, subtitleSensitiveValues, `Portable G5 smoke ${testCase.id} status`);
         await Promise.all([stdoutFile.sync(), stderrFile.sync()]);
@@ -1093,6 +1252,7 @@ async function runPortableG5Smoke({
             ffmpegPath,
             ffprobePath,
             caseRoot,
+            embeddedSubtitleFont,
           })
           : await verifyErrorCase(testCase, status, outputPath);
         evidence.push(caseEvidence);
@@ -1146,6 +1306,9 @@ export {
   MALFORMED_SUBTITLE_TEXT,
   REQUIRED_G5_SMOKE_STAGES,
   STAGED_EXTERNAL_SRT_FILE_NAME,
+  STAGED_EXTERNAL_SUBTITLE_FONT_DIR_NAME,
+  STAGED_EXTERNAL_SUBTITLE_FONT_FILE_NAME,
+  SUBTITLE_FONT_SHA256,
   VALID_SUBTITLE_FILE_NAME,
   VALID_SUBTITLE_TEXT,
   assertPrivacySafeStatusRaw,
@@ -1160,9 +1323,14 @@ export {
   getPortableG5Paths,
   grayFrameStats,
   normalizeMissingCapabilityFilters,
+  portablePathIdentity,
+  portablePathsReferToSameFile,
   resolveG5SmokeCases,
+  retainSubtitleFontPreflightFailure,
   runPortableG5Smoke,
+  sanitizeSubtitleFontPreflightLog,
   subtitleFixturePath,
   targetResultQueueOutcomeKind,
   validateTargetResultEvidence,
+  verifyEmbeddedSubtitleFont,
 };
