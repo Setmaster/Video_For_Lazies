@@ -14,6 +14,7 @@ const SUPPORTED_PREVIEW_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "web
 
 struct JobHandle {
     job_id: u64,
+    attempt_id: u64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
 }
@@ -67,6 +68,21 @@ impl JobManager {
 
     fn alloc_job_id(&self) -> u64 {
         self.next_job_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn clear_if_matches(&self, job_id: u64, attempt_id: u64) -> bool {
+        let Ok(mut guard) = self.current.lock() else {
+            return false;
+        };
+        if guard
+            .as_ref()
+            .is_some_and(|handle| handle.job_id == job_id && handle.attempt_id == attempt_id)
+        {
+            *guard = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn kill_active_job(&self) {
@@ -443,8 +459,13 @@ fn write_smoke_status(status: AppSmokeStatus) -> Result<(), String> {
 fn start_encode(
     window: Window,
     state: State<'_, JobManager>,
+    attempt_id: u64,
     request: video::EncodeRequest,
 ) -> Result<u64, String> {
+    if attempt_id == 0 || attempt_id > 9_007_199_254_740_991 {
+        return Err("Encode attempt ID must be a positive safe integer.".to_string());
+    }
+
     let mut current = state
         .current
         .lock()
@@ -460,6 +481,7 @@ fn start_encode(
 
     *current = Some(JobHandle {
         job_id,
+        attempt_id,
         cancel: cancel.clone(),
         child: child.clone(),
     });
@@ -468,13 +490,17 @@ fn start_encode(
     let app_handle = window.app_handle().clone();
 
     std::thread::spawn(move || {
-        let result = video::run_encode_job(&window, job_id, &cancel, &child, request);
+        let result = video::run_encode_job(&window, attempt_id, job_id, &cancel, &child, request);
+
+        let manager: State<'_, JobManager> = app_handle.state();
+        manager.clear_if_matches(job_id, attempt_id);
 
         let _ = match result {
             Ok(done) => window.emit("encode-finished", done),
             Err(err) => window.emit(
                 "encode-finished",
                 video::EncodeFinishedPayload {
+                    attempt_id,
                     job_id,
                     ok: false,
                     output_path: None,
@@ -484,13 +510,6 @@ fn start_encode(
                 },
             ),
         };
-
-        let manager: State<'_, JobManager> = app_handle.state();
-        if let Ok(mut guard) = manager.current.lock()
-            && guard.as_ref().is_some_and(|handle| handle.job_id == job_id)
-        {
-            *guard = None;
-        }
     });
 
     Ok(job_id)
@@ -566,12 +585,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSmokeConfig, AppSmokeStatus, is_supported_preview_path, merge_smoke_optional_fields,
-        merge_smoke_stage_history, parse_smoke_config_from_env,
+        AppSmokeConfig, AppSmokeStatus, JobHandle, JobManager, is_supported_preview_path,
+        merge_smoke_optional_fields, merge_smoke_stage_history, parse_smoke_config_from_env,
     };
     use crate::video::{OutputFormat, ResizeMode};
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     fn smoke_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -588,6 +609,23 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir.join("status.json").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn job_manager_clears_only_the_matching_attempt() {
+        let manager = JobManager::new();
+        *manager.current.lock().unwrap() = Some(JobHandle {
+            job_id: 4,
+            attempt_id: 44,
+            cancel: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(Mutex::new(None)),
+        });
+
+        assert!(!manager.clear_if_matches(3, 44));
+        assert!(!manager.clear_if_matches(4, 43));
+        assert!(manager.current.lock().unwrap().is_some());
+        assert!(manager.clear_if_matches(4, 44));
+        assert!(manager.current.lock().unwrap().is_none());
     }
 
     #[test]

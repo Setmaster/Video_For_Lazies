@@ -4,6 +4,7 @@ export type VideoQualityPreference = "auto" | "smaller" | "balanced" | "higher";
 export type EncodeSpeedPreference = "auto" | "faster" | "balanced" | "smaller";
 export type AudioChannelPreference = "auto" | "stereo" | "mono";
 export type ResizeMode = "source" | "maxEdge" | "custom";
+export type StreamAction = "copy" | "encode" | "drop";
 
 export interface VideoProbe {
   durationS: number;
@@ -11,6 +12,13 @@ export interface VideoProbe {
   height: number;
   frameRate?: number | null;
   hasAudio: boolean;
+  sourceFormat?: string | null;
+  videoStreamIndex: number;
+  videoCodec?: string | null;
+  videoIsDefault: boolean;
+  audioStreamIndex?: number | null;
+  audioCodec?: string | null;
+  audioIsDefault: boolean;
 }
 
 export interface Trim {
@@ -89,6 +97,7 @@ export interface EncodeCapabilities {
 }
 
 export interface EncodeProgressPayload {
+  attemptId: number;
   jobId: number;
   pass: number;
   totalPasses: number;
@@ -97,6 +106,7 @@ export interface EncodeProgressPayload {
 }
 
 export interface EncodeFinishedPayload {
+  attemptId: number;
   jobId: number;
   ok: boolean;
   outputPath?: string | null;
@@ -107,6 +117,11 @@ export interface EncodeFinishedPayload {
 
 export interface ExportDiagnostics {
   mode: string;
+  videoAction?: StreamAction | null;
+  audioAction: StreamAction;
+  sourceFormat?: string | null;
+  sourceVideoCodec?: string | null;
+  sourceAudioCodec?: string | null;
   videoCodec?: string | null;
   audioCodec?: string | null;
   videoBitrateKbps?: number | null;
@@ -116,6 +131,7 @@ export interface ExportDiagnostics {
   passes: number;
   attempts: number;
   audioRemovedForSizeTarget: boolean;
+  copyFallbackReason?: string | null;
   commandPreview: string;
 }
 

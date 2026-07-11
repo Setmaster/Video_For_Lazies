@@ -1038,6 +1038,16 @@ input[type="range"]:focus-visible {
   background: rgba(226, 180, 94, 0.08);
 }
 
+.vfl-plan-hero.is-failed {
+  border-color: rgba(239, 112, 112, 0.5);
+  background: rgba(239, 112, 112, 0.09);
+}
+
+.vfl-plan-hero.is-cancelled {
+  border-color: rgba(226, 180, 94, 0.5);
+  background: rgba(226, 180, 94, 0.08);
+}
+
 .vfl-plan-hero-kicker {
   font-size: 10.5px;
   font-weight: 700;
@@ -1048,6 +1058,14 @@ input[type="range"]:focus-visible {
 
 .vfl-plan-hero.is-ready .vfl-plan-hero-kicker {
   color: var(--accent-strong);
+}
+
+.vfl-plan-hero.is-failed .vfl-plan-hero-kicker {
+  color: var(--danger);
+}
+
+.vfl-plan-hero.is-cancelled .vfl-plan-hero-kicker {
+  color: var(--warn);
 }
 
 .vfl-plan-hero-copy {

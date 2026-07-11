@@ -20,6 +20,7 @@ import type {
   ExportDiagnostics,
   OutputFormat,
   ResizeMode,
+  StreamAction,
   UpdateApplyResponse,
   UpdateCheckResponse,
   VideoCodecPreference,
@@ -34,6 +35,17 @@ import {
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
 import { basename, dirname, ensureUniqueOutputPath, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
 import { getActiveProgressUi } from "./lib/progress";
+import {
+  acceptsEncodeEvent,
+  beginEncodeAttempt,
+  bindStartedEncode,
+  createIdleEncodeAttempt,
+  deriveEncodeAttemptPresentation,
+  failEncodeAttemptStart,
+  requestEncodeCancellation,
+  settleEncodeFinished,
+  type EncodeAttemptState,
+} from "./lib/encodeAttempt";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import { EXPORT_RECIPES, findMatchingExportRecipe, normalizeRecipeResizeSettings, type ExportRecipe } from "./lib/exportRecipes";
 import { buildPreviewColorFilter } from "./lib/previewFilter";
@@ -280,6 +292,13 @@ function formatVideoCodecLabel(codec: VideoCodecPreference) {
   return ffmpegName ? `${VIDEO_CODEC_LABELS[codec]} (${ffmpegName})` : VIDEO_CODEC_LABELS[codec];
 }
 
+function formatStreamAction(action: StreamAction | null | undefined) {
+  if (action === "copy") return "copied";
+  if (action === "encode") return "re-encoded";
+  if (action === "drop") return "removed";
+  return "not present";
+}
+
 function colorIsDefault(brightness: string, contrast: string, saturation: string) {
   const brightnessNum = Number(brightness);
   const contrastNum = Number(contrast);
@@ -424,6 +443,7 @@ function App() {
   const [smokeConfig, setSmokeConfig] = useState<AppSmokeConfig | null>(null);
   const [previewMediaReady, setPreviewMediaReady] = useState(false);
   const [lastExport, setLastExport] = useState<LastExportResult | null>(null);
+  const [latestAttempt, setLatestAttempt] = useState<EncodeAttemptState>(() => createIdleEncodeAttempt());
   const [exportQueue, setExportQueue] = useState<ExportQueueItem[]>([]);
   const [queueRunning, setQueueRunning] = useState(false);
   const [queueActiveItemId, setQueueActiveItemId] = useState<number | null>(null);
@@ -438,6 +458,8 @@ function App() {
   const [aboutOpen, setAboutOpen] = useState(false);
 
   const jobIdRef = useRef<number | null>(null);
+  const attemptIdRef = useRef(Math.floor(Date.now() * 1000));
+  const latestAttemptRef = useRef<EncodeAttemptState>(latestAttempt);
   const inputPathRef = useRef("");
   const audioEnabledRef = useRef(true);
   const autoMutedRef = useRef(false);
@@ -456,7 +478,7 @@ function App() {
   const smokeStatusWriteRef = useRef<Promise<void>>(Promise.resolve());
   const smokeAppliedRef = useRef(false);
   const smokeStartRef = useRef(false);
-  const smokeJobIdRef = useRef<number | null>(null);
+  const smokeAttemptIdRef = useRef<number | null>(null);
   const smokeMetricsRef = useRef<{ trimStartS: number | null; trimEndS: number | null; expectedDurationS: number | null } | null>(null);
   const smokeInteractionRunningRef = useRef(false);
   const smokeInteractionDoneRef = useRef(false);
@@ -466,13 +488,20 @@ function App() {
   const activeTrimTargetRef = useRef<TrimFocusTarget>(activeTrimTarget);
   const trimTimelineRef = useRef<TrimTimeline | null>(null);
   const pendingEncodeRef = useRef<{
+    attemptId: number;
     jobId: number | null;
+    cancelRequested: boolean;
     outputPath: string;
     durationS: number | null;
     format: OutputFormat;
     queueItemId: number | null;
     sample: { outputDurationS: number; fullDurationS: number | null } | null;
   } | null>(null);
+
+  function updateLatestAttempt(next: EncodeAttemptState) {
+    latestAttemptRef.current = next;
+    setLatestAttempt(next);
+  }
 
   async function reportSmokeStatus(stage: string, extra: Omit<AppSmokeStatus, "stage"> = {}) {
     if (!smokeConfigRef.current) return;
@@ -688,7 +717,7 @@ function App() {
       try {
         const handle = await getCurrentWindow().onCloseRequested(async (event) => {
           const queuedCount = exportQueueRef.current.filter((item) => item.status === "queued").length;
-          const encoding = jobIdRef.current !== null;
+          const encoding = jobIdRef.current !== null || pendingEncodeRef.current !== null;
           if (!encoding && queuedCount === 0) return;
 
           const queuedText = `${queuedCount} queued export${queuedCount === 1 ? "" : "s"}`;
@@ -732,10 +761,12 @@ function App() {
     setPreviewPlaying(false);
     setPreviewMediaReady(false);
     setLastExport(null);
+    if (jobIdRef.current === null && pendingEncodeRef.current === null) {
+      updateLatestAttempt(createIdleEncodeAttempt());
+    }
     setActiveTrimTarget("preview");
     previewSelectionTimeRef.current = 0;
     smokeMetricsRef.current = null;
-    pendingEncodeRef.current = null;
   }, [inputPath]);
 
   useEffect(() => {
@@ -807,7 +838,7 @@ function App() {
         smokeStatusWriteRef.current = Promise.resolve();
         smokeAppliedRef.current = false;
         smokeStartRef.current = false;
-        smokeJobIdRef.current = null;
+        smokeAttemptIdRef.current = null;
         smokeConfigRef.current = config;
         setSmokeConfig(config);
         await reportSmokeStatus("detected", { message: "Packaged app smoke mode detected." });
@@ -822,6 +853,7 @@ function App() {
   }, [settingsReady]);
 
   function applyNewInput(path: string, nextFormat: OutputFormat) {
+    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
     setOutputAuto(true);
     setOutputPath("");
 
@@ -831,6 +863,7 @@ function App() {
   }
 
   function resetAllSettings() {
+    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
     setFormat(DEFAULT_OUTPUT_FORMAT);
     setTitle("");
     setSizeLimitMb(DEFAULT_SIZE_LIMIT_MB);
@@ -955,7 +988,7 @@ function App() {
 
     smokeAppliedRef.current = true;
     smokeStartRef.current = false;
-    smokeJobIdRef.current = null;
+    smokeAttemptIdRef.current = null;
     smokeMetricsRef.current = null;
     smokeInteractionRunningRef.current = false;
     smokeInteractionDoneRef.current = false;
@@ -1232,8 +1265,19 @@ function App() {
     format === "mp3"
       ? "No video codec"
       : advancedVideoCodec === "auto"
-        ? "Auto codec"
+        ? "Automatic safe codec plan, verified after export"
         : formatVideoCodecLabel(advancedVideoCodec);
+  const sourceStreamSummary = probe
+    ? [
+        `${probe.videoCodec ?? "unknown"} video (stream ${probe.videoStreamIndex})`,
+        probe.audioStreamIndex === null || probe.audioStreamIndex === undefined
+          ? "no audio"
+          : `${probe.audioCodec ?? "unknown"} audio (stream ${probe.audioStreamIndex})`,
+        probe.sourceFormat ? `container ${probe.sourceFormat}` : null,
+      ]
+        .filter(Boolean)
+        .join(" • ")
+    : "Probe the source to inspect its selected streams.";
   const advancedQualitySummary =
     format === "mp3"
       ? "No video quality"
@@ -1451,15 +1495,23 @@ function App() {
   const lastExportSizeText = lastExport?.outputSizeBytes ? `${(lastExport.outputSizeBytes / 1_000_000).toFixed(2)} MB` : null;
   const lastExportDurationText = lastExport?.durationS ? formatClock(lastExport.durationS) : null;
   const progressUi = getActiveProgressUi(progress, jobId !== null);
-  const displayedStatus = jobId !== null && progressUi.isFinalizing ? "Finalizing output..." : status;
+  const attemptUi = deriveEncodeAttemptPresentation(latestAttempt);
+  const encodeBusy = attemptUi.isActive;
+  const lastExportIsCurrentOutcome = latestAttempt.kind === "succeeded";
+  const latestAttemptOutputPath =
+    "outputPath" in latestAttempt ? latestAttempt.outputPath ?? null : null;
+  const displayedStatus =
+    latestAttempt.kind === "running" && jobId !== null && progressUi.isFinalizing
+      ? "Finalizing output..."
+      : status;
 
   const footerKicker =
-    jobId !== null
+    latestAttempt.kind === "running"
       ? progressUi.isFinalizing
         ? "Finalizing output"
         : "Encoding now"
-      : lastExport
-        ? "Export complete"
+      : attemptUi.kicker
+        ? attemptUi.kicker
         : inputPath
         ? probe
           ? "Ready to export"
@@ -1467,7 +1519,10 @@ function App() {
         : "Waiting for input";
 
   const footerMetaText = useMemo(() => {
-    if (jobId !== null) return planSummaryText ?? inputSummary;
+    if (attemptUi.isActive) return planSummaryText ?? inputSummary;
+    if (attemptUi.isFailure || attemptUi.isCancelled) {
+      return latestAttemptOutputPath || outputPath || planSummaryText || outputModeSummary;
+    }
     if (lastExport) {
       const parts = [
         lastExportDurationText ? `${lastExportDurationText} export` : null,
@@ -1478,10 +1533,13 @@ function App() {
     }
     return outputPath || planSummaryText || outputModeSummary;
   }, [
-    jobId,
+    attemptUi.isActive,
+    attemptUi.isCancelled,
+    attemptUi.isFailure,
     lastExport,
     lastExportDurationText,
     lastExportSizeText,
+    latestAttemptOutputPath,
     planSummaryText,
     inputSummary,
     outputPath,
@@ -1489,6 +1547,8 @@ function App() {
   ]);
 
   const exportReady = Boolean(inputPath && outputPath && probe && !selectedVideoCodecUnavailable);
+  const planHeroReady =
+    exportReady && !attemptUi.isActive && !attemptUi.isFailure && !attemptUi.isCancelled;
   const queueCounts = useMemo(
     () => ({
       queued: exportQueue.filter((item) => item.status === "queued").length,
@@ -1499,8 +1559,10 @@ function App() {
     [exportQueue],
   );
   const planStatusText =
-    jobId !== null
+    attemptUi.isActive
       ? displayedStatus
+      : attemptUi.isFailure || attemptUi.isCancelled
+        ? attemptUi.message ?? displayedStatus
       : !inputPath
         ? "Load a source video to unlock the export plan and composing tools."
         : !probe
@@ -1509,7 +1571,7 @@ function App() {
             ? "Pick an output path to enable export."
             : selectedVideoCodecUnavailable
               ? "Choose an available codec before exporting."
-            : lastExport
+            : lastExportIsCurrentOutcome
               ? "Last export completed. Review the output below or adjust the settings and export another variation."
               : "Source, output path, and current settings are valid. Export is ready.";
 
@@ -1643,7 +1705,7 @@ function App() {
     if (!hasTauriRuntime()) return;
 
     const cleanupWindowDrop = bindWindowFileDrop(window, {
-      isDropAllowed: () => jobIdRef.current === null,
+      isDropAllowed: () => jobIdRef.current === null && pendingEncodeRef.current === null,
       onDragActiveChange: setDragActive,
       onPathsDropped: handleDroppedPaths,
     });
@@ -1657,7 +1719,7 @@ function App() {
         unlisten = await getCurrentWebviewWindow().onDragDropEvent((event) => {
           const p = event.payload;
           if (p.type === "enter" || p.type === "over") {
-            if (jobIdRef.current === null) {
+            if (jobIdRef.current === null && pendingEncodeRef.current === null) {
               setDragActive(true);
             }
             return;
@@ -1878,7 +1940,6 @@ function App() {
         await reportSmokeFailure(`Packaged app smoke encode failed to start: ${result.message}`);
         return;
       }
-      smokeJobIdRef.current = result.jobId;
     })();
   }, [
     smokeConfig,
@@ -1901,18 +1962,33 @@ function App() {
 
     (async () => {
       unlistenProgress = await listen<EncodeProgressPayload>("encode-progress", (event) => {
+        const pendingEncode = pendingEncodeRef.current;
+        if (!acceptsEncodeEvent(pendingEncode, event.payload)) return;
         setProgress(Math.max(0, Math.min(1, event.payload.overallPct)));
       });
       unlistenFinished = await listen<EncodeFinishedPayload>("encode-finished", (event) => {
         const p = event.payload;
         const pendingEncode = pendingEncodeRef.current;
-        const completedQueueItemId = pendingEncode?.queueItemId ?? null;
+        if (!acceptsEncodeEvent(pendingEncode, p) || !pendingEncode) return;
+
+        const completedAtMs = Date.now();
+        const settlement = settleEncodeFinished(
+          pendingEncode,
+          latestAttemptRef.current,
+          p,
+          completedAtMs,
+        );
+        if (!settlement.accepted || !settlement.context) return;
+        const completedContext = settlement.context;
+        const completedQueueItemId = completedContext.queueItemId;
+        updateLatestAttempt(settlement.state);
+        pendingEncodeRef.current = settlement.pending;
         setJobId(null);
         jobIdRef.current = null;
         setProgress(0);
 
-        if (smokeJobIdRef.current === p.jobId) {
-          smokeJobIdRef.current = null;
+        if (smokeAttemptIdRef.current === p.attemptId) {
+          smokeAttemptIdRef.current = null;
           if (!p.ok) {
             void reportSmokeFailure(`Packaged app smoke encode failed: ${p.message || "Encode failed."}`);
           } else {
@@ -1924,33 +2000,34 @@ function App() {
               outputSizeBytes: p.outputSizeBytes ?? null,
               trimStartS: smokeMetrics?.trimStartS ?? null,
               trimEndS: smokeMetrics?.trimEndS ?? null,
-              expectedDurationS: smokeMetrics?.expectedDurationS ?? pendingEncode?.durationS ?? null,
+              expectedDurationS: smokeMetrics?.expectedDurationS ?? completedContext.durationS,
             });
           }
         }
 
         if (!p.ok) {
+          const failureMessage =
+            settlement.state.kind === "cancelled" ? "Export canceled." : p.message || "Encode failed.";
           if (completedQueueItemId !== null) {
             updateExportQueue((items) =>
               items.map((item) =>
                 item.id === completedQueueItemId
-                  ? { ...item, status: "failed", message: p.message || "Encode failed.", outputSizeBytes: null }
+                  ? { ...item, status: "failed", message: failureMessage, outputSizeBytes: null }
                   : item,
               ),
             );
             queueActiveItemIdRef.current = null;
             setQueueActiveItemId(null);
           }
-          pendingEncodeRef.current = null;
-          setStatus(p.message || "Encode failed.");
+          setStatus(failureMessage);
           if (completedQueueItemId !== null && queueRunningRef.current) {
             window.setTimeout(() => void startNextQueuedItem(), 0);
           }
           return;
         }
 
-        if (pendingEncode?.sample && p.outputSizeBytes) {
-          const { outputDurationS, fullDurationS } = pendingEncode.sample;
+        if (completedContext.sample && p.outputSizeBytes) {
+          const { outputDurationS, fullDurationS } = completedContext.sample;
           setSampleEstimate({
             sampleBytes: p.outputSizeBytes,
             estimateBytes:
@@ -1967,13 +2044,13 @@ function App() {
           setStatus(`Done${suffix}. ${p.message}`);
         }
         setLastExport({
-          outputPath: p.outputPath ?? pendingEncode?.outputPath ?? outputPath,
+          outputPath: p.outputPath ?? completedContext.outputPath,
           outputSizeBytes: p.outputSizeBytes ?? null,
-          durationS: pendingEncode?.durationS ?? plannedSummary?.durationS ?? null,
-          format: pendingEncode?.format ?? formatRef.current,
+          durationS: completedContext.durationS,
+          format: completedContext.format,
           message: p.message ?? null,
           diagnostics: p.diagnostics ?? null,
-          completedAtMs: Date.now(),
+          completedAtMs,
         });
         if (completedQueueItemId !== null) {
           updateExportQueue((items) =>
@@ -1991,7 +2068,6 @@ function App() {
           queueActiveItemIdRef.current = null;
           setQueueActiveItemId(null);
         }
-        pendingEncodeRef.current = null;
         if (outputAutoRef.current) {
           setOutputSuggestNonce((n) => n + 1);
         }
@@ -2008,6 +2084,7 @@ function App() {
   }, []);
 
   async function pickInput() {
+    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
     try {
       const selected = await openDialog({
         multiple: false,
@@ -2017,6 +2094,7 @@ function App() {
       });
 
       if (typeof selected === "string") {
+        if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
         const pickedExt = extname(selected).toLowerCase();
         const nextFormat: OutputFormat =
           pickedExt === "mp4" || pickedExt === "webm" ? (pickedExt as OutputFormat) : format;
@@ -2036,6 +2114,7 @@ function App() {
   }
 
   async function pickOutput() {
+    if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
     const ext = format;
     const defaultPath = outputPath || (inputPath ? suggestOutputPath(inputPath, ext) : `output.${ext}`);
 
@@ -2047,6 +2126,7 @@ function App() {
       });
 
       if (typeof selected === "string") {
+        if (jobIdRef.current !== null || pendingEncodeRef.current !== null) return;
         setOutputAuto(false);
         setOutputPath(replaceExtension(selected, format));
       }
@@ -2358,7 +2438,7 @@ function App() {
   }
 
   async function addFilesToQueue() {
-    if (jobId !== null) return;
+    if (jobId !== null || pendingEncodeRef.current !== null) return;
     try {
       const selected = await openDialog({
         multiple: true,
@@ -2444,7 +2524,7 @@ function App() {
   }
 
   function runQueue() {
-    if (jobId !== null || queueRunningRef.current) return;
+    if (jobId !== null || pendingEncodeRef.current !== null || queueRunningRef.current) return;
     const hasQueuedItems = exportQueueRef.current.some((item) => item.status === "queued");
     if (!hasQueuedItems) {
       setStatus("Queue is empty.");
@@ -2493,37 +2573,80 @@ function App() {
     queueItemId?: number | null;
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
   }): Promise<StartEncodeResult> {
+    if (pendingEncodeRef.current !== null) {
+      return { ok: false, message: "An export is already starting or running." };
+    }
+
+    attemptIdRef.current += 1;
+    const attemptId = attemptIdRef.current;
+    updateLatestAttempt(beginEncodeAttempt(attemptId));
+
     try {
       const request = options?.request ?? buildRequest();
       pendingEncodeRef.current = {
+        attemptId,
         jobId: null,
+        cancelRequested: false,
         outputPath: request.outputPath,
         durationS: options?.durationS ?? plannedSummary?.durationS ?? null,
         format: request.format,
         queueItemId: options?.queueItemId ?? null,
         sample: options?.sample ?? null,
       };
+      if (smokeConfigRef.current) {
+        smokeAttemptIdRef.current = attemptId;
+      }
       setStatus(options?.startingStatus ?? "Starting…");
       setProgress(0);
-      const id = await invoke<number>("start_encode", { request });
-      setJobId(id);
-      jobIdRef.current = id;
-      setStatus("Encoding…");
-      smokeJobIdRef.current = id;
-      if (pendingEncodeRef.current) {
-        pendingEncodeRef.current.jobId = id;
+      const id = await invoke<number>("start_encode", { request, attemptId });
+      const binding = bindStartedEncode(
+        pendingEncodeRef.current,
+        latestAttemptRef.current,
+        attemptId,
+        id,
+      );
+      if (binding.accepted && binding.pending) {
+        pendingEncodeRef.current = binding.pending;
+        setJobId(id);
+        jobIdRef.current = id;
+        setStatus("Encoding…");
+        updateLatestAttempt(binding.state);
       }
       return { ok: true, jobId: id };
     } catch (e) {
-      pendingEncodeRef.current = null;
       const msg = coerceErrorMessage(e, "Failed to start encode.");
+      const attemptedOutputPath =
+        pendingEncodeRef.current?.attemptId === attemptId
+          ? pendingEncodeRef.current.outputPath
+          : options?.request?.outputPath ?? outputPath;
+      if (pendingEncodeRef.current?.attemptId === attemptId) {
+        pendingEncodeRef.current = null;
+      }
+      if (smokeAttemptIdRef.current === attemptId) {
+        smokeAttemptIdRef.current = null;
+      }
+      updateLatestAttempt(
+        failEncodeAttemptStart(
+          latestAttemptRef.current,
+          attemptId,
+          msg,
+          Date.now(),
+          attemptedOutputPath,
+        ),
+      );
       setStatus(msg);
       return { ok: false, message: msg };
     }
   }
 
   async function exportSample() {
-    if (!inputPath || !probe || jobId !== null || selectedVideoCodecUnavailable) return;
+    if (
+      !inputPath ||
+      !probe ||
+      jobId !== null ||
+      pendingEncodeRef.current !== null ||
+      selectedVideoCodecUnavailable
+    ) return;
 
     try {
       const request = buildRequest();
@@ -2568,6 +2691,17 @@ function App() {
 
   async function cancelEncode() {
     if (jobId === null) return;
+    const pendingEncode = pendingEncodeRef.current;
+    if (pendingEncode?.jobId === jobId) {
+      pendingEncode.cancelRequested = true;
+      updateLatestAttempt(
+        requestEncodeCancellation(
+          latestAttemptRef.current,
+          pendingEncode.attemptId,
+          jobId,
+        ),
+      );
+    }
     if (queueActiveItemIdRef.current !== null) {
       queueRunningRef.current = false;
       setQueueRunning(false);
@@ -2593,7 +2727,11 @@ function App() {
   }
 
   async function openOutputFolder() {
-    const p = lastExport?.outputPath || outputPath || inputPath;
+    const latestAttemptUsesCurrentPlan =
+      latestAttempt.kind === "failed" || latestAttempt.kind === "cancelled";
+    const p = latestAttemptUsesCurrentPlan
+      ? latestAttempt.outputPath || outputPath || inputPath
+      : lastExport?.outputPath || outputPath || inputPath;
     if (!p) return;
     await openFolderFor(p);
   }
@@ -2618,7 +2756,7 @@ function App() {
 
   async function saveCurrentFrame() {
     if (!inputPath || !previewReady || !probe) return;
-    if (frameSaving || jobId !== null) return;
+    if (frameSaving || jobId !== null || pendingEncodeRef.current !== null) return;
 
     const defaultPath = `${dirname(inputPath)}${stem(inputPath)}-frame.png`;
     const prevStatus = status;
@@ -2807,7 +2945,7 @@ function App() {
   }
 
   function runComposeShortcutAction(action: ComposeShortcutAction) {
-    if (!previewReady || !probe || jobId !== null) return false;
+    if (!previewReady || !probe || jobId !== null || pendingEncodeRef.current !== null) return false;
 
     switch (action.kind) {
       case "toggle-playback":
@@ -2988,7 +3126,7 @@ function App() {
   }
 
   async function togglePreviewPlayback() {
-    if (!previewReady || jobId !== null) return;
+    if (!previewReady || jobId !== null || pendingEncodeRef.current !== null) return;
     const nextPlaying = await cropperRef.current?.togglePlayback();
     if (typeof nextPlaying === "boolean") {
       if (nextPlaying) {
@@ -3175,7 +3313,7 @@ function App() {
               <div className="vfl-update-summary">{updateStatus ?? updateNotice.notes?.summary ?? "A new portable release is ready."}</div>
             </div>
             <div className="vfl-update-actions">
-              <button className="primary" onClick={() => void applyUpdate()} disabled={updateBusy || jobId !== null}>
+              <button className="primary" onClick={() => void applyUpdate()} disabled={updateBusy || encodeBusy}>
                 {updateBusy ? "Updating..." : "Update now"}
               </button>
               <button onClick={() => void dismissUpdate("remindLater")} disabled={updateBusy}>
@@ -3240,7 +3378,7 @@ function App() {
                           aspect={aspect}
                           frameAspectRatio={probe.width / probe.height}
                           cropEnabled={cropEnabled}
-                          disabled={jobId !== null}
+                          disabled={encodeBusy}
                           colorFilter={previewColorFilter}
                           onTimeUpdate={setPreviewTimeS}
                           onPlaybackChange={setPreviewPlaying}
@@ -3257,25 +3395,25 @@ function App() {
                         value={clampedPreviewTimeS}
                         style={rangeFillStyle(clampedPreviewTimeS, 0, previewDurationS || 0)}
                         onChange={(e) => syncPreviewToTime(Number(e.currentTarget.value), "preview")}
-                        disabled={jobId !== null || !previewReady || !probe}
+                        disabled={encodeBusy || !previewReady || !probe}
                         aria-label="Preview timeline"
                       />
 
                       <div className="vfl-transport-row">
-                        <button className="primary" onClick={togglePreviewPlayback} disabled={jobId !== null || !previewReady || !probe}>
+                        <button className="primary" onClick={togglePreviewPlayback} disabled={encodeBusy || !previewReady || !probe}>
                           {previewPlaying ? "Pause" : "Play"}
                         </button>
-                        <button onClick={() => stepPreview(-5)} disabled={jobId !== null || !previewReady || !probe}>
+                        <button onClick={() => stepPreview(-5)} disabled={encodeBusy || !previewReady || !probe}>
                           Back 5s
                         </button>
-                        <button onClick={() => stepPreview(5)} disabled={jobId !== null || !previewReady || !probe}>
+                        <button onClick={() => stepPreview(5)} disabled={encodeBusy || !previewReady || !probe}>
                           Forward 5s
                         </button>
                         <button
                           type="button"
                           className="vfl-icon-button"
                           onClick={saveCurrentFrame}
-                          disabled={jobId !== null || !previewReady || !probe || frameSaving}
+                          disabled={encodeBusy || !previewReady || !probe || frameSaving}
                           title="Save Frame"
                           aria-label="Save the current preview frame as a PNG"
                           aria-busy={frameSaving}
@@ -3315,7 +3453,7 @@ function App() {
                               style={{ left: `${(trimTimeline.start / previewDurationS) * 100}%` }}
                               onPointerDown={(e) => beginTrimHandleDrag("start", e)}
                               onFocus={() => focusTrimTarget("start")}
-                              disabled={jobId !== null || !previewReady || !probe || previewDurationS <= 0}
+                              disabled={encodeBusy || !previewReady || !probe || previewDurationS <= 0}
                               aria-label="Trim start"
                             />
                             <button
@@ -3324,7 +3462,7 @@ function App() {
                               style={{ left: `${(trimTimeline.end / previewDurationS) * 100}%` }}
                               onPointerDown={(e) => beginTrimHandleDrag("end", e)}
                               onFocus={() => focusTrimTarget("end")}
-                              disabled={jobId !== null || !previewReady || !probe || previewDurationS <= 0}
+                              disabled={encodeBusy || !previewReady || !probe || previewDurationS <= 0}
                               aria-label="Trim end"
                             />
                           </div>
@@ -3336,13 +3474,13 @@ function App() {
                                 value={trimStart}
                                 onFocus={() => focusTrimTarget("start")}
                                 onChange={(e) => setTrimStart(e.currentTarget.value)}
-                                disabled={jobId !== null}
+                                disabled={encodeBusy}
                                 inputMode="decimal"
                               />
                               <button
                                 type="button"
                                 onClick={applyTrimStartFromCurrent}
-                                disabled={jobId !== null || !previewReady || !probe}
+                                disabled={encodeBusy || !previewReady || !probe}
                                 title="Use the current preview time"
                               >
                                 Set
@@ -3355,19 +3493,19 @@ function App() {
                                 value={trimEnd}
                                 onFocus={() => focusTrimTarget("end")}
                                 onChange={(e) => setTrimEnd(e.currentTarget.value)}
-                                disabled={jobId !== null}
+                                disabled={encodeBusy}
                                 placeholder="(end)"
                                 inputMode="decimal"
                               />
                               <button
                                 type="button"
                                 onClick={applyTrimEndFromCurrent}
-                                disabled={jobId !== null || !previewReady || !probe}
+                                disabled={encodeBusy || !previewReady || !probe}
                                 title="Use the current preview time"
                               >
                                 Set
                               </button>
-                              <button type="button" onClick={() => setTrimEnd("")} disabled={jobId !== null || trimEnd.trim() === ""}>
+                              <button type="button" onClick={() => setTrimEnd("")} disabled={encodeBusy || trimEnd.trim() === ""}>
                                 Clear
                               </button>
                             </div>
@@ -3388,11 +3526,11 @@ function App() {
                                 step={1}
                                 value={trimDragSnapS}
                                 onChange={(e) => setTrimDragSnapS(normalizeTrimDragSnapInput(e.currentTarget.value, probe?.durationS ?? null))}
-                                disabled={jobId !== null || !probe}
+                                disabled={encodeBusy || !probe}
                                 inputMode="numeric"
                               />
                             </div>
-                            <button type="button" className="vfl-trim-reset" onClick={resetTrim} disabled={jobId !== null}>
+                            <button type="button" className="vfl-trim-reset" onClick={resetTrim} disabled={encodeBusy}>
                               Reset trim
                             </button>
                           </div>
@@ -3410,7 +3548,7 @@ function App() {
                         and crop tools live here.
                       </div>
                       <div className="vfl-actions">
-                        <button className="primary" onClick={pickInput} disabled={jobId !== null}>
+                        <button className="primary" onClick={pickInput} disabled={encodeBusy}>
                           Browse…
                         </button>
                       </div>
@@ -3455,7 +3593,7 @@ function App() {
               <label htmlFor="vfl-input-path">Input</label>
               <input id="vfl-input-path" value={inputPath} placeholder="Pick a video…" readOnly />
               <div className="vfl-file-actions">
-                <button className={!inputPath ? "primary" : ""} onClick={pickInput} disabled={jobId !== null}>
+                <button className={!inputPath ? "primary" : ""} onClick={pickInput} disabled={encodeBusy}>
                   Browse…
                 </button>
               </div>
@@ -3465,10 +3603,10 @@ function App() {
               <label htmlFor="vfl-output-path">Output</label>
               <input id="vfl-output-path" value={outputPath} placeholder="Pick an output path…" readOnly />
               <div className="vfl-file-actions">
-                <button className={!outputPath ? "primary" : ""} onClick={pickOutput} disabled={!inputPath || jobId !== null}>
+                <button className={!outputPath ? "primary" : ""} onClick={pickOutput} disabled={!inputPath || encodeBusy}>
                   Save as…
                 </button>
-                <button onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || jobId !== null}>
+                <button onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || encodeBusy}>
                   Open folder
                 </button>
               </div>
@@ -3490,7 +3628,7 @@ function App() {
             <div className="vfl-recipe-grid">
               {EXPORT_RECIPES.map((recipe) => {
                 const isActive = matchingRecipe?.id === recipe.id;
-                const isDisabled = jobId !== null || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
+                const isDisabled = encodeBusy || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
                 return (
                   <button
                     key={recipe.id}
@@ -3517,7 +3655,7 @@ function App() {
             <div className="vfl-stack-md">
               <div className="vfl-field">
                 <label htmlFor="vfl-format">Format</label>
-                <select id="vfl-format" value={format} onChange={(e) => setFormat(e.currentTarget.value as OutputFormat)} disabled={jobId !== null}>
+                <select id="vfl-format" value={format} onChange={(e) => setFormat(e.currentTarget.value as OutputFormat)} disabled={encodeBusy}>
                   <option value="mp4">mp4</option>
                   <option value="webm">webm</option>
                   <option value="mp3" disabled={probe !== null && !probe.hasAudio}>
@@ -3535,7 +3673,7 @@ function App() {
                       autoMutedRef.current = false;
                       setAudioEnabled(e.currentTarget.checked);
                     }}
-                    disabled={jobId !== null || format === "mp3" || !probe?.hasAudio}
+                    disabled={encodeBusy || format === "mp3" || !probe?.hasAudio}
                   />
                   <span>{format === "mp3" ? "Always enabled for mp3 export" : "Include audio in the export"}</span>
                 </label>
@@ -3546,7 +3684,7 @@ function App() {
                   id="vfl-size-limit"
                   value={sizeLimitMb}
                   onChange={(e) => setSizeLimitMb(e.currentTarget.value)}
-                  disabled={jobId !== null}
+                  disabled={encodeBusy}
                   placeholder="0 or empty = no limit"
                 />
                 <div className="vfl-chips" aria-label="Size presets">
@@ -3554,7 +3692,7 @@ function App() {
                     type="button"
                     className={`vfl-preset-chip ${Number(sizeLimitMb) === 0 ? "active" : ""}`}
                     onClick={() => setSizeLimitMb("")}
-                    disabled={jobId !== null}
+                    disabled={encodeBusy}
                   >
                     No limit
                   </button>
@@ -3566,7 +3704,7 @@ function App() {
                         type="button"
                         className={`vfl-preset-chip ${active ? "active" : ""}`}
                         onClick={() => setSizeLimitMb(String(v))}
-                        disabled={jobId !== null}
+                        disabled={encodeBusy}
                         title={SIZE_PRESET_HINTS[v]}
                       >
                         {v} MB
@@ -3582,7 +3720,7 @@ function App() {
                     type="button"
                     className={resizeMode === "source" ? "active" : ""}
                     onClick={() => handleResizeModeChange("source")}
-                    disabled={jobId !== null || format === "mp3"}
+                    disabled={encodeBusy || format === "mp3"}
                     aria-pressed={resizeMode === "source"}
                   >
                     Original
@@ -3591,7 +3729,7 @@ function App() {
                     type="button"
                     className={resizeMode === "maxEdge" ? "active" : ""}
                     onClick={() => handleResizeModeChange("maxEdge")}
-                    disabled={jobId !== null || format === "mp3"}
+                    disabled={encodeBusy || format === "mp3"}
                     aria-pressed={resizeMode === "maxEdge"}
                   >
                     Max edge
@@ -3600,7 +3738,7 @@ function App() {
                     type="button"
                     className={resizeMode === "custom" ? "active" : ""}
                     onClick={() => handleResizeModeChange("custom")}
-                    disabled={jobId !== null || format === "mp3"}
+                    disabled={encodeBusy || format === "mp3"}
                     aria-pressed={resizeMode === "custom"}
                   >
                     Custom
@@ -3619,7 +3757,7 @@ function App() {
                         id="vfl-max-edge"
                         value={maxEdgePx}
                         onChange={(e) => setMaxEdgePx(e.currentTarget.value)}
-                        disabled={jobId !== null}
+                        disabled={encodeBusy}
                         placeholder="720"
                         inputMode="numeric"
                       />
@@ -3634,7 +3772,7 @@ function App() {
                             id="vfl-output-width"
                             value={customWidthPx}
                             onChange={(e) => handleCustomWidthChange(e.currentTarget.value)}
-                            disabled={jobId !== null}
+                            disabled={encodeBusy}
                             placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.width) : "1280"}
                             inputMode="numeric"
                           />
@@ -3645,7 +3783,7 @@ function App() {
                             id="vfl-output-height"
                             value={customHeightPx}
                             onChange={(e) => handleCustomHeightChange(e.currentTarget.value)}
-                            disabled={jobId !== null}
+                            disabled={encodeBusy}
                             placeholder={shapedVideoDimensions ? String(shapedVideoDimensions.height) : "720"}
                             inputMode="numeric"
                           />
@@ -3656,7 +3794,7 @@ function App() {
                           type="checkbox"
                           checked={outputAspectLocked}
                           onChange={(e) => handleOutputAspectLockChange(e.currentTarget.checked)}
-                          disabled={jobId !== null}
+                          disabled={encodeBusy}
                         />
                         <span>Lock aspect ratio</span>
                       </label>
@@ -3668,7 +3806,7 @@ function App() {
               </div>
               <div className="vfl-field">
                 <label htmlFor="vfl-title-metadata">Title metadata</label>
-                <input id="vfl-title-metadata" value={title} onChange={(e) => setTitle(e.currentTarget.value)} disabled={jobId !== null} />
+                <input id="vfl-title-metadata" value={title} onChange={(e) => setTitle(e.currentTarget.value)} disabled={encodeBusy} />
               </div>
               <div className="vfl-field">
                 <div className="vfl-field-label">Privacy</div>
@@ -3677,7 +3815,7 @@ function App() {
                     type="checkbox"
                     checked={stripMetadata}
                     onChange={(e) => setStripMetadata(e.currentTarget.checked)}
-                    disabled={jobId !== null}
+                    disabled={encodeBusy}
                   />
                   <span>Strip location metadata</span>
                 </label>
@@ -3694,7 +3832,7 @@ function App() {
                     type="checkbox"
                     checked={format === "mp3" ? false : perturbFirstFrame}
                     onChange={(e) => setPerturbFirstFrame(e.currentTarget.checked)}
-                    disabled={jobId !== null || format === "mp3"}
+                    disabled={encodeBusy || format === "mp3"}
                   />
                   <span>Make each export unique</span>
                 </label>
@@ -3718,7 +3856,7 @@ function App() {
                 type="checkbox"
                 checked={cropEnabled}
                 onChange={(e) => setCropEnabled(e.currentTarget.checked)}
-                disabled={jobId !== null || !probe}
+                disabled={encodeBusy || !probe}
               />
               Enable crop
             </label>
@@ -3728,7 +3866,7 @@ function App() {
                   type="checkbox"
                   checked={aspectLocked}
                   onChange={(e) => setAspectLocked(e.currentTarget.checked)}
-                  disabled={jobId !== null || !cropEnabled}
+                  disabled={encodeBusy || !cropEnabled}
                 />
                 Lock aspect
               </label>
@@ -3738,7 +3876,7 @@ function App() {
                   id="vfl-aspect-preset"
                   value={aspectPreset}
                   onChange={(e) => setAspectPreset(e.currentTarget.value as typeof aspectPreset)}
-                  disabled={jobId !== null || !cropEnabled || !aspectLocked}
+                  disabled={encodeBusy || !cropEnabled || !aspectLocked}
                 >
                   <option value="free">Free</option>
                   <option value="1:1">1:1</option>
@@ -3752,7 +3890,7 @@ function App() {
             <div className="vfl-actions vfl-actions-wrap">
               <button
                 onClick={autoDetectCrop}
-                disabled={jobId !== null || !probe || !inputPath || cropDetecting}
+                disabled={encodeBusy || !probe || !inputPath || cropDetecting}
                 title="Detect black bars and suggest a crop"
               >
                 {cropDetecting ? "Detecting…" : "Auto detect crop"}
@@ -3762,7 +3900,7 @@ function App() {
                   setCropRect({ x: 0, y: 0, w: 1, h: 1 });
                   setCropDetectHint(null);
                 }}
-                disabled={jobId !== null || !probe}
+                disabled={encodeBusy || !probe}
                 title="Reset crop selection"
               >
                 Reset crop
@@ -3786,7 +3924,7 @@ function App() {
                     <div className="vfl-row2">
                       <div className="vfl-field">
                         <label htmlFor="vfl-speed">Speed</label>
-                        <input id="vfl-speed" value={speed} onChange={(e) => setSpeed(e.currentTarget.value)} disabled={jobId !== null} />
+                        <input id="vfl-speed" value={speed} onChange={(e) => setSpeed(e.currentTarget.value)} disabled={encodeBusy} />
                       </div>
                       <div className="vfl-field">
                         <label htmlFor="vfl-rotate">Rotate</label>
@@ -3794,7 +3932,7 @@ function App() {
                           id="vfl-rotate"
                           value={rotateDeg}
                           onChange={(e) => setRotateDeg(Number(e.currentTarget.value))}
-                          disabled={jobId !== null}
+                          disabled={encodeBusy}
                         >
                           <option value={0}>0°</option>
                           <option value={90}>90° clockwise</option>
@@ -3808,7 +3946,7 @@ function App() {
                         type="checkbox"
                         checked={reverse}
                         onChange={(e) => setReverse(e.currentTarget.checked)}
-                        disabled={jobId !== null}
+                        disabled={encodeBusy}
                       />
                       Reverse (video + audio)
                     </label>
@@ -3817,7 +3955,7 @@ function App() {
                         type="checkbox"
                         checked={format === "mp3" ? false : loopVideo}
                         onChange={(e) => setLoopVideo(e.currentTarget.checked)}
-                        disabled={jobId !== null || format === "mp3"}
+                        disabled={encodeBusy || format === "mp3"}
                       />
                       Loop (boomerang)
                     </label>
@@ -3845,7 +3983,7 @@ function App() {
                           value={brightness}
                           style={rangeFillStyle(Number(brightness), -1, 1)}
                           onChange={(e) => setBrightness(e.currentTarget.value)}
-                          disabled={jobId !== null}
+                          disabled={encodeBusy}
                         />
                         <div className="vfl-inline-hint">Lift shadows or darken the whole frame.</div>
                       </div>
@@ -3863,7 +4001,7 @@ function App() {
                           value={contrast}
                           style={rangeFillStyle(Number(contrast), 0, 2)}
                           onChange={(e) => setContrast(e.currentTarget.value)}
-                          disabled={jobId !== null}
+                          disabled={encodeBusy}
                         />
                         <div className="vfl-inline-hint">Increase separation between dark and bright areas.</div>
                       </div>
@@ -3882,7 +4020,7 @@ function App() {
                         value={saturation}
                         style={rangeFillStyle(Number(saturation), 0, 3)}
                         onChange={(e) => setSaturation(e.currentTarget.value)}
-                        disabled={jobId !== null}
+                        disabled={encodeBusy}
                       />
                       <div className="vfl-inline-hint">Boost or soften overall color intensity.</div>
                     </div>
@@ -3893,7 +4031,7 @@ function App() {
                           setContrast("1");
                           setSaturation("1");
                         }}
-                        disabled={jobId !== null}
+                        disabled={encodeBusy}
                       >
                         Reset color
                       </button>
@@ -3918,7 +4056,7 @@ function App() {
                           id="vfl-video-codec"
                           value={advancedVideoCodec}
                           onChange={(e) => setAdvancedVideoCodec(e.currentTarget.value as VideoCodecPreference)}
-                          disabled={jobId !== null || format === "mp3"}
+                          disabled={encodeBusy || format === "mp3"}
                         >
                           <option value="auto">
                             Auto
@@ -3948,7 +4086,7 @@ function App() {
                           id="vfl-audio-bitrate"
                           value={advancedAudioBitrateKbps}
                           onChange={(e) => setAdvancedAudioBitrateKbps(e.currentTarget.value)}
-                          disabled={jobId !== null || sizeLimitEnabled || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
+                          disabled={encodeBusy || sizeLimitEnabled || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
                         >
                           <option value="auto">Auto</option>
                           {AUDIO_BITRATE_PRESETS_KBPS.map((kbps) => (
@@ -3974,7 +4112,7 @@ function App() {
                           id="vfl-video-quality"
                           value={advancedVideoQuality}
                           onChange={(e) => setAdvancedVideoQuality(e.currentTarget.value as VideoQualityPreference)}
-                          disabled={jobId !== null || format === "mp3"}
+                          disabled={encodeBusy || format === "mp3"}
                         >
                           <option value="auto">Auto</option>
                           <option value="smaller">Smaller file</option>
@@ -3997,7 +4135,7 @@ function App() {
                           id="vfl-encode-speed"
                           value={advancedEncodeSpeed}
                           onChange={(e) => setAdvancedEncodeSpeed(e.currentTarget.value as EncodeSpeedPreference)}
-                          disabled={jobId !== null || format === "mp3"}
+                          disabled={encodeBusy || format === "mp3"}
                         >
                           <option value="auto">Auto</option>
                           <option value="faster">Faster</option>
@@ -4021,7 +4159,7 @@ function App() {
                           id="vfl-frame-rate-cap"
                           value={advancedFrameRateCapFps}
                           onChange={(e) => setAdvancedFrameRateCapFps(e.currentTarget.value)}
-                          disabled={jobId !== null || format === "mp3"}
+                          disabled={encodeBusy || format === "mp3"}
                         >
                           <option value="auto">Auto</option>
                           {FRAME_RATE_CAP_PRESETS_FPS.map((fps) => (
@@ -4046,7 +4184,7 @@ function App() {
                           id="vfl-audio-channels"
                           value={advancedAudioChannels}
                           onChange={(e) => setAdvancedAudioChannels(e.currentTarget.value as AudioChannelPreference)}
-                          disabled={jobId !== null || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
+                          disabled={encodeBusy || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
                         >
                           <option value="auto">Auto</option>
                           <option value="stereo">Stereo</option>
@@ -4070,7 +4208,7 @@ function App() {
                             type="checkbox"
                             checked={normalizeAudio}
                             onChange={(e) => setNormalizeAudio(e.currentTarget.checked)}
-                            disabled={jobId !== null || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
+                            disabled={encodeBusy || (format !== "mp3" && (!audioEnabled || (probe !== null && !probe.hasAudio)))}
                           />
                           <span>Normalize speech</span>
                         </label>
@@ -4094,7 +4232,7 @@ function App() {
                               type="button"
                               className={sampleDurationS === seconds ? "active" : ""}
                               onClick={() => setSampleDurationS(seconds)}
-                              disabled={jobId !== null}
+                              disabled={encodeBusy}
                               aria-pressed={sampleDurationS === seconds}
                             >
                               {seconds} s
@@ -4104,7 +4242,7 @@ function App() {
                         <button
                           type="button"
                           onClick={() => void exportSample()}
-                          disabled={!exportReady || jobId !== null}
+                          disabled={!exportReady || encodeBusy}
                         >
                           Export sample
                         </button>
@@ -4130,7 +4268,7 @@ function App() {
                           setAdvancedAudioChannels("auto");
                           setNormalizeAudio(false);
                         }}
-                        disabled={jobId !== null || advancedOverrideCount === 0}
+                        disabled={encodeBusy || advancedOverrideCount === 0}
                       >
                         Reset advanced
                       </button>
@@ -4141,7 +4279,7 @@ function App() {
                             setEncodeCapabilities(null);
                             setEncodeCapabilitiesError(null);
                           }}
-                          disabled={jobId !== null}
+                          disabled={encodeBusy}
                         >
                           Retry capability check
                         </button>
@@ -4207,18 +4345,22 @@ function App() {
 
           <RailCard
             title="Current plan"
-            summary={jobId !== null ? "Encoding now" : exportReady ? "Ready" : "Waiting"}
+            summary={attemptUi.summary ?? (exportReady ? "Ready" : "Waiting")}
             open={openCards.plan}
             onToggle={() => toggleCard("plan")}
           >
-                  <div className={`vfl-plan-hero ${exportReady ? "is-ready" : ""} ${jobId !== null ? "is-busy" : ""} ${lastExport ? "is-done" : ""}`}>
-                    <div className="vfl-plan-hero-kicker">{jobId !== null ? "Encoding now" : footerKicker}</div>
+                  <div className={`vfl-plan-hero ${planHeroReady ? "is-ready" : ""} ${attemptUi.isActive ? "is-busy" : ""} ${attemptUi.isSuccess ? "is-done" : ""} ${attemptUi.isFailure ? "is-failed" : ""} ${attemptUi.isCancelled ? "is-cancelled" : ""}`}>
+                    <div className="vfl-plan-hero-kicker">{footerKicker}</div>
                     <div className="vfl-plan-hero-copy">{planStatusText}</div>
                   </div>
                   <div className="vfl-summary-list">
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Source</div>
                       <div className="vfl-summary-value">{inputSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Source streams</div>
+                      <div className="vfl-summary-value">{sourceStreamSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Output</div>
@@ -4268,7 +4410,9 @@ function App() {
                     <div className="vfl-export-result">
                       <div className="vfl-export-result-head">
                         <div>
-                          <div className="vfl-export-result-kicker">Last export</div>
+                          <div className="vfl-export-result-kicker">
+                            {lastExportIsCurrentOutcome ? "Last export" : "Previous successful export"}
+                          </div>
                           <div className="vfl-export-result-title">Done{lastExportSizeText ? ` (${lastExportSizeText})` : ""}</div>
                         </div>
                         <div className="vfl-chip active">{lastExport.format.toUpperCase()}</div>
@@ -4288,12 +4432,24 @@ function App() {
                               <strong>{lastExport.diagnostics.mode}</strong>
                             </div>
                             <div>
-                              <span>Video</span>
-                              <strong>{lastExport.diagnostics.videoCodec ?? "none"}</strong>
+                              <span>Video result</span>
+                              <strong>
+                                {lastExport.diagnostics.videoCodec ?? "none"} ({formatStreamAction(lastExport.diagnostics.videoAction)})
+                              </strong>
                             </div>
                             <div>
-                              <span>Audio</span>
-                              <strong>{lastExport.diagnostics.audioCodec ?? "none"}</strong>
+                              <span>Audio result</span>
+                              <strong>
+                                {lastExport.diagnostics.audioCodec ?? "none"} ({formatStreamAction(lastExport.diagnostics.audioAction)})
+                              </strong>
+                            </div>
+                            <div>
+                              <span>Source media</span>
+                              <strong>
+                                {[lastExport.diagnostics.sourceFormat, lastExport.diagnostics.sourceVideoCodec, lastExport.diagnostics.sourceAudioCodec]
+                                  .filter(Boolean)
+                                  .join(" • ") || "unknown"}
+                              </strong>
                             </div>
                             <div>
                               <span>Passes</span>
@@ -4322,18 +4478,23 @@ function App() {
                           {lastExport.diagnostics.audioRemovedForSizeTarget ? (
                             <div className="vfl-export-result-note">Audio was removed to fit the requested size target.</div>
                           ) : null}
+                          {lastExport.diagnostics.copyFallbackReason ? (
+                            <div className="vfl-export-result-note">
+                              Copy fallback: {lastExport.diagnostics.copyFallbackReason}
+                            </div>
+                          ) : null}
                           <pre className="vfl-command-preview">{lastExport.diagnostics.commandPreview}</pre>
                         </details>
                       ) : null}
                       <div className="vfl-actions vfl-actions-secondary">
                         <button onClick={() => void openOutputFile(lastExport.outputPath)}>Open file</button>
-                        <button onClick={() => void openOutputFolder()}>Open folder</button>
+                        <button onClick={() => void openFolderFor(lastExport.outputPath)}>Open folder</button>
                       </div>
                     </div>
                   ) : null}
                   <div className="vfl-plan-actions">
                     <div className="vfl-actions vfl-actions-secondary">
-                      <button onClick={resetAllSettings} disabled={jobId !== null}>
+                      <button onClick={resetAllSettings} disabled={encodeBusy}>
                         Reset all settings
                       </button>
                     </div>
@@ -4356,13 +4517,13 @@ function App() {
               Add exports as snapshots and run them one after another with no parallel FFmpeg jobs.
             </div>
             <div className="vfl-actions vfl-actions-wrap vfl-queue-actions">
-              <button type="button" onClick={() => void addCurrentPlanToQueue()} disabled={!exportReady || jobId !== null}>
+              <button type="button" onClick={() => void addCurrentPlanToQueue()} disabled={!exportReady || encodeBusy}>
                 Add current plan
               </button>
-              <button type="button" onClick={() => void addFilesToQueue()} disabled={jobId !== null}>
+              <button type="button" onClick={() => void addFilesToQueue()} disabled={encodeBusy}>
                 Add files
               </button>
-              <button type="button" className="primary" onClick={runQueue} disabled={jobId !== null || queueRunning || queueCounts.queued === 0}>
+              <button type="button" className="primary" onClick={runQueue} disabled={encodeBusy || queueRunning || queueCounts.queued === 0}>
                 Run queue
               </button>
               <button type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
@@ -4415,7 +4576,7 @@ function App() {
         </aside>
       </div>
 
-      <footer className={`vfl-footer ${jobId !== null ? "is-active" : "is-idle"}`}>
+      <footer className={`vfl-footer ${attemptUi.isActive ? "is-active" : "is-idle"}`}>
         <div className="vfl-footer-main">
           <div className="vfl-footer-copy">
             <div className="vfl-footer-kicker">{footerKicker}</div>
@@ -4424,14 +4585,18 @@ function App() {
           </div>
           <div className="vfl-footer-actions">
             {lastExport ? (
-              <button onClick={() => void openOutputFile(lastExport.outputPath)} disabled={jobId !== null}>
-                Open file
+              <button onClick={() => void openOutputFile(lastExport.outputPath)} disabled={encodeBusy}>
+                {lastExportIsCurrentOutcome ? "Open file" : "Open previous file"}
               </button>
             ) : null}
-            <button onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || jobId !== null}>
+            <button onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || encodeBusy}>
               Open folder
             </button>
-            {jobId !== null ? (
+            {latestAttempt.kind === "starting" ? (
+              <button className="primary vfl-export-button" disabled>
+                Starting…
+              </button>
+            ) : jobId !== null ? (
               <button className="danger vfl-export-button" onClick={cancelEncode}>
                 Cancel
               </button>

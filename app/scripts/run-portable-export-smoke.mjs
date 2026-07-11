@@ -10,6 +10,38 @@ const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const __filename = url.fileURLToPath(import.meta.url);
 const requiredSmokeStages = ["input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding", "success"];
 const supportedSmokeOutputFormats = new Set(["mp4", "webm", "mp3"]);
+const codecFixtures = Object.freeze({
+  "vp8-vorbis-webm": Object.freeze({
+    extension: "webm",
+    videoArgs: ["-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8"],
+    audioArgs: ["-c:a", "libvorbis", "-q:a", "4"],
+  }),
+  "vp9-opus-mkv": Object.freeze({
+    extension: "mkv",
+    videoArgs: ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8"],
+    audioArgs: ["-c:a", "libopus", "-b:a", "96k"],
+  }),
+  "h264-aac-mkv": Object.freeze({
+    extension: "mkv",
+    videoArgs: ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"],
+    audioArgs: ["-c:a", "aac", "-b:a", "128k"],
+  }),
+  "h264-opus-mkv": Object.freeze({
+    extension: "mkv",
+    videoArgs: ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"],
+    audioArgs: ["-c:a", "libopus", "-b:a", "96k"],
+  }),
+  "vp9-aac-mkv": Object.freeze({
+    extension: "mkv",
+    videoArgs: ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8"],
+    audioArgs: ["-c:a", "aac", "-b:a", "128k"],
+  }),
+  "h264-aac-mp4": Object.freeze({
+    extension: "mp4",
+    videoArgs: ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"],
+    audioArgs: ["-c:a", "aac", "-b:a", "128k"],
+  }),
+});
 
 function smokeNumber(value, fallback) {
   return value === undefined || value === null ? fallback : value;
@@ -21,6 +53,14 @@ function normalizeSmokeOutputFormat(value) {
     throw new Error(`Unsupported portable export smoke format: ${value}`);
   }
   return outputFormat;
+}
+
+function resolveCodecFixture(name) {
+  const fixture = codecFixtures[name];
+  if (!fixture) {
+    throw new Error(`Unsupported portable export smoke codec fixture: ${name}`);
+  }
+  return fixture;
 }
 
 function sleep(ms) {
@@ -84,6 +124,73 @@ async function captureStdout(command, args) {
       reject(new Error(`${command} exited with code ${code}\n${stderr}`));
     });
   });
+}
+
+async function probeMedia(ffprobePath, mediaPath) {
+  return JSON.parse(await captureStdout(ffprobePath, [
+    "-v",
+    "quiet",
+    "-print_format",
+    "json",
+    "-show_format",
+    "-show_streams",
+    mediaPath,
+  ]));
+}
+
+async function streamPacketHashes(ffprobePath, mediaPath, selector) {
+  const payload = JSON.parse(await captureStdout(ffprobePath, [
+    "-v",
+    "quiet",
+    "-select_streams",
+    selector,
+    "-show_packets",
+    "-show_entries",
+    "packet=data_hash",
+    "-show_data_hash",
+    "sha256",
+    "-print_format",
+    "json",
+    mediaPath,
+  ]));
+  const hashes = Array.isArray(payload?.packets)
+    ? payload.packets.map((packet) => packet.data_hash).filter(Boolean)
+    : [];
+  if (hashes.length === 0) {
+    throw new Error(`Portable export smoke found no ${selector} packet hashes in ${mediaPath}.`);
+  }
+  return hashes;
+}
+
+function selectedCodec(probe, type) {
+  const stream = Array.isArray(probe?.streams)
+    ? probe.streams.find((candidate) => candidate.codec_type === type)
+    : null;
+  return stream?.codec_name ?? null;
+}
+
+async function assertStreamAction({
+  ffprobePath,
+  inputPath,
+  outputPath,
+  selector,
+  expectedAction,
+}) {
+  if (!expectedAction) return;
+  if (expectedAction !== "copy" && expectedAction !== "encode") {
+    throw new Error(`Unsupported expected stream action: ${expectedAction}`);
+  }
+  const [inputHashes, outputHashes] = await Promise.all([
+    streamPacketHashes(ffprobePath, inputPath, selector),
+    streamPacketHashes(ffprobePath, outputPath, selector),
+  ]);
+  const packetsMatch = JSON.stringify(inputHashes) === JSON.stringify(outputHashes);
+  if (expectedAction === "copy" && !packetsMatch) {
+    throw new Error(`Portable export smoke expected ${selector} packet copy, but packet hashes changed.`);
+  }
+  if (expectedAction === "encode" && packetsMatch) {
+    throw new Error(`Portable export smoke expected ${selector} re-encode, but packet hashes were unchanged.`);
+  }
 }
 
 async function readJsonFileOrNull(filePath) {
@@ -236,21 +343,28 @@ async function runLinuxPortableExportSmoke({
   inputHeight = 360,
   inputRate = 30,
   inputVideoBitrateKbps = 900,
+  codecFixture = "vp8-vorbis-webm",
   outputFormat = "mp4",
   sizeLimitMb = 0,
+  useFullDuration = false,
+  expectedVideoCodec,
+  expectedAudioCodec,
+  expectedVideoAction,
+  expectedAudioAction,
   resizeMode,
   resizeMaxEdgePx,
   resizeWidthPx,
   resizeHeightPx,
 } = {}) {
   outputFormat = normalizeSmokeOutputFormat(outputFormat);
+  const fixture = resolveCodecFixture(codecFixture);
   const { portableRoot, appPath, ffmpegPath, ffprobePath } = getLinuxPortablePaths(portableDir);
   for (const requiredPath of [appPath, ffmpegPath, ffprobePath]) {
     await assertRequiredFile(requiredPath);
   }
 
   const smokeRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-portable-export-smoke-"));
-  const inputPath = path.resolve(smokeRoot, "smoke-input.webm");
+  const inputPath = path.resolve(smokeRoot, `smoke-input.${fixture.extension}`);
   const outputPath = path.resolve(smokeRoot, `smoke-output.${outputFormat}`);
   const statusPath = path.resolve(smokeRoot, "smoke-status.json");
   let child = null;
@@ -271,20 +385,13 @@ async function runLinuxPortableExportSmoke({
       "sine=frequency=880:sample_rate=48000",
       "-t",
       "2",
-      "-c:v",
-      "libvpx",
-      "-deadline",
-      "good",
-      "-cpu-used",
-      "8",
+      ...fixture.videoArgs,
       "-b:v",
       `${inputVideoBitrateKbps}k`,
-      "-c:a",
-      "libvorbis",
-      "-q:a",
-      "4",
+      ...fixture.audioArgs,
       inputPath,
     ]);
+    const inputProbe = await probeMedia(ffprobePath, inputPath);
 
     const launch = buildLinuxLaunchCommand(appPath);
     child = spawn(launch.command, launch.args, {
@@ -298,7 +405,7 @@ async function runLinuxPortableExportSmoke({
         VFL_SMOKE_FORMAT: outputFormat,
         VFL_SMOKE_SIZE_LIMIT_MB: String(sizeLimitMb),
         VFL_SMOKE_TRIM_START_S: "0",
-        VFL_SMOKE_TRIM_END_S: String(trimEndSeconds),
+        ...(useFullDuration ? {} : { VFL_SMOKE_TRIM_END_S: String(trimEndSeconds) }),
         VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS: "1",
         ...(resizeMode ? { VFL_SMOKE_RESIZE_MODE: String(resizeMode) } : {}),
         ...(resizeMaxEdgePx === undefined || resizeMaxEdgePx === null ? {} : { VFL_SMOKE_RESIZE_MAX_EDGE_PX: String(resizeMaxEdgePx) }),
@@ -328,16 +435,13 @@ async function runLinuxPortableExportSmoke({
     if (outputStats.size <= 0) {
       throw new Error("Portable export smoke wrote an empty output file.");
     }
+    const inputMode = (await fs.stat(inputPath)).mode & 0o777;
+    const outputMode = outputStats.mode & 0o777;
+    if (outputMode !== inputMode) {
+      throw new Error(`Portable export smoke output permissions mismatch. expected=${inputMode.toString(8)} actual=${outputMode.toString(8)}`);
+    }
 
-    const ffprobe = JSON.parse(await captureStdout(ffprobePath, [
-      "-v",
-      "quiet",
-      "-print_format",
-      "json",
-      "-show_format",
-      "-show_streams",
-      outputPath,
-    ]));
+    const ffprobe = await probeMedia(ffprobePath, outputPath);
     const outputDurationS = Number.parseFloat(ffprobe?.format?.duration);
     if (!Number.isFinite(outputDurationS)) {
       throw new Error("Portable export smoke wrote an output file with an invalid duration.");
@@ -351,6 +455,29 @@ async function runLinuxPortableExportSmoke({
       }
     }
 
+    const actualVideoCodec = selectedCodec(ffprobe, "video");
+    const actualAudioCodec = selectedCodec(ffprobe, "audio");
+    if (expectedVideoCodec && actualVideoCodec !== expectedVideoCodec) {
+      throw new Error(`Portable export smoke video codec mismatch. expected=${expectedVideoCodec} actual=${actualVideoCodec ?? "none"}`);
+    }
+    if (expectedAudioCodec && actualAudioCodec !== expectedAudioCodec) {
+      throw new Error(`Portable export smoke audio codec mismatch. expected=${expectedAudioCodec} actual=${actualAudioCodec ?? "none"}`);
+    }
+    await assertStreamAction({
+      ffprobePath,
+      inputPath,
+      outputPath,
+      selector: "v:0",
+      expectedAction: expectedVideoAction,
+    });
+    await assertStreamAction({
+      ffprobePath,
+      inputPath,
+      outputPath,
+      selector: "a:0",
+      expectedAction: expectedAudioAction,
+    });
+
     const { trimStartS, trimEndS, expectedDurationS } = parseStatusTrimMetrics(status);
     if (trimEndS <= trimStartS) {
       throw new Error(`Portable export smoke reported invalid trim metrics: start=${trimStartS} end=${trimEndS}`);
@@ -359,7 +486,7 @@ async function runLinuxPortableExportSmoke({
       throw new Error(`Portable export smoke output duration mismatch. expected=${expectedDurationS.toFixed(3)}s actual=${outputDurationS.toFixed(3)}s`);
     }
 
-    console.log(`Portable export smoke passed. output=${outputPath} size_bytes=${outputStats.size} duration_s=${outputDurationS.toFixed(3)} trim=${trimStartS.toFixed(3)}-${trimEndS.toFixed(3)} status=${statusPath} stages=${stageHistory.join(" -> ")}`);
+    console.log(`Portable export smoke passed. fixture=${codecFixture} input=${selectedCodec(inputProbe, "video")}/${selectedCodec(inputProbe, "audio")} output=${actualVideoCodec}/${actualAudioCodec} output_path=${outputPath} size_bytes=${outputStats.size} duration_s=${outputDurationS.toFixed(3)} trim=${trimStartS.toFixed(3)}-${trimEndS.toFixed(3)} status=${statusPath} stages=${stageHistory.join(" -> ")}`);
   } finally {
     if (child) {
       await terminateLinuxSmokeProcess(child);

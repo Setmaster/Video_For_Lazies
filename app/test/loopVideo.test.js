@@ -27,9 +27,9 @@ test("backend wraps the filter chains as a forward+reverse boomerang", async () 
   assert.match(video, /asplit\[fa\]\[ra0\];\[ra0\]areverse\[ra\];\[fa\]\[ra\]concat=n=2:v=0:a=1/);
   // Loop is a no-op for audio-only mp3.
   assert.match(video, /!req\.loop_video \|\| matches!\(req\.format, OutputFormat::Mp3\)/);
-  // Output duration doubles; stream-copy is disabled.
+  // Output duration doubles; the planner treats Loop as a timeline encode.
   assert.match(video, /if loop_video \{ base \* 2\.0 \} else \{ base \}/);
-  assert.match(video, /&& !request\.loop_video;/);
+  assert.match(video, /fn timeline_requires_encode[\s\S]*\|\| request\.loop_video/);
 });
 
 test("frontend exposes a Loop toggle wired through the request", async () => {

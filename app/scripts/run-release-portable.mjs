@@ -15,6 +15,7 @@ import {
 } from "./ffmpegBundle.mjs";
 import { runPortableSmoke } from "./run-portable-smoke.mjs";
 import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
+import { runPortableCodecPlanSmoke } from "./run-portable-codec-plan-smoke.mjs";
 import {
   buildChecksumLines,
   getPortableChecksumPath,
@@ -319,6 +320,7 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
       inputVideoBitrateKbps: 2400,
       sizeLimitMb: 0.3,
     });
+    await runPortableCodecPlanSmoke({ portableDir });
     console.log("Linux portable payload verified with bundled FFmpeg, FFprobe, and packaged app export smokes.");
     return;
   }

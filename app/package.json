@@ -11,6 +11,7 @@
     "prepare:ffmpeg-sidecar": "node scripts/run-sync-ffmpeg-sidecar.mjs",
     "smoke:portable": "node scripts/run-portable-smoke.mjs",
     "smoke:portable:export": "node scripts/run-portable-export-smoke.mjs",
+    "smoke:portable:codecs": "node scripts/run-portable-codec-plan-smoke.mjs",
     "release:portable": "node scripts/run-release-portable.mjs",
     "release:notes": "node scripts/generate-release-notes.mjs",
     "release:assets": "node scripts/prepare-release-assets.mjs",

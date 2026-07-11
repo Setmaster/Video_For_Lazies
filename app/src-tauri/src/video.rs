@@ -6,10 +6,14 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Window};
+use tempfile::{Builder as TempFileBuilder, TempDir, TempPath};
 
 const MB_BYTES: u64 = 1_000_000;
 const PROGRESS_EMIT_EVERY: Duration = Duration::from_millis(200);
@@ -47,6 +51,13 @@ pub struct VideoProbe {
     pub height: u32,
     pub frame_rate: Option<f64>,
     pub has_audio: bool,
+    pub source_format: Option<String>,
+    pub video_stream_index: u32,
+    pub video_codec: Option<String>,
+    pub video_is_default: bool,
+    pub audio_stream_index: Option<u32>,
+    pub audio_codec: Option<String>,
+    pub audio_is_default: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,6 +213,7 @@ pub struct EncodeRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeProgressPayload {
+    pub attempt_id: u64,
     pub job_id: u64,
     pub pass: u8,
     pub total_passes: u8,
@@ -212,6 +224,7 @@ pub struct EncodeProgressPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeFinishedPayload {
+    pub attempt_id: u64,
     pub job_id: u64,
     pub ok: bool,
     pub output_path: Option<String>,
@@ -224,6 +237,11 @@ pub struct EncodeFinishedPayload {
 #[serde(rename_all = "camelCase")]
 pub struct ExportDiagnostics {
     pub mode: String,
+    pub video_action: Option<StreamAction>,
+    pub audio_action: StreamAction,
+    pub source_format: Option<String>,
+    pub source_video_codec: Option<String>,
+    pub source_audio_codec: Option<String>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub video_bitrate_kbps: Option<u32>,
@@ -233,6 +251,7 @@ pub struct ExportDiagnostics {
     pub passes: u8,
     pub attempts: u32,
     pub audio_removed_for_size_target: bool,
+    pub copy_fallback_reason: Option<String>,
     pub command_preview: String,
 }
 
@@ -269,6 +288,15 @@ impl VideoCodec {
             VideoCodec::LibVpx => "libvpx",
         }
     }
+
+    fn as_codec_name(self) -> &'static str {
+        match self {
+            VideoCodec::LibX264 => "h264",
+            VideoCodec::Mpeg4 => "mpeg4",
+            VideoCodec::LibVpxVp9 => "vp9",
+            VideoCodec::LibVpx => "vp8",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +316,15 @@ impl AudioCodec {
             AudioCodec::LibVorbis => "libvorbis",
             AudioCodec::LibMp3Lame => "libmp3lame",
             AudioCodec::Mp3 => "mp3",
+        }
+    }
+
+    fn as_codec_name(self) -> &'static str {
+        match self {
+            AudioCodec::Aac => "aac",
+            AudioCodec::LibOpus => "opus",
+            AudioCodec::LibVorbis => "vorbis",
+            AudioCodec::LibMp3Lame | AudioCodec::Mp3 => "mp3",
         }
     }
 }
@@ -312,6 +349,90 @@ struct CodecSelection {
     video_codec: Option<VideoCodec>,
     audio_codec: Option<AudioCodec>,
     quality_mode: Option<QualityMode>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamAction {
+    Copy,
+    Encode,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodeMode {
+    Remux,
+    VideoCopyAudioEncode,
+    VideoEncodeAudioCopy,
+    FullEncode,
+    SizeTargeted,
+    AudioOnlyEncode,
+}
+
+impl EncodeMode {
+    fn label(self) -> &'static str {
+        match self {
+            EncodeMode::Remux => "Stream copy",
+            EncodeMode::VideoCopyAudioEncode => "Video copy + audio re-encode",
+            EncodeMode::VideoEncodeAudioCopy => "Video re-encode + audio copy",
+            EncodeMode::FullEncode => "Video re-encode",
+            EncodeMode::SizeTargeted => "Size-targeted two-pass encode",
+            EncodeMode::AudioOnlyEncode => "Audio-only encode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanReason {
+    CompatibleSourceCodec,
+    IncompatibleSourceCodec,
+    MissingStream,
+    AudioDisabled,
+    VideoTransform,
+    TimelineTransform,
+    ExplicitVideoCodec,
+    VideoQuality,
+    EncodeSpeed,
+    FrameRateCap,
+    AudioNormalization,
+    AudioBitrate,
+    AudioChannels,
+    SizeTarget,
+    AudioOnlyOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyCandidatePlan {
+    video_stream_index: u32,
+    audio_stream_index: Option<u32>,
+    audio_action: StreamAction,
+}
+
+#[derive(Debug, Clone)]
+struct EncodeCommandPlan {
+    mode: EncodeMode,
+    video_stream_index: Option<u32>,
+    audio_stream_index: Option<u32>,
+    source_video_codec: Option<String>,
+    source_audio_codec: Option<String>,
+    video_action: StreamAction,
+    audio_action: StreamAction,
+    video_encoder: Option<VideoCodec>,
+    audio_encoder: Option<AudioCodec>,
+    output_video_codec: Option<String>,
+    output_audio_codec: Option<String>,
+    quality_mode: Option<QualityMode>,
+    encode_speed: EncodeSpeedPreference,
+    audio_bitrate_kbps: Option<u32>,
+    audio_channels: Option<u8>,
+    video_filters: Option<String>,
+    audio_filters: Option<String>,
+    #[allow(dead_code)] // retained for plan inspection and focused tests
+    video_reasons: Vec<PlanReason>,
+    #[allow(dead_code)] // retained for plan inspection and focused tests
+    audio_reasons: Vec<PlanReason>,
+    size_contract: Option<SizeLimitedEncodeContract>,
+    size_copy_candidate: Option<CopyCandidatePlan>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -544,8 +665,8 @@ fn push_metadata_args(args: &mut Vec<String>, request: &EncodeRequest) {
     }
 }
 
-fn build_stream_copy_args(input: &str, request: &EncodeRequest, probe: &VideoProbe) -> Vec<String> {
-    let mut args = vec![
+fn base_ffmpeg_args(input: &str) -> Vec<String> {
+    vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -555,19 +676,34 @@ fn build_stream_copy_args(input: &str, request: &EncodeRequest, probe: &VideoPro
         "-progress".to_string(),
         "pipe:1".to_string(),
         "-nostats".to_string(),
-        "-map".to_string(),
-        "0:v:0".to_string(),
-        "-c:v".to_string(),
-        "copy".to_string(),
-    ];
+    ]
+}
 
-    if request.audio_enabled && probe.has_audio {
-        args.push("-map".to_string());
-        args.push("0:a:0?".to_string());
-        args.push("-c:a".to_string());
-        args.push("copy".to_string());
-    } else {
-        args.push("-an".to_string());
+fn push_absolute_map(args: &mut Vec<String>, stream_index: u32) {
+    args.push("-map".to_string());
+    args.push(format!("0:{stream_index}"));
+}
+
+fn build_copy_candidate_args(
+    input: &str,
+    request: &EncodeRequest,
+    candidate: &CopyCandidatePlan,
+) -> Vec<String> {
+    let mut args = base_ffmpeg_args(input);
+    push_absolute_map(&mut args, candidate.video_stream_index);
+    args.extend(["-c:v", "copy"].into_iter().map(String::from));
+
+    match candidate.audio_action {
+        StreamAction::Copy => {
+            if let Some(stream_index) = candidate.audio_stream_index {
+                push_absolute_map(&mut args, stream_index);
+                args.extend(["-c:a", "copy"].into_iter().map(String::from));
+            } else {
+                args.push("-an".to_string());
+            }
+        }
+        StreamAction::Drop => args.push("-an".to_string()),
+        StreamAction::Encode => unreachable!("copy candidate cannot encode audio"),
     }
 
     push_metadata_args(&mut args, request);
@@ -580,27 +716,167 @@ fn build_stream_copy_args(input: &str, request: &EncodeRequest, probe: &VideoPro
     args
 }
 
-fn temp_output_path(output_path: &Path, job_id: u64, label: &str) -> Result<PathBuf, String> {
+fn build_single_pass_args(
+    input: &str,
+    request: &EncodeRequest,
+    plan: &EncodeCommandPlan,
+) -> Result<Vec<String>, String> {
+    let mut args = base_ffmpeg_args(input);
+    let video_stream_index = plan
+        .video_stream_index
+        .ok_or_else(|| "Missing selected video stream index.".to_string())?;
+    push_absolute_map(&mut args, video_stream_index);
+
+    match plan.video_action {
+        StreamAction::Copy => {
+            args.extend(["-c:v", "copy"].into_iter().map(String::from));
+        }
+        StreamAction::Encode => {
+            let video_encoder = plan
+                .video_encoder
+                .ok_or_else(|| "Missing video encoder for re-encode plan.".to_string())?;
+            args.extend(
+                ["-c:v", video_encoder.as_ffmpeg_name()]
+                    .into_iter()
+                    .map(String::from),
+            );
+            match plan
+                .quality_mode
+                .ok_or_else(|| "Missing quality settings for export format.".to_string())?
+            {
+                QualityMode::Crf { crf, preset } => {
+                    args.extend(["-crf", crf].into_iter().map(String::from));
+                    if let Some(preset) = preset
+                        && plan.encode_speed == EncodeSpeedPreference::Auto
+                    {
+                        args.extend(["-preset", preset].into_iter().map(String::from));
+                    }
+                }
+                QualityMode::Cq { crf, bitrate } => {
+                    args.extend(["-crf", crf, "-b:v", bitrate].into_iter().map(String::from));
+                }
+                QualityMode::QScale { qscale } => {
+                    args.extend(["-q:v", qscale].into_iter().map(String::from));
+                }
+            }
+            args.extend(encode_speed_args_for_codec(
+                video_encoder,
+                plan.encode_speed,
+            ));
+            if let Some(video_filters) = &plan.video_filters {
+                args.push("-vf".to_string());
+                args.push(video_filters.clone());
+            }
+        }
+        StreamAction::Drop => return Err("Video output plan cannot drop video.".to_string()),
+    }
+
+    match plan.audio_action {
+        StreamAction::Copy => {
+            let audio_stream_index = plan
+                .audio_stream_index
+                .ok_or_else(|| "Missing selected audio stream index.".to_string())?;
+            push_absolute_map(&mut args, audio_stream_index);
+            args.extend(["-c:a", "copy"].into_iter().map(String::from));
+        }
+        StreamAction::Encode => {
+            let audio_stream_index = plan
+                .audio_stream_index
+                .ok_or_else(|| "Missing selected audio stream index.".to_string())?;
+            let audio_encoder = plan
+                .audio_encoder
+                .ok_or_else(|| "Missing audio encoder for re-encode plan.".to_string())?;
+            push_absolute_map(&mut args, audio_stream_index);
+            args.extend(
+                ["-c:a", audio_encoder.as_ffmpeg_name()]
+                    .into_iter()
+                    .map(String::from),
+            );
+            if let Some(channels) = plan.audio_channels {
+                args.extend(["-ac".to_string(), channels.to_string()]);
+            }
+            let audio_kbps = plan.audio_bitrate_kbps.unwrap_or(match request.format {
+                OutputFormat::Mp4 => 192,
+                OutputFormat::Webm => 128,
+                OutputFormat::Mp3 => unreachable!(),
+            });
+            args.extend(["-b:a".to_string(), format!("{audio_kbps}k")]);
+            if let Some(audio_filters) = &plan.audio_filters {
+                args.push("-af".to_string());
+                args.push(audio_filters.clone());
+            }
+        }
+        StreamAction::Drop => args.push("-an".to_string()),
+    }
+
+    push_metadata_args(&mut args, request);
+    if matches!(request.format, OutputFormat::Mp4) {
+        args.extend(["-movflags", "+faststart"].into_iter().map(String::from));
+        if plan.video_action == StreamAction::Encode {
+            args.extend(["-pix_fmt", "yuv420p"].into_iter().map(String::from));
+        }
+    }
+    Ok(args)
+}
+
+fn full_reencode_fallback(plan: &EncodeCommandPlan) -> EncodeCommandPlan {
+    let mut fallback = plan.clone();
+    if fallback.video_action == StreamAction::Copy {
+        fallback.video_action = StreamAction::Encode;
+        fallback.output_video_codec = fallback
+            .video_encoder
+            .map(|codec| codec.as_codec_name().to_string());
+    }
+    if fallback.audio_action == StreamAction::Copy {
+        fallback.audio_action = StreamAction::Encode;
+        fallback.output_audio_codec = fallback
+            .audio_encoder
+            .map(|codec| codec.as_codec_name().to_string());
+    }
+    fallback.mode = match (fallback.video_action, fallback.audio_action) {
+        (StreamAction::Encode, StreamAction::Copy) => EncodeMode::VideoEncodeAudioCopy,
+        (StreamAction::Copy, StreamAction::Encode) => EncodeMode::VideoCopyAudioEncode,
+        (StreamAction::Copy, StreamAction::Copy | StreamAction::Drop) => EncodeMode::Remux,
+        (StreamAction::Encode, StreamAction::Encode | StreamAction::Drop) => EncodeMode::FullEncode,
+        (StreamAction::Drop, _) => unreachable!("video output cannot drop video"),
+    };
+    fallback
+}
+
+fn create_temp_output(output_path: &Path, job_id: u64, label: &str) -> Result<TempPath, String> {
     let parent = output_path
         .parent()
         .ok_or_else(|| "Output path must include a folder.".to_string())?;
-    let stem = output_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("output");
     let extension = output_path
         .extension()
         .and_then(|extension| extension.to_str())
         .ok_or_else(|| "Output path must include an extension.".to_string())?;
-    Ok(parent.join(format!(".{stem}.vfl-{job_id}-{label}.tmp.{extension}")))
+    let prefix = format!(".vfl-{}-{job_id}-{label}-", std::process::id());
+    let suffix = format!(".tmp.{extension}");
+    let mut builder = TempFileBuilder::new();
+    builder.prefix(&prefix).suffix(&suffix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Match an ordinary created output (0666 filtered by the process
+        // umask). Tempfile defaults to 0600, which would otherwise persist as
+        // an unexpected owner-only mode after no-clobber publication.
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    builder
+        .tempfile_in(parent)
+        .map(|file| file.into_temp_path())
+        .map_err(|error| format!("Failed to reserve temporary output file: {error}"))
 }
 
-fn publish_output_file(temp_path: &Path, output_path: &Path) -> Result<(), String> {
-    if output_path.exists() {
-        let _ = fs::remove_file(temp_path);
-        return Err("Output file already exists. Choose a new filename.".to_string());
-    }
-    fs::rename(temp_path, output_path).map_err(|e| format!("Failed to publish output file: {e}"))
+fn publish_output_file(temp_path: TempPath, output_path: &Path) -> Result<(), String> {
+    temp_path.persist_noclobber(output_path).map_err(|error| {
+        if output_path.exists() {
+            "Output file already exists. Choose a new filename.".to_string()
+        } else {
+            format!("Failed to publish output file: {}", error.error)
+        }
+    })
 }
 
 fn parse_encoder_names(stdout: &str) -> HashSet<String> {
@@ -980,50 +1256,307 @@ fn output_frame_rate_for_planning(
     }
 }
 
-fn advanced_forces_reencode(
+fn normalized_codec_name(codec: Option<&str>) -> Option<String> {
+    codec
+        .map(str::trim)
+        .filter(|codec| !codec.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn video_copy_compatible(format: OutputFormat, codec: Option<&str>) -> bool {
+    let Some(codec) = codec.map(str::trim) else {
+        return false;
+    };
+    match format {
+        OutputFormat::Mp4 => {
+            codec.eq_ignore_ascii_case("h264") || codec.eq_ignore_ascii_case("mpeg4")
+        }
+        OutputFormat::Webm => {
+            codec.eq_ignore_ascii_case("vp8") || codec.eq_ignore_ascii_case("vp9")
+        }
+        OutputFormat::Mp3 => false,
+    }
+}
+
+fn audio_copy_compatible(format: OutputFormat, codec: Option<&str>) -> bool {
+    let Some(codec) = codec.map(str::trim) else {
+        return false;
+    };
+    match format {
+        OutputFormat::Mp4 => codec.eq_ignore_ascii_case("aac"),
+        OutputFormat::Webm => {
+            codec.eq_ignore_ascii_case("opus") || codec.eq_ignore_ascii_case("vorbis")
+        }
+        OutputFormat::Mp3 => false,
+    }
+}
+
+fn timeline_requires_encode(request: &EncodeRequest) -> bool {
+    request.trim.is_some()
+        || request.reverse
+        || (request.speed - 1.0).abs() > 1e-9
+        || request.loop_video
+}
+
+fn video_transform_requires_encode(request: &EncodeRequest) -> Result<bool, String> {
+    Ok(timeline_requires_encode(request)
+        || request.crop.is_some()
+        || request.rotate_deg != 0
+        || !matches!(requested_resize(request)?, ResizePlan::Source)
+        || !color_is_noop(&request.color)
+        || request.perturb_first_frame)
+}
+
+fn build_encode_command_plan(
     request: &EncodeRequest,
     probe: &VideoProbe,
-    size_limit_enabled: bool,
-) -> Result<bool, String> {
-    if matches!(request.format, OutputFormat::Mp3) {
-        return Ok(false);
+    codec_selection: CodecSelection,
+    source_size_bytes: u64,
+    resolved_perturb_seed: Option<u32>,
+) -> Result<EncodeCommandPlan, String> {
+    let size_limit_enabled = request.size_limit_mb > 0.0;
+    let advanced_audio_bitrate = advanced_audio_bitrate_kbps(request)?;
+    let advanced_audio_channels = audio_channel_count(request);
+    let encode_speed = encode_speed_preference(&request.advanced);
+
+    let mut resolved_request = request.clone();
+    if request.perturb_first_frame {
+        resolved_request.perturb_seed = Some(
+            resolved_perturb_seed
+                .ok_or_else(|| "Missing resolved first-frame perturbation seed.".to_string())?,
+        );
     }
 
-    let video_codec = request
+    let audio_filters = build_audio_filters(&resolved_request, probe)?;
+    let video_filters = if matches!(request.format, OutputFormat::Mp3) {
+        None
+    } else {
+        build_video_filters(&resolved_request, probe)?
+    };
+
+    if matches!(request.format, OutputFormat::Mp3) {
+        if !request.audio_enabled {
+            return Err("Audio must be enabled for MP3 output.".to_string());
+        }
+        let audio_stream_index = probe
+            .audio_stream_index
+            .ok_or_else(|| "Input file has no audio stream.".to_string())?;
+        let audio_encoder = codec_selection
+            .audio_codec
+            .unwrap_or(AudioCodec::LibMp3Lame);
+        return Ok(EncodeCommandPlan {
+            mode: EncodeMode::AudioOnlyEncode,
+            video_stream_index: None,
+            audio_stream_index: Some(audio_stream_index),
+            source_video_codec: probe.video_codec.clone(),
+            source_audio_codec: probe.audio_codec.clone(),
+            video_action: StreamAction::Drop,
+            audio_action: StreamAction::Encode,
+            video_encoder: None,
+            audio_encoder: Some(audio_encoder),
+            output_video_codec: None,
+            output_audio_codec: Some(audio_encoder.as_codec_name().to_string()),
+            quality_mode: None,
+            encode_speed,
+            audio_bitrate_kbps: advanced_audio_bitrate,
+            audio_channels: advanced_audio_channels,
+            video_filters: None,
+            audio_filters,
+            video_reasons: vec![PlanReason::AudioOnlyOutput],
+            audio_reasons: vec![PlanReason::AudioOnlyOutput],
+            size_contract: None,
+            size_copy_candidate: None,
+        });
+    }
+
+    let selected_video_encoder = codec_selection
+        .video_codec
+        .ok_or_else(|| "Missing video codec selection.".to_string())?;
+    let selected_audio_encoder = codec_selection.audio_codec.unwrap_or(AudioCodec::Aac);
+    let timeline_change = timeline_requires_encode(request);
+
+    let mut video_reasons = Vec::new();
+    let mut natural_video_action =
+        if video_copy_compatible(request.format, probe.video_codec.as_deref()) {
+            video_reasons.push(PlanReason::CompatibleSourceCodec);
+            StreamAction::Copy
+        } else {
+            video_reasons.push(PlanReason::IncompatibleSourceCodec);
+            StreamAction::Encode
+        };
+
+    if video_transform_requires_encode(request)? {
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(if timeline_change {
+            PlanReason::TimelineTransform
+        } else {
+            PlanReason::VideoTransform
+        });
+    }
+    if request
         .advanced
         .video_codec
-        .unwrap_or(VideoCodecPreference::Auto);
-    if video_codec != VideoCodecPreference::Auto {
-        return Ok(true);
+        .unwrap_or(VideoCodecPreference::Auto)
+        != VideoCodecPreference::Auto
+    {
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::ExplicitVideoCodec);
     }
-
     if !size_limit_enabled
         && video_quality_preference(&request.advanced) != VideoQualityPreference::Auto
     {
-        return Ok(true);
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::VideoQuality);
     }
-
-    if encode_speed_preference(&request.advanced) != EncodeSpeedPreference::Auto {
-        return Ok(true);
+    if encode_speed != EncodeSpeedPreference::Auto {
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::EncodeSpeed);
     }
-
     if frame_rate_cap_filter_fps(request, probe)?.is_some() {
-        return Ok(true);
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::FrameRateCap);
     }
 
-    if request.audio_enabled && probe.has_audio {
+    let mut audio_reasons = Vec::new();
+    let mut natural_audio_action = if !request.audio_enabled {
+        audio_reasons.push(PlanReason::AudioDisabled);
+        StreamAction::Drop
+    } else if probe.audio_stream_index.is_none() {
+        audio_reasons.push(PlanReason::MissingStream);
+        StreamAction::Drop
+    } else if audio_copy_compatible(request.format, probe.audio_codec.as_deref()) {
+        audio_reasons.push(PlanReason::CompatibleSourceCodec);
+        StreamAction::Copy
+    } else {
+        audio_reasons.push(PlanReason::IncompatibleSourceCodec);
+        StreamAction::Encode
+    };
+
+    if natural_audio_action != StreamAction::Drop {
+        if timeline_change {
+            natural_audio_action = StreamAction::Encode;
+            audio_reasons.push(PlanReason::TimelineTransform);
+        }
         if request.normalize_audio {
-            return Ok(true);
+            natural_audio_action = StreamAction::Encode;
+            audio_reasons.push(PlanReason::AudioNormalization);
         }
-        if !size_limit_enabled && request.advanced.audio_bitrate_kbps.is_some() {
-            return Ok(true);
+        if !size_limit_enabled && advanced_audio_bitrate.is_some() {
+            natural_audio_action = StreamAction::Encode;
+            audio_reasons.push(PlanReason::AudioBitrate);
         }
-        if audio_channel_count(request).is_some() {
-            return Ok(true);
+        if advanced_audio_channels.is_some() {
+            natural_audio_action = StreamAction::Encode;
+            audio_reasons.push(PlanReason::AudioChannels);
         }
     }
 
-    Ok(false)
+    if size_limit_enabled {
+        let output_duration_s = estimate_output_duration_s(
+            probe.duration_s,
+            &request.trim,
+            request.speed,
+            request.loop_video,
+        )?;
+        let include_audio = request.audio_enabled && probe.audio_stream_index.is_some();
+        let size_contract = build_size_limited_encode_contract(
+            request,
+            probe,
+            selected_video_encoder,
+            output_duration_s,
+            include_audio,
+        )?;
+        let audio_action = if size_contract.plan.include_audio {
+            StreamAction::Encode
+        } else {
+            StreamAction::Drop
+        };
+        video_reasons.push(PlanReason::SizeTarget);
+        audio_reasons.push(PlanReason::SizeTarget);
+
+        let target_bytes = (request.size_limit_mb * MB_BYTES as f64) as u64;
+        let explicitly_dropping_existing_audio =
+            !request.audio_enabled && probe.audio_stream_index.is_some();
+        let size_copy_candidate = (natural_video_action == StreamAction::Copy
+            && matches!(
+                natural_audio_action,
+                StreamAction::Copy | StreamAction::Drop
+            )
+            && (source_size_bytes <= target_bytes || explicitly_dropping_existing_audio))
+            .then_some(CopyCandidatePlan {
+                video_stream_index: probe.video_stream_index,
+                audio_stream_index: probe.audio_stream_index,
+                audio_action: natural_audio_action,
+            });
+
+        return Ok(EncodeCommandPlan {
+            mode: EncodeMode::SizeTargeted,
+            video_stream_index: Some(probe.video_stream_index),
+            audio_stream_index: probe.audio_stream_index,
+            source_video_codec: probe.video_codec.clone(),
+            source_audio_codec: probe.audio_codec.clone(),
+            video_action: StreamAction::Encode,
+            audio_action,
+            video_encoder: Some(selected_video_encoder),
+            audio_encoder: (audio_action == StreamAction::Encode).then_some(selected_audio_encoder),
+            output_video_codec: Some(selected_video_encoder.as_codec_name().to_string()),
+            output_audio_codec: (audio_action == StreamAction::Encode)
+                .then(|| selected_audio_encoder.as_codec_name().to_string()),
+            quality_mode: codec_selection.quality_mode,
+            encode_speed,
+            audio_bitrate_kbps: None,
+            audio_channels: advanced_audio_channels,
+            video_filters,
+            audio_filters,
+            video_reasons,
+            audio_reasons,
+            size_contract: Some(size_contract),
+            size_copy_candidate,
+        });
+    }
+
+    let mode = match (natural_video_action, natural_audio_action) {
+        (StreamAction::Copy, StreamAction::Copy | StreamAction::Drop) => EncodeMode::Remux,
+        (StreamAction::Copy, StreamAction::Encode) => EncodeMode::VideoCopyAudioEncode,
+        (StreamAction::Encode, StreamAction::Copy) => EncodeMode::VideoEncodeAudioCopy,
+        (StreamAction::Encode, StreamAction::Encode | StreamAction::Drop) => EncodeMode::FullEncode,
+        (StreamAction::Drop, _) => unreachable!("video output must retain a video stream"),
+    };
+    let output_video_codec = match natural_video_action {
+        StreamAction::Copy => probe.video_codec.clone(),
+        StreamAction::Encode => Some(selected_video_encoder.as_codec_name().to_string()),
+        StreamAction::Drop => None,
+    };
+    let output_audio_codec = match natural_audio_action {
+        StreamAction::Copy => probe.audio_codec.clone(),
+        StreamAction::Encode => Some(selected_audio_encoder.as_codec_name().to_string()),
+        StreamAction::Drop => None,
+    };
+
+    Ok(EncodeCommandPlan {
+        mode,
+        video_stream_index: Some(probe.video_stream_index),
+        audio_stream_index: probe.audio_stream_index,
+        source_video_codec: probe.video_codec.clone(),
+        source_audio_codec: probe.audio_codec.clone(),
+        video_action: natural_video_action,
+        audio_action: natural_audio_action,
+        video_encoder: Some(selected_video_encoder),
+        audio_encoder: (natural_audio_action != StreamAction::Drop)
+            .then_some(selected_audio_encoder),
+        output_video_codec,
+        output_audio_codec,
+        quality_mode: codec_selection.quality_mode,
+        encode_speed,
+        audio_bitrate_kbps: advanced_audio_bitrate,
+        audio_channels: advanced_audio_channels,
+        video_filters,
+        audio_filters,
+        video_reasons,
+        audio_reasons,
+        size_contract: None,
+        size_copy_candidate: None,
+    })
 }
 
 fn encode_speed_args_for_codec(
@@ -1288,11 +1821,7 @@ pub fn extract_frame(input_path: String, time_s: f64, output_path: String) -> Re
     }
 
     let output_path = validate_output_path(&input_path, &PathBuf::from(output_path.trim()), "png")?;
-    let temp_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_millis(0))
-        .as_millis() as u64;
-    let temp_path = temp_output_path(&output_path, temp_id, "frame")?;
+    let temp_path = create_temp_output(&output_path, 0, "frame")?;
 
     let ffmpeg_bin = default_ffmpeg();
 
@@ -1319,13 +1848,9 @@ pub fn extract_frame(input_path: String, time_s: f64, output_path: String) -> Re
         &ffmpeg_bin,
         "frame export",
         FRAME_EXTRACT_TIMEOUT,
-    )
-    .inspect_err(|_| {
-        let _ = fs::remove_file(&temp_path);
-    })?;
+    )?;
 
     if !output.status.success() {
-        let _ = fs::remove_file(&temp_path);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let lines: Vec<&str> = stderr.lines().collect();
         let start = lines.len().saturating_sub(20);
@@ -1333,7 +1858,7 @@ pub fn extract_frame(input_path: String, time_s: f64, output_path: String) -> Re
         return Err(format!("Frame export failed.\n\n{tail}"));
     }
 
-    publish_output_file(&temp_path, &output_path)?;
+    publish_output_file(temp_path, &output_path)?;
 
     Ok(())
 }
@@ -1349,6 +1874,7 @@ struct FFProbeOutput {
 #[derive(Debug, Deserialize, Default)]
 struct FFProbeFormat {
     duration: Option<String>,
+    format_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1362,8 +1888,18 @@ struct FFProbeStreamTags {
     rotate: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct FFProbeDisposition {
+    #[serde(default)]
+    default: u8,
+    #[serde(default)]
+    attached_pic: u8,
+}
+
 #[derive(Debug, Deserialize)]
 struct FFProbeStream {
+    index: Option<u32>,
+    codec_name: Option<String>,
     codec_type: Option<String>,
     duration: Option<String>,
     width: Option<u32>,
@@ -1373,6 +1909,38 @@ struct FFProbeStream {
     #[serde(default)]
     side_data_list: Vec<FFProbeSideData>,
     tags: Option<FFProbeStreamTags>,
+    #[serde(default)]
+    disposition: FFProbeDisposition,
+}
+
+fn select_primary_video_stream(streams: &[FFProbeStream]) -> Option<&FFProbeStream> {
+    streams
+        .iter()
+        .filter(|stream| {
+            stream.codec_type.as_deref() == Some("video")
+                && stream.index.is_some()
+                && stream.width.is_some()
+                && stream.height.is_some()
+                && stream.disposition.attached_pic == 0
+        })
+        .min_by_key(|stream| {
+            (
+                stream.disposition.default == 0,
+                stream.index.unwrap_or(u32::MAX),
+            )
+        })
+}
+
+fn select_primary_audio_stream(streams: &[FFProbeStream]) -> Option<&FFProbeStream> {
+    streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio") && stream.index.is_some())
+        .min_by_key(|stream| {
+            (
+                stream.disposition.default == 0,
+                stream.index.unwrap_or(u32::MAX),
+            )
+        })
 }
 
 fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
@@ -1476,10 +2044,10 @@ fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
     let parsed: FFProbeOutput =
         serde_json::from_str(stdout).map_err(|e| format!("ffprobe returned invalid JSON: {e}"))?;
 
-    let has_audio = parsed
-        .streams
-        .iter()
-        .any(|s| s.codec_type.as_deref() == Some("audio"));
+    let selected_video = select_primary_video_stream(&parsed.streams).ok_or_else(|| {
+        "Could not find a usable non-attached video stream (ffprobe).".to_string()
+    })?;
+    let selected_audio = select_primary_audio_stream(&parsed.streams);
 
     let mut duration_s = parsed
         .format
@@ -1489,52 +2057,49 @@ fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
         .unwrap_or(0.0);
 
     if duration_s <= 0.0 {
-        for stream in &parsed.streams {
-            if stream.codec_type.as_deref() == Some("video")
-                && let Some(d) = stream
-                    .duration
-                    .as_deref()
-                    .and_then(|d| d.parse::<f64>().ok())
-            {
-                duration_s = d;
-                break;
-            }
-        }
+        duration_s = selected_video
+            .duration
+            .as_deref()
+            .and_then(|duration| duration.parse::<f64>().ok())
+            .unwrap_or(0.0);
     }
 
     if duration_s <= 0.0 {
         return Err("Could not determine video duration (ffprobe).".to_string());
     }
 
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut frame_rate = None;
-    for stream in &parsed.streams {
-        if stream.codec_type.as_deref() == Some("video")
-            && let (Some(w), Some(h)) = (stream.width, stream.height)
-        {
-            width = w;
-            height = h;
-            // The webview preview, ffmpeg autorotation, and cropdetect all work
-            // in display space, so report display-oriented dimensions.
-            if matches!(stream_rotation_deg(stream), 90 | 270) {
-                std::mem::swap(&mut width, &mut height);
-            }
-            frame_rate = parse_ffprobe_rate(stream.avg_frame_rate.as_deref())
-                .or_else(|| parse_ffprobe_rate(stream.r_frame_rate.as_deref()));
-            break;
-        }
+    let mut width = selected_video
+        .width
+        .ok_or_else(|| "Could not determine video width (ffprobe).".to_string())?;
+    let mut height = selected_video
+        .height
+        .ok_or_else(|| "Could not determine video height (ffprobe).".to_string())?;
+    // The webview preview, ffmpeg autorotation, and cropdetect all work in
+    // display space, so report display-oriented dimensions.
+    if matches!(stream_rotation_deg(selected_video), 90 | 270) {
+        std::mem::swap(&mut width, &mut height);
     }
-    if width == 0 || height == 0 {
-        return Err("Could not determine video dimensions (ffprobe).".to_string());
-    }
+    let frame_rate = parse_ffprobe_rate(selected_video.avg_frame_rate.as_deref())
+        .or_else(|| parse_ffprobe_rate(selected_video.r_frame_rate.as_deref()));
+    let video_stream_index = selected_video
+        .index
+        .ok_or_else(|| "Selected video stream has no absolute index (ffprobe).".to_string())?;
+    let audio_stream_index = selected_audio.and_then(|stream| stream.index);
 
     Ok(VideoProbe {
         duration_s,
         width,
         height,
         frame_rate,
-        has_audio,
+        has_audio: selected_audio.is_some(),
+        source_format: parsed.format.format_name,
+        video_stream_index,
+        video_codec: normalized_codec_name(selected_video.codec_name.as_deref()),
+        video_is_default: selected_video.disposition.default != 0,
+        audio_stream_index,
+        audio_codec: selected_audio
+            .and_then(|stream| normalized_codec_name(stream.codec_name.as_deref())),
+        audio_is_default: selected_audio.is_some_and(|stream| stream.disposition.default != 0),
     })
 }
 
@@ -2048,16 +2613,16 @@ fn null_sink() -> &'static str {
     if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
-fn temp_dir_for_job(job_id: u64, attempt: u32) -> Result<PathBuf, String> {
-    let base = std::env::temp_dir();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("System time error: {e}"))?
-        .as_millis();
-
-    let dir = base.join(format!("video_for_lazies_{job_id}_{attempt}_{now}"));
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create temp dir: {e}"))?;
-    Ok(dir)
+fn temp_dir_for_job(job_id: u64, attempt: u32) -> Result<TempDir, String> {
+    TempFileBuilder::new()
+        .prefix(&format!(
+            "video_for_lazies_{}_{}_{}_",
+            std::process::id(),
+            job_id,
+            attempt
+        ))
+        .tempdir()
+        .map_err(|error| format!("Failed to create temporary passlog directory: {error}"))
 }
 
 fn parse_out_time_us(line: &str) -> Option<u64> {
@@ -2071,6 +2636,7 @@ fn parse_out_time_us(line: &str) -> Option<u64> {
 
 fn emit_progress(
     window: &Window,
+    attempt_id: u64,
     job_id: u64,
     pass: u8,
     total_passes: u8,
@@ -2090,6 +2656,7 @@ fn emit_progress(
     let _ = window.emit(
         "encode-progress",
         EncodeProgressPayload {
+            attempt_id,
             job_id,
             pass,
             total_passes,
@@ -2102,6 +2669,7 @@ fn emit_progress(
 #[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_with_progress(
     window: &Window,
+    attempt_id: u64,
     job_id: u64,
     ffmpeg_bin: &str,
     args: &[String],
@@ -2227,7 +2795,15 @@ fn run_ffmpeg_with_progress(
             let now = Instant::now();
             if now.duration_since(last_emit) >= PROGRESS_EMIT_EVERY {
                 last_emit = now;
-                emit_progress(window, job_id, pass, total_passes, out_time_us, duration_us);
+                emit_progress(
+                    window,
+                    attempt_id,
+                    job_id,
+                    pass,
+                    total_passes,
+                    out_time_us,
+                    duration_us,
+                );
             }
             continue;
         }
@@ -2279,7 +2855,15 @@ fn run_ffmpeg_with_progress(
         ));
     }
 
-    emit_progress(window, job_id, pass, total_passes, duration_us, duration_us);
+    emit_progress(
+        window,
+        attempt_id,
+        job_id,
+        pass,
+        total_passes,
+        duration_us,
+        duration_us,
+    );
     Ok(())
 }
 
@@ -2399,6 +2983,7 @@ fn size_limited_completion_message(
 
 pub fn run_encode_job(
     window: &Window,
+    attempt_id: u64,
     job_id: u64,
     cancel: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
@@ -2438,62 +3023,47 @@ pub fn run_encode_job(
     let probe = probe_video(input_path.to_string_lossy().to_string())?;
     let encoder_names = cached_encoder_names(&ffmpeg_bin)?;
     let codec_selection = select_codec_plan(request.format, &encoder_names, &request.advanced)?;
-    let advanced_audio_bitrate_kbps = advanced_audio_bitrate_kbps(&request)?;
-    let advanced_audio_channel_count = audio_channel_count(&request);
-    let advanced_force_reencode = advanced_forces_reencode(&request, &probe, size_limit_enabled)?;
+    let source_size_bytes = fs::metadata(&input_path)
+        .map_err(|error| format!("Failed to stat input file: {error}"))?
+        .len();
+    let resolved_perturb_seed = request
+        .perturb_first_frame
+        .then(|| request.perturb_seed.unwrap_or_else(random_perturb_seed));
+    let command_plan = build_encode_command_plan(
+        &request,
+        &probe,
+        codec_selection,
+        source_size_bytes,
+        resolved_perturb_seed,
+    )?;
 
     let output_duration_s = estimate_output_duration_s(
         probe.duration_s,
         &request.trim,
         request.speed,
-        request.loop_video,
+        request.loop_video && !matches!(request.format, OutputFormat::Mp3),
     )?;
     let duration_us = (output_duration_s * 1_000_000.0).max(1.0) as u64;
 
-    let include_audio =
-        request.audio_enabled && probe.has_audio && !matches!(request.format, OutputFormat::Mp3);
-    let audio_filters = build_audio_filters(&request, &probe)?;
-    let video_filters = if matches!(request.format, OutputFormat::Mp3) {
-        None
-    } else {
-        build_video_filters(&request, &probe)?
-    };
-
     if matches!(request.format, OutputFormat::Mp3) {
-        let audio_codec = codec_selection
-            .audio_codec
-            .unwrap_or(AudioCodec::LibMp3Lame)
-            .as_ffmpeg_name();
-        if !request.audio_enabled {
-            return Err("Audio must be enabled for MP3 output.".to_string());
-        }
-        if !probe.has_audio {
-            return Err("Input file has no audio stream.".to_string());
-        }
+        let audio_encoder = command_plan
+            .audio_encoder
+            .ok_or_else(|| "Missing MP3 audio encoder.".to_string())?;
+        let audio_stream_index = command_plan
+            .audio_stream_index
+            .ok_or_else(|| "Input file has no audio stream.".to_string())?;
+        let mut args = base_ffmpeg_args(&input_str);
+        push_absolute_map(&mut args, audio_stream_index);
+        args.push("-vn".to_string());
 
-        let mut args = vec![
-            "-y".to_string(),
-            "-hide_banner".to_string(),
-            "-loglevel".to_string(),
-            "error".to_string(),
-            "-i".to_string(),
-            input_str.clone(),
-            "-progress".to_string(),
-            "pipe:1".to_string(),
-            "-nostats".to_string(),
-            "-map".to_string(),
-            "0:a:0".to_string(),
-            "-vn".to_string(),
-        ];
-
-        if let Some(af) = audio_filters {
+        if let Some(af) = &command_plan.audio_filters {
             args.push("-af".to_string());
-            args.push(af);
+            args.push(af.clone());
         }
 
         args.push("-c:a".to_string());
-        args.push(audio_codec.to_string());
-        if let Some(channels) = advanced_audio_channel_count {
+        args.push(audio_encoder.as_ffmpeg_name().to_string());
+        if let Some(channels) = command_plan.audio_channels {
             args.push("-ac".to_string());
             args.push(channels.to_string());
         }
@@ -2503,7 +3073,7 @@ pub fn run_encode_job(
             args.push("-b:a".to_string());
             args.push(format!("{audio_kbps}k"));
             Some(audio_kbps)
-        } else if let Some(audio_kbps) = advanced_audio_bitrate_kbps {
+        } else if let Some(audio_kbps) = command_plan.audio_bitrate_kbps {
             args.push("-b:a".to_string());
             args.push(format!("{audio_kbps}k"));
             Some(audio_kbps)
@@ -2515,14 +3085,74 @@ pub fn run_encode_job(
 
         push_metadata_args(&mut args, &request);
 
-        let temp_path = temp_output_path(&output_path, job_id, "mp3")?;
+        let temp_path = create_temp_output(&output_path, job_id, "mp3")?;
         args.push(temp_path.to_string_lossy().to_string());
         let temp_str = temp_path.to_string_lossy().to_string();
         let command_preview =
             ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
-        if let Err(error) = run_ffmpeg_with_progress(
+        run_ffmpeg_with_progress(
             window,
+            attempt_id,
+            job_id,
+            &ffmpeg_bin,
+            &args,
+            1,
+            1,
+            duration_us,
+            cancel.as_ref(),
+            child_slot,
+        )?;
+
+        let out_size = fs::metadata(&temp_path)
+            .map_err(|e| format!("Failed to stat output file: {e}"))?
+            .len();
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Canceled.".to_string());
+        }
+        publish_output_file(temp_path, &output_path)?;
+
+        return Ok(EncodeFinishedPayload {
+            attempt_id,
+            job_id,
+            ok: true,
+            output_path: Some(output_path.to_string_lossy().to_string()),
+            output_size_bytes: Some(out_size),
+            message: None,
+            diagnostics: Some(ExportDiagnostics {
+                mode: command_plan.mode.label().to_string(),
+                video_action: None,
+                audio_action: StreamAction::Encode,
+                source_format: probe.source_format.clone(),
+                source_video_codec: probe.video_codec.clone(),
+                source_audio_codec: probe.audio_codec.clone(),
+                video_codec: None,
+                audio_codec: command_plan.output_audio_codec.clone(),
+                video_bitrate_kbps: None,
+                audio_bitrate_kbps: selected_audio_bitrate_kbps,
+                requested_size_bytes: size_limit_enabled.then_some(target_bytes),
+                actual_size_bytes: Some(out_size),
+                passes: 1,
+                attempts: 1,
+                audio_removed_for_size_target: false,
+                copy_fallback_reason: None,
+                command_preview,
+            }),
+        });
+    }
+
+    let mut size_copy_fallback_reason: Option<String> = None;
+    if let Some(candidate) = command_plan.size_copy_candidate.as_ref() {
+        let mut args = build_copy_candidate_args(&input_str, &request, candidate);
+        let temp_path = create_temp_output(&output_path, job_id, "size-copy")?;
+        args.push(temp_path.to_string_lossy().to_string());
+        let temp_str = temp_path.to_string_lossy().to_string();
+        let command_preview =
+            ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
+
+        match run_ffmpeg_with_progress(
+            window,
+            attempt_id,
             job_id,
             &ffmpeg_bin,
             &args,
@@ -2532,72 +3162,83 @@ pub fn run_encode_job(
             cancel.as_ref(),
             child_slot,
         ) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
+            Ok(()) => {
+                let out_size = fs::metadata(&temp_path)
+                    .map_err(|error| format!("Failed to stat output file: {error}"))?
+                    .len();
+                if out_size <= target_bytes {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("Canceled.".to_string());
+                    }
+                    publish_output_file(temp_path, &output_path)?;
+                    return Ok(EncodeFinishedPayload {
+                        attempt_id,
+                        job_id,
+                        ok: true,
+                        output_path: Some(output_path.to_string_lossy().to_string()),
+                        output_size_bytes: Some(out_size),
+                        message: None,
+                        diagnostics: Some(ExportDiagnostics {
+                            mode: EncodeMode::Remux.label().to_string(),
+                            video_action: Some(StreamAction::Copy),
+                            audio_action: candidate.audio_action,
+                            source_format: probe.source_format.clone(),
+                            source_video_codec: probe.video_codec.clone(),
+                            source_audio_codec: probe.audio_codec.clone(),
+                            video_codec: probe.video_codec.clone(),
+                            audio_codec: (candidate.audio_action == StreamAction::Copy)
+                                .then(|| probe.audio_codec.clone())
+                                .flatten(),
+                            video_bitrate_kbps: None,
+                            audio_bitrate_kbps: None,
+                            requested_size_bytes: Some(target_bytes),
+                            actual_size_bytes: Some(out_size),
+                            passes: 1,
+                            attempts: 1,
+                            audio_removed_for_size_target: false,
+                            copy_fallback_reason: None,
+                            command_preview,
+                        }),
+                    });
+                }
+                size_copy_fallback_reason =
+                    Some("Compatible copy exceeded the size target.".to_string());
+            }
+            Err(error) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(error);
+                }
+                size_copy_fallback_reason =
+                    Some("Compatible copy was rejected by FFmpeg.".to_string());
+            }
         }
-
-        let out_size = fs::metadata(&temp_path)
-            .map_err(|e| format!("Failed to stat output file: {e}"))?
-            .len();
-        publish_output_file(&temp_path, &output_path)?;
-
-        return Ok(EncodeFinishedPayload {
-            job_id,
-            ok: true,
-            output_path: Some(output_path.to_string_lossy().to_string()),
-            output_size_bytes: Some(out_size),
-            message: None,
-            diagnostics: Some(ExportDiagnostics {
-                mode: "Audio-only encode".to_string(),
-                video_codec: None,
-                audio_codec: Some(audio_codec.to_string()),
-                video_bitrate_kbps: None,
-                audio_bitrate_kbps: selected_audio_bitrate_kbps,
-                requested_size_bytes: size_limit_enabled.then_some(target_bytes),
-                actual_size_bytes: Some(out_size),
-                passes: 1,
-                attempts: 1,
-                audio_removed_for_size_target: false,
-                command_preview,
-            }),
-        });
     }
 
-    // Fast path: no-op transforms (avoid inflating already-small files).
-    let no_op_transforms = request.trim.is_none()
-        && request.crop.is_none()
-        && !request.reverse
-        && request.rotate_deg == 0
-        && (request.speed - 1.0).abs() <= 1e-9
-        && matches!(requested_resize(&request)?, ResizePlan::Source)
-        && color_is_noop(&request.color)
-        // First-frame perturbation and the boomerang loop both require a
-        // re-encode; never stream-copy when either is on.
-        && !request.perturb_first_frame
-        && !request.loop_video;
+    if !size_limit_enabled {
+        let mut executed_plan = command_plan.clone();
+        let mut copy_fallback_reason: Option<String> = None;
+        let mut execution_attempts = 0u32;
 
-    if no_op_transforms {
-        let input_size = fs::metadata(&input_path)
-            .map_err(|e| format!("Failed to stat input file: {e}"))?
-            .len();
-
-        let should_try_stream_copy = if size_limit_enabled {
-            input_size <= target_bytes || !request.audio_enabled
-        } else {
-            true
-        } && !advanced_force_reencode;
-
-        if should_try_stream_copy {
-            let mut args = build_stream_copy_args(&input_str, &request, &probe);
-
-            let temp_path = temp_output_path(&output_path, job_id, "copy")?;
+        loop {
+            execution_attempts += 1;
+            let mut args = build_single_pass_args(&input_str, &request, &executed_plan)?;
+            let temp_path = create_temp_output(
+                &output_path,
+                job_id,
+                if execution_attempts == 1 {
+                    "single"
+                } else {
+                    "fallback"
+                },
+            )?;
             args.push(temp_path.to_string_lossy().to_string());
             let temp_str = temp_path.to_string_lossy().to_string();
             let command_preview =
                 ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
-            if run_ffmpeg_with_progress(
+            match run_ffmpeg_with_progress(
                 window,
+                attempt_id,
                 job_id,
                 &ffmpeg_bin,
                 &args,
@@ -2606,209 +3247,77 @@ pub fn run_encode_job(
                 duration_us,
                 cancel.as_ref(),
                 child_slot,
-            )
-            .is_ok()
-            {
-                let out_size = fs::metadata(&temp_path)
-                    .map_err(|e| format!("Failed to stat output file: {e}"))?
-                    .len();
-                if !size_limit_enabled || out_size <= target_bytes {
-                    publish_output_file(&temp_path, &output_path)?;
+            ) {
+                Ok(()) => {
+                    let out_size = fs::metadata(&temp_path)
+                        .map_err(|error| format!("Failed to stat output file: {error}"))?
+                        .len();
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("Canceled.".to_string());
+                    }
+                    publish_output_file(temp_path, &output_path)?;
+                    let selected_audio_bitrate_kbps =
+                        (executed_plan.audio_action == StreamAction::Encode).then(|| {
+                            executed_plan
+                                .audio_bitrate_kbps
+                                .unwrap_or(match request.format {
+                                    OutputFormat::Mp4 => 192,
+                                    OutputFormat::Webm => 128,
+                                    OutputFormat::Mp3 => unreachable!(),
+                                })
+                        });
                     return Ok(EncodeFinishedPayload {
+                        attempt_id,
                         job_id,
                         ok: true,
                         output_path: Some(output_path.to_string_lossy().to_string()),
                         output_size_bytes: Some(out_size),
                         message: None,
                         diagnostics: Some(ExportDiagnostics {
-                            mode: "Stream copy".to_string(),
-                            video_codec: Some("copy".to_string()),
-                            audio_codec: Some(
-                                if request.audio_enabled && probe.has_audio {
-                                    "copy"
-                                } else {
-                                    "none"
-                                }
-                                .to_string(),
-                            ),
+                            mode: executed_plan.mode.label().to_string(),
+                            video_action: Some(executed_plan.video_action),
+                            audio_action: executed_plan.audio_action,
+                            source_format: probe.source_format.clone(),
+                            source_video_codec: executed_plan.source_video_codec.clone(),
+                            source_audio_codec: executed_plan.source_audio_codec.clone(),
+                            video_codec: executed_plan.output_video_codec.clone(),
+                            audio_codec: executed_plan.output_audio_codec.clone(),
                             video_bitrate_kbps: None,
-                            audio_bitrate_kbps: None,
-                            requested_size_bytes: size_limit_enabled.then_some(target_bytes),
+                            audio_bitrate_kbps: selected_audio_bitrate_kbps,
+                            requested_size_bytes: None,
                             actual_size_bytes: Some(out_size),
                             passes: 1,
-                            attempts: 1,
+                            attempts: execution_attempts,
                             audio_removed_for_size_target: false,
+                            copy_fallback_reason,
                             command_preview,
                         }),
                     });
                 }
-            }
-            let _ = fs::remove_file(&temp_path);
-        }
-    }
-
-    if !size_limit_enabled {
-        let video_codec = codec_selection
-            .video_codec
-            .ok_or_else(|| "Missing video codec selection.".to_string())?
-            .as_ffmpeg_name();
-        let audio_codec = codec_selection
-            .audio_codec
-            .unwrap_or(AudioCodec::Aac)
-            .as_ffmpeg_name();
-        let quality_mode = codec_selection
-            .quality_mode
-            .ok_or_else(|| "Missing quality settings for export format.".to_string())?;
-        let selected_video_codec = codec_selection
-            .video_codec
-            .ok_or_else(|| "Missing video codec selection.".to_string())?;
-        let encode_speed_preference = encode_speed_preference(&request.advanced);
-        let mut selected_audio_bitrate_kbps: Option<u32> = None;
-
-        let mut args = vec![
-            "-y".to_string(),
-            "-hide_banner".to_string(),
-            "-loglevel".to_string(),
-            "error".to_string(),
-            "-i".to_string(),
-            input_str.clone(),
-            "-progress".to_string(),
-            "pipe:1".to_string(),
-            "-nostats".to_string(),
-            "-map".to_string(),
-            "0:v:0".to_string(),
-            "-c:v".to_string(),
-            video_codec.to_string(),
-        ];
-
-        match quality_mode {
-            QualityMode::Crf { crf, preset } => {
-                args.extend(["-crf", crf].into_iter().map(|s| s.to_string()));
-                if let Some(preset) = preset
-                    && encode_speed_preference == EncodeSpeedPreference::Auto
-                {
-                    args.extend(["-preset", preset].into_iter().map(|s| s.to_string()));
+                Err(error) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(error);
+                    }
+                    let contains_copy = executed_plan.video_action == StreamAction::Copy
+                        || executed_plan.audio_action == StreamAction::Copy;
+                    if !contains_copy || execution_attempts >= 2 {
+                        return Err(error);
+                    }
+                    executed_plan = full_reencode_fallback(&executed_plan);
+                    copy_fallback_reason =
+                        Some("Stream-copy execution was rejected by FFmpeg.".to_string());
                 }
             }
-            QualityMode::Cq { crf, bitrate } => {
-                args.extend(
-                    ["-crf", crf, "-b:v", bitrate]
-                        .into_iter()
-                        .map(|s| s.to_string()),
-                );
-            }
-            QualityMode::QScale { qscale } => {
-                args.extend(["-q:v", qscale].into_iter().map(|s| s.to_string()));
-            }
         }
-        args.extend(encode_speed_args_for_codec(
-            selected_video_codec,
-            encode_speed_preference,
-        ));
-
-        if let Some(vf) = &video_filters {
-            args.push("-vf".to_string());
-            args.push(vf.clone());
-        }
-
-        if include_audio && probe.has_audio && request.audio_enabled {
-            args.extend(["-map", "0:a:0?"].into_iter().map(|s| s.to_string()));
-            args.extend(["-c:a", audio_codec].into_iter().map(|s| s.to_string()));
-            if let Some(channels) = advanced_audio_channel_count {
-                args.push("-ac".to_string());
-                args.push(channels.to_string());
-            }
-            args.push("-b:a".to_string());
-            let audio_kbps = advanced_audio_bitrate_kbps.unwrap_or(match request.format {
-                OutputFormat::Mp4 => 192,
-                OutputFormat::Webm => 128,
-                OutputFormat::Mp3 => unreachable!(),
-            });
-            selected_audio_bitrate_kbps = Some(audio_kbps);
-            args.push(format!("{audio_kbps}k"));
-            if let Some(af) = &audio_filters {
-                args.push("-af".to_string());
-                args.push(af.clone());
-            }
-        } else {
-            args.push("-an".to_string());
-        }
-
-        push_metadata_args(&mut args, &request);
-
-        if matches!(request.format, OutputFormat::Mp4) {
-            args.extend(
-                ["-movflags", "+faststart", "-pix_fmt", "yuv420p"]
-                    .into_iter()
-                    .map(|s| s.to_string()),
-            );
-        }
-
-        let temp_path = temp_output_path(&output_path, job_id, "encode")?;
-        args.push(temp_path.to_string_lossy().to_string());
-        let temp_str = temp_path.to_string_lossy().to_string();
-        let command_preview =
-            ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
-
-        if let Err(error) = run_ffmpeg_with_progress(
-            window,
-            job_id,
-            &ffmpeg_bin,
-            &args,
-            1,
-            1,
-            duration_us,
-            cancel.as_ref(),
-            child_slot,
-        ) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
-
-        let out_size = fs::metadata(&temp_path)
-            .map_err(|e| format!("Failed to stat output file: {e}"))?
-            .len();
-        publish_output_file(&temp_path, &output_path)?;
-
-        return Ok(EncodeFinishedPayload {
-            job_id,
-            ok: true,
-            output_path: Some(output_path.to_string_lossy().to_string()),
-            output_size_bytes: Some(out_size),
-            message: None,
-            diagnostics: Some(ExportDiagnostics {
-                mode: "Video re-encode".to_string(),
-                video_codec: Some(video_codec.to_string()),
-                audio_codec: Some(
-                    if include_audio && probe.has_audio && request.audio_enabled {
-                        audio_codec
-                    } else {
-                        "none"
-                    }
-                    .to_string(),
-                ),
-                video_bitrate_kbps: None,
-                audio_bitrate_kbps: selected_audio_bitrate_kbps,
-                requested_size_bytes: None,
-                actual_size_bytes: Some(out_size),
-                passes: 1,
-                attempts: 1,
-                audio_removed_for_size_target: false,
-                command_preview,
-            }),
-        });
     }
 
-    let selected_video_codec = codec_selection
-        .video_codec
+    let selected_video_codec = command_plan
+        .video_encoder
         .ok_or_else(|| "Missing video codec selection.".to_string())?;
-    let contract = build_size_limited_encode_contract(
-        &request,
-        &probe,
-        selected_video_codec,
-        output_duration_s,
-        include_audio,
-    )?;
+    let contract = command_plan
+        .size_contract
+        .clone()
+        .ok_or_else(|| "Missing size-target encode contract.".to_string())?;
     let planned_width = contract.planned_width;
     let planned_height = contract.planned_height;
     let min_video_kbps = contract.min_video_kbps;
@@ -2816,11 +3325,9 @@ pub fn run_encode_job(
     let mut plan = contract.plan;
 
     let video_codec = selected_video_codec.as_ffmpeg_name();
-    let audio_codec = codec_selection
-        .audio_codec
-        .unwrap_or(AudioCodec::Aac)
-        .as_ffmpeg_name();
-    let encode_speed_preference = encode_speed_preference(&request.advanced);
+    let audio_encoder = command_plan.audio_encoder.unwrap_or(AudioCodec::Aac);
+    let audio_codec = audio_encoder.as_ffmpeg_name();
+    let encode_speed_preference = command_plan.encode_speed;
 
     let mut attempt: u32 = 0;
     let max_attempts: u32 = 3;
@@ -2832,7 +3339,7 @@ pub fn run_encode_job(
         }
 
         let temp_dir = temp_dir_for_job(job_id, attempt)?;
-        let passlog_prefix = temp_dir.join("ffmpeg2pass");
+        let passlog_prefix = temp_dir.path().join("ffmpeg2pass");
         let passlog_str = passlog_prefix.to_string_lossy().to_string();
 
         // Pass 1
@@ -2847,7 +3354,7 @@ pub fn run_encode_job(
             "pipe:1".to_string(),
             "-nostats".to_string(),
             "-map".to_string(),
-            "0:v:0".to_string(),
+            format!("0:{}", probe.video_stream_index),
             "-c:v".to_string(),
             video_codec.to_string(),
             "-b:v".to_string(),
@@ -2862,7 +3369,7 @@ pub fn run_encode_job(
             selected_video_codec,
             encode_speed_preference,
         ));
-        if let Some(vf) = &video_filters {
+        if let Some(vf) = &command_plan.video_filters {
             pass1.push("-vf".to_string());
             pass1.push(vf.clone());
         }
@@ -2873,6 +3380,7 @@ pub fn run_encode_job(
 
         if let Err(error) = run_ffmpeg_with_progress(
             window,
+            attempt_id,
             job_id,
             &ffmpeg_bin,
             &pass1,
@@ -2882,7 +3390,6 @@ pub fn run_encode_job(
             cancel.as_ref(),
             child_slot,
         ) {
-            let _ = fs::remove_dir_all(&temp_dir);
             return Err(map_mpeg4_size_limit_error(
                 request.format,
                 selected_video_codec,
@@ -2905,7 +3412,7 @@ pub fn run_encode_job(
             "pipe:1".to_string(),
             "-nostats".to_string(),
             "-map".to_string(),
-            "0:v:0".to_string(),
+            format!("0:{}", probe.video_stream_index),
             "-c:v".to_string(),
             video_codec.to_string(),
             "-b:v".to_string(),
@@ -2920,7 +3427,7 @@ pub fn run_encode_job(
             encode_speed_preference,
         ));
 
-        if let Some(vf) = &video_filters {
+        if let Some(vf) = &command_plan.video_filters {
             pass2.push("-vf".to_string());
             pass2.push(vf.clone());
         }
@@ -2933,15 +3440,18 @@ pub fn run_encode_job(
             };
 
         if pass2_audio_bitrate_kbps.is_some() {
-            pass2.extend(["-map", "0:a:0?"].into_iter().map(|s| s.to_string()));
+            let audio_stream_index = probe
+                .audio_stream_index
+                .ok_or_else(|| "Missing selected audio stream index.".to_string())?;
+            push_absolute_map(&mut pass2, audio_stream_index);
             pass2.extend(["-c:a", audio_codec].into_iter().map(|s| s.to_string()));
-            if let Some(channels) = advanced_audio_channel_count {
+            if let Some(channels) = command_plan.audio_channels {
                 pass2.push("-ac".to_string());
                 pass2.push(channels.to_string());
             }
             pass2.push("-b:a".to_string());
             pass2.push(format!("{}k", pass2_audio_bitrate_kbps.unwrap_or(32)));
-            if let Some(af) = &audio_filters {
+            if let Some(af) = &command_plan.audio_filters {
                 pass2.push("-af".to_string());
                 pass2.push(af.clone());
             }
@@ -2959,7 +3469,7 @@ pub fn run_encode_job(
             );
         }
 
-        let temp_output = temp_output_path(&output_path, job_id, &format!("pass2-{attempt}"))?;
+        let temp_output = create_temp_output(&output_path, job_id, &format!("pass2-{attempt}"))?;
         pass2.push(temp_output.to_string_lossy().to_string());
         let temp_output_str = temp_output.to_string_lossy().to_string();
         let command_preview = ffmpeg_command_preview(
@@ -2973,6 +3483,7 @@ pub fn run_encode_job(
 
         if let Err(error) = run_ffmpeg_with_progress(
             window,
+            attempt_id,
             job_id,
             &ffmpeg_bin,
             &pass2,
@@ -2982,8 +3493,6 @@ pub fn run_encode_job(
             cancel.as_ref(),
             child_slot,
         ) {
-            let _ = fs::remove_file(&temp_output);
-            let _ = fs::remove_dir_all(&temp_dir);
             return Err(map_mpeg4_size_limit_error(
                 request.format,
                 selected_video_codec,
@@ -2999,11 +3508,15 @@ pub fn run_encode_job(
             .len();
 
         let met_target = out_size <= target_bytes;
-        let _ = fs::remove_dir_all(&temp_dir);
+        drop(temp_dir);
 
         if met_target || attempt >= max_attempts {
-            publish_output_file(&temp_output, &output_path)?;
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Canceled.".to_string());
+            }
+            publish_output_file(temp_output, &output_path)?;
             return Ok(EncodeFinishedPayload {
+                attempt_id,
                 job_id,
                 ok: true,
                 output_path: Some(output_path.to_string_lossy().to_string()),
@@ -3016,14 +3529,19 @@ pub fn run_encode_job(
                     audio_removed_for_size_target,
                 ),
                 diagnostics: Some(ExportDiagnostics {
-                    mode: "Size-targeted two-pass encode".to_string(),
-                    video_codec: Some(video_codec.to_string()),
-                    audio_codec: Some(
-                        pass2_audio_bitrate_kbps
-                            .map(|_| audio_codec)
-                            .unwrap_or("none")
-                            .to_string(),
-                    ),
+                    mode: command_plan.mode.label().to_string(),
+                    video_action: Some(StreamAction::Encode),
+                    audio_action: if pass2_audio_bitrate_kbps.is_some() {
+                        StreamAction::Encode
+                    } else {
+                        StreamAction::Drop
+                    },
+                    source_format: probe.source_format.clone(),
+                    source_video_codec: probe.video_codec.clone(),
+                    source_audio_codec: probe.audio_codec.clone(),
+                    video_codec: Some(selected_video_codec.as_codec_name().to_string()),
+                    audio_codec: pass2_audio_bitrate_kbps
+                        .map(|_| audio_encoder.as_codec_name().to_string()),
                     video_bitrate_kbps: Some(plan.video_bitrate_kbps.max(min_video_kbps)),
                     audio_bitrate_kbps: pass2_audio_bitrate_kbps,
                     requested_size_bytes: Some(target_bytes),
@@ -3031,6 +3549,7 @@ pub fn run_encode_job(
                     passes: 2,
                     attempts: attempt,
                     audio_removed_for_size_target,
+                    copy_fallback_reason: size_copy_fallback_reason.clone(),
                     command_preview,
                 }),
             });
@@ -3041,8 +3560,12 @@ pub fn run_encode_job(
         let new_video_kbps = ((plan.video_bitrate_kbps as f64) * reduction_factor).floor() as u32;
         let next_video_kbps = new_video_kbps.max(min_video_kbps);
         if next_video_kbps >= plan.video_bitrate_kbps {
-            publish_output_file(&temp_output, &output_path)?;
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Canceled.".to_string());
+            }
+            publish_output_file(temp_output, &output_path)?;
             return Ok(EncodeFinishedPayload {
+                attempt_id,
                 job_id,
                 ok: true,
                 output_path: Some(output_path.to_string_lossy().to_string()),
@@ -3055,14 +3578,19 @@ pub fn run_encode_job(
                     audio_removed_for_size_target,
                 ),
                 diagnostics: Some(ExportDiagnostics {
-                    mode: "Size-targeted two-pass encode".to_string(),
-                    video_codec: Some(video_codec.to_string()),
-                    audio_codec: Some(
-                        pass2_audio_bitrate_kbps
-                            .map(|_| audio_codec)
-                            .unwrap_or("none")
-                            .to_string(),
-                    ),
+                    mode: command_plan.mode.label().to_string(),
+                    video_action: Some(StreamAction::Encode),
+                    audio_action: if pass2_audio_bitrate_kbps.is_some() {
+                        StreamAction::Encode
+                    } else {
+                        StreamAction::Drop
+                    },
+                    source_format: probe.source_format.clone(),
+                    source_video_codec: probe.video_codec.clone(),
+                    source_audio_codec: probe.audio_codec.clone(),
+                    video_codec: Some(selected_video_codec.as_codec_name().to_string()),
+                    audio_codec: pass2_audio_bitrate_kbps
+                        .map(|_| audio_encoder.as_codec_name().to_string()),
                     video_bitrate_kbps: Some(plan.video_bitrate_kbps.max(min_video_kbps)),
                     audio_bitrate_kbps: pass2_audio_bitrate_kbps,
                     requested_size_bytes: Some(target_bytes),
@@ -3070,11 +3598,12 @@ pub fn run_encode_job(
                     passes: 2,
                     attempts: attempt,
                     audio_removed_for_size_target,
+                    copy_fallback_reason: size_copy_fallback_reason.clone(),
                     command_preview,
                 }),
             });
         }
-        let _ = fs::remove_file(&temp_output);
+        drop(temp_output);
         plan.video_bitrate_kbps = next_video_kbps;
     }
 }
@@ -3115,7 +3644,40 @@ mod tests {
             height: 1080,
             frame_rate: Some(30.0),
             has_audio: true,
+            source_format: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
+            video_stream_index: 0,
+            video_codec: Some("h264".to_string()),
+            video_is_default: true,
+            audio_stream_index: Some(1),
+            audio_codec: Some("aac".to_string()),
+            audio_is_default: true,
         }
+    }
+
+    fn test_command_plan(
+        request: &EncodeRequest,
+        probe: &VideoProbe,
+        source_size_bytes: u64,
+    ) -> EncodeCommandPlan {
+        let encoders = HashSet::from([
+            "libx264".to_string(),
+            "mpeg4".to_string(),
+            "aac".to_string(),
+            "libvpx-vp9".to_string(),
+            "libvpx".to_string(),
+            "libopus".to_string(),
+            "libvorbis".to_string(),
+            "libmp3lame".to_string(),
+        ]);
+        let codecs = select_codec_plan(request.format, &encoders, &request.advanced).unwrap();
+        build_encode_command_plan(
+            request,
+            probe,
+            codecs,
+            source_size_bytes,
+            request.perturb_first_frame.then_some(123),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3235,17 +3797,73 @@ mod tests {
             .as_millis();
         let dir = std::env::temp_dir().join(format!("vfl_test_publish_out_{now}"));
         fs::create_dir_all(&dir).unwrap();
-        let temp = dir.join(".output.tmp.mp4");
         let dest = dir.join("output.mp4");
+        let temp = create_temp_output(&dest, 7, "test").unwrap();
+        let temp_path = temp.to_path_buf();
         fs::write(&temp, b"new").unwrap();
         fs::write(&dest, b"old").unwrap();
 
-        let err = publish_output_file(&temp, &dest).unwrap_err();
+        let err = publish_output_file(temp, &dest).unwrap_err();
         assert!(err.contains("already exists"));
         assert_eq!(fs::read(&dest).unwrap(), b"old");
-        assert!(!temp.exists());
+        assert!(!temp_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporary_outputs_are_unique_and_publish_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("output.mp4");
+        let first = create_temp_output(&destination, 9, "encode").unwrap();
+        let second = create_temp_output(&destination, 9, "encode").unwrap();
+        assert_ne!(first.to_path_buf(), second.to_path_buf());
+        assert_eq!(first.parent(), Some(dir.path()));
+        assert_eq!(second.parent(), Some(dir.path()));
+        assert!(first.to_string_lossy().ends_with(".tmp.mp4"));
+        assert!(second.to_string_lossy().ends_with(".tmp.mp4"));
+
+        fs::write(&first, b"encoded").unwrap();
+        drop(second);
+        publish_output_file(first, &destination).unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"encoded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_output_and_publication_honor_normal_creation_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("output.mp4");
+        let control = dir.path().join("ordinary.mp4");
+        fs::write(&control, b"control").unwrap();
+        let expected_mode = fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+
+        let temp = create_temp_output(&destination, 10, "permissions").unwrap();
+        assert_eq!(
+            fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+            expected_mode
+        );
+        fs::write(&temp, b"encoded").unwrap();
+        publish_output_file(temp, &destination).unwrap();
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            expected_mode
+        );
+    }
+
+    #[test]
+    fn passlog_directories_are_process_unique_and_clean_up_on_drop() {
+        let first = temp_dir_for_job(2, 1).unwrap();
+        let second = temp_dir_for_job(2, 1).unwrap();
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        assert_ne!(first_path, second_path);
+        drop(first);
+        drop(second);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
     }
 
     #[test]
@@ -3413,38 +4031,58 @@ Encoders:
     }
 
     #[test]
-    fn advanced_overrides_force_reencode_when_they_affect_video_output() {
+    fn advanced_overrides_affect_only_the_stream_they_change() {
         let probe = probe_10s_1920x1080_audio();
         let mut req = base_request();
         req.size_limit_mb = 0.0;
 
-        assert!(!advanced_forces_reencode(&req, &probe, false).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Copy);
+        assert_eq!(plan.audio_action, StreamAction::Copy);
 
         req.advanced.video_codec = Some(VideoCodecPreference::H264);
-        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert_eq!(plan.audio_action, StreamAction::Copy);
 
         req.advanced.video_codec = None;
         req.advanced.audio_bitrate_kbps = Some(192);
-        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Copy);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
 
         req.advanced.audio_bitrate_kbps = None;
         req.advanced.video_quality = Some(VideoQualityPreference::Higher);
-        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+        assert_eq!(
+            test_command_plan(&req, &probe, 1_000_000).video_action,
+            StreamAction::Encode
+        );
 
         req.advanced.video_quality = None;
         req.advanced.encode_speed = Some(EncodeSpeedPreference::Faster);
-        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+        assert_eq!(
+            test_command_plan(&req, &probe, 1_000_000).video_action,
+            StreamAction::Encode
+        );
 
         req.advanced.encode_speed = None;
         req.advanced.frame_rate_cap_fps = Some(24);
-        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+        assert_eq!(
+            test_command_plan(&req, &probe, 1_000_000).video_action,
+            StreamAction::Encode
+        );
 
         req.advanced.frame_rate_cap_fps = Some(60);
-        assert!(!advanced_forces_reencode(&req, &probe, false).unwrap());
+        assert_eq!(
+            test_command_plan(&req, &probe, 1_000_000).video_action,
+            StreamAction::Copy
+        );
 
         req.advanced.frame_rate_cap_fps = None;
         req.advanced.audio_channels = Some(AudioChannelPreference::Mono);
-        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Copy);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
     }
 
     #[test]
@@ -3454,10 +4092,137 @@ Encoders:
         req.advanced.audio_bitrate_kbps = Some(192);
         req.advanced.video_quality = Some(VideoQualityPreference::Higher);
 
-        assert!(!advanced_forces_reencode(&req, &probe, true).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert!(plan.size_copy_candidate.is_some());
 
         req.advanced.encode_speed = Some(EncodeSpeedPreference::Smaller);
-        assert!(advanced_forces_reencode(&req, &probe, true).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert!(plan.size_copy_candidate.is_none());
+    }
+
+    #[test]
+    fn copy_compatibility_is_conservative_per_output_container() {
+        assert!(video_copy_compatible(OutputFormat::Mp4, Some("h264")));
+        assert!(video_copy_compatible(OutputFormat::Mp4, Some("mpeg4")));
+        assert!(!video_copy_compatible(OutputFormat::Mp4, Some("vp9")));
+        assert!(!video_copy_compatible(OutputFormat::Mp4, Some("hevc")));
+        assert!(audio_copy_compatible(OutputFormat::Mp4, Some("aac")));
+        assert!(!audio_copy_compatible(OutputFormat::Mp4, Some("opus")));
+
+        assert!(video_copy_compatible(OutputFormat::Webm, Some("vp8")));
+        assert!(video_copy_compatible(OutputFormat::Webm, Some("vp9")));
+        assert!(!video_copy_compatible(OutputFormat::Webm, Some("h264")));
+        assert!(audio_copy_compatible(OutputFormat::Webm, Some("opus")));
+        assert!(audio_copy_compatible(OutputFormat::Webm, Some("vorbis")));
+        assert!(!audio_copy_compatible(OutputFormat::Webm, Some("aac")));
+
+        assert!(!video_copy_compatible(OutputFormat::Mp3, Some("h264")));
+        assert!(!audio_copy_compatible(OutputFormat::Mp3, Some("mp3")));
+        assert!(!video_copy_compatible(OutputFormat::Mp4, None));
+        assert!(!audio_copy_compatible(OutputFormat::Webm, None));
+    }
+
+    #[test]
+    fn mp4_plan_reencodes_vp9_and_opus() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+        let probe = VideoProbe {
+            source_format: Some("matroska,webm".to_string()),
+            video_codec: Some("vp9".to_string()),
+            audio_codec: Some("opus".to_string()),
+            ..probe_10s_1920x1080_audio()
+        };
+
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.mode, EncodeMode::FullEncode);
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
+        assert_eq!(plan.output_video_codec.as_deref(), Some("h264"));
+        assert_eq!(plan.output_audio_codec.as_deref(), Some("aac"));
+    }
+
+    #[test]
+    fn audio_only_change_builds_video_copy_audio_encode_with_absolute_maps() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+        req.normalize_audio = true;
+        let probe = VideoProbe {
+            video_stream_index: 3,
+            audio_stream_index: Some(7),
+            audio_codec: Some("opus".to_string()),
+            ..probe_10s_1920x1080_audio()
+        };
+
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.mode, EncodeMode::VideoCopyAudioEncode);
+        assert_eq!(plan.video_action, StreamAction::Copy);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
+        let args = build_single_pass_args("in.mkv", &req, &plan).unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:3"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:7"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+        assert!(!args.iter().any(|arg| arg == "-pix_fmt"));
+    }
+
+    #[test]
+    fn video_only_change_can_preserve_compatible_audio() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+        req.crop = Some(Crop {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        });
+        let probe = VideoProbe {
+            video_stream_index: 2,
+            audio_stream_index: Some(5),
+            video_codec: Some("vp9".to_string()),
+            ..probe_10s_1920x1080_audio()
+        };
+
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.mode, EncodeMode::VideoEncodeAudioCopy);
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert_eq!(plan.audio_action, StreamAction::Copy);
+        let args = build_single_pass_args("in.mkv", &req, &plan).unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:2"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:5"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+    }
+
+    #[test]
+    fn timeline_change_reencodes_both_retained_streams() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.0;
+        req.trim = Some(Trim {
+            start_s: 1.0,
+            end_s: Some(5.0),
+        });
+
+        let plan = test_command_plan(&req, &probe_10s_1920x1080_audio(), 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
+        assert!(plan.video_reasons.contains(&PlanReason::TimelineTransform));
+        assert!(plan.audio_reasons.contains(&PlanReason::TimelineTransform));
+    }
+
+    #[test]
+    fn size_copy_candidate_requires_all_retained_streams_to_be_compatible() {
+        let req = base_request();
+        let compatible = test_command_plan(&req, &probe_10s_1920x1080_audio(), 1_000_000);
+        assert!(compatible.size_copy_candidate.is_some());
+
+        let incompatible_audio = VideoProbe {
+            audio_codec: Some("opus".to_string()),
+            ..probe_10s_1920x1080_audio()
+        };
+        let plan = test_command_plan(&req, &incompatible_audio, 1_000_000);
+        assert!(plan.size_copy_candidate.is_none());
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
     }
 
     #[test]
@@ -3679,11 +4444,9 @@ Encoders:
             req
         };
         let probe = VideoProbe {
-            duration_s: 10.0,
             width: 853,
             height: 480,
-            frame_rate: Some(30.0),
-            has_audio: true,
+            ..probe_10s_1920x1080_audio()
         };
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(filters, "crop=w=trunc(iw/2)*2:h=trunc(ih/2)*2");
@@ -3853,6 +4616,9 @@ Encoders:
 
         let silent_probe = VideoProbe {
             has_audio: false,
+            audio_stream_index: None,
+            audio_codec: None,
+            audio_is_default: false,
             ..probe_10s_1920x1080_audio()
         };
         assert_eq!(build_audio_filters(&req, &silent_probe).unwrap(), None);
@@ -3878,12 +4644,19 @@ Encoders:
     }
 
     #[test]
-    fn stream_copy_args_strip_metadata_before_explicit_title() {
+    fn copy_candidate_args_strip_metadata_before_explicit_title() {
         let mut req = base_request();
         req.title = Some("  Beach day  ".to_string());
         req.strip_metadata = true;
 
-        let args = build_stream_copy_args("in.mp4", &req, &probe_10s_1920x1080_audio());
+        let candidate = CopyCandidatePlan {
+            video_stream_index: 3,
+            audio_stream_index: Some(7),
+            audio_action: StreamAction::Copy,
+        };
+        let args = build_copy_candidate_args("in.mp4", &req, &candidate);
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:3"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:7"]));
         let strip_index = args
             .iter()
             .position(|arg| arg == "-map_metadata")
@@ -3905,20 +4678,26 @@ Encoders:
     fn normalize_audio_forces_reencode() {
         let probe = probe_10s_1920x1080_audio();
         let mut req = base_request();
+        req.size_limit_mb = 0.0;
         req.normalize_audio = true;
-        assert!(advanced_forces_reencode(&req, &probe, false).unwrap());
-        assert!(advanced_forces_reencode(&req, &probe, true).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Copy);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
 
         req.audio_enabled = false;
-        assert!(!advanced_forces_reencode(&req, &probe, false).unwrap());
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Copy);
+        assert_eq!(plan.audio_action, StreamAction::Drop);
     }
 
     #[test]
     fn parse_probe_output_swaps_dimensions_for_display_rotation() {
         let json = r#"{
-            "format": {"duration": "12.5"},
+            "format": {"duration": "12.5", "format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
             "streams": [
                 {
+                    "index": 2,
+                    "codec_name": "h264",
                     "codec_type": "video",
                     "width": 1920,
                     "height": 1080,
@@ -3927,12 +4706,16 @@ Encoders:
                         {"side_data_type": "Display Matrix", "rotation": -90}
                     ]
                 },
-                {"codec_type": "audio"}
+                {"index": 5, "codec_name": "aac", "codec_type": "audio"}
             ]
         }"#;
         let probe = parse_probe_output(json).unwrap();
         assert_eq!((probe.width, probe.height), (1080, 1920));
         assert!(probe.has_audio);
+        assert_eq!(probe.video_stream_index, 2);
+        assert_eq!(probe.audio_stream_index, Some(5));
+        assert_eq!(probe.video_codec.as_deref(), Some("h264"));
+        assert_eq!(probe.audio_codec.as_deref(), Some("aac"));
         assert!((probe.duration_s - 12.5).abs() < 1e-9);
     }
 
@@ -3941,7 +4724,7 @@ Encoders:
         let rotated_tag = r#"{
             "format": {"duration": "5"},
             "streams": [
-                {"codec_type": "video", "width": 640, "height": 480,
+                {"index": 0, "codec_name": "h264", "codec_type": "video", "width": 640, "height": 480,
                  "avg_frame_rate": "30/1", "tags": {"rotate": "90"}}
             ]
         }"#;
@@ -3951,7 +4734,7 @@ Encoders:
         let upside_down = r#"{
             "format": {"duration": "5"},
             "streams": [
-                {"codec_type": "video", "width": 640, "height": 480,
+                {"index": 0, "codec_name": "h264", "codec_type": "video", "width": 640, "height": 480,
                  "avg_frame_rate": "30/1",
                  "side_data_list": [
                     {"side_data_type": "Display Matrix", "rotation": 180}
@@ -3964,13 +4747,59 @@ Encoders:
         let no_rotation = r#"{
             "format": {"duration": "5"},
             "streams": [
-                {"codec_type": "video", "width": 640, "height": 480,
+                {"index": 0, "codec_name": "h264", "codec_type": "video", "width": 640, "height": 480,
                  "avg_frame_rate": "30/1"}
             ]
         }"#;
         let probe = parse_probe_output(no_rotation).unwrap();
         assert_eq!((probe.width, probe.height), (640, 480));
         assert!(!probe.has_audio);
+    }
+
+    #[test]
+    fn parse_probe_selects_default_non_attached_video_and_default_audio() {
+        let json = r#"{
+            "format": {"duration": "4", "format_name": "matroska,webm"},
+            "streams": [
+                {"index": 0, "codec_name": "mjpeg", "codec_type": "video",
+                 "width": 600, "height": 600,
+                 "disposition": {"default": 1, "attached_pic": 1}},
+                {"index": 3, "codec_name": "vp9", "codec_type": "video",
+                 "width": 1280, "height": 720,
+                 "avg_frame_rate": "24/1",
+                 "disposition": {"default": 0, "attached_pic": 0}},
+                {"index": 4, "codec_name": "vorbis", "codec_type": "audio",
+                 "disposition": {"default": 0}},
+                {"index": 7, "codec_name": "opus", "codec_type": "audio",
+                 "disposition": {"default": 1}}
+            ]
+        }"#;
+
+        let probe = parse_probe_output(json).unwrap();
+        assert_eq!(probe.source_format.as_deref(), Some("matroska,webm"));
+        assert_eq!(probe.video_stream_index, 3);
+        assert_eq!(probe.video_codec.as_deref(), Some("vp9"));
+        assert!(!probe.video_is_default);
+        assert_eq!(probe.audio_stream_index, Some(7));
+        assert_eq!(probe.audio_codec.as_deref(), Some("opus"));
+        assert!(probe.audio_is_default);
+        assert_eq!((probe.width, probe.height), (1280, 720));
+    }
+
+    #[test]
+    fn parse_probe_rejects_attached_picture_as_only_video() {
+        let json = r#"{
+            "format": {"duration": "4", "format_name": "mp3"},
+            "streams": [
+                {"index": 0, "codec_name": "mjpeg", "codec_type": "video",
+                 "width": 600, "height": 600,
+                 "disposition": {"default": 1, "attached_pic": 1}},
+                {"index": 1, "codec_name": "mp3", "codec_type": "audio"}
+            ]
+        }"#;
+
+        let error = parse_probe_output(json).unwrap_err();
+        assert!(error.contains("non-attached video stream"));
     }
 
     #[test]
@@ -4017,8 +4846,7 @@ Encoders:
             duration_s: 60.0,
             width: 1280,
             height: 720,
-            frame_rate: Some(30.0),
-            has_audio: true,
+            ..probe_10s_1920x1080_audio()
         };
 
         let contract =

@@ -91,6 +91,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   const packageJsonPath = path.resolve(__dirname, "../package.json");
   const smokeWrapperPath = path.resolve(__dirname, "../scripts/run-portable-smoke.mjs");
   const exportSmokeWrapperPath = path.resolve(__dirname, "../scripts/run-portable-export-smoke.mjs");
+  const codecSmokeWrapperPath = path.resolve(__dirname, "../scripts/run-portable-codec-plan-smoke.mjs");
   const makePortablePath = path.resolve(__dirname, "../scripts/make-portable.mjs");
   const releaseRunnerPath = path.resolve(__dirname, "../scripts/run-release-portable.mjs");
   const smokePowerShellPath = path.resolve(__dirname, "../scripts/windows-portable-smoke.ps1");
@@ -101,12 +102,14 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   const updateHelperScript = json?.scripts?.["build:update-helper"] ?? "";
   const smokeScript = json?.scripts?.["smoke:portable"] ?? "";
   const exportSmokeScript = json?.scripts?.["smoke:portable:export"] ?? "";
+  const codecSmokeScript = json?.scripts?.["smoke:portable:codecs"] ?? "";
   const releaseScript = json?.scripts?.["release:portable"] ?? "";
   const makePortableRaw = await fs.readFile(makePortablePath, "utf8");
   const smokePowerShellRaw = await fs.readFile(smokePowerShellPath, "utf8");
 
   await fs.access(smokeWrapperPath);
   await fs.access(exportSmokeWrapperPath);
+  await fs.access(codecSmokeWrapperPath);
   await fs.access(makePortablePath);
   await fs.access(releaseRunnerPath);
   await fs.access(smokePowerShellPath);
@@ -118,6 +121,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   assert.match(updateHelperScript, /--bin vfl-update-helper/);
   assert.equal(smokeScript, "node scripts/run-portable-smoke.mjs");
   assert.equal(exportSmokeScript, "node scripts/run-portable-export-smoke.mjs");
+  assert.equal(codecSmokeScript, "node scripts/run-portable-codec-plan-smoke.mjs");
   assert.equal(releaseScript, "node scripts/run-release-portable.mjs");
   assert.match(smokePowerShellRaw, /\[int\]\$StartupTimeoutSeconds = 30/);
   assert.match(smokePowerShellRaw, /\[int\]\$MaxAttempts = 8/);
@@ -157,6 +161,7 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(releaseRaw, /assertBundledLibx264/);
   assert.match(releaseRaw, /runBundledEncodeSmoke/);
   assert.match(releaseRaw, /runPortableExportSmoke\(\{ portableDir, outputFormat: "webm" \}\)/);
+  assert.match(releaseRaw, /runPortableCodecPlanSmoke\(\{ portableDir \}\)/);
   assert.match(releaseRaw, /missing libx264/);
   assert.match(releaseRaw, /getFfmpegSourceArchiveNames/);
   assert.match(appRaw, /smokeStatusWriteRef/);
@@ -168,6 +173,26 @@ test("portable export smoke enforces the interaction-ready stage history", async
   assert.match(releaseRaw, /sizeLimitMb:\s*0\.3/);
   assert.match(releaseRaw, /inputWidth:\s*1920/);
   assert.match(releaseRaw, /inputHeight:\s*1080/);
+});
+
+test("portable codec-plan smoke covers remux, both partial directions, and incompatible MP4/WebM paths", async () => {
+  const matrixPath = path.resolve(__dirname, "../scripts/run-portable-codec-plan-smoke.mjs");
+  const wrapperPath = path.resolve(__dirname, "../scripts/run-portable-export-smoke.mjs");
+  const matrixRaw = await fs.readFile(matrixPath, "utf8");
+  const wrapperRaw = await fs.readFile(wrapperPath, "utf8");
+
+  assert.match(matrixRaw, /MP4 compatible remux/);
+  assert.match(matrixRaw, /MP4 video copy and audio re-encode/);
+  assert.match(matrixRaw, /MP4 video re-encode and audio copy/);
+  assert.match(matrixRaw, /MP4 incompatible full re-encode/);
+  assert.match(matrixRaw, /WebM compatible remux/);
+  assert.match(matrixRaw, /WebM incompatible full re-encode/);
+  assert.match(matrixRaw, /expectedVideoAction: "copy"/);
+  assert.match(matrixRaw, /expectedAudioAction: "encode"/);
+  assert.match(wrapperRaw, /show_data_hash/);
+  assert.match(wrapperRaw, /output permissions mismatch/);
+  assert.match(wrapperRaw, /expected stream action/);
+  assert.match(wrapperRaw, /useFullDuration/);
 });
 
 test("settings rail scrolls while plan card stays in normal flow", async () => {
