@@ -95,8 +95,8 @@ export function UserRecipeDialog({
           <div id="vfl-recipe-privacy-summary">
             <strong>Saved fields:</strong> format, size target, resize, audio, uniqueness, and encoder settings.
             <br />
-            <strong>Never saved:</strong> media or output paths, title, trim, crop, transforms, color edits, HDR conversion choice,
-            diagnostics, or queue and job state. Metadata privacy remains a separate global setting.
+            <strong>Never saved:</strong> media or output paths, title, trim, trim method, expected or accepted Fast Trim boundaries,
+            crop, transforms, color edits, HDR conversion choice, diagnostics, or queue and job state. Metadata privacy remains a separate global setting.
           </div>
         </div>
       ) : null}

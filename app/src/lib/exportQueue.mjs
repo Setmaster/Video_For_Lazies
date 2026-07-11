@@ -208,6 +208,9 @@ function normalizeOutcome(outcome, runId, request) {
     diagnostics: outcome.diagnostics === null || outcome.diagnostics === undefined
       ? null
       : cloneJson(outcome.diagnostics),
+    trimResult: outcome.trimResult === null || outcome.trimResult === undefined
+      ? null
+      : cloneJson(outcome.trimResult),
     completedAtMs,
   };
 }

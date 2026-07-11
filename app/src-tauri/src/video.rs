@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{Emitter, Window};
 use tempfile::{Builder as TempFileBuilder, TempDir, TempPath};
 
@@ -37,6 +38,20 @@ const EXTERNAL_SUBTITLE_MAX_LINE_CHARS: usize = 10_000;
 const STRICT_FIT_MAX_PLANS: u32 = 4;
 const STRICT_FIT_REDUCED_AUDIO_KBPS: u32 = 32;
 const STRICT_FIT_MAX_EDGE_TIERS: &[u32] = &[1280, 960, 720, 540, 360];
+const FAST_TRIM_PLAN_SCHEMA: u32 = 1;
+const FAST_TRIM_MAX_DURATION_US: u64 = 4 * 60 * 60 * 1_000_000;
+const FAST_TRIM_MAX_EDGE_EXPANSION_US: u64 = 10 * 1_000_000;
+const FAST_TRIM_MAX_KEYFRAME_GAP_US: u64 = 12 * 1_000_000;
+const FAST_TRIM_MAX_VIDEO_PACKETS: usize = 750_000;
+const FAST_TRIM_PACKET_PROBE_MAX_STDOUT_BYTES: usize = 96 * 1024 * 1024;
+const FAST_TRIM_PACKET_PROBE_MAX_STDERR_BYTES: usize = 256 * 1024;
+const FAST_TRIM_AUDIO_EVIDENCE_MARGIN_US: i64 = 1_000_000;
+const FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US: u64 = 2_000;
+const FAST_TRIM_AV_EDGE_SKEW_US: u64 = 100_000;
+const FAST_TRIM_DURATION_TOLERANCE_FLOOR_US: u64 = 2_000;
+const FAST_TRIM_STALE_CONSENT_ERROR: &str =
+    "Fast trim consent is stale. Re-check compatibility and accept the current boundaries.";
+const TITLE_METADATA_MAX_CHARS: usize = 512;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -91,14 +106,24 @@ pub enum DynamicRange {
 #[serde(rename_all = "camelCase")]
 pub struct StreamDispositions {
     pub default: bool,
+    pub dub: bool,
     pub original: bool,
     pub comment: bool,
+    pub lyrics: bool,
+    pub karaoke: bool,
     pub forced: bool,
     pub hearing_impaired: bool,
     pub visual_impaired: bool,
+    pub clean_effects: bool,
     pub attached_pic: bool,
     pub timed_thumbnails: bool,
+    pub non_diegetic: bool,
+    pub captions: bool,
+    pub descriptions: bool,
+    pub metadata: bool,
+    pub dependent: bool,
     pub still_image: bool,
+    pub multilayer: bool,
 }
 
 fn command_no_window(bin: &str) -> Command {
@@ -137,6 +162,7 @@ pub struct VideoProbe {
     pub audio_stream_index: Option<u32>,
     pub audio_codec: Option<String>,
     pub audio_is_default: bool,
+    pub selected_audio_dispositions: StreamDispositions,
     pub pixel_format: Option<String>,
     pub bit_depth: Option<u8>,
     pub color_range: Option<String>,
@@ -155,11 +181,128 @@ pub struct VideoProbe {
     pub decoded_audio_bytes_per_sample: Option<u8>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TrimMode {
+    #[default]
+    Exact,
+    FastCopy,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FastTrimConsent {
+    pub plan_schema: u32,
+    pub confirmation_token: String,
+    pub requested_start_us: u64,
+    pub requested_end_us: u64,
+    pub effective_start_us: u64,
+    pub effective_end_us: u64,
+    pub video_packet_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FastTrimInspectionStatus {
+    Ready,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum FastTrimReasonCode {
+    FastModeRequired,
+    TrimRequired,
+    InvalidTrim,
+    UnsupportedOutputFormat,
+    SizeTargetEnabled,
+    StrictFitEnabled,
+    VideoCodecIncompatible,
+    AudioCodecIncompatible,
+    UnsafeColor,
+    NonSquarePixels,
+    SourceRotationUnsupported,
+    ManualRotationEnabled,
+    CropEnabled,
+    ResizeEnabled,
+    ColorAdjustmentEnabled,
+    ColorConversionEnabled,
+    SpeedChanged,
+    ReverseEnabled,
+    LoopEnabled,
+    PerturbationEnabled,
+    SubtitleEnabled,
+    AudioNormalizationEnabled,
+    FrameRateOverride,
+    VideoCodecOverride,
+    VideoQualityOverride,
+    EncodeSpeedOverride,
+    AudioBitrateOverride,
+    AudioChannelsOverride,
+    ChaptersPresent,
+    SourceDurationExceeded,
+    PacketLimitExceeded,
+    InspectionTimeout,
+    KeyframeGapExceeded,
+    OpenGop,
+    MalformedPacketEvidence,
+    StartBoundaryMissing,
+    EndBoundaryMissing,
+    EdgeExpansionExceeded,
+    EmptyInterval,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FastTrimReason {
+    pub code: FastTrimReasonCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FastTrimInspection {
+    pub status: FastTrimInspectionStatus,
+    pub reasons: Vec<FastTrimReason>,
+    pub requested_start_us: u64,
+    pub requested_end_us: u64,
+    pub effective_start_us: Option<u64>,
+    pub effective_end_us: Option<u64>,
+    pub start_expansion_us: Option<u64>,
+    pub end_expansion_us: Option<u64>,
+    pub requires_acceptance: bool,
+    pub video_packet_count: Option<u64>,
+    pub video_action: Option<StreamAction>,
+    pub audio_action: Option<StreamAction>,
+    pub consent: Option<FastTrimConsent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrimResult {
+    pub mode: TrimMode,
+    pub requested_start_us: u64,
+    pub requested_end_us: u64,
+    pub effective_start_us: u64,
+    pub effective_end_us: u64,
+    pub actual_start_us: u64,
+    pub actual_end_us: u64,
+    pub video_packet_count: u64,
+    pub video_action: StreamAction,
+    pub audio_action: StreamAction,
+    pub ffmpeg_invocations: u32,
+    pub command_preview: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Trim {
     pub start_s: f64,
     pub end_s: Option<f64>,
+    #[serde(default)]
+    pub mode: TrimMode,
+    #[serde(default)]
+    pub fast_copy_consent: Option<FastTrimConsent>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -341,6 +484,7 @@ pub struct EncodeFinishedPayload {
     pub output_path: Option<String>,
     pub output_size_bytes: Option<u64>,
     pub target_result: Option<TargetResult>,
+    pub trim_result: Option<TrimResult>,
     pub message: Option<String>,
     pub diagnostics: Option<ExportDiagnostics>,
 }
@@ -416,6 +560,15 @@ pub struct ExportDiagnostics {
     pub reverse_buffer_action: Option<String>,
     pub failure_stage: Option<String>,
     pub failure_reason: Option<String>,
+    pub trim_mode: Option<TrimMode>,
+    pub trim_requested_start_us: Option<u64>,
+    pub trim_requested_end_us: Option<u64>,
+    pub trim_effective_start_us: Option<u64>,
+    pub trim_effective_end_us: Option<u64>,
+    pub trim_actual_start_us: Option<u64>,
+    pub trim_actual_end_us: Option<u64>,
+    pub trim_video_packet_count: Option<u64>,
+    pub trim_ffmpeg_invocations: Option<u32>,
     pub command_preview: String,
 }
 
@@ -436,6 +589,11 @@ fn target_bytes_from_size_limit_mb(size_limit_mb: f64) -> Option<u64> {
 pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> ExportDiagnostics {
     let requested_size_bytes = target_bytes_from_size_limit_mb(request.size_limit_mb);
     let redacted_reason = safe_failure_diagnostic_reason(request, reason);
+    let failure_stage = if reason.trim() == FAST_TRIM_STALE_CONSENT_ERROR {
+        "fast-trim-consent"
+    } else {
+        "backend"
+    };
     ExportDiagnostics {
         mode: "failed".to_string(),
         video_action: None,
@@ -459,8 +617,24 @@ pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> Expor
         sar_action: "Not completed".to_string(),
         reverse_buffer_estimate_bytes: None,
         reverse_buffer_action: None,
-        failure_stage: Some("backend".to_string()),
+        failure_stage: Some(failure_stage.to_string()),
         failure_reason: Some(redacted_reason),
+        trim_mode: request.trim.as_ref().map(|trim| trim.mode),
+        trim_requested_start_us: request
+            .trim
+            .as_ref()
+            .and_then(|trim| seconds_to_unsigned_us(trim.start_s)),
+        trim_requested_end_us: request
+            .trim
+            .as_ref()
+            .and_then(|trim| trim.end_s)
+            .and_then(seconds_to_unsigned_us),
+        trim_effective_start_us: None,
+        trim_effective_end_us: None,
+        trim_actual_start_us: None,
+        trim_actual_end_us: None,
+        trim_video_packet_count: None,
+        trim_ffmpeg_invocations: None,
         command_preview:
             "No FFmpeg command evidence was retained because the export failed before completion."
                 .to_string(),
@@ -1398,6 +1572,107 @@ fn run_command_output_with_timeout(
             Err(e) => return Err(format!("Failed while waiting for {action}: {e}")),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_command_output_bounded(
+    mut cmd: Command,
+    binary_name: &str,
+    env_var: &str,
+    tried: &str,
+    action: &str,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<Output, String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            binary_not_found_message(binary_name, env_var, tried)
+        } else {
+            format!("Failed to start {action} ({tried}): {error}")
+        }
+    })?;
+
+    fn spawn_bounded_reader<R: Read + Send + 'static>(
+        mut reader: R,
+        limit: usize,
+        exceeded: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut output = Vec::with_capacity(limit.min(64 * 1024));
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                let read = match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                if output.len().saturating_add(read) > limit {
+                    let remaining = limit.saturating_sub(output.len());
+                    output.extend_from_slice(&chunk[..remaining]);
+                    exceeded.store(true, Ordering::Relaxed);
+                    break;
+                }
+                output.extend_from_slice(&chunk[..read]);
+            }
+            output
+        })
+    }
+
+    let stdout_exceeded = Arc::new(AtomicBool::new(false));
+    let stderr_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("Failed to capture {action} output."))?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("Failed to capture {action} error output."))?;
+    let stdout_thread = spawn_bounded_reader(stdout_reader, stdout_limit, stdout_exceeded.clone());
+    let stderr_thread = spawn_bounded_reader(stderr_reader, stderr_limit, stderr_exceeded.clone());
+    let started_at = Instant::now();
+
+    let status = loop {
+        if stdout_exceeded.load(Ordering::Relaxed) || stderr_exceeded.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .map_err(|error| format!("Failed while stopping {action}: {error}"))?;
+            break status;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started_at.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!(
+                    "{action} timed out after {} seconds.",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(format!("Failed while waiting for {action}: {error}")),
+        }
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if stdout_exceeded.load(Ordering::Relaxed) {
+        return Err("FAST_TRIM_EVIDENCE_LIMIT: selected-stream packet evidence exceeded the bounded capture limit.".to_string());
+    }
+    if stderr_exceeded.load(Ordering::Relaxed) {
+        return Err(
+            "Fast trim packet inspection produced excessive diagnostic output.".to_string(),
+        );
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn canonical_destination_path(path: &Path) -> Result<PathBuf, String> {
@@ -3842,6 +4117,9 @@ struct FFProbeOutput {
 struct FFProbeFormat {
     duration: Option<String>,
     format_name: Option<String>,
+    start_time: Option<String>,
+    #[serde(default)]
+    tags: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3852,18 +4130,19 @@ struct FFProbeSideData {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct FFProbeStreamTags {
-    rotate: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
 struct FFProbeDisposition {
     #[serde(default)]
     default: u8,
     #[serde(default)]
+    dub: u8,
+    #[serde(default)]
     original: u8,
     #[serde(default)]
     comment: u8,
+    #[serde(default)]
+    lyrics: u8,
+    #[serde(default)]
+    karaoke: u8,
     #[serde(default)]
     forced: u8,
     #[serde(default)]
@@ -3871,11 +4150,25 @@ struct FFProbeDisposition {
     #[serde(default)]
     visual_impaired: u8,
     #[serde(default)]
+    clean_effects: u8,
+    #[serde(default)]
     attached_pic: u8,
     #[serde(default)]
     timed_thumbnails: u8,
     #[serde(default)]
+    non_diegetic: u8,
+    #[serde(default)]
+    captions: u8,
+    #[serde(default)]
+    descriptions: u8,
+    #[serde(default)]
+    metadata: u8,
+    #[serde(default)]
+    dependent: u8,
+    #[serde(default)]
     still_image: u8,
+    #[serde(default)]
+    multilayer: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3884,6 +4177,7 @@ struct FFProbeStream {
     codec_name: Option<String>,
     codec_type: Option<String>,
     duration: Option<String>,
+    start_time: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     pix_fmt: Option<String>,
@@ -3904,9 +4198,1221 @@ struct FFProbeStream {
     r_frame_rate: Option<String>,
     #[serde(default)]
     side_data_list: Vec<FFProbeSideData>,
-    tags: Option<FFProbeStreamTags>,
+    #[serde(default)]
+    tags: HashMap<String, serde_json::Value>,
     #[serde(default)]
     disposition: FFProbeDisposition,
+}
+
+#[derive(Debug, Deserialize)]
+struct FastPacketJson {
+    stream_index: Option<u32>,
+    pts_time: Option<String>,
+    dts_time: Option<String>,
+    duration_time: Option<String>,
+    flags: Option<String>,
+    data_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FastProbeJson {
+    #[serde(default)]
+    streams: Vec<FFProbeStream>,
+    #[serde(default)]
+    format: FFProbeFormat,
+    #[serde(default)]
+    chapters: Vec<serde_json::Value>,
+    #[serde(default)]
+    packets: Vec<FastPacketJson>,
+}
+
+#[derive(Debug, Clone)]
+struct FastPacket {
+    stream_index: u32,
+    pts_us: i64,
+    dts_us: i64,
+    duration_us: u64,
+    key: bool,
+    data_hash: String,
+}
+
+type NormalizedTagMap = BTreeMap<String, String>;
+
+#[derive(Debug, Clone)]
+struct FastStreamSummary {
+    index: u32,
+    codec_type: String,
+    codec_name: String,
+    start_us: Option<i64>,
+    tags: NormalizedTagMap,
+}
+
+#[derive(Debug, Clone)]
+struct FastPacketProbe {
+    streams: Vec<FastStreamSummary>,
+    packets: Vec<FastPacket>,
+    format_start_us: Option<i64>,
+    format_duration_us: Option<u64>,
+    format_tags: NormalizedTagMap,
+    chapter_count: usize,
+}
+
+#[derive(Debug)]
+enum FastPacketProbeError {
+    Blocked(FastTrimReason),
+    Operational(String),
+}
+
+#[derive(Debug, Clone)]
+struct FastTrimPlan {
+    inspection: FastTrimInspection,
+    absolute_start_us: i64,
+    video_stream_index: u32,
+    audio_stream_index: Option<u32>,
+    video_codec: String,
+    audio_codec: Option<String>,
+    video_packet_hashes: Vec<String>,
+    source_audio_packets: Vec<FastPacket>,
+    duration_tolerance_us: u64,
+    sample_aspect_ratio: Rational,
+    pixel_format: Option<String>,
+    bit_depth: Option<u8>,
+    color_range: Option<String>,
+    color_primaries: Option<String>,
+    color_transfer: Option<String>,
+    color_space: Option<String>,
+    video_dispositions: StreamDispositions,
+    audio_dispositions: StreamDispositions,
+    strip_metadata: bool,
+    replacement_title: Option<String>,
+    source_global_tags: NormalizedTagMap,
+    source_video_tags: NormalizedTagMap,
+    source_audio_tags: NormalizedTagMap,
+}
+
+enum FastTrimPlannerOutcome {
+    Ready(Box<FastTrimPlan>),
+    Blocked(FastTrimInspection),
+}
+
+fn fast_trim_reason(code: FastTrimReasonCode, message: impl Into<String>) -> FastTrimReason {
+    FastTrimReason {
+        code,
+        message: message.into(),
+    }
+}
+
+fn seconds_to_unsigned_us(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value > JS_MAX_SAFE_INTEGER_BYTES as f64 / 1_000_000.0 {
+        return None;
+    }
+    Some((value * 1_000_000.0).round() as u64)
+}
+
+fn seconds_text_to_signed_us(value: Option<&str>) -> Option<i64> {
+    let value = value?.trim().parse::<f64>().ok()?;
+    if !value.is_finite()
+        || value < i64::MIN as f64 / 1_000_000.0
+        || value > i64::MAX as f64 / 1_000_000.0
+    {
+        return None;
+    }
+    Some((value * 1_000_000.0).round() as i64)
+}
+
+fn ffprobe_tag_value<'a>(
+    tags: &'a HashMap<String, serde_json::Value>,
+    expected_key: &str,
+) -> Option<&'a str> {
+    tags.iter().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case(expected_key)
+            .then(|| value.as_str())
+            .flatten()
+    })
+}
+
+fn normalized_ffprobe_tags(tags: &HashMap<String, serde_json::Value>) -> NormalizedTagMap {
+    tags.iter()
+        .filter_map(|(key, value)| {
+            let key = key.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                return None;
+            }
+            let value = match value {
+                serde_json::Value::String(value) => value.trim().to_string(),
+                serde_json::Value::Number(value) => value.to_string(),
+                serde_json::Value::Bool(value) => value.to_string(),
+                _ => return None,
+            };
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn fast_trim_blocked_inspection(
+    requested_start_us: u64,
+    requested_end_us: u64,
+    reasons: Vec<FastTrimReason>,
+) -> FastTrimInspection {
+    FastTrimInspection {
+        status: FastTrimInspectionStatus::Blocked,
+        reasons,
+        requested_start_us,
+        requested_end_us,
+        effective_start_us: None,
+        effective_end_us: None,
+        start_expansion_us: None,
+        end_expansion_us: None,
+        requires_acceptance: false,
+        video_packet_count: None,
+        video_action: None,
+        audio_action: None,
+        consent: None,
+    }
+}
+
+pub(crate) fn validate_title_metadata(title: Option<&str>) -> Result<Option<String>, String> {
+    let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) else {
+        return Ok(None);
+    };
+    if title.chars().count() > TITLE_METADATA_MAX_CHARS {
+        return Err(format!(
+            "Title metadata must be at most {TITLE_METADATA_MAX_CHARS} characters."
+        ));
+    }
+    if title.chars().any(char::is_control) {
+        return Err("Title metadata cannot contain NUL or control characters.".to_string());
+    }
+    Ok(Some(title.to_string()))
+}
+
+fn validate_base_request_scalars(request: &EncodeRequest) -> Result<(), String> {
+    if request.speed <= 0.0 || !request.speed.is_finite() {
+        return Err("Speed must be > 0.".to_string());
+    }
+    if request.size_limit_mb < 0.0 || !request.size_limit_mb.is_finite() {
+        return Err("Size limit must be >= 0 MB.".to_string());
+    }
+    let size_limit_enabled = request.size_limit_mb > 0.0;
+    if size_limit_enabled && request.size_limit_mb < 0.1 {
+        return Err("Size limit must be >= 0.1 MB (or 0 to disable).".to_string());
+    }
+    validate_strict_fit_options(
+        request.strict_fit,
+        request.strict_fit_allow_audio_removal,
+        size_limit_enabled,
+        request.format,
+    )
+}
+
+fn fast_trim_compatibility(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+) -> (u64, u64, StreamAction, Vec<FastTrimReason>) {
+    let duration_us = seconds_to_unsigned_us(probe.duration_s).unwrap_or_default();
+    let mut requested_start_us = 0;
+    let mut requested_end_us = duration_us;
+    let mut reasons = Vec::new();
+
+    let Some(trim) = request.trim.as_ref() else {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::TrimRequired,
+            "Fast trim requires an active trim range.",
+        ));
+        return (
+            requested_start_us,
+            requested_end_us,
+            StreamAction::Drop,
+            reasons,
+        );
+    };
+
+    if trim.mode != TrimMode::FastCopy {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::FastModeRequired,
+            "Select Fast trim before checking compatibility.",
+        ));
+    }
+    if let Some(start_us) = seconds_to_unsigned_us(trim.start_s) {
+        requested_start_us = start_us;
+    } else {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::InvalidTrim,
+            "Trim start must be a finite non-negative time.",
+        ));
+    }
+    if let Some(end_s) = trim.end_s {
+        if let Some(end_us) = seconds_to_unsigned_us(end_s) {
+            requested_end_us = end_us;
+        } else {
+            reasons.push(fast_trim_reason(
+                FastTrimReasonCode::InvalidTrim,
+                "Trim end must be a finite non-negative time.",
+            ));
+        }
+    }
+    if requested_start_us >= requested_end_us || requested_end_us > duration_us {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::InvalidTrim,
+            "Trim must be a nonempty range within the source duration.",
+        ));
+    }
+    if requested_start_us == 0 && requested_end_us == duration_us {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::EmptyInterval,
+            "Fast trim requires a range that changes at least one source boundary.",
+        ));
+    }
+    if duration_us > FAST_TRIM_MAX_DURATION_US {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::SourceDurationExceeded,
+            "This source is longer than the bounded Fast trim inspection limit.",
+        ));
+    }
+    if !matches!(request.format, OutputFormat::Mp4 | OutputFormat::Webm) {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::UnsupportedOutputFormat,
+            "Fast trim is available only for MP4 and WebM video.",
+        ));
+    }
+    if request.size_limit_mb > 0.0 {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::SizeTargetEnabled,
+            "Fast trim cannot be combined with a size target.",
+        ));
+    }
+    if request.strict_fit || request.strict_fit_allow_audio_removal {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::StrictFitEnabled,
+            "Fast trim cannot be combined with Strict Fit.",
+        ));
+    }
+    if !video_copy_compatible(request.format, probe.video_codec.as_deref()) {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::VideoCodecIncompatible,
+            "The selected video codec cannot be copied into this output format.",
+        ));
+    }
+
+    let audio_action = if request.audio_enabled && probe.audio_stream_index.is_some() {
+        if audio_copy_compatible(request.format, probe.audio_codec.as_deref()) {
+            StreamAction::Copy
+        } else {
+            reasons.push(fast_trim_reason(
+                FastTrimReasonCode::AudioCodecIncompatible,
+                "The selected audio codec cannot be copied; disable audio or use Exact trim.",
+            ));
+            StreamAction::Drop
+        }
+    } else {
+        StreamAction::Drop
+    };
+
+    let safe_pixel_format = probe
+        .pixel_format
+        .as_deref()
+        .is_some_and(|format| matches!(format, "yuv420p" | "yuvj420p"));
+    let safe_standard_color = matches!(
+        probe.dynamic_range,
+        DynamicRange::Sdr | DynamicRange::Unknown
+    ) && probe
+        .color_range
+        .as_deref()
+        .is_some_and(|value| matches!(value, "tv" | "mpeg"))
+        && probe
+            .color_space
+            .as_deref()
+            .is_some_and(|value| value == "bt709")
+        && probe
+            .color_primaries
+            .as_deref()
+            .is_none_or(|value| value == "bt709")
+        && probe
+            .color_transfer
+            .as_deref()
+            .is_none_or(|value| value == "bt709");
+    if !safe_standard_color || probe.bit_depth.is_none_or(|depth| depth > 8) || !safe_pixel_format {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::UnsafeColor,
+            "Fast trim requires standard 8-bit SDR BT.709 4:2:0 video.",
+        ));
+    }
+    if !probe.sample_aspect_ratio.is_square() {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::NonSquarePixels,
+            "Fast trim requires square source pixels.",
+        ));
+    }
+    if probe.rotation_deg != 0 || probe.unsupported_rotation_deg.is_some() {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::SourceRotationUnsupported,
+            "Fast trim requires source rotation metadata of zero degrees.",
+        ));
+    }
+    if request.rotate_deg != 0 {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::ManualRotationEnabled,
+            "Fast trim cannot apply rotation.",
+        ));
+    }
+    if request.crop.is_some() {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::CropEnabled,
+            "Fast trim cannot apply crop.",
+        ));
+    }
+    if request.max_edge_px.is_some()
+        || request
+            .resize
+            .as_ref()
+            .is_some_and(|resize| resize.mode != ResizeMode::Source)
+    {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::ResizeEnabled,
+            "Fast trim cannot resize video.",
+        ));
+    }
+    if !color_is_noop(&request.color) {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::ColorAdjustmentEnabled,
+            "Fast trim cannot apply color adjustments.",
+        ));
+    }
+    if request.color_policy != ColorPolicy::Auto {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::ColorConversionEnabled,
+            "Fast trim cannot convert color space.",
+        ));
+    }
+    if (request.speed - 1.0).abs() > 1e-9 {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::SpeedChanged,
+            "Fast trim requires normal playback speed.",
+        ));
+    }
+    if request.reverse {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::ReverseEnabled,
+            "Fast trim cannot reverse video.",
+        ));
+    }
+    if request.loop_video {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::LoopEnabled,
+            "Fast trim cannot create a loop.",
+        ));
+    }
+    if request.perturb_first_frame || request.perturb_seed.is_some() {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::PerturbationEnabled,
+            "Fast trim cannot perturb the first frame.",
+        ));
+    }
+    if request.subtitle_path.is_some() {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::SubtitleEnabled,
+            "Fast trim cannot burn subtitles.",
+        ));
+    }
+    if request.normalize_audio {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::AudioNormalizationEnabled,
+            "Fast trim cannot normalize audio.",
+        ));
+    }
+    if request.advanced.frame_rate_cap_fps.is_some() {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::FrameRateOverride,
+            "Fast trim cannot apply a frame-rate cap.",
+        ));
+    }
+    if request
+        .advanced
+        .video_codec
+        .is_some_and(|value| value != VideoCodecPreference::Auto)
+    {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::VideoCodecOverride,
+            "Fast trim cannot force a video codec.",
+        ));
+    }
+    if request
+        .advanced
+        .video_quality
+        .is_some_and(|value| value != VideoQualityPreference::Auto)
+    {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::VideoQualityOverride,
+            "Fast trim cannot apply an encode quality.",
+        ));
+    }
+    if request
+        .advanced
+        .encode_speed
+        .is_some_and(|value| value != EncodeSpeedPreference::Auto)
+    {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::EncodeSpeedOverride,
+            "Fast trim cannot apply an encode speed.",
+        ));
+    }
+    if request.advanced.audio_bitrate_kbps.is_some() {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::AudioBitrateOverride,
+            "Fast trim cannot change audio bitrate.",
+        ));
+    }
+    if request
+        .advanced
+        .audio_channels
+        .is_some_and(|value| value != AudioChannelPreference::Auto)
+    {
+        reasons.push(fast_trim_reason(
+            FastTrimReasonCode::AudioChannelsOverride,
+            "Fast trim cannot change audio channels.",
+        ));
+    }
+
+    (requested_start_us, requested_end_us, audio_action, reasons)
+}
+
+fn fast_probe_read_interval(start_us: i64, end_us: i64, source_origin_us: i64) -> Option<String> {
+    (end_us > start_us).then(|| {
+        if start_us <= source_origin_us {
+            format!("%{}", format_signed_microseconds(end_us))
+        } else {
+            format!(
+                "{}%{}",
+                format_signed_microseconds(start_us),
+                format_signed_microseconds(end_us)
+            )
+        }
+    })
+}
+
+fn probe_fast_packets(
+    path: &Path,
+    selected_stream_index: Option<u32>,
+    read_window_us: Option<(i64, i64, i64)>,
+) -> Result<FastPacketProbe, FastPacketProbeError> {
+    let ffprobe_bin = default_ffprobe();
+    let mut command = command_no_window(&ffprobe_bin);
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-print_format")
+        .arg("json");
+    if let Some(stream_index) = selected_stream_index {
+        command.arg("-select_streams").arg(stream_index.to_string());
+    }
+    if let Some((start_us, end_us, source_origin_us)) = read_window_us {
+        let interval =
+            fast_probe_read_interval(start_us, end_us, source_origin_us).ok_or_else(|| {
+                FastPacketProbeError::Blocked(fast_trim_reason(
+                    FastTrimReasonCode::MalformedPacketEvidence,
+                    "Fast trim audio packet evidence has an invalid bounded time window.",
+                ))
+            })?;
+        command.arg("-read_intervals").arg(interval);
+    }
+    command
+        .arg("-show_streams")
+        .arg("-show_format")
+        .arg("-show_chapters")
+        .arg("-show_packets")
+        .arg("-show_data_hash")
+        .arg("sha256")
+        .arg("-show_entries")
+        .arg("packet=stream_index,pts_time,dts_time,duration_time,flags,data_hash:stream=index,codec_name,codec_type,start_time,avg_frame_rate:stream_tags:format=start_time,duration:format_tags:chapter=id,start_time,end_time")
+        .arg(path.as_os_str());
+
+    let output = run_command_output_bounded(
+        command,
+        "ffprobe",
+        "VFL_FFPROBE_PATH",
+        &ffprobe_bin,
+        "Fast trim packet inspection",
+        FFPROBE_TIMEOUT,
+        FAST_TRIM_PACKET_PROBE_MAX_STDOUT_BYTES,
+        FAST_TRIM_PACKET_PROBE_MAX_STDERR_BYTES,
+    )
+    .map_err(|error| {
+        if error.starts_with("FAST_TRIM_EVIDENCE_LIMIT:") {
+            FastPacketProbeError::Blocked(fast_trim_reason(
+                FastTrimReasonCode::PacketLimitExceeded,
+                "Fast trim packet evidence exceeded the bounded inspection limit.",
+            ))
+        } else if error.contains("timed out after") {
+            FastPacketProbeError::Blocked(fast_trim_reason(
+                FastTrimReasonCode::InspectionTimeout,
+                "Fast trim packet inspection exceeded its bounded time limit.",
+            ))
+        } else {
+            FastPacketProbeError::Operational(error)
+        }
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .replace(&path.to_string_lossy().to_string(), "<input>");
+        return Err(FastPacketProbeError::Operational(format!(
+            "Fast trim packet inspection failed.\n\n{}",
+            stderr.trim()
+        )));
+    }
+
+    let parsed: FastProbeJson = serde_json::from_slice(&output.stdout).map_err(|error| {
+        FastPacketProbeError::Operational(format!(
+            "Fast trim packet inspection returned invalid JSON: {error}"
+        ))
+    })?;
+    let packet_limit = if selected_stream_index.is_some() {
+        FAST_TRIM_MAX_VIDEO_PACKETS
+    } else {
+        FAST_TRIM_MAX_VIDEO_PACKETS.saturating_mul(3)
+    };
+    if parsed.packets.len() > packet_limit {
+        return Err(FastPacketProbeError::Blocked(fast_trim_reason(
+            FastTrimReasonCode::PacketLimitExceeded,
+            "This trim needs more selected-stream packets than the bounded Fast trim limit.",
+        )));
+    }
+
+    let mut streams = Vec::with_capacity(parsed.streams.len());
+    for stream in &parsed.streams {
+        let Some(index) = stream.index else {
+            continue;
+        };
+        streams.push(FastStreamSummary {
+            index,
+            codec_type: stream.codec_type.clone().unwrap_or_default(),
+            codec_name: stream.codec_name.clone().unwrap_or_default(),
+            start_us: seconds_text_to_signed_us(stream.start_time.as_deref()),
+            tags: normalized_ffprobe_tags(&stream.tags),
+        });
+    }
+
+    let mut packets = Vec::with_capacity(parsed.packets.len());
+    for packet in parsed.packets {
+        let Some(stream_index) = packet.stream_index else {
+            return Err(FastPacketProbeError::Blocked(fast_trim_reason(
+                FastTrimReasonCode::MalformedPacketEvidence,
+                "A packet is missing its stream index.",
+            )));
+        };
+        let Some(pts_us) = seconds_text_to_signed_us(packet.pts_time.as_deref()) else {
+            return Err(FastPacketProbeError::Blocked(fast_trim_reason(
+                FastTrimReasonCode::MalformedPacketEvidence,
+                "A video packet has no finite presentation timestamp.",
+            )));
+        };
+        let Some(dts_us) = seconds_text_to_signed_us(packet.dts_time.as_deref()) else {
+            return Err(FastPacketProbeError::Blocked(fast_trim_reason(
+                FastTrimReasonCode::MalformedPacketEvidence,
+                "A video packet has no finite decode timestamp.",
+            )));
+        };
+        let Some(duration_us) = seconds_text_to_signed_us(packet.duration_time.as_deref())
+            .and_then(|duration| u64::try_from(duration).ok())
+            .filter(|duration| *duration > 0)
+        else {
+            return Err(FastPacketProbeError::Blocked(fast_trim_reason(
+                FastTrimReasonCode::MalformedPacketEvidence,
+                "A video packet has no finite positive duration.",
+            )));
+        };
+        let Some(data_hash) = packet
+            .data_hash
+            .map(|hash| hash.trim().to_ascii_lowercase())
+            .filter(|hash| hash.starts_with("sha256:") && hash.len() > "sha256:".len())
+        else {
+            return Err(FastPacketProbeError::Blocked(fast_trim_reason(
+                FastTrimReasonCode::MalformedPacketEvidence,
+                "A video packet is missing its bounded SHA-256 payload evidence.",
+            )));
+        };
+        packets.push(FastPacket {
+            stream_index,
+            pts_us,
+            dts_us,
+            duration_us,
+            key: packet
+                .flags
+                .as_deref()
+                .is_some_and(|flags| flags.contains('K')),
+            data_hash,
+        });
+    }
+
+    Ok(FastPacketProbe {
+        streams,
+        packets,
+        format_start_us: seconds_text_to_signed_us(parsed.format.start_time.as_deref()),
+        format_duration_us: seconds_text_to_signed_us(parsed.format.duration.as_deref())
+            .and_then(|duration| u64::try_from(duration).ok()),
+        format_tags: normalized_ffprobe_tags(&parsed.format.tags),
+        chapter_count: parsed.chapters.len(),
+    })
+}
+
+fn fast_source_identity(
+    path: &Path,
+    probe: &VideoProbe,
+    video_packets: &[FastPacket],
+    audio_packets: &[FastPacket],
+) -> Result<String, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Could not read source identity metadata: {error}"))?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"vfl-fast-trim-source-v1\0");
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified_ns.to_le_bytes());
+    hasher.update(probe.video_stream_index.to_le_bytes());
+    hasher.update(probe.video_codec.as_deref().unwrap_or_default().as_bytes());
+    if let Some(audio_index) = probe.audio_stream_index {
+        hasher.update(audio_index.to_le_bytes());
+    }
+    hasher.update(probe.audio_codec.as_deref().unwrap_or_default().as_bytes());
+    hasher.update(b"\0video-packets\0");
+    for packet in video_packets {
+        hasher.update(packet.stream_index.to_le_bytes());
+        hasher.update(packet.pts_us.to_le_bytes());
+        hasher.update(packet.dts_us.to_le_bytes());
+        hasher.update(packet.duration_us.to_le_bytes());
+        hasher.update(packet.data_hash.as_bytes());
+    }
+    hasher.update(b"\0audio-window-packets\0");
+    for packet in audio_packets {
+        hasher.update(packet.stream_index.to_le_bytes());
+        hasher.update(packet.pts_us.to_le_bytes());
+        hasher.update(packet.dts_us.to_le_bytes());
+        hasher.update(packet.duration_us.to_le_bytes());
+        hasher.update(packet.data_hash.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn ordered_packet_evidence_digest(packets: &[FastPacket]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"vfl-fast-trim-ordered-packets-v1\0");
+    hasher.update((packets.len() as u64).to_le_bytes());
+    for packet in packets {
+        hasher.update(packet.stream_index.to_le_bytes());
+        hasher.update(packet.pts_us.to_le_bytes());
+        hasher.update(packet.dts_us.to_le_bytes());
+        hasher.update(packet.duration_us.to_le_bytes());
+        hasher.update(packet.data_hash.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fast_confirmation_token(
+    source_identity: &str,
+    request: &EncodeRequest,
+    requested_start_us: u64,
+    requested_end_us: u64,
+    effective_start_us: u64,
+    effective_end_us: u64,
+    video_packet_count: u64,
+    audio_action: StreamAction,
+    audio_packet_count: u64,
+    audio_packet_evidence_digest: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"vfl-fast-trim-consent-v1\0");
+    hasher.update(FAST_TRIM_PLAN_SCHEMA.to_le_bytes());
+    hasher.update(source_identity.as_bytes());
+    hasher.update(requested_start_us.to_le_bytes());
+    hasher.update(requested_end_us.to_le_bytes());
+    hasher.update(effective_start_us.to_le_bytes());
+    hasher.update(effective_end_us.to_le_bytes());
+    hasher.update(video_packet_count.to_le_bytes());
+    hasher.update([request.format as u8]);
+    hasher.update([request.strip_metadata as u8]);
+    hasher.update([audio_action as u8]);
+    hasher.update(audio_packet_count.to_le_bytes());
+    hasher.update(audio_packet_evidence_digest.as_bytes());
+    hasher.update(
+        request
+            .title
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FastIntervalSelection {
+    start_index: usize,
+    end_index: usize,
+    effective_start_us: u64,
+    effective_end_us: u64,
+    start_expansion_us: u64,
+    end_expansion_us: u64,
+}
+
+fn select_fast_trim_interval(
+    packets: &[FastPacket],
+    origin_us: i64,
+    source_duration_us: u64,
+    requested_start_us: u64,
+    requested_end_us: u64,
+) -> Result<FastIntervalSelection, FastTrimReason> {
+    if packets.is_empty() {
+        return Err(fast_trim_reason(
+            FastTrimReasonCode::MalformedPacketEvidence,
+            "No selected-video packets were found.",
+        ));
+    }
+    if packets
+        .windows(2)
+        .any(|window| window[1].dts_us < window[0].dts_us)
+    {
+        return Err(fast_trim_reason(
+            FastTrimReasonCode::MalformedPacketEvidence,
+            "Video decode timestamps are not monotonic.",
+        ));
+    }
+    let source_end_absolute_us = origin_us.saturating_add(
+        i64::try_from(source_duration_us).unwrap_or(i64::MAX.saturating_sub(origin_us)),
+    );
+    let key_indices = packets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, packet)| packet.key.then_some(index))
+        .collect::<Vec<_>>();
+    if key_indices.is_empty() {
+        return Err(fast_trim_reason(
+            FastTrimReasonCode::StartBoundaryMissing,
+            "No usable video keyframe boundary was found.",
+        ));
+    }
+
+    let mut usable_key_indices = Vec::new();
+    let mut open_key_indices = HashSet::new();
+    let mut excessive_gap_key_indices = HashSet::new();
+    for (position, key_index) in key_indices.iter().copied().enumerate() {
+        let key_packet = &packets[key_index];
+        let next_key_index = key_indices.get(position + 1).copied();
+        let group_end = next_key_index.unwrap_or(packets.len());
+        if packets[key_index + 1..group_end]
+            .iter()
+            .any(|packet| packet.pts_us < key_packet.pts_us)
+        {
+            open_key_indices.insert(key_index);
+            continue;
+        }
+        let group_end_pts_us = next_key_index
+            .map(|index| packets[index].pts_us)
+            .unwrap_or(source_end_absolute_us);
+        let keyframe_gap_us = group_end_pts_us.saturating_sub(key_packet.pts_us);
+        if keyframe_gap_us <= 0
+            || u64::try_from(keyframe_gap_us)
+                .ok()
+                .is_none_or(|gap| gap > FAST_TRIM_MAX_KEYFRAME_GAP_US)
+        {
+            excessive_gap_key_indices.insert(key_index);
+            continue;
+        }
+        usable_key_indices.push(key_index);
+    }
+
+    let relative_key_us = |index: usize| -> Option<u64> {
+        packets[index]
+            .pts_us
+            .checked_sub(origin_us)
+            .and_then(|relative| u64::try_from(relative).ok())
+    };
+    let start_index = usable_key_indices
+        .iter()
+        .copied()
+        .filter(|index| relative_key_us(*index).is_some_and(|time| time <= requested_start_us))
+        .max_by_key(|index| relative_key_us(*index).unwrap_or_default())
+        .ok_or_else(|| {
+            if !open_key_indices.is_empty() {
+                fast_trim_reason(
+                    FastTrimReasonCode::OpenGop,
+                    "The requested start has no closed-GOP keyframe boundary.",
+                )
+            } else if !excessive_gap_key_indices.is_empty() {
+                fast_trim_reason(
+                    FastTrimReasonCode::KeyframeGapExceeded,
+                    "The requested start exceeds the bounded keyframe-gap limit.",
+                )
+            } else {
+                fast_trim_reason(
+                    FastTrimReasonCode::StartBoundaryMissing,
+                    "No usable keyframe exists at or before the requested start.",
+                )
+            }
+        })?;
+    let effective_start_us = relative_key_us(start_index).unwrap_or_default();
+    let end_key_index = usable_key_indices
+        .iter()
+        .copied()
+        .filter(|index| *index > start_index)
+        .filter(|index| relative_key_us(*index).is_some_and(|time| time >= requested_end_us))
+        .min_by_key(|index| relative_key_us(*index).unwrap_or(u64::MAX));
+    let (effective_end_us, end_index) = end_key_index
+        .map(|index| (relative_key_us(index).unwrap_or(source_duration_us), index))
+        .unwrap_or((source_duration_us, packets.len()));
+
+    if let Some(key_index) = key_indices.iter().copied().find(|key_index| {
+        *key_index >= start_index
+            && *key_index < end_index
+            && (open_key_indices.contains(key_index)
+                || excessive_gap_key_indices.contains(key_index))
+    }) {
+        if open_key_indices.contains(&key_index) {
+            return Err(fast_trim_reason(
+                FastTrimReasonCode::OpenGop,
+                "The containing interval crosses an open GOP with leading pictures.",
+            ));
+        }
+        return Err(fast_trim_reason(
+            FastTrimReasonCode::KeyframeGapExceeded,
+            "The containing interval crosses an excessive keyframe gap.",
+        ));
+    }
+    if effective_start_us > requested_start_us || effective_end_us < requested_end_us {
+        return Err(fast_trim_reason(
+            FastTrimReasonCode::EndBoundaryMissing,
+            "A containing closed-GOP interval could not be proven.",
+        ));
+    }
+    let start_expansion_us = requested_start_us - effective_start_us;
+    let end_expansion_us = effective_end_us - requested_end_us;
+    if start_expansion_us > FAST_TRIM_MAX_EDGE_EXPANSION_US
+        || end_expansion_us > FAST_TRIM_MAX_EDGE_EXPANSION_US
+    {
+        return Err(fast_trim_reason(
+            FastTrimReasonCode::EdgeExpansionExceeded,
+            "A Fast trim boundary would expand by more than 10 seconds.",
+        ));
+    }
+    if end_index <= start_index {
+        return Err(fast_trim_reason(
+            FastTrimReasonCode::EmptyInterval,
+            "The selected Fast trim interval contains no video packets.",
+        ));
+    }
+    Ok(FastIntervalSelection {
+        start_index,
+        end_index,
+        effective_start_us,
+        effective_end_us,
+        start_expansion_us,
+        end_expansion_us,
+    })
+}
+
+fn plan_fast_trim(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+    input_path: &Path,
+) -> Result<FastTrimPlannerOutcome, String> {
+    let (requested_start_us, requested_end_us, audio_action, reasons) =
+        fast_trim_compatibility(request, probe);
+    if !reasons.is_empty() {
+        return Ok(FastTrimPlannerOutcome::Blocked(
+            fast_trim_blocked_inspection(requested_start_us, requested_end_us, reasons),
+        ));
+    }
+
+    let packet_probe = match probe_fast_packets(input_path, Some(probe.video_stream_index), None) {
+        Ok(packet_probe) => packet_probe,
+        Err(FastPacketProbeError::Blocked(reason)) => {
+            return Ok(FastTrimPlannerOutcome::Blocked(
+                fast_trim_blocked_inspection(requested_start_us, requested_end_us, vec![reason]),
+            ));
+        }
+        Err(FastPacketProbeError::Operational(error)) => return Err(error),
+    };
+    if packet_probe.chapter_count > 0 {
+        return Ok(FastTrimPlannerOutcome::Blocked(
+            fast_trim_blocked_inspection(
+                requested_start_us,
+                requested_end_us,
+                vec![fast_trim_reason(
+                    FastTrimReasonCode::ChaptersPresent,
+                    "Fast trim does not copy chapter timelines.",
+                )],
+            ),
+        ));
+    }
+    if packet_probe.packets.is_empty() {
+        return Ok(FastTrimPlannerOutcome::Blocked(
+            fast_trim_blocked_inspection(
+                requested_start_us,
+                requested_end_us,
+                vec![fast_trim_reason(
+                    FastTrimReasonCode::MalformedPacketEvidence,
+                    "No selected-video packets were found.",
+                )],
+            ),
+        ));
+    }
+    if packet_probe
+        .packets
+        .windows(2)
+        .any(|window| window[1].dts_us < window[0].dts_us)
+    {
+        return Ok(FastTrimPlannerOutcome::Blocked(
+            fast_trim_blocked_inspection(
+                requested_start_us,
+                requested_end_us,
+                vec![fast_trim_reason(
+                    FastTrimReasonCode::MalformedPacketEvidence,
+                    "Video decode timestamps are not monotonic.",
+                )],
+            ),
+        ));
+    }
+
+    let origin_us = packet_probe
+        .format_start_us
+        .or_else(|| {
+            packet_probe
+                .streams
+                .iter()
+                .find(|stream| stream.index == probe.video_stream_index)
+                .and_then(|stream| stream.start_us)
+        })
+        .unwrap_or(packet_probe.packets[0].pts_us);
+    let source_duration_us = packet_probe
+        .format_duration_us
+        .unwrap_or_else(|| requested_end_us.max(1));
+    let selection = match select_fast_trim_interval(
+        &packet_probe.packets,
+        origin_us,
+        source_duration_us,
+        requested_start_us,
+        requested_end_us,
+    ) {
+        Ok(selection) => selection,
+        Err(reason) => {
+            return Ok(FastTrimPlannerOutcome::Blocked(
+                fast_trim_blocked_inspection(requested_start_us, requested_end_us, vec![reason]),
+            ));
+        }
+    };
+    let start_index = selection.start_index;
+    let packet_end_index = selection.end_index;
+    let effective_start_us = selection.effective_start_us;
+    let effective_end_us = selection.effective_end_us;
+    let start_expansion_us = selection.start_expansion_us;
+    let end_expansion_us = selection.end_expansion_us;
+    let video_packet_count = packet_end_index - start_index;
+    if video_packet_count > FAST_TRIM_MAX_VIDEO_PACKETS {
+        return Ok(FastTrimPlannerOutcome::Blocked(
+            fast_trim_blocked_inspection(
+                requested_start_us,
+                requested_end_us,
+                vec![fast_trim_reason(
+                    FastTrimReasonCode::PacketLimitExceeded,
+                    "The containing interval exceeds the Fast trim packet limit.",
+                )],
+            ),
+        ));
+    }
+
+    let absolute_start_us = packet_probe.packets[start_index].pts_us;
+    let absolute_effective_end_us = origin_us.saturating_add(
+        i64::try_from(effective_end_us).unwrap_or(i64::MAX.saturating_sub(origin_us)),
+    );
+    let source_end_us = origin_us.saturating_add(
+        i64::try_from(source_duration_us).unwrap_or(i64::MAX.saturating_sub(origin_us)),
+    );
+    let Some(source_video_tags) = packet_probe
+        .streams
+        .iter()
+        .find(|stream| stream.index == probe.video_stream_index)
+        .map(|stream| stream.tags.clone())
+    else {
+        return Ok(FastTrimPlannerOutcome::Blocked(
+            fast_trim_blocked_inspection(
+                requested_start_us,
+                requested_end_us,
+                vec![fast_trim_reason(
+                    FastTrimReasonCode::MalformedPacketEvidence,
+                    "Fast trim could not capture selected-video metadata evidence.",
+                )],
+            ),
+        ));
+    };
+    let source_global_tags = packet_probe.format_tags.clone();
+    let (source_audio_packets, source_audio_tags) = if audio_action == StreamAction::Copy {
+        let audio_stream_index = probe.audio_stream_index.ok_or_else(|| {
+            "Fast trim audio-copy plan is missing the selected audio stream.".to_string()
+        })?;
+        let window_start_us = absolute_start_us
+            .saturating_sub(FAST_TRIM_AUDIO_EVIDENCE_MARGIN_US)
+            .max(origin_us);
+        let window_end_us = absolute_effective_end_us
+            .saturating_add(FAST_TRIM_AUDIO_EVIDENCE_MARGIN_US)
+            .min(source_end_us);
+        let audio_probe = match probe_fast_packets(
+            input_path,
+            Some(audio_stream_index),
+            Some((window_start_us, window_end_us, origin_us)),
+        ) {
+            Ok(packet_probe) => packet_probe,
+            Err(FastPacketProbeError::Blocked(reason)) => {
+                return Ok(FastTrimPlannerOutcome::Blocked(
+                    fast_trim_blocked_inspection(
+                        requested_start_us,
+                        requested_end_us,
+                        vec![reason],
+                    ),
+                ));
+            }
+            Err(FastPacketProbeError::Operational(error)) => return Err(error),
+        };
+        let source_audio_tags = audio_probe
+            .streams
+            .iter()
+            .find(|stream| stream.index == audio_stream_index)
+            .map(|stream| stream.tags.clone());
+        if audio_probe.packets.is_empty()
+            || source_audio_tags.is_none()
+            || audio_probe
+                .packets
+                .iter()
+                .any(|packet| packet.stream_index != audio_stream_index)
+            || audio_probe
+                .packets
+                .windows(2)
+                .any(|window| window[1].dts_us < window[0].dts_us)
+        {
+            return Ok(FastTrimPlannerOutcome::Blocked(
+                fast_trim_blocked_inspection(
+                    requested_start_us,
+                    requested_end_us,
+                    vec![fast_trim_reason(
+                        FastTrimReasonCode::MalformedPacketEvidence,
+                        "Copied audio has missing or malformed bounded packet evidence.",
+                    )],
+                ),
+            ));
+        }
+        (audio_probe.packets, source_audio_tags.unwrap_or_default())
+    } else {
+        (Vec::new(), NormalizedTagMap::new())
+    };
+    let audio_packet_evidence_digest = ordered_packet_evidence_digest(&source_audio_packets);
+    let source_identity = fast_source_identity(
+        input_path,
+        probe,
+        &packet_probe.packets,
+        &source_audio_packets,
+    )?;
+    let confirmation_token = fast_confirmation_token(
+        &source_identity,
+        request,
+        requested_start_us,
+        requested_end_us,
+        effective_start_us,
+        effective_end_us,
+        video_packet_count as u64,
+        audio_action,
+        source_audio_packets.len() as u64,
+        &audio_packet_evidence_digest,
+    );
+    let consent = FastTrimConsent {
+        plan_schema: FAST_TRIM_PLAN_SCHEMA,
+        confirmation_token,
+        requested_start_us,
+        requested_end_us,
+        effective_start_us,
+        effective_end_us,
+        video_packet_count: video_packet_count as u64,
+    };
+    let inspection = FastTrimInspection {
+        status: FastTrimInspectionStatus::Ready,
+        reasons: Vec::new(),
+        requested_start_us,
+        requested_end_us,
+        effective_start_us: Some(effective_start_us),
+        effective_end_us: Some(effective_end_us),
+        start_expansion_us: Some(start_expansion_us),
+        end_expansion_us: Some(end_expansion_us),
+        requires_acceptance: start_expansion_us > 0 || end_expansion_us > 0,
+        video_packet_count: Some(video_packet_count as u64),
+        video_action: Some(StreamAction::Copy),
+        audio_action: Some(audio_action),
+        consent: Some(consent),
+    };
+    let frame_duration_us = probe
+        .frame_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .map(|rate| (1_000_000.0 / rate).ceil() as u64)
+        .or_else(|| {
+            packet_probe.packets[start_index..packet_end_index]
+                .iter()
+                .map(|packet| packet.duration_us)
+                .max()
+        })
+        .unwrap_or(40_000);
+    let video_packet_hashes = packet_probe.packets[start_index..packet_end_index]
+        .iter()
+        .map(|packet| packet.data_hash.clone())
+        .collect();
+    Ok(FastTrimPlannerOutcome::Ready(Box::new(FastTrimPlan {
+        inspection,
+        absolute_start_us,
+        video_stream_index: probe.video_stream_index,
+        audio_stream_index: (audio_action == StreamAction::Copy)
+            .then_some(probe.audio_stream_index)
+            .flatten(),
+        video_codec: probe.video_codec.clone().unwrap_or_default(),
+        audio_codec: (audio_action == StreamAction::Copy)
+            .then(|| probe.audio_codec.clone())
+            .flatten(),
+        video_packet_hashes,
+        source_audio_packets,
+        duration_tolerance_us: frame_duration_us
+            .saturating_add(FAST_TRIM_DURATION_TOLERANCE_FLOOR_US),
+        sample_aspect_ratio: probe.sample_aspect_ratio,
+        pixel_format: probe.pixel_format.clone(),
+        bit_depth: probe.bit_depth,
+        color_range: probe.color_range.clone(),
+        color_primaries: probe.color_primaries.clone(),
+        color_transfer: probe.color_transfer.clone(),
+        color_space: probe.color_space.clone(),
+        video_dispositions: probe.selected_video_dispositions.clone(),
+        audio_dispositions: probe.selected_audio_dispositions.clone(),
+        strip_metadata: request.strip_metadata,
+        replacement_title: validate_title_metadata(request.title.as_deref())?,
+        source_global_tags,
+        source_video_tags,
+        source_audio_tags,
+    })))
+}
+
+pub fn inspect_fast_trim(request: EncodeRequest) -> Result<FastTrimInspection, String> {
+    validate_title_metadata(request.title.as_deref())?;
+    validate_base_request_scalars(&request)?;
+    let input_path = PathBuf::from(request.input_path.trim());
+    if !input_path.is_file() {
+        return Err("Fast trim input must point to a readable file.".to_string());
+    }
+    let input_path = input_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve Fast trim input: {error}"))?;
+    let probe = probe_video(input_path.to_string_lossy().to_string())?;
+    match plan_fast_trim(&request, &probe, &input_path)? {
+        FastTrimPlannerOutcome::Ready(plan) => Ok(plan.inspection.clone()),
+        FastTrimPlannerOutcome::Blocked(inspection) => Ok(inspection),
+    }
 }
 
 fn select_primary_video_stream(streams: &[FFProbeStream]) -> Option<&FFProbeStream> {
@@ -4024,11 +5530,7 @@ fn stream_rotation(stream: &FFProbeStream) -> SourceRotation {
     let raw = display_matrix
         .and_then(|sd| sd.rotation.as_ref().and_then(json_number_to_f64))
         .or_else(|| {
-            stream
-                .tags
-                .as_ref()
-                .and_then(|t| t.rotate.as_deref())
-                .and_then(|r| r.trim().parse::<f64>().ok())
+            ffprobe_tag_value(&stream.tags, "rotate").and_then(|r| r.trim().parse::<f64>().ok())
         });
     if display_matrix.is_some()
         && display_matrix
@@ -4162,14 +5664,24 @@ fn normalized_probe_field(value: Option<&str>) -> Option<String> {
 fn stream_dispositions(disposition: &FFProbeDisposition) -> StreamDispositions {
     StreamDispositions {
         default: disposition.default != 0,
+        dub: disposition.dub != 0,
         original: disposition.original != 0,
         comment: disposition.comment != 0,
+        lyrics: disposition.lyrics != 0,
+        karaoke: disposition.karaoke != 0,
         forced: disposition.forced != 0,
         hearing_impaired: disposition.hearing_impaired != 0,
         visual_impaired: disposition.visual_impaired != 0,
+        clean_effects: disposition.clean_effects != 0,
         attached_pic: disposition.attached_pic != 0,
         timed_thumbnails: disposition.timed_thumbnails != 0,
+        non_diegetic: disposition.non_diegetic != 0,
+        captions: disposition.captions != 0,
+        descriptions: disposition.descriptions != 0,
+        metadata: disposition.metadata != 0,
+        dependent: disposition.dependent != 0,
         still_image: disposition.still_image != 0,
+        multilayer: disposition.multilayer != 0,
     }
 }
 
@@ -4588,6 +6100,9 @@ fn parse_probe_output_with_pixel_formats(
         audio_codec: selected_audio
             .and_then(|stream| normalized_codec_name(stream.codec_name.as_deref())),
         audio_is_default: selected_audio.is_some_and(|stream| stream.disposition.default != 0),
+        selected_audio_dispositions: selected_audio
+            .map(|stream| stream_dispositions(&stream.disposition))
+            .unwrap_or_default(),
         pixel_format,
         bit_depth,
         color_range,
@@ -5642,6 +7157,581 @@ fn build_mutated_size_reencode_plan(
     }
 }
 
+fn format_signed_microseconds(value_us: i64) -> String {
+    let negative = value_us < 0;
+    let magnitude = value_us.unsigned_abs();
+    let seconds = magnitude / 1_000_000;
+    let micros = magnitude % 1_000_000;
+    if negative {
+        format!("-{seconds}.{micros:06}")
+    } else {
+        format!("{seconds}.{micros:06}")
+    }
+}
+
+fn ffmpeg_disposition_value(dispositions: &StreamDispositions) -> String {
+    let flags = [
+        (dispositions.default, "default"),
+        (dispositions.dub, "dub"),
+        (dispositions.original, "original"),
+        (dispositions.comment, "comment"),
+        (dispositions.lyrics, "lyrics"),
+        (dispositions.karaoke, "karaoke"),
+        (dispositions.forced, "forced"),
+        (dispositions.hearing_impaired, "hearing_impaired"),
+        (dispositions.visual_impaired, "visual_impaired"),
+        (dispositions.clean_effects, "clean_effects"),
+        (dispositions.attached_pic, "attached_pic"),
+        (dispositions.timed_thumbnails, "timed_thumbnails"),
+        (dispositions.non_diegetic, "non_diegetic"),
+        (dispositions.captions, "captions"),
+        (dispositions.descriptions, "descriptions"),
+        (dispositions.metadata, "metadata"),
+        (dispositions.dependent, "dependent"),
+        (dispositions.still_image, "still_image"),
+        (dispositions.multilayer, "multilayer"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect::<Vec<_>>();
+    if flags.is_empty() {
+        "0".to_string()
+    } else {
+        flags.join("+")
+    }
+}
+
+fn push_fast_trim_disposition_args(args: &mut Vec<String>, plan: &FastTrimPlan) {
+    args.push("-disposition:v:0".to_string());
+    args.push(ffmpeg_disposition_value(&plan.video_dispositions));
+    if plan.inspection.audio_action == Some(StreamAction::Copy) {
+        args.push("-disposition:a:0".to_string());
+        args.push(ffmpeg_disposition_value(&plan.audio_dispositions));
+    }
+}
+
+fn build_fast_trim_args(input: &str, request: &EncodeRequest, plan: &FastTrimPlan) -> Vec<String> {
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-seek_timestamp".to_string(),
+        "1".to_string(),
+        "-ss".to_string(),
+        format_signed_microseconds(plan.absolute_start_us),
+        "-i".to_string(),
+        input.to_string(),
+        "-progress".to_string(),
+        "pipe:1".to_string(),
+        "-nostats".to_string(),
+    ];
+    push_absolute_map(&mut args, plan.video_stream_index);
+    args.extend(["-c:v", "copy"].into_iter().map(str::to_string));
+    args.push("-frames:v".to_string());
+    args.push(plan.video_packet_hashes.len().to_string());
+
+    match plan.inspection.audio_action {
+        Some(StreamAction::Copy) => {
+            if let Some(audio_stream_index) = plan.audio_stream_index {
+                push_absolute_map(&mut args, audio_stream_index);
+                args.extend(["-c:a", "copy"].into_iter().map(str::to_string));
+                args.push("-shortest".to_string());
+            } else {
+                args.push("-an".to_string());
+            }
+        }
+        Some(StreamAction::Drop) | None => args.push("-an".to_string()),
+        Some(StreamAction::Encode) => unreachable!("Fast trim never encodes audio"),
+    }
+    // `-map_metadata -1` also suppresses dispositions for some muxers. Set
+    // every modeled flag explicitly so strip/preserve policy cannot silently
+    // change selected-stream semantics, including the all-clear (`0`) case.
+    push_fast_trim_disposition_args(&mut args, plan);
+    args.extend(["-map_chapters", "-1"].into_iter().map(str::to_string));
+    push_metadata_args(&mut args, request);
+    if request.format == OutputFormat::Mp4 {
+        args.extend(["-movflags", "+faststart"].into_iter().map(str::to_string));
+    }
+    args
+}
+
+fn fast_packet_presentation_bounds(packets: &[&FastPacket]) -> Option<(i64, i64)> {
+    let start_us = packets.iter().map(|packet| packet.pts_us).min()?;
+    let end_us = packets
+        .iter()
+        .filter_map(|packet| {
+            i64::try_from(packet.duration_us)
+                .ok()
+                .and_then(|duration| packet.pts_us.checked_add(duration))
+        })
+        .max()?;
+    (end_us > start_us).then_some((start_us, end_us))
+}
+
+fn packet_timestamp_maps_from_seek(
+    source_timestamp_us: i64,
+    output_timestamp_us: i64,
+    absolute_seek_us: i64,
+    tolerance_us: u64,
+) -> bool {
+    source_timestamp_us
+        .checked_sub(absolute_seek_us)
+        .is_some_and(|expected_output_us| {
+            expected_output_us.abs_diff(output_timestamp_us) <= tolerance_us
+        })
+}
+
+fn audio_packets_are_exact_mapped_contiguous_subsequence(
+    source_packets: &[FastPacket],
+    output_packets: &[&FastPacket],
+    absolute_seek_us: i64,
+    tolerance_us: u64,
+) -> bool {
+    if output_packets.is_empty() || output_packets.len() > source_packets.len() {
+        return false;
+    }
+    source_packets.windows(output_packets.len()).any(|window| {
+        window
+            .iter()
+            .zip(output_packets)
+            .all(|(source_packet, output_packet)| {
+                source_packet.data_hash == output_packet.data_hash
+                    && packet_timestamp_maps_from_seek(
+                        source_packet.pts_us,
+                        output_packet.pts_us,
+                        absolute_seek_us,
+                        tolerance_us,
+                    )
+                    && packet_timestamp_maps_from_seek(
+                        source_packet.dts_us,
+                        output_packet.dts_us,
+                        absolute_seek_us,
+                        tolerance_us,
+                    )
+                    && source_packet
+                        .duration_us
+                        .abs_diff(output_packet.duration_us)
+                        <= tolerance_us
+            })
+    })
+}
+
+fn metadata_tag_is_muxer_managed(key: &str, value: &str) -> bool {
+    matches!(
+        key,
+        "encoder"
+            | "major_brand"
+            | "minor_version"
+            | "compatible_brands"
+            | "duration"
+            | "bps"
+            | "number_of_frames"
+            | "number_of_bytes"
+            | "vendor_id"
+            | "handler_vendor_id"
+            | "_statistics_writing_app"
+            | "_statistics_writing_date_utc"
+            | "_statistics_tags"
+    ) || (key == "language" && value.eq_ignore_ascii_case("und"))
+        || (key == "handler_name"
+            && matches!(
+                value.to_ascii_lowercase().as_str(),
+                "videohandler" | "soundhandler"
+            ))
+}
+
+fn private_metadata_tags(tags: &NormalizedTagMap) -> NormalizedTagMap {
+    tags.iter()
+        .filter(|(key, value)| !metadata_tag_is_muxer_managed(key, value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn expected_global_private_tags(plan: &FastTrimPlan) -> NormalizedTagMap {
+    let mut expected = if plan.strip_metadata {
+        NormalizedTagMap::new()
+    } else {
+        private_metadata_tags(&plan.source_global_tags)
+    };
+    if let Some(title) = &plan.replacement_title {
+        expected.insert("title".to_string(), title.clone());
+    } else if plan.strip_metadata {
+        expected.remove("title");
+    }
+    expected
+}
+
+fn validate_fast_metadata_policy(
+    plan: &FastTrimPlan,
+    output_probe: &FastPacketProbe,
+    output_video_stream_index: u32,
+    output_audio_stream_index: Option<u32>,
+) -> Result<(), String> {
+    let output_video_tags = output_probe
+        .streams
+        .iter()
+        .find(|stream| stream.index == output_video_stream_index)
+        .map(|stream| private_metadata_tags(&stream.tags))
+        .ok_or_else(|| {
+            "Fast trim post-verification could not inspect selected-video metadata.".to_string()
+        })?;
+    let output_audio_tags = output_audio_stream_index
+        .map(|stream_index| {
+            output_probe
+                .streams
+                .iter()
+                .find(|stream| stream.index == stream_index)
+                .map(|stream| private_metadata_tags(&stream.tags))
+                .ok_or_else(|| {
+                    "Fast trim post-verification could not inspect selected-audio metadata."
+                        .to_string()
+                })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let output_global_tags = private_metadata_tags(&output_probe.format_tags);
+    let expected_global_tags = expected_global_private_tags(plan);
+    let expected_video_tags = if plan.strip_metadata {
+        NormalizedTagMap::new()
+    } else {
+        private_metadata_tags(&plan.source_video_tags)
+    };
+    let expected_audio_tags = if plan.strip_metadata {
+        NormalizedTagMap::new()
+    } else {
+        private_metadata_tags(&plan.source_audio_tags)
+    };
+
+    if output_global_tags != expected_global_tags
+        || output_video_tags != expected_video_tags
+        || output_audio_tags != expected_audio_tags
+    {
+        return Err(if plan.strip_metadata {
+            "Fast trim post-verification found source-private metadata after stripping.".to_string()
+        } else {
+            "Fast trim post-verification found changed or missing preserved source metadata."
+                .to_string()
+        });
+    }
+    Ok(())
+}
+
+fn postverify_fast_trim_output(
+    output_path: &Path,
+    plan: &FastTrimPlan,
+) -> Result<(u64, u64), String> {
+    let output_probe = probe_video(output_path.to_string_lossy().to_string()).map_err(|_| {
+        "Fast trim post-verification could not probe the unpublished output.".to_string()
+    })?;
+    if output_probe.video_codec.as_deref() != Some(plan.video_codec.as_str()) {
+        return Err("Fast trim post-verification found a different video codec.".to_string());
+    }
+    let expected_audio = plan.inspection.audio_action == Some(StreamAction::Copy);
+    if output_probe.has_audio != expected_audio
+        || (expected_audio && output_probe.audio_codec != plan.audio_codec)
+    {
+        return Err(
+            "Fast trim post-verification found unexpected audio stream evidence.".to_string(),
+        );
+    }
+    if output_probe.rotation_deg != 0
+        || output_probe.unsupported_rotation_deg.is_some()
+        || output_probe.sample_aspect_ratio != plan.sample_aspect_ratio
+        || output_probe.pixel_format != plan.pixel_format
+        || output_probe.bit_depth != plan.bit_depth
+        || output_probe.color_range != plan.color_range
+        || output_probe.color_primaries != plan.color_primaries
+        || output_probe.color_transfer != plan.color_transfer
+        || output_probe.color_space != plan.color_space
+        || output_probe.selected_video_dispositions != plan.video_dispositions
+        || (expected_audio && output_probe.selected_audio_dispositions != plan.audio_dispositions)
+    {
+        return Err(
+            "Fast trim post-verification found changed media-policy or disposition evidence."
+                .to_string(),
+        );
+    }
+
+    let packet_probe = match probe_fast_packets(output_path, None, None) {
+        Ok(packet_probe) => packet_probe,
+        Err(FastPacketProbeError::Blocked(_)) => {
+            return Err(
+                "Fast trim post-verification exceeded its bounded packet evidence limit."
+                    .to_string(),
+            );
+        }
+        Err(FastPacketProbeError::Operational(_)) => {
+            return Err("Fast trim post-verification could not inspect packets.".to_string());
+        }
+    };
+    let video_streams = packet_probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == "video")
+        .collect::<Vec<_>>();
+    let audio_streams = packet_probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == "audio")
+        .collect::<Vec<_>>();
+    if video_streams.len() != 1
+        || audio_streams.len() != usize::from(expected_audio)
+        || packet_probe
+            .streams
+            .iter()
+            .any(|stream| !matches!(stream.codec_type.as_str(), "video" | "audio"))
+    {
+        return Err("Fast trim post-verification found unexpected copied streams.".to_string());
+    }
+    if video_streams[0].codec_name != plan.video_codec
+        || (expected_audio
+            && audio_streams.first().is_none_or(|stream| {
+                Some(stream.codec_name.as_str()) != plan.audio_codec.as_deref()
+            }))
+    {
+        return Err("Fast trim post-verification found an unexpected stream codec.".to_string());
+    }
+
+    validate_fast_metadata_policy(
+        plan,
+        &packet_probe,
+        video_streams[0].index,
+        audio_streams.first().map(|stream| stream.index),
+    )?;
+
+    let output_video_index = video_streams[0].index;
+    let video_packets = packet_probe
+        .packets
+        .iter()
+        .filter(|packet| packet.stream_index == output_video_index)
+        .collect::<Vec<_>>();
+    if video_packets.len() != plan.video_packet_hashes.len() {
+        return Err(format!(
+            "Fast trim post-verification expected {} video packets but found {}.",
+            plan.video_packet_hashes.len(),
+            video_packets.len()
+        ));
+    }
+    if !video_packets.first().is_some_and(|packet| packet.key) {
+        return Err("Fast trim post-verification found a non-key first video packet.".to_string());
+    }
+    if !video_packets
+        .iter()
+        .map(|packet| packet.data_hash.as_str())
+        .eq(plan.video_packet_hashes.iter().map(String::as_str))
+    {
+        return Err(
+            "Fast trim post-verification found changed or reordered video packet payloads."
+                .to_string(),
+        );
+    }
+    let (video_start_us, video_end_us) = fast_packet_presentation_bounds(&video_packets)
+        .ok_or_else(|| "Fast trim post-verification found invalid video timing.".to_string())?;
+    let actual_duration_us = u64::try_from(video_end_us.saturating_sub(video_start_us))
+        .map_err(|_| "Fast trim post-verification found invalid video duration.".to_string())?;
+    let expected_duration_us = plan
+        .inspection
+        .effective_end_us
+        .zip(plan.inspection.effective_start_us)
+        .map(|(end, start)| end.saturating_sub(start))
+        .ok_or_else(|| "Fast trim plan is missing effective boundaries.".to_string())?;
+    if actual_duration_us.abs_diff(expected_duration_us) > plan.duration_tolerance_us {
+        return Err(format!(
+            "Fast trim post-verification duration differed by {} microseconds, beyond the bounded tolerance.",
+            actual_duration_us.abs_diff(expected_duration_us)
+        ));
+    }
+
+    if expected_audio {
+        let audio_stream_index = audio_streams[0].index;
+        let audio_packets = packet_probe
+            .packets
+            .iter()
+            .filter(|packet| packet.stream_index == audio_stream_index)
+            .collect::<Vec<_>>();
+        if !audio_packets_are_exact_mapped_contiguous_subsequence(
+            &plan.source_audio_packets,
+            &audio_packets,
+            plan.absolute_start_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ) {
+            return Err(
+                "Fast trim post-verification found copied audio that was missing, changed, reordered, noncontiguous, or mapped from the wrong source timeline."
+                    .to_string(),
+            );
+        }
+        let (audio_start_us, audio_end_us) = fast_packet_presentation_bounds(&audio_packets)
+            .ok_or_else(|| "Fast trim post-verification found invalid audio timing.".to_string())?;
+        let start_skew_us = video_start_us.abs_diff(audio_start_us);
+        let end_skew_us = video_end_us.abs_diff(audio_end_us);
+        if start_skew_us > FAST_TRIM_AV_EDGE_SKEW_US || end_skew_us > FAST_TRIM_AV_EDGE_SKEW_US {
+            return Err(format!(
+                "Fast trim post-verification found A/V edge skew of {start_skew_us}/{end_skew_us} microseconds."
+            ));
+        }
+    }
+
+    let actual_start_us = plan
+        .inspection
+        .effective_start_us
+        .ok_or_else(|| "Fast trim plan is missing its effective start.".to_string())?;
+    Ok((
+        actual_start_us,
+        actual_start_us.saturating_add(actual_duration_us),
+    ))
+}
+
+fn validate_fast_trim_consent(request: &EncodeRequest, plan: &FastTrimPlan) -> Result<(), String> {
+    let expected_consent = plan
+        .inspection
+        .consent
+        .as_ref()
+        .ok_or_else(|| "Fast trim inspection did not produce consent evidence.".to_string())?;
+    let supplied_consent = request
+        .trim
+        .as_ref()
+        .and_then(|trim| trim.fast_copy_consent.as_ref())
+        .ok_or_else(|| {
+            "Fast trim requires a fresh compatibility check and explicit boundary acceptance."
+                .to_string()
+        })?;
+    if supplied_consent != expected_consent {
+        return Err(FAST_TRIM_STALE_CONSENT_ERROR.to_string());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fast_trim_job(
+    window: &Window,
+    attempt_id: u64,
+    job_id: u64,
+    cancel: &Arc<AtomicBool>,
+    child_slot: &Arc<Mutex<Option<Child>>>,
+    request: &EncodeRequest,
+    input_str: &str,
+    output_path: &Path,
+    ffmpeg_bin: &str,
+    probe: &VideoProbe,
+    plan: FastTrimPlan,
+) -> Result<EncodeFinishedPayload, String> {
+    validate_fast_trim_consent(request, &plan)?;
+
+    let effective_start_us = plan.inspection.effective_start_us.unwrap_or_default();
+    let effective_end_us = plan.inspection.effective_end_us.unwrap_or_default();
+    let duration_us = effective_end_us.saturating_sub(effective_start_us).max(1);
+    let temp_path = create_temp_output(output_path, job_id, "fast-trim")?;
+    let mut args = build_fast_trim_args(input_str, request, &plan);
+    args.push(temp_path.to_string_lossy().to_string());
+    let temp_str = temp_path.to_string_lossy().to_string();
+    let command_preview =
+        ffmpeg_command_preview(&args, &[(input_str, "<input>"), (&temp_str, "<output>")]);
+
+    run_ffmpeg_with_progress(
+        window,
+        attempt_id,
+        job_id,
+        ffmpeg_bin,
+        &args,
+        None,
+        1,
+        1,
+        duration_us,
+        ffmpeg_run_limits(false),
+        cancel.as_ref(),
+        child_slot,
+    )
+    .map_err(|error| {
+        if cancel.load(Ordering::Relaxed) {
+            "Canceled.".to_string()
+        } else {
+            let reason = safe_failure_diagnostic_reason(request, &error);
+            format!("Fast trim execution failed before publication: {reason}")
+        }
+    })?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Canceled.".to_string());
+    }
+    let (actual_start_us, actual_end_us) = postverify_fast_trim_output(&temp_path, &plan)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Canceled.".to_string());
+    }
+    let output_size_bytes = fs::metadata(&temp_path)
+        .map_err(|_| "Failed to stat the unpublished Fast trim output.".to_string())?
+        .len();
+    let requested_start_us = plan.inspection.requested_start_us;
+    let requested_end_us = plan.inspection.requested_end_us;
+    let video_packet_count = plan.video_packet_hashes.len() as u64;
+    let audio_action = plan.inspection.audio_action.unwrap_or(StreamAction::Drop);
+    let trim_result = TrimResult {
+        mode: TrimMode::FastCopy,
+        requested_start_us,
+        requested_end_us,
+        effective_start_us,
+        effective_end_us,
+        actual_start_us,
+        actual_end_us,
+        video_packet_count,
+        video_action: StreamAction::Copy,
+        audio_action,
+        ffmpeg_invocations: 1,
+        command_preview: command_preview.clone(),
+    };
+    let diagnostics = ExportDiagnostics {
+        mode: "Fast trim (no re-encode)".to_string(),
+        video_action: Some(StreamAction::Copy),
+        audio_action: Some(audio_action),
+        source_format: probe.source_format.clone(),
+        source_video_codec: probe.video_codec.clone(),
+        source_audio_codec: probe.audio_codec.clone(),
+        video_codec: probe.video_codec.clone(),
+        audio_codec: (audio_action == StreamAction::Copy)
+            .then(|| probe.audio_codec.clone())
+            .flatten(),
+        video_bitrate_kbps: None,
+        audio_bitrate_kbps: None,
+        requested_size_bytes: None,
+        actual_size_bytes: Some(output_size_bytes),
+        passes: 1,
+        attempts: 1,
+        audio_removed_for_size_target: false,
+        subtitle_burned_in: false,
+        subtitle_cue_count: None,
+        copy_fallback_reason: None,
+        color_action: "Copied source color metadata without conversion".to_string(),
+        sar_action: "Preserved square source pixels".to_string(),
+        reverse_buffer_estimate_bytes: None,
+        reverse_buffer_action: None,
+        failure_stage: None,
+        failure_reason: None,
+        trim_mode: Some(TrimMode::FastCopy),
+        trim_requested_start_us: Some(requested_start_us),
+        trim_requested_end_us: Some(requested_end_us),
+        trim_effective_start_us: Some(effective_start_us),
+        trim_effective_end_us: Some(effective_end_us),
+        trim_actual_start_us: Some(actual_start_us),
+        trim_actual_end_us: Some(actual_end_us),
+        trim_video_packet_count: Some(video_packet_count),
+        trim_ffmpeg_invocations: Some(1),
+        command_preview,
+    };
+    publish_output_file(temp_path, output_path)?;
+    Ok(EncodeFinishedPayload {
+        attempt_id,
+        job_id,
+        ok: true,
+        output_path: Some(output_path.to_string_lossy().to_string()),
+        output_size_bytes: Some(output_size_bytes),
+        target_result: None,
+        trim_result: Some(trim_result),
+        message: Some(
+            "Fast trim copied the disclosed keyframe interval without re-encoding.".to_string(),
+        ),
+        diagnostics: Some(diagnostics),
+    })
+}
+
 pub fn run_encode_job(
     window: &Window,
     attempt_id: u64,
@@ -5650,6 +7740,8 @@ pub fn run_encode_job(
     child_slot: &Arc<Mutex<Option<Child>>>,
     mut request: EncodeRequest,
 ) -> Result<EncodeFinishedPayload, String> {
+    request.title = validate_title_metadata(request.title.as_deref())?;
+    validate_base_request_scalars(&request)?;
     let input_path = PathBuf::from(request.input_path.trim());
     if !input_path.exists() {
         return Err(format!("File not found: {}", input_path.display()));
@@ -5658,24 +7750,7 @@ pub fn run_encode_job(
         return Err("Input path must point to a file.".to_string());
     }
 
-    if request.speed <= 0.0 || !request.speed.is_finite() {
-        return Err("Speed must be > 0.".to_string());
-    }
-
-    if request.size_limit_mb < 0.0 || !request.size_limit_mb.is_finite() {
-        return Err("Size limit must be >= 0 MB.".to_string());
-    }
-
     let size_limit_enabled = request.size_limit_mb > 0.0;
-    if size_limit_enabled && request.size_limit_mb < 0.1 {
-        return Err("Size limit must be >= 0.1 MB (or 0 to disable).".to_string());
-    }
-    validate_strict_fit_options(
-        request.strict_fit,
-        request.strict_fit_allow_audio_removal,
-        size_limit_enabled,
-        request.format,
-    )?;
     if request.format == OutputFormat::Mp3 && request.subtitle_path.is_some() {
         return Err("External subtitles require MP4 or WebM video output.".to_string());
     }
@@ -5699,6 +7774,38 @@ pub fn run_encode_job(
 
     let mut ffmpeg_bin = default_ffmpeg();
     let probe = probe_video(input_path.to_string_lossy().to_string())?;
+    if request
+        .trim
+        .as_ref()
+        .is_some_and(|trim| trim.mode == TrimMode::FastCopy)
+    {
+        let plan = match plan_fast_trim(&request, &probe, &input_path)? {
+            FastTrimPlannerOutcome::Ready(plan) => *plan,
+            FastTrimPlannerOutcome::Blocked(inspection) => {
+                let reason = inspection
+                    .reasons
+                    .first()
+                    .map(|reason| reason.message.as_str())
+                    .unwrap_or("Fast trim is not compatible with the current plan.");
+                return Err(format!(
+                    "Fast trim is blocked. Re-check compatibility: {reason}"
+                ));
+            }
+        };
+        return run_fast_trim_job(
+            window,
+            attempt_id,
+            job_id,
+            cancel,
+            child_slot,
+            &request,
+            &input_str,
+            &output_path,
+            &ffmpeg_bin,
+            &probe,
+            plan,
+        );
+    }
     let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
     let capability_contract = ffmpeg_capability_contract()?;
     let prepared_subtitle = if let Some(subtitle_path) = request
@@ -5862,6 +7969,7 @@ pub fn run_encode_job(
             output_path: Some(output_path.to_string_lossy().to_string()),
             output_size_bytes: Some(out_size),
             target_result: mp3_target_result.clone(),
+            trim_result: None,
             message: mp3_target_result
                 .as_ref()
                 .map(|result| exact_target_message(result.status, out_size, target_bytes)),
@@ -5903,6 +8011,22 @@ pub fn run_encode_job(
                     .map(|estimate| estimate.action.diagnostic().to_string()),
                 failure_stage: None,
                 failure_reason: None,
+                trim_mode: request.trim.as_ref().map(|trim| trim.mode),
+                trim_requested_start_us: request
+                    .trim
+                    .as_ref()
+                    .and_then(|trim| seconds_to_unsigned_us(trim.start_s)),
+                trim_requested_end_us: request
+                    .trim
+                    .as_ref()
+                    .and_then(|trim| trim.end_s)
+                    .and_then(seconds_to_unsigned_us),
+                trim_effective_start_us: None,
+                trim_effective_end_us: None,
+                trim_actual_start_us: None,
+                trim_actual_end_us: None,
+                trim_video_packet_count: None,
+                trim_ffmpeg_invocations: None,
                 command_preview,
             }),
         });
@@ -5983,6 +8107,7 @@ pub fn run_encode_job(
                             output_path: Some(output_path.to_string_lossy().to_string()),
                             output_size_bytes: Some(out_size),
                             target_result: Some(target_result),
+                            trim_result: None,
                             message: Some("Fit confirmed by exact output bytes.".to_string()),
                             diagnostics: Some(ExportDiagnostics {
                                 mode: EncodeMode::Remux.label().to_string(),
@@ -6024,6 +8149,22 @@ pub fn run_encode_job(
                                     .map(|estimate| estimate.action.diagnostic().to_string()),
                                 failure_stage: None,
                                 failure_reason: None,
+                                trim_mode: request.trim.as_ref().map(|trim| trim.mode),
+                                trim_requested_start_us: request
+                                    .trim
+                                    .as_ref()
+                                    .and_then(|trim| seconds_to_unsigned_us(trim.start_s)),
+                                trim_requested_end_us: request
+                                    .trim
+                                    .as_ref()
+                                    .and_then(|trim| trim.end_s)
+                                    .and_then(seconds_to_unsigned_us),
+                                trim_effective_start_us: None,
+                                trim_effective_end_us: None,
+                                trim_actual_start_us: None,
+                                trim_actual_end_us: None,
+                                trim_video_packet_count: None,
+                                trim_ffmpeg_invocations: None,
                                 command_preview,
                             }),
                         });
@@ -6144,6 +8285,7 @@ pub fn run_encode_job(
                         output_path: Some(output_path.to_string_lossy().to_string()),
                         output_size_bytes: Some(out_size),
                         target_result: None,
+                        trim_result: None,
                         message: None,
                         diagnostics: Some(ExportDiagnostics {
                             mode: executed_plan.mode.label().to_string(),
@@ -6183,6 +8325,22 @@ pub fn run_encode_job(
                                 .map(|estimate| estimate.action.diagnostic().to_string()),
                             failure_stage: None,
                             failure_reason: None,
+                            trim_mode: request.trim.as_ref().map(|trim| trim.mode),
+                            trim_requested_start_us: request
+                                .trim
+                                .as_ref()
+                                .and_then(|trim| seconds_to_unsigned_us(trim.start_s)),
+                            trim_requested_end_us: request
+                                .trim
+                                .as_ref()
+                                .and_then(|trim| trim.end_s)
+                                .and_then(seconds_to_unsigned_us),
+                            trim_effective_start_us: None,
+                            trim_effective_end_us: None,
+                            trim_actual_start_us: None,
+                            trim_actual_end_us: None,
+                            trim_video_packet_count: None,
+                            trim_ffmpeg_invocations: None,
                             command_preview,
                         }),
                     });
@@ -6691,6 +8849,22 @@ pub fn run_encode_job(
             .map(|estimate| estimate.action.diagnostic().to_string()),
         failure_stage: None,
         failure_reason: None,
+        trim_mode: request.trim.as_ref().map(|trim| trim.mode),
+        trim_requested_start_us: request
+            .trim
+            .as_ref()
+            .and_then(|trim| seconds_to_unsigned_us(trim.start_s)),
+        trim_requested_end_us: request
+            .trim
+            .as_ref()
+            .and_then(|trim| trim.end_s)
+            .and_then(seconds_to_unsigned_us),
+        trim_effective_start_us: None,
+        trim_effective_end_us: None,
+        trim_actual_start_us: None,
+        trim_actual_end_us: None,
+        trim_video_packet_count: None,
+        trim_ffmpeg_invocations: None,
         command_preview: selected.command_preview,
     };
     let output_size_bytes = selected.actual_size_bytes;
@@ -6702,6 +8876,7 @@ pub fn run_encode_job(
         output_path: Some(output_path.to_string_lossy().to_string()),
         output_size_bytes: Some(output_size_bytes),
         target_result: Some(target_result),
+        trim_result: None,
         message: Some(message),
         diagnostics: Some(diagnostics),
     })
@@ -6798,6 +8973,29 @@ mod tests {
                 .unwrap()
                 .contains("café")
         );
+    }
+
+    #[test]
+    fn stale_fast_consent_failure_has_a_stable_zero_attempt_stage() {
+        let mut request = fast_request(2.5, 5.5);
+        request.input_path = "/private/source.mp4".to_string();
+        request.output_path = "/private/result.mp4".to_string();
+        let diagnostics = failed_encode_diagnostics(&request, FAST_TRIM_STALE_CONSENT_ERROR);
+
+        assert_eq!(
+            diagnostics.failure_stage.as_deref(),
+            Some("fast-trim-consent")
+        );
+        assert_eq!(
+            diagnostics.failure_reason.as_deref(),
+            Some(FAST_TRIM_STALE_CONSENT_ERROR)
+        );
+        assert_eq!(diagnostics.passes, 0);
+        assert_eq!(diagnostics.attempts, 0);
+        assert_eq!(diagnostics.video_action, None);
+        assert_eq!(diagnostics.audio_action, None);
+        let serialized = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!serialized.contains("/private/"));
     }
 
     #[test]
@@ -6973,6 +9171,10 @@ mod tests {
             audio_stream_index: Some(1),
             audio_codec: Some("aac".to_string()),
             audio_is_default: true,
+            selected_audio_dispositions: StreamDispositions {
+                default: true,
+                ..StreamDispositions::default()
+            },
             pixel_format: Some("yuv420p".to_string()),
             bit_depth: Some(8),
             color_range: Some("tv".to_string()),
@@ -6996,6 +9198,1156 @@ mod tests {
             decoded_video_bytes_per_pixel: Some(1.5),
             decoded_audio_bytes_per_sample: Some(4),
         }
+    }
+
+    fn fast_request(start_s: f64, end_s: f64) -> EncodeRequest {
+        let mut request = base_request();
+        request.size_limit_mb = 0.0;
+        request.trim = Some(Trim {
+            start_s,
+            end_s: Some(end_s),
+            mode: TrimMode::FastCopy,
+            fast_copy_consent: None,
+        });
+        request
+    }
+
+    fn fast_packet(pts_us: i64, dts_us: i64, key: bool, label: &str) -> FastPacket {
+        FastPacket {
+            stream_index: 0,
+            pts_us,
+            dts_us,
+            duration_us: 1_000_000,
+            key,
+            data_hash: format!("sha256:{label}"),
+        }
+    }
+
+    fn closed_gop_packets(origin_us: i64, seconds: usize) -> Vec<FastPacket> {
+        (0..seconds)
+            .map(|second| {
+                let pts_us = origin_us + second as i64 * 1_000_000;
+                fast_packet(
+                    pts_us,
+                    pts_us - 66_667,
+                    second % 2 == 0,
+                    &format!("packet-{second}"),
+                )
+            })
+            .collect()
+    }
+
+    fn tag_map(entries: &[(&str, &str)]) -> NormalizedTagMap {
+        entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn fast_metadata_test_plan(strip_metadata: bool) -> FastTrimPlan {
+        let probe = probe_10s_1920x1080_audio();
+        FastTrimPlan {
+            inspection: FastTrimInspection {
+                status: FastTrimInspectionStatus::Ready,
+                reasons: Vec::new(),
+                requested_start_us: 2_000_000,
+                requested_end_us: 6_000_000,
+                effective_start_us: Some(2_000_000),
+                effective_end_us: Some(6_000_000),
+                start_expansion_us: Some(0),
+                end_expansion_us: Some(0),
+                requires_acceptance: false,
+                video_packet_count: Some(1),
+                video_action: Some(StreamAction::Copy),
+                audio_action: Some(StreamAction::Copy),
+                consent: None,
+            },
+            absolute_start_us: 2_000_000,
+            video_stream_index: 0,
+            audio_stream_index: Some(1),
+            video_codec: "h264".to_string(),
+            audio_codec: Some("aac".to_string()),
+            video_packet_hashes: vec!["sha256:video".to_string()],
+            source_audio_packets: Vec::new(),
+            duration_tolerance_us: 35_334,
+            sample_aspect_ratio: probe.sample_aspect_ratio,
+            pixel_format: probe.pixel_format,
+            bit_depth: probe.bit_depth,
+            color_range: probe.color_range,
+            color_primaries: probe.color_primaries,
+            color_transfer: probe.color_transfer,
+            color_space: probe.color_space,
+            video_dispositions: probe.selected_video_dispositions,
+            audio_dispositions: probe.selected_audio_dispositions,
+            strip_metadata,
+            replacement_title: Some("Replacement title".to_string()),
+            source_global_tags: tag_map(&[
+                ("title", "Private title"),
+                ("artist", "Private artist"),
+                ("encoder", "Source muxer"),
+            ]),
+            source_video_tags: tag_map(&[
+                ("language", "deu"),
+                ("handler_name", "Private Video"),
+                ("duration", "00:00:08.000"),
+            ]),
+            source_audio_tags: tag_map(&[
+                ("language", "fra"),
+                ("handler_name", "Private Audio"),
+                ("duration", "00:00:08.000"),
+            ]),
+        }
+    }
+
+    fn fast_metadata_test_probe(
+        global_tags: NormalizedTagMap,
+        video_tags: NormalizedTagMap,
+        audio_tags: NormalizedTagMap,
+    ) -> FastPacketProbe {
+        FastPacketProbe {
+            streams: vec![
+                FastStreamSummary {
+                    index: 0,
+                    codec_type: "video".to_string(),
+                    codec_name: "h264".to_string(),
+                    start_us: Some(0),
+                    tags: video_tags,
+                },
+                FastStreamSummary {
+                    index: 1,
+                    codec_type: "audio".to_string(),
+                    codec_name: "aac".to_string(),
+                    start_us: Some(0),
+                    tags: audio_tags,
+                },
+            ],
+            packets: Vec::new(),
+            format_start_us: Some(0),
+            format_duration_us: Some(4_000_000),
+            format_tags: global_tags,
+            chapter_count: 0,
+        }
+    }
+
+    #[test]
+    fn trim_mode_is_backward_compatible_and_fast_consent_is_explicit() {
+        let old_trim: Trim = serde_json::from_str(r#"{"startS":1.0,"endS":2.0}"#).unwrap();
+        assert_eq!(old_trim.mode, TrimMode::Exact);
+        assert_eq!(old_trim.fast_copy_consent, None);
+
+        let serialized = serde_json::to_value(Trim {
+            start_s: 1.0,
+            end_s: Some(2.0),
+            mode: TrimMode::FastCopy,
+            fast_copy_consent: Some(FastTrimConsent {
+                plan_schema: 1,
+                confirmation_token: "opaque".to_string(),
+                requested_start_us: 1_000_000,
+                requested_end_us: 2_000_000,
+                effective_start_us: 0,
+                effective_end_us: 2_000_000,
+                video_packet_count: 60,
+            }),
+        })
+        .unwrap();
+        assert_eq!(serialized["mode"], "fastCopy");
+        assert_eq!(serialized["fastCopyConsent"]["confirmationToken"], "opaque");
+    }
+
+    #[test]
+    fn fast_trim_reason_codes_are_stable_camel_case_contract_values() {
+        for (code, expected) in [
+            (
+                FastTrimReasonCode::AudioCodecIncompatible,
+                "audioCodecIncompatible",
+            ),
+            (FastTrimReasonCode::ResizeEnabled, "resizeEnabled"),
+            (FastTrimReasonCode::OpenGop, "openGop"),
+            (
+                FastTrimReasonCode::EdgeExpansionExceeded,
+                "edgeExpansionExceeded",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn fast_trim_compatibility_is_authoritative_and_reports_all_transform_blocks() {
+        let probe = probe_10s_1920x1080_audio();
+        let mut request = fast_request(2.0, 6.0);
+        let (_, _, audio_action, reasons) = fast_trim_compatibility(&request, &probe);
+        assert_eq!(audio_action, StreamAction::Copy);
+        assert!(reasons.is_empty());
+
+        request.crop = Some(Crop {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 180,
+        });
+        request.resize = Some(ResizeSettings {
+            mode: ResizeMode::Custom,
+            width_px: Some(320),
+            height_px: Some(180),
+            max_edge_px: None,
+        });
+        request.rotate_deg = 90;
+        request.speed = 2.0;
+        request.reverse = true;
+        request.loop_video = true;
+        request.perturb_first_frame = true;
+        request.subtitle_path = Some("captions.srt".to_string());
+        request.normalize_audio = true;
+        request.advanced.video_codec = Some(VideoCodecPreference::H264);
+        request.advanced.video_quality = Some(VideoQualityPreference::Higher);
+        request.advanced.encode_speed = Some(EncodeSpeedPreference::Faster);
+        request.advanced.frame_rate_cap_fps = Some(24);
+        request.advanced.audio_bitrate_kbps = Some(128);
+        request.advanced.audio_channels = Some(AudioChannelPreference::Mono);
+        let (_, _, _, reasons) = fast_trim_compatibility(&request, &probe);
+        let codes = reasons
+            .iter()
+            .map(|reason| reason.code)
+            .collect::<HashSet<_>>();
+        for expected in [
+            FastTrimReasonCode::CropEnabled,
+            FastTrimReasonCode::ResizeEnabled,
+            FastTrimReasonCode::ManualRotationEnabled,
+            FastTrimReasonCode::SpeedChanged,
+            FastTrimReasonCode::ReverseEnabled,
+            FastTrimReasonCode::LoopEnabled,
+            FastTrimReasonCode::PerturbationEnabled,
+            FastTrimReasonCode::SubtitleEnabled,
+            FastTrimReasonCode::AudioNormalizationEnabled,
+            FastTrimReasonCode::VideoCodecOverride,
+            FastTrimReasonCode::VideoQualityOverride,
+            FastTrimReasonCode::EncodeSpeedOverride,
+            FastTrimReasonCode::FrameRateOverride,
+            FastTrimReasonCode::AudioBitrateOverride,
+            FastTrimReasonCode::AudioChannelsOverride,
+        ] {
+            assert!(codes.contains(&expected), "missing {expected:?}");
+        }
+
+        let mut incompatible_audio = probe;
+        incompatible_audio.audio_codec = Some("opus".to_string());
+        let (_, _, action, reasons) =
+            fast_trim_compatibility(&fast_request(2.0, 6.0), &incompatible_audio);
+        assert_eq!(action, StreamAction::Drop);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.code == FastTrimReasonCode::AudioCodecIncompatible)
+        );
+
+        let mut audio_dropped = fast_request(2.0, 6.0);
+        audio_dropped.audio_enabled = false;
+        let (_, _, action, reasons) = fast_trim_compatibility(&audio_dropped, &incompatible_audio);
+        assert_eq!(action, StreamAction::Drop);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn closed_gop_planner_selects_containing_aligned_and_expanded_intervals() {
+        let packets = closed_gop_packets(0, 8);
+        let aligned =
+            select_fast_trim_interval(&packets, 0, 8_000_000, 2_000_000, 6_000_000).unwrap();
+        assert_eq!(aligned.start_index, 2);
+        assert_eq!(aligned.end_index, 6);
+        assert_eq!(aligned.effective_start_us, 2_000_000);
+        assert_eq!(aligned.effective_end_us, 6_000_000);
+        assert_eq!(aligned.start_expansion_us, 0);
+        assert_eq!(aligned.end_expansion_us, 0);
+
+        let expanded =
+            select_fast_trim_interval(&packets, 0, 8_000_000, 2_500_000, 5_500_000).unwrap();
+        assert_eq!(expanded.start_index, 2);
+        assert_eq!(expanded.end_index, 6);
+        assert_eq!(expanded.effective_start_us, 2_000_000);
+        assert_eq!(expanded.effective_end_us, 6_000_000);
+        assert_eq!(expanded.start_expansion_us, 500_000);
+        assert_eq!(expanded.end_expansion_us, 500_000);
+    }
+
+    #[test]
+    fn closed_gop_planner_uses_absolute_negative_origin_and_eof() {
+        let packets = closed_gop_packets(-7_000, 8);
+        let selection =
+            select_fast_trim_interval(&packets, -7_000, 8_000_000, 4_500_000, 7_500_000).unwrap();
+        assert_eq!(selection.start_index, 4);
+        assert_eq!(selection.end_index, 8);
+        assert_eq!(selection.effective_start_us, 4_000_000);
+        assert_eq!(selection.effective_end_us, 8_000_000);
+    }
+
+    #[test]
+    fn closed_gop_planner_rejects_leading_picture_open_gop() {
+        let mut packets = closed_gop_packets(0, 8);
+        // Decode order after the 2-second key contains a presentation timestamp
+        // before that boundary. Copying from the key could expose/drop it.
+        packets[3].pts_us = 1_900_000;
+        let error =
+            select_fast_trim_interval(&packets, 0, 8_000_000, 2_500_000, 5_500_000).unwrap_err();
+        assert_eq!(error.code, FastTrimReasonCode::OpenGop);
+    }
+
+    #[test]
+    fn closed_gop_planner_enforces_gap_and_independent_edge_caps() {
+        let packets = vec![
+            fast_packet(0, 0, true, "zero"),
+            fast_packet(11_000_000, 11_000_000, true, "eleven"),
+            fast_packet(12_000_000, 12_000_000, false, "twelve"),
+        ];
+        let error =
+            select_fast_trim_interval(&packets, 0, 13_000_000, 10_500_000, 11_500_000).unwrap_err();
+        assert_eq!(error.code, FastTrimReasonCode::EdgeExpansionExceeded);
+
+        let excessive_gap = vec![
+            fast_packet(0, 0, true, "zero"),
+            fast_packet(13_000_000, 13_000_000, true, "thirteen"),
+        ];
+        let error = select_fast_trim_interval(&excessive_gap, 0, 14_000_000, 1_000_000, 2_000_000)
+            .unwrap_err();
+        assert_eq!(error.code, FastTrimReasonCode::KeyframeGapExceeded);
+    }
+
+    #[test]
+    fn fast_audio_probe_interval_is_absolute_and_source_bounded() {
+        assert_eq!(
+            fast_probe_read_interval(6_000_000, 12_000_000, 5_000_000).as_deref(),
+            Some("6.000000%12.000000")
+        );
+        assert_eq!(
+            fast_probe_read_interval(-7_000, 6_000_000, -7_000).as_deref(),
+            Some("%6.000000")
+        );
+        assert_eq!(fast_probe_read_interval(12, 12, 0), None);
+    }
+
+    #[test]
+    fn copied_audio_must_be_an_exact_source_mapped_contiguous_subsequence() {
+        let absolute_seek_us = 2_000_000;
+        let source = (0..5)
+            .map(|index| {
+                let timestamp_us = 1_900_000 + index * 20_000;
+                let mut packet = fast_packet(
+                    timestamp_us,
+                    timestamp_us,
+                    false,
+                    &char::from(b'a' + index as u8).to_string(),
+                );
+                packet.stream_index = 1;
+                packet.duration_us = 20_000;
+                packet
+            })
+            .collect::<Vec<_>>();
+        let mapped_output = |source_index: usize| {
+            let mut packet = source[source_index].clone();
+            packet.stream_index = 0;
+            packet.pts_us -= absolute_seek_us;
+            packet.dts_us -= absolute_seek_us;
+            packet
+        };
+        let b = mapped_output(1);
+        let c = mapped_output(2);
+        let d = mapped_output(3);
+        assert!(audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&b, &c, &d],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+        assert!(!audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&b, &d],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+        assert!(!audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&c, &b],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+
+        let mut changed = c.clone();
+        changed.data_hash = "sha256:changed".to_string();
+        assert!(!audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&b, &changed, &d],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+
+        let mut shifted_segment_retimestamped_to_zero = source[0].clone();
+        shifted_segment_retimestamped_to_zero.stream_index = 0;
+        shifted_segment_retimestamped_to_zero.pts_us = 0;
+        shifted_segment_retimestamped_to_zero.dts_us = 0;
+        assert!(!audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&shifted_segment_retimestamped_to_zero],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+
+        let mut within_tolerance = c.clone();
+        within_tolerance.pts_us += FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US as i64;
+        within_tolerance.dts_us -= FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US as i64;
+        within_tolerance.duration_us += FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US;
+        assert!(audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&within_tolerance],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+        let mut timestamp_outside_tolerance = c.clone();
+        timestamp_outside_tolerance.pts_us += FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US as i64 + 1;
+        assert!(!audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&timestamp_outside_tolerance],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+        let mut duration_outside_tolerance = c;
+        duration_outside_tolerance.duration_us += FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US + 1;
+        assert!(!audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[&duration_outside_tolerance],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+        assert!(!audio_packets_are_exact_mapped_contiguous_subsequence(
+            &source,
+            &[],
+            absolute_seek_us,
+            FAST_TRIM_AUDIO_TIMESTAMP_TOLERANCE_US,
+        ));
+    }
+
+    #[test]
+    fn ordered_audio_evidence_digest_binds_order_timing_and_payload() {
+        let first = fast_packet(0, 0, false, "a");
+        let second = fast_packet(20_000, 20_000, false, "b");
+        let baseline = ordered_packet_evidence_digest(&[first.clone(), second.clone()]);
+        assert_eq!(
+            baseline,
+            ordered_packet_evidence_digest(&[first.clone(), second.clone()])
+        );
+        assert_ne!(
+            baseline,
+            ordered_packet_evidence_digest(&[second.clone(), first.clone()])
+        );
+        let mut changed_timing = second.clone();
+        changed_timing.pts_us += 1;
+        assert_ne!(
+            baseline,
+            ordered_packet_evidence_digest(&[first.clone(), changed_timing])
+        );
+        let mut changed_payload = second;
+        changed_payload.data_hash = "sha256:changed".to_string();
+        assert_ne!(
+            baseline,
+            ordered_packet_evidence_digest(&[first, changed_payload])
+        );
+    }
+
+    #[test]
+    fn fast_metadata_policy_strips_private_tags_and_preserves_or_overrides_them_explicitly() {
+        let raw_tags = HashMap::from([
+            (
+                " ARTIST ".to_string(),
+                serde_json::json!(" Private artist "),
+            ),
+            ("NUMBER".to_string(), serde_json::json!(7)),
+        ]);
+        assert_eq!(
+            normalized_ffprobe_tags(&raw_tags),
+            tag_map(&[("artist", "Private artist"), ("number", "7")])
+        );
+
+        let strip_plan = fast_metadata_test_plan(true);
+        let stripped_output = fast_metadata_test_probe(
+            tag_map(&[("title", "Replacement title"), ("encoder", "Output muxer")]),
+            tag_map(&[
+                ("language", "und"),
+                ("handler_name", "VideoHandler"),
+                ("duration", "00:00:04.000"),
+            ]),
+            tag_map(&[
+                ("language", "und"),
+                ("handler_name", "SoundHandler"),
+                ("duration", "00:00:04.000"),
+            ]),
+        );
+        assert!(validate_fast_metadata_policy(&strip_plan, &stripped_output, 0, Some(1)).is_ok());
+
+        let mut leaked_output = stripped_output.clone();
+        leaked_output
+            .format_tags
+            .insert("artist".to_string(), "Private artist".to_string());
+        assert!(
+            validate_fast_metadata_policy(&strip_plan, &leaked_output, 0, Some(1))
+                .unwrap_err()
+                .contains("source-private metadata")
+        );
+
+        let preserve_plan = fast_metadata_test_plan(false);
+        let preserved_output = fast_metadata_test_probe(
+            tag_map(&[
+                ("title", "Replacement title"),
+                ("artist", "Private artist"),
+                ("encoder", "Output muxer"),
+            ]),
+            tag_map(&[
+                ("language", "deu"),
+                ("handler_name", "Private Video"),
+                ("duration", "00:00:04.000"),
+            ]),
+            tag_map(&[
+                ("language", "fra"),
+                ("handler_name", "Private Audio"),
+                ("duration", "00:00:04.000"),
+            ]),
+        );
+        assert!(
+            validate_fast_metadata_policy(&preserve_plan, &preserved_output, 0, Some(1)).is_ok()
+        );
+        let mut changed_output = preserved_output;
+        changed_output.streams[1]
+            .tags
+            .insert("language".to_string(), "eng".to_string());
+        assert!(
+            validate_fast_metadata_policy(&preserve_plan, &changed_output, 0, Some(1))
+                .unwrap_err()
+                .contains("changed or missing preserved")
+        );
+    }
+
+    #[test]
+    fn fast_trim_args_are_copy_only_bounded_and_absolute_seeked() {
+        let request = fast_request(2.5, 5.5);
+        let inspection = FastTrimInspection {
+            status: FastTrimInspectionStatus::Ready,
+            reasons: Vec::new(),
+            requested_start_us: 2_500_000,
+            requested_end_us: 5_500_000,
+            effective_start_us: Some(2_000_000),
+            effective_end_us: Some(6_000_000),
+            start_expansion_us: Some(500_000),
+            end_expansion_us: Some(500_000),
+            requires_acceptance: true,
+            video_packet_count: Some(4),
+            video_action: Some(StreamAction::Copy),
+            audio_action: Some(StreamAction::Copy),
+            consent: Some(FastTrimConsent {
+                plan_schema: 1,
+                confirmation_token: "opaque-plan".to_string(),
+                requested_start_us: 2_500_000,
+                requested_end_us: 5_500_000,
+                effective_start_us: 2_000_000,
+                effective_end_us: 6_000_000,
+                video_packet_count: 4,
+            }),
+        };
+        let probe = probe_10s_1920x1080_audio();
+        let plan = FastTrimPlan {
+            inspection,
+            absolute_start_us: -7_000,
+            video_stream_index: 0,
+            audio_stream_index: Some(1),
+            video_codec: "h264".to_string(),
+            audio_codec: Some("aac".to_string()),
+            video_packet_hashes: vec!["a".to_string(); 4],
+            source_audio_packets: vec![
+                fast_packet(-27_000, -27_000, false, "audio-a"),
+                fast_packet(973_000, 973_000, false, "audio-b"),
+            ],
+            duration_tolerance_us: 35_334,
+            sample_aspect_ratio: probe.sample_aspect_ratio,
+            pixel_format: probe.pixel_format,
+            bit_depth: probe.bit_depth,
+            color_range: probe.color_range,
+            color_primaries: probe.color_primaries,
+            color_transfer: probe.color_transfer,
+            color_space: probe.color_space,
+            video_dispositions: probe.selected_video_dispositions,
+            audio_dispositions: probe.selected_audio_dispositions,
+            strip_metadata: request.strip_metadata,
+            replacement_title: None,
+            source_global_tags: NormalizedTagMap::new(),
+            source_video_tags: NormalizedTagMap::new(),
+            source_audio_tags: NormalizedTagMap::new(),
+        };
+        let args = build_fast_trim_args("/private/input.mp4", &request, &plan);
+        assert!(args.windows(2).any(|args| args == ["-seek_timestamp", "1"]));
+        assert!(args.windows(2).any(|args| args == ["-ss", "-0.007000"]));
+        assert!(args.windows(2).any(|args| args == ["-c:v", "copy"]));
+        assert!(args.windows(2).any(|args| args == ["-c:a", "copy"]));
+        assert!(args.windows(2).any(|args| args == ["-frames:v", "4"]));
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-disposition:v:0", "default"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-disposition:a:0", "default"])
+        );
+        assert!(args.contains(&"-shortest".to_string()));
+        assert!(args.windows(2).any(|args| args == ["-map_chapters", "-1"]));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-t" | "-to" | "-copyts"))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("libx264") || arg.contains("libopus"))
+        );
+
+        assert!(validate_fast_trim_consent(&request, &plan).is_err());
+        let mut accepted = request.clone();
+        accepted.trim.as_mut().unwrap().fast_copy_consent = plan.inspection.consent.clone();
+        assert!(validate_fast_trim_consent(&accepted, &plan).is_ok());
+        accepted
+            .trim
+            .as_mut()
+            .unwrap()
+            .fast_copy_consent
+            .as_mut()
+            .unwrap()
+            .video_packet_count += 1;
+        assert!(
+            validate_fast_trim_consent(&accepted, &plan)
+                .unwrap_err()
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn fast_trim_disposition_args_emit_all_flags_in_stable_order_and_clear_none() {
+        let mut plan = fast_metadata_test_plan(false);
+        plan.inspection.audio_action = Some(StreamAction::Copy);
+        plan.video_dispositions = StreamDispositions {
+            default: true,
+            dub: true,
+            original: true,
+            comment: true,
+            lyrics: true,
+            karaoke: true,
+            forced: true,
+            hearing_impaired: true,
+            visual_impaired: true,
+            clean_effects: true,
+            attached_pic: true,
+            timed_thumbnails: true,
+            non_diegetic: true,
+            captions: true,
+            descriptions: true,
+            metadata: true,
+            dependent: true,
+            still_image: true,
+            multilayer: true,
+        };
+        plan.audio_dispositions = StreamDispositions::default();
+
+        let mut args = Vec::new();
+        push_fast_trim_disposition_args(&mut args, &plan);
+        assert_eq!(
+            args,
+            vec![
+                "-disposition:v:0",
+                "default+dub+original+comment+lyrics+karaoke+forced+hearing_impaired+visual_impaired+clean_effects+attached_pic+timed_thumbnails+non_diegetic+captions+descriptions+metadata+dependent+still_image+multilayer",
+                "-disposition:a:0",
+                "0",
+            ]
+        );
+
+        plan.inspection.audio_action = Some(StreamAction::Drop);
+        let mut drop_args = Vec::new();
+        push_fast_trim_disposition_args(&mut drop_args, &plan);
+        assert_eq!(drop_args.len(), 2);
+        assert_eq!(drop_args[0], "-disposition:v:0");
+    }
+
+    #[test]
+    fn fast_consent_token_binds_source_plan_actions_and_remux_settings() {
+        let request = fast_request(2.5, 5.5);
+        let base = fast_confirmation_token(
+            "source-a",
+            &request,
+            2_500_000,
+            5_500_000,
+            2_000_000,
+            6_000_000,
+            120,
+            StreamAction::Copy,
+            200,
+            "audio-digest-a",
+        );
+        assert_eq!(
+            base,
+            fast_confirmation_token(
+                "source-a",
+                &request,
+                2_500_000,
+                5_500_000,
+                2_000_000,
+                6_000_000,
+                120,
+                StreamAction::Copy,
+                200,
+                "audio-digest-a",
+            )
+        );
+        assert_ne!(
+            base,
+            fast_confirmation_token(
+                "source-b",
+                &request,
+                2_500_000,
+                5_500_000,
+                2_000_000,
+                6_000_000,
+                120,
+                StreamAction::Copy,
+                200,
+                "audio-digest-a",
+            )
+        );
+        let mut stripped = request.clone();
+        stripped.strip_metadata = true;
+        assert_ne!(
+            base,
+            fast_confirmation_token(
+                "source-a",
+                &stripped,
+                2_500_000,
+                5_500_000,
+                2_000_000,
+                6_000_000,
+                120,
+                StreamAction::Copy,
+                200,
+                "audio-digest-a",
+            )
+        );
+        assert_ne!(
+            base,
+            fast_confirmation_token(
+                "source-a",
+                &request,
+                2_500_000,
+                5_500_000,
+                2_000_000,
+                6_000_000,
+                120,
+                StreamAction::Copy,
+                200,
+                "audio-digest-b",
+            )
+        );
+    }
+
+    #[test]
+    fn fast_source_identity_binds_bounded_audio_packet_evidence() {
+        let root = TempDir::new().unwrap();
+        let input = root.path().join("identity.mp4");
+        fs::write(&input, b"source identity fixture").unwrap();
+        let probe = probe_10s_1920x1080_audio();
+        let video = vec![fast_packet(0, -1, true, "video")];
+        let mut audio = fast_packet(0, 0, true, "audio-a");
+        audio.stream_index = 1;
+        let baseline = fast_source_identity(&input, &probe, &video, &[audio.clone()]).unwrap();
+        assert_eq!(
+            baseline,
+            fast_source_identity(&input, &probe, &video, &[audio.clone()]).unwrap()
+        );
+        audio.data_hash = "sha256:audio-b".to_string();
+        assert_ne!(
+            baseline,
+            fast_source_identity(&input, &probe, &video, &[audio]).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            fast_source_identity(&input, &probe, &video, &[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn title_metadata_validation_is_trimmed_bounded_and_control_free() {
+        assert_eq!(
+            validate_title_metadata(Some("  Replacement title  ")).unwrap(),
+            Some("Replacement title".to_string())
+        );
+        assert_eq!(validate_title_metadata(Some("  ")).unwrap(), None);
+        assert!(validate_title_metadata(Some("bad\ntitle")).is_err());
+        assert!(validate_title_metadata(Some(&"x".repeat(TITLE_METADATA_MAX_CHARS + 1))).is_err());
+    }
+
+    #[test]
+    fn fast_inspection_and_execution_share_base_scalar_validation() {
+        let request = fast_request(2.5, 5.5);
+        assert!(validate_base_request_scalars(&request).is_ok());
+
+        for invalid_size in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = request.clone();
+            invalid.size_limit_mb = invalid_size;
+            assert!(
+                validate_base_request_scalars(&invalid)
+                    .unwrap_err()
+                    .contains("Size limit")
+            );
+        }
+        let mut undersized = request.clone();
+        undersized.size_limit_mb = 0.01;
+        assert!(
+            validate_base_request_scalars(&undersized)
+                .unwrap_err()
+                .contains("0.1 MB")
+        );
+        for invalid_speed in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = request.clone();
+            invalid.speed = invalid_speed;
+            assert!(
+                validate_base_request_scalars(&invalid)
+                    .unwrap_err()
+                    .contains("Speed")
+            );
+        }
+        let mut orphan_audio_removal = request.clone();
+        orphan_audio_removal.strict_fit_allow_audio_removal = true;
+        assert!(
+            validate_base_request_scalars(&orphan_audio_removal)
+                .unwrap_err()
+                .contains("requires Strict Fit")
+        );
+        let mut strict_without_target = request;
+        strict_without_target.strict_fit = true;
+        assert!(
+            validate_base_request_scalars(&strict_without_target)
+                .unwrap_err()
+                .contains("requires an MP4 or WebM size target")
+        );
+    }
+
+    #[test]
+    fn fast_trim_pinned_sidecar_round_trip_is_opt_in() {
+        if std::env::var("VFL_RUN_FAST_TRIM_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+        let root = TempDir::new().unwrap();
+        let input = root.path().join("source.mp4");
+        let output = root.path().join("fast.mp4");
+        let preserved_output = root.path().join("fast-preserved.mp4");
+        let ffmpeg = default_ffmpeg();
+        let generated = command_no_window(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30:duration=8",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=8",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-color_range",
+                "tv",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+                "-x264-params",
+                "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv",
+                "-g",
+                "60",
+                "-keyint_min",
+                "60",
+                "-sc_threshold",
+                "0",
+                "-bf",
+                "2",
+                "-c:a",
+                "aac",
+                "-metadata",
+                "title=Private source title",
+                "-metadata",
+                "artist=Private source artist",
+                "-metadata:s:v:0",
+                "language=deu",
+                "-metadata:s:v:0",
+                "handler_name=Private Video Handler",
+                "-metadata:s:a:0",
+                "language=fra",
+                "-metadata:s:a:0",
+                "handler_name=Private Audio Handler",
+                "-disposition:a:0",
+                "default+dub+comment+forced+hearing_impaired+visual_impaired+captions+descriptions",
+                "-shortest",
+            ])
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(generated.success());
+
+        let mut request = fast_request(2.5, 5.5);
+        request.input_path = input.to_string_lossy().to_string();
+        request.output_path = output.to_string_lossy().to_string();
+        request.strip_metadata = true;
+        request.title = Some("Replacement title".to_string());
+        let probe = probe_video(request.input_path.clone()).unwrap();
+        let plan = match plan_fast_trim(&request, &probe, &input).unwrap() {
+            FastTrimPlannerOutcome::Ready(plan) => *plan,
+            FastTrimPlannerOutcome::Blocked(inspection) => {
+                panic!("unexpected Fast trim block: {:?}", inspection.reasons)
+            }
+        };
+        assert!(!plan.source_audio_packets.is_empty());
+        assert!(plan.audio_dispositions.default);
+        assert!(plan.audio_dispositions.dub);
+        assert!(plan.audio_dispositions.comment);
+        assert!(plan.audio_dispositions.forced);
+        assert!(plan.audio_dispositions.hearing_impaired);
+        assert!(plan.audio_dispositions.visual_impaired);
+        assert!(plan.audio_dispositions.captions);
+        assert!(plan.audio_dispositions.descriptions);
+        let mut audio_drop_request = request.clone();
+        audio_drop_request.audio_enabled = false;
+        let audio_drop_plan = match plan_fast_trim(&audio_drop_request, &probe, &input).unwrap() {
+            FastTrimPlannerOutcome::Ready(plan) => *plan,
+            FastTrimPlannerOutcome::Blocked(inspection) => {
+                panic!(
+                    "unexpected audio-drop Fast trim block: {:?}",
+                    inspection.reasons
+                )
+            }
+        };
+        assert_eq!(
+            audio_drop_plan.inspection.audio_action,
+            Some(StreamAction::Drop)
+        );
+        assert!(audio_drop_plan.source_audio_packets.is_empty());
+        request.trim.as_mut().unwrap().fast_copy_consent = plan.inspection.consent.clone();
+        let mut args = build_fast_trim_args(&request.input_path, &request, &plan);
+        let expected_audio_dispositions = ffmpeg_disposition_value(&plan.audio_dispositions);
+        let expected_video_dispositions = ffmpeg_disposition_value(&plan.video_dispositions);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-disposition:a:0" && pair[1] == expected_audio_dispositions));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-disposition:v:0" && pair[1] == expected_video_dispositions));
+        args.push(request.output_path.clone());
+        let result = command_no_window(&ffmpeg).args(&args).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let (actual_start_us, actual_end_us) = postverify_fast_trim_output(&output, &plan).unwrap();
+        assert_eq!(actual_start_us, 2_000_000);
+        assert!(actual_end_us.abs_diff(6_000_000) <= plan.duration_tolerance_us);
+        let output_probe = probe_video(output.to_string_lossy().to_string()).unwrap();
+        assert_eq!(
+            output_probe.selected_video_dispositions,
+            plan.video_dispositions
+        );
+        assert_eq!(
+            output_probe.selected_audio_dispositions,
+            plan.audio_dispositions
+        );
+        assert_eq!(plan.video_packet_hashes.len(), 120);
+        let mut shifted_audio_plan = plan.clone();
+        for packet in &mut shifted_audio_plan.source_audio_packets {
+            packet.pts_us = packet.pts_us.saturating_add(1_000_000);
+            packet.dts_us = packet.dts_us.saturating_add(1_000_000);
+        }
+        assert!(
+            postverify_fast_trim_output(&output, &shifted_audio_plan)
+                .unwrap_err()
+                .contains("wrong source timeline")
+        );
+
+        let metadata = command_no_window(&default_ffprobe())
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags=title",
+                "-of",
+                "default=nw=1",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        let metadata = String::from_utf8_lossy(&metadata.stdout);
+        assert!(metadata.contains("Replacement title"));
+        assert!(!metadata.contains("Private source title"));
+
+        let mut preserved_request = request.clone();
+        preserved_request.output_path = preserved_output.to_string_lossy().to_string();
+        preserved_request.strip_metadata = false;
+        preserved_request.title = Some("Preserved replacement title".to_string());
+        let preserved_plan = match plan_fast_trim(&preserved_request, &probe, &input).unwrap() {
+            FastTrimPlannerOutcome::Ready(plan) => *plan,
+            FastTrimPlannerOutcome::Blocked(inspection) => {
+                panic!(
+                    "unexpected metadata-preserving Fast trim block: {:?}",
+                    inspection.reasons
+                )
+            }
+        };
+        preserved_request.trim.as_mut().unwrap().fast_copy_consent =
+            preserved_plan.inspection.consent.clone();
+        let mut preserved_args = build_fast_trim_args(
+            &preserved_request.input_path,
+            &preserved_request,
+            &preserved_plan,
+        );
+        preserved_args.push(preserved_request.output_path.clone());
+        let result = command_no_window(&ffmpeg)
+            .args(&preserved_args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        postverify_fast_trim_output(&preserved_output, &preserved_plan).unwrap();
+
+        let webm_input = root.path().join("source.webm");
+        let webm_output = root.path().join("fast.webm");
+        let generated = command_no_window(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30:duration=8",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=660:sample_rate=48000:duration=8",
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                "yuv420p",
+                "-color_range",
+                "tv",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+                "-g",
+                "60",
+                "-keyint_min",
+                "60",
+                "-c:a",
+                "libopus",
+                "-output_ts_offset",
+                "5",
+                "-metadata",
+                "title=Private WebM title",
+                "-metadata",
+                "artist=Private WebM artist",
+                "-metadata:s:v:0",
+                "language=deu",
+                "-metadata:s:v:0",
+                "handler_name=Private WebM Video Handler",
+                "-metadata:s:a:0",
+                "language=fra",
+                "-metadata:s:a:0",
+                "handler_name=Private WebM Audio Handler",
+                "-disposition:a:0",
+                "forced",
+                "-shortest",
+            ])
+            .arg(&webm_input)
+            .status()
+            .unwrap();
+        assert!(generated.success());
+
+        let mut webm_request = fast_request(2.5, 5.5);
+        webm_request.format = OutputFormat::Webm;
+        webm_request.input_path = webm_input.to_string_lossy().to_string();
+        webm_request.output_path = webm_output.to_string_lossy().to_string();
+        webm_request.strip_metadata = true;
+        webm_request.title = Some("Replacement WebM title".to_string());
+        let webm_probe = probe_video(webm_request.input_path.clone()).unwrap();
+        let webm_plan = match plan_fast_trim(&webm_request, &webm_probe, &webm_input).unwrap() {
+            FastTrimPlannerOutcome::Ready(plan) => *plan,
+            FastTrimPlannerOutcome::Blocked(inspection) => {
+                panic!("unexpected WebM Fast trim block: {:?}", inspection.reasons)
+            }
+        };
+        assert!(!webm_plan.source_audio_packets.is_empty());
+        assert_eq!(webm_plan.absolute_start_us, 7_000_000);
+        assert!(webm_plan.audio_dispositions.forced);
+        webm_request.trim.as_mut().unwrap().fast_copy_consent =
+            webm_plan.inspection.consent.clone();
+        let mut webm_args =
+            build_fast_trim_args(&webm_request.input_path, &webm_request, &webm_plan);
+        let expected_webm_audio_dispositions =
+            ffmpeg_disposition_value(&webm_plan.audio_dispositions);
+        assert!(webm_args.windows(2).any(|pair| {
+            pair[0] == "-disposition:a:0" && pair[1] == expected_webm_audio_dispositions
+        }));
+        webm_args.push(webm_request.output_path.clone());
+        let result = command_no_window(&ffmpeg)
+            .args(&webm_args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let (actual_start_us, actual_end_us) =
+            postverify_fast_trim_output(&webm_output, &webm_plan).unwrap();
+        let webm_output_probe = probe_video(webm_output.to_string_lossy().to_string()).unwrap();
+        assert_eq!(
+            webm_output_probe.selected_video_dispositions,
+            webm_plan.video_dispositions
+        );
+        assert_eq!(
+            webm_output_probe.selected_audio_dispositions,
+            webm_plan.audio_dispositions
+        );
+        assert_eq!(
+            Some(actual_start_us),
+            webm_plan.inspection.effective_start_us
+        );
+        assert_eq!(
+            actual_end_us,
+            webm_plan.inspection.effective_end_us.unwrap(),
+            "WebM actual/effective evidence drifted beyond exact fixture expectations"
+        );
+        assert_eq!(webm_plan.video_packet_hashes.len(), 120);
+        let mut shifted_webm_audio_plan = webm_plan.clone();
+        for packet in &mut shifted_webm_audio_plan.source_audio_packets {
+            packet.pts_us = packet.pts_us.saturating_sub(1_000_000);
+            packet.dts_us = packet.dts_us.saturating_sub(1_000_000);
+        }
+        assert!(
+            postverify_fast_trim_output(&webm_output, &shifted_webm_audio_plan)
+                .unwrap_err()
+                .contains("wrong source timeline")
+        );
     }
 
     fn test_command_plan(
@@ -7595,6 +10947,8 @@ Encoders:
         req.trim = Some(Trim {
             start_s: 1.0,
             end_s: Some(5.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
 
         let plan = test_command_plan(&req, &probe_10s_1920x1080_audio(), 1_000_000);
@@ -7778,6 +11132,8 @@ Encoders:
         request.trim = Some(Trim {
             start_s: 10.0,
             end_s: Some(11.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
         let error = reverse_buffer_estimate(
             &request,
@@ -7804,6 +11160,8 @@ Encoders:
         let trim = Some(Trim {
             start_s: 2.0,
             end_s: Some(8.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
         let out = estimate_output_duration_s(10.0, &trim, 2.0, false).unwrap();
         assert!((out - 3.0).abs() < 1e-9);
@@ -7820,6 +11178,8 @@ Encoders:
         let trim = Some(Trim {
             start_s: 2.0,
             end_s: Some(8.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
         let looped_trim = estimate_output_duration_s(10.0, &trim, 2.0, true).unwrap();
         assert!((looped_trim - 6.0).abs() < 1e-9);
@@ -7907,6 +11267,8 @@ Encoders:
         req.trim = Some(Trim {
             start_s: 1.0,
             end_s: Some(5.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
         req.crop = Some(Crop {
             x: 1,
@@ -7934,6 +11296,8 @@ Encoders:
         req.trim = Some(Trim {
             start_s: 5.0,
             end_s: Some(9.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
         req.crop = Some(Crop {
             x: 0,
@@ -8172,6 +11536,8 @@ Encoders:
         req.trim = Some(Trim {
             start_s: 1.0,
             end_s: Some(5.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
         req.reverse = true;
         req.speed = 4.0;
@@ -8191,6 +11557,8 @@ Encoders:
         req.trim = Some(Trim {
             start_s: 1.0,
             end_s: Some(5.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
 
         let probe = probe_10s_1920x1080_audio();
@@ -8423,7 +11791,15 @@ Encoders:
                 {"index": 4, "codec_name": "vorbis", "codec_type": "audio",
                  "disposition": {"default": 0}},
                 {"index": 7, "codec_name": "opus", "codec_type": "audio",
-                 "disposition": {"default": 1}}
+                 "disposition": {"default": 1, "dub": 1, "original": 1,
+                                  "comment": 1, "lyrics": 1, "karaoke": 1,
+                                  "forced": 1, "hearing_impaired": 1,
+                                  "visual_impaired": 1, "clean_effects": 1,
+                                  "attached_pic": 1, "timed_thumbnails": 1,
+                                  "non_diegetic": 1, "captions": 1,
+                                  "descriptions": 1, "metadata": 1,
+                                  "dependent": 1, "still_image": 1,
+                                  "multilayer": 1}}
             ]
         }"#;
 
@@ -8435,6 +11811,45 @@ Encoders:
         assert_eq!(probe.audio_stream_index, Some(7));
         assert_eq!(probe.audio_codec.as_deref(), Some("opus"));
         assert!(probe.audio_is_default);
+        assert_eq!(
+            probe.selected_audio_dispositions,
+            StreamDispositions {
+                default: true,
+                dub: true,
+                original: true,
+                comment: true,
+                lyrics: true,
+                karaoke: true,
+                forced: true,
+                hearing_impaired: true,
+                visual_impaired: true,
+                clean_effects: true,
+                attached_pic: true,
+                timed_thumbnails: true,
+                non_diegetic: true,
+                captions: true,
+                descriptions: true,
+                metadata: true,
+                dependent: true,
+                still_image: true,
+                multilayer: true,
+            }
+        );
+        let serialized = serde_json::to_value(&probe).unwrap();
+        assert_eq!(
+            serialized["selectedAudioDispositions"]["hearingImpaired"],
+            true
+        );
+        assert_eq!(
+            serialized["selectedAudioDispositions"]["visualImpaired"],
+            true
+        );
+        assert_eq!(
+            serialized["selectedAudioDispositions"]["cleanEffects"],
+            true
+        );
+        assert_eq!(serialized["selectedAudioDispositions"]["nonDiegetic"], true);
+        assert_eq!(serialized["selectedAudioDispositions"]["multilayer"], true);
         assert_eq!((probe.width, probe.height), (1280, 720));
     }
 
@@ -8599,6 +12014,8 @@ Encoders:
         req.trim = Some(Trim {
             start_s: 0.0,
             end_s: Some(60.0),
+            mode: TrimMode::Exact,
+            fast_copy_consent: None,
         });
         let probe = VideoProbe {
             duration_s: 60.0,

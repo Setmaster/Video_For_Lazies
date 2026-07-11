@@ -5,6 +5,7 @@ export type EncodeSpeedPreference = "auto" | "faster" | "balanced" | "smaller";
 export type AudioChannelPreference = "auto" | "stereo" | "mono";
 export type ResizeMode = "source" | "maxEdge" | "custom";
 export type StreamAction = "copy" | "encode" | "drop";
+export type TrimMode = "exact" | "fastCopy";
 export type ColorPolicy = "auto" | "standardSdr";
 export type DynamicRange = "sdr" | "hdr10" | "hlg" | "dolbyVision" | "unknown";
 
@@ -15,14 +16,24 @@ export interface Rational {
 
 export interface StreamDispositions {
   default: boolean;
+  dub?: boolean;
   original: boolean;
   comment: boolean;
+  lyrics?: boolean;
+  karaoke?: boolean;
   forced: boolean;
   hearingImpaired: boolean;
   visualImpaired: boolean;
+  cleanEffects?: boolean;
   attachedPic: boolean;
   timedThumbnails: boolean;
+  nonDiegetic?: boolean;
+  captions?: boolean;
+  descriptions?: boolean;
+  metadata?: boolean;
+  dependent?: boolean;
   stillImage: boolean;
+  multilayer?: boolean;
 }
 
 export interface VideoProbe {
@@ -53,6 +64,7 @@ export interface VideoProbe {
   displayAspectRatio?: Rational | null;
   attachedPictureCount?: number | null;
   selectedVideoDispositions?: StreamDispositions | null;
+  selectedAudioDispositions?: StreamDispositions | null;
   audioSampleRate?: number | null;
   audioChannels?: number | null;
   audioSampleFormat?: string | null;
@@ -63,6 +75,95 @@ export interface VideoProbe {
 export interface Trim {
   startS: number;
   endS?: number | null;
+  mode?: TrimMode;
+  fastCopyConsent?: FastTrimConsent | null;
+}
+
+export interface FastTrimConsent {
+  planSchema: number;
+  confirmationToken: string;
+  requestedStartUs: number;
+  requestedEndUs: number;
+  effectiveStartUs: number;
+  effectiveEndUs: number;
+  videoPacketCount: number;
+}
+
+export type FastTrimReasonCode =
+  | "fastModeRequired"
+  | "trimRequired"
+  | "invalidTrim"
+  | "unsupportedOutputFormat"
+  | "sizeTargetEnabled"
+  | "strictFitEnabled"
+  | "videoCodecIncompatible"
+  | "audioCodecIncompatible"
+  | "unsafeColor"
+  | "nonSquarePixels"
+  | "sourceRotationUnsupported"
+  | "manualRotationEnabled"
+  | "cropEnabled"
+  | "resizeEnabled"
+  | "colorAdjustmentEnabled"
+  | "colorConversionEnabled"
+  | "speedChanged"
+  | "reverseEnabled"
+  | "loopEnabled"
+  | "perturbationEnabled"
+  | "subtitleEnabled"
+  | "audioNormalizationEnabled"
+  | "frameRateOverride"
+  | "videoCodecOverride"
+  | "videoQualityOverride"
+  | "encodeSpeedOverride"
+  | "audioBitrateOverride"
+  | "audioChannelsOverride"
+  | "chaptersPresent"
+  | "sourceDurationExceeded"
+  | "packetLimitExceeded"
+  | "keyframeGapExceeded"
+  | "openGop"
+  | "malformedPacketEvidence"
+  | "startBoundaryMissing"
+  | "endBoundaryMissing"
+  | "edgeExpansionExceeded"
+  | "inspectionTimeout"
+  | "emptyInterval";
+
+export interface FastTrimReason {
+  code: FastTrimReasonCode;
+  message: string;
+}
+
+export interface FastTrimInspection {
+  status: "ready" | "blocked";
+  reasons: FastTrimReason[];
+  requestedStartUs: number;
+  requestedEndUs: number;
+  effectiveStartUs?: number | null;
+  effectiveEndUs?: number | null;
+  startExpansionUs?: number | null;
+  endExpansionUs?: number | null;
+  requiresAcceptance: boolean;
+  videoPacketCount?: number | null;
+  consent?: FastTrimConsent | null;
+  videoAction?: StreamAction | null;
+  audioAction?: StreamAction | null;
+}
+
+export interface TrimResult {
+  mode: TrimMode;
+  requestedStartUs: number;
+  requestedEndUs: number;
+  effectiveStartUs: number;
+  effectiveEndUs: number;
+  actualStartUs: number;
+  actualEndUs: number;
+  videoPacketCount: number;
+  videoAction: StreamAction;
+  audioAction: StreamAction;
+  ffmpegInvocations: number;
+  commandPreview: string;
 }
 
 export interface Crop {
@@ -168,6 +269,7 @@ export interface EncodeFinishedPayload {
   targetResult?: TargetResult | null;
   message?: string | null;
   diagnostics?: ExportDiagnostics | null;
+  trimResult?: TrimResult | null;
 }
 
 export type SizeTargetStatus = "met" | "missed";
@@ -228,6 +330,15 @@ export interface ExportDiagnostics {
   reverseBufferAction?: string | null;
   failureStage?: string | null;
   failureReason?: string | null;
+  trimMode?: TrimMode | null;
+  trimRequestedStartUs?: number | null;
+  trimRequestedEndUs?: number | null;
+  trimEffectiveStartUs?: number | null;
+  trimEffectiveEndUs?: number | null;
+  trimActualStartUs?: number | null;
+  trimActualEndUs?: number | null;
+  trimVideoPacketCount?: number | null;
+  trimFfmpegInvocations?: number | null;
   commandPreview: string;
 }
 
@@ -239,6 +350,11 @@ export interface AppSmokeConfig {
   sizeLimitMb: number;
   trimStartS: number;
   trimEndS?: number | null;
+  fastTrim?: boolean | null;
+  audioEnabled?: boolean | null;
+  stripMetadata?: boolean | null;
+  sourceMutation?: boolean | null;
+  title?: string | null;
   resizeMode?: ResizeMode | null;
   resizeMaxEdgePx?: number | null;
   resizeWidthPx?: number | null;
@@ -268,6 +384,8 @@ export interface AppSmokeStatus {
   stageHistory?: string[] | null;
   targetResult?: TargetResult | null;
   diagnostics?: ExportDiagnostics | null;
+  fastTrimInspection?: FastTrimInspection | null;
+  trimResult?: TrimResult | null;
   queueOutcomeKind?: "done" | "target-missed" | null;
 }
 

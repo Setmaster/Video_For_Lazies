@@ -18,6 +18,7 @@ import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
 import { runPortableCodecPlanSmoke } from "./run-portable-codec-plan-smoke.mjs";
 import { runPortableMediaDepthSmoke } from "./run-portable-media-depth-smoke.mjs";
 import { runPortableG5Smoke } from "./run-portable-g5-smoke.mjs";
+import { runPortableG6FastTrimSmoke } from "./run-portable-g6-fast-trim-smoke.mjs";
 import {
   FFMPEG_CAPABILITY_CONTRACT_FILE_NAME,
   assertCapabilityContractCopy,
@@ -346,6 +347,7 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
   await verifyWindowsUpdateHelperManifest(portableDir, { platform });
   await runPortableMediaDepthSmoke({ portableDir, platform });
   await runPortableG5Smoke({ portableDir, platform });
+  await runPortableG6FastTrimSmoke({ portableDir, platform, verifyPreflight: false });
 
   if (platform === "linux") {
     await runPortableExportSmoke({ portableDir });

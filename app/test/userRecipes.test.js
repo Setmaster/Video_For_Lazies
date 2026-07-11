@@ -72,7 +72,20 @@ test("recipe settings rebuild through the strict reusable allowlist", () => {
     inputPath: sentinelPath,
     outputPath: "C:/Private/secret-output.mp4",
     title: "Private title",
-    trim: { startS: 12, endS: 15 },
+    trim: {
+      startS: 12,
+      endS: 15,
+      mode: "fastCopy",
+      fastCopyConsent: {
+        planSchema: 1,
+        confirmationToken: "private-confirmation",
+        requestedStartUs: 12_000_000,
+        requestedEndUs: 15_000_000,
+        effectiveStartUs: 10_000_000,
+        effectiveEndUs: 16_000_000,
+        videoPacketCount: 180,
+      },
+    },
     crop: { x: 1, y: 2, width: 3, height: 4 },
     reverse: true,
     loopVideo: true,
@@ -93,6 +106,9 @@ test("recipe settings rebuild through the strict reusable allowlist", () => {
     "secret-output",
     "Private title",
     "trim",
+    "fastCopy",
+    "private-confirmation",
+    "videoPacketCount",
     "crop",
     "reverse",
     "loopVideo",
@@ -129,7 +145,20 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
       frameRateCapFps: 24,
       audioChannels: "mono",
     },
-    trim: { startS: 4, endS: 9 },
+    trim: {
+      startS: 4,
+      endS: 9,
+      mode: "fastCopy",
+      fastCopyConsent: {
+        planSchema: 1,
+        confirmationToken: "request-only-token",
+        requestedStartUs: 4_000_000,
+        requestedEndUs: 9_000_000,
+        effectiveStartUs: 2_000_000,
+        effectiveEndUs: 10_000_000,
+        videoPacketCount: 240,
+      },
+    },
     crop: { x: 2, y: 4, width: 100, height: 80 },
     reverse: true,
     speed: 0.5,
@@ -171,6 +200,9 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
   assert.equal(reusableRaw.includes(subtitlePath), false);
   assert.equal(reusableRaw.includes(JSON.stringify(subtitlePath).slice(1, -1)), false);
   assert.equal(reusableRaw.includes("subtitlePath"), false);
+  assert.equal(reusableRaw.includes("fastCopy"), false);
+  assert.equal(reusableRaw.includes("request-only-token"), false);
+  assert.equal(reusableRaw.includes("videoPacketCount"), false);
 });
 
 test("MP3 recipes canonicalize video-only settings and always retain audio", () => {

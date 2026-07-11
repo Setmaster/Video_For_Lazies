@@ -10,6 +10,14 @@ async function read(relativePath) {
   return fs.readFile(path.resolve(__dirname, relativePath), "utf8");
 }
 
+function between(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0, `Missing start marker: ${startMarker}`);
+  assert.ok(end > start, `Missing end marker after ${startMarker}: ${endMarker}`);
+  return source.slice(start, end);
+}
+
 test("App uses one reducer-backed queue identity and closes queue continuation races", async () => {
   const app = await read("../src/App.tsx");
 
@@ -68,8 +76,61 @@ test("drop, output claims, retry, snapshot, and diagnostics are wired through pr
   assert.match(app, /focusQueueAfterMutation\(preferred, remainingAttempts - 1\)/);
   assert.match(app, /queueRegionRef\.current\?\.isConnected\) queueRegionRef\.current\.focus\(\)/);
   assert.match(app, /removeQueueItem[\s\S]*?focusQueueAfterMutation\(queueFallbackButtonRef\)/);
+  assert.match(
+    app,
+    /const getRemoveDuplicateButton = \(\) =>[\s\S]*?waitForSmokeCondition\(\(\) => getRemoveDuplicateButton\(\) !== null\)[\s\S]*?const removeDuplicateButton = getRemoveDuplicateButton\(\)/,
+  );
   assert.match(app, /const resumed = resumeQueueAfterPreparation\(next, resumeIntent\);[\s\S]*?resumed\.autoRun \? queueStopButtonRef : queueRunButtonRef/);
   assert.match(app, /ref=\{queueRegionRef\}[\s\S]*?role="group"[\s\S]*?aria-label="Export queue controls"/);
+});
+
+test("workflow smoke waits for committed mounted controls instead of fixed render sleeps", async () => {
+  const app = await read("../src/App.tsx");
+  const workflow = between(
+    app,
+    "async function runSmokeWorkflowChecks",
+    "async function runSmokeAccessibilityChecks",
+  );
+
+  assert.doesNotMatch(workflow, /waitMs\((?:180|100|160|120)\)/);
+  assert.match(
+    workflow,
+    /function isMountedEnabledButton[\s\S]*?button\?\.isConnected && !button\.disabled/,
+  );
+
+  const applyClick = workflow.indexOf("applyRecipeButton.click();");
+  const applyWait = workflow.indexOf("const applyCommitted = await waitForSmokeCondition", applyClick);
+  const committedStatus = workflow.indexOf("status.textContent?.startsWith(`Applied ${smokeRecipeName}.`)", applyWait);
+  const freshRename = workflow.indexOf("const renameRecipeButton = getRecipeActions(smokeRecipeName).rename", committedStatus);
+  assert.ok(applyClick >= 0 && applyWait > applyClick && committedStatus > applyWait && freshRename > committedStatus);
+  assert.doesNotMatch(workflow.slice(0, applyClick), /const renameRecipeButton\s*=/);
+  assert.match(
+    workflow,
+    /const renameDialogMounted = await waitForSmokeCondition[\s\S]*?document\.activeElement === input[\s\S]*?"Rename recipe"/,
+  );
+
+  for (const [startMarker, endMarker] of [
+    ["function getRecipeNameDialogControls", "try {"],
+    ["const getSaveRecipeButton", "const saveRecipeMounted"],
+    ["const getRecipeActions", "const restoredMounted"],
+    ["const getDeleteDialogControls", "const deleteDialogMounted"],
+    ["const getDuplicateButton", "const duplicateMounted"],
+    ["const getRemoveDuplicateButton", "const removeDuplicateMounted"],
+    ["const getApplySnapshotButton", "const snapshotMounted"],
+    ["const getFailureControls", "const failureMounted"],
+  ]) {
+    const getter = between(workflow, startMarker, endMarker);
+    assert.match(getter, /isMountedEnabledButton/);
+  }
+  assert.match(between(workflow, "const getRecipeActions", "const restoredMounted"), /row\?\.isConnected/);
+  assert.match(between(workflow, "const getDeleteDialogControls", "const deleteDialogMounted"), /dialog\?\.isConnected/);
+  assert.match(between(workflow, "const getFailureControls", "const failureMounted"), /diagnostics\?\.isConnected/);
+
+  assert.match(
+    workflow,
+    /const retryPassed = await waitForSmokeCondition[\s\S]*?runQueueButton\?\.isConnected[\s\S]*?!runQueueButton\.disabled[\s\S]*?document\.activeElement === runQueueButton/,
+  );
+  assert.match(workflow, /if \(!isMountedEnabledButton\(runQueueButton\)\)/);
 });
 
 test("user recipe management is accessible, persist-first, and explicit about privacy", async () => {
