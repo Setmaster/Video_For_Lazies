@@ -8,19 +8,27 @@ const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
 test("trim UI keeps preview synced to the selected start or end handle", async () => {
   const appPath = path.resolve(__dirname, "../src/App.tsx");
+  const handlePath = path.resolve(__dirname, "../src/components/TrimSliderHandle.tsx");
   const cssPath = path.resolve(__dirname, "../src/App.css");
   const raw = await fs.readFile(appPath, "utf8");
+  const handle = await fs.readFile(handlePath, "utf8");
   const css = await fs.readFile(cssPath, "utf8");
 
   assert.match(raw, /const \[activeTrimTarget, setActiveTrimTarget\] = useState<TrimFocusTarget>\("preview"\);/);
   assert.match(raw, /function focusTrimTarget\(target: Exclude<TrimFocusTarget, "preview">\)/);
   assert.match(raw, /function beginTrimHandleDrag\(target: Exclude<TrimFocusTarget, "preview">, event: ReactPointerEvent<HTMLButtonElement>\)/);
   assert.match(raw, /syncPreviewToTime\(nextTimeS, target, \{ pause: true \}\);/);
-  assert.match(raw, /onPointerDown=\{\(e\) => beginTrimHandleDrag\("start", e\)\}/);
-  assert.match(raw, /onPointerDown=\{\(e\) => beginTrimHandleDrag\("end", e\)\}/);
+  assert.match(raw, /onPointerDown=\{\(event\) => beginTrimHandleDrag\("start", event\)\}/);
+  assert.match(raw, /onPointerDown=\{\(event\) => beginTrimHandleDrag\("end", event\)\}/);
+  assert.match(handle, /role="slider"/);
+  assert.match(handle, /aria-valuemin=\{min\}/);
+  assert.match(handle, /aria-valuemax=\{max\}/);
+  assert.match(handle, /aria-valuenow=\{value\}/);
+  assert.match(handle, /aria-valuetext=\{valueText\}/);
   assert.match(raw, /Drag either trim handle or click Start\/End above to make the preview jump to that boundary\./);
   assert.match(raw, /ref=\{trimTimelineTrackRef\}/);
   assert.match(css, /\.vfl-trim-timeline-grab \{/);
+  assert.match(css, /width: 24px;\s*height: 24px;/s);
   assert.match(css, /\.vfl-trim-timeline-grab:hover:enabled \{\s*transform: translate\(-50%, -50%\) scale\(1\.04\);/s);
   assert.match(css, /\.vfl-trim-timeline-grab:active:enabled \{\s*transform: translate\(-50%, -50%\) scale\(0\.98\);/s);
   assert.doesNotMatch(raw, /vfl-trim-timeline-input-start/);
@@ -40,8 +48,10 @@ test("set start and set end use the remembered preview selection instead of the 
 
 test("trim UI exposes drag snap controls and compose keyboard shortcuts", async () => {
   const appPath = path.resolve(__dirname, "../src/App.tsx");
+  const handlePath = path.resolve(__dirname, "../src/components/TrimSliderHandle.tsx");
   const cssPath = path.resolve(__dirname, "../src/App.css");
   const raw = await fs.readFile(appPath, "utf8");
+  const handle = await fs.readFile(handlePath, "utf8");
   const css = await fs.readFile(cssPath, "utf8");
 
   assert.match(raw, /const TRIM_DRAG_SNAP_MAX_S = 60;/);
@@ -65,7 +75,9 @@ test("trim UI exposes drag snap controls and compose keyboard shortcuts", async 
   assert.match(raw, /Drag snap \(s\)/);
   assert.match(raw, /0 disables snapping\./);
   assert.match(raw, /never allows a value above the current clip length\./);
-  assert.match(raw, /Left\/Right nudges/);
+  assert.match(raw, /Arrow keys nudge/);
+  assert.match(handle, /resolveTrimSliderKey/);
+  assert.match(handle, /event\.preventDefault\(\);\s*event\.stopPropagation\(\);/s);
   assert.doesNotMatch(raw, /Fine tune selected point/);
   assert.doesNotMatch(raw, /Preview selected/);
   assert.doesNotMatch(raw, /vfl-trim-fine-tune/);

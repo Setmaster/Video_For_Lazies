@@ -1,4 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { pixelAspectToNormalizedRatio } from "../lib/accessibility";
 
 export type NormalizedRect = { x: number; y: number; w: number; h: number };
 export type VideoCropperHandle = {
@@ -67,17 +68,18 @@ function cornerFromPoint(
   x: number,
   y: number,
   rect: NormalizedRect,
-  threshold: number,
+  thresholdX: number,
+  thresholdY: number,
 ): "nw" | "ne" | "sw" | "se" | null {
   const left = rect.x;
   const top = rect.y;
   const right = rect.x + rect.w;
   const bottom = rect.y + rect.h;
 
-  const nearLeft = Math.abs(x - left) <= threshold;
-  const nearRight = Math.abs(x - right) <= threshold;
-  const nearTop = Math.abs(y - top) <= threshold;
-  const nearBottom = Math.abs(y - bottom) <= threshold;
+  const nearLeft = Math.abs(x - left) <= thresholdX;
+  const nearRight = Math.abs(x - right) <= thresholdX;
+  const nearTop = Math.abs(y - top) <= thresholdY;
+  const nearBottom = Math.abs(y - bottom) <= thresholdY;
 
   if (nearLeft && nearTop) return "nw";
   if (nearRight && nearTop) return "ne";
@@ -90,20 +92,21 @@ function edgeFromPoint(
   x: number,
   y: number,
   rect: NormalizedRect,
-  threshold: number,
+  thresholdX: number,
+  thresholdY: number,
 ): "n" | "s" | "e" | "w" | null {
   const left = rect.x;
   const top = rect.y;
   const right = rect.x + rect.w;
   const bottom = rect.y + rect.h;
 
-  const nearLeft = Math.abs(x - left) <= threshold;
-  const nearRight = Math.abs(x - right) <= threshold;
-  const nearTop = Math.abs(y - top) <= threshold;
-  const nearBottom = Math.abs(y - bottom) <= threshold;
+  const nearLeft = Math.abs(x - left) <= thresholdX;
+  const nearRight = Math.abs(x - right) <= thresholdX;
+  const nearTop = Math.abs(y - top) <= thresholdY;
+  const nearBottom = Math.abs(y - bottom) <= thresholdY;
 
-  const withinX = x >= left - threshold && x <= right + threshold;
-  const withinY = y >= top - threshold && y <= bottom + threshold;
+  const withinX = x >= left - thresholdX && x <= right + thresholdX;
+  const withinY = y >= top - thresholdY && y <= bottom + thresholdY;
 
   if (nearLeft && withinY) return "w";
   if (nearRight && withinY) return "e";
@@ -249,6 +252,14 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     [containerSize, videoSize],
   );
 
+  const normalizedAspectRatio = useMemo(
+    () =>
+      aspect.locked && aspect.ratio
+        ? pixelAspectToNormalizedRatio(aspect.ratio, content.width, content.height)
+        : null,
+    [aspect.locked, aspect.ratio, content.height, content.width],
+  );
+
   const rectPx = useMemo(() => {
     return {
       left: content.x + rect.x * content.width,
@@ -279,8 +290,9 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     const container = containerEl.getBoundingClientRect();
     const p = toNorm(e.clientX, e.clientY, container, content);
 
-    const threshold = 10 / Math.max(1, content.width);
-    const corner = cornerFromPoint(p.x, p.y, rect, threshold);
+    const thresholdX = 12 / Math.max(1, content.width);
+    const thresholdY = 12 / Math.max(1, content.height);
+    const corner = cornerFromPoint(p.x, p.y, rect, thresholdX, thresholdY);
 
     if (corner) {
       dragRef.current = { kind: "resize", corner, anchor: rect };
@@ -290,7 +302,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
       return;
     }
 
-    const edge = edgeFromPoint(p.x, p.y, rect, threshold);
+    const edge = edgeFromPoint(p.x, p.y, rect, thresholdX, thresholdY);
     if (edge) {
       dragRef.current = { kind: "resize-edge", edge, anchor: rect };
       setCursor(cursorForEdge(edge));
@@ -323,13 +335,14 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     const p = toNorm(e.clientX, e.clientY, container, content);
 
     if (mode.kind === "none") {
-      const threshold = 10 / Math.max(1, content.width);
-      const corner = cornerFromPoint(p.x, p.y, rect, threshold);
+      const thresholdX = 12 / Math.max(1, content.width);
+      const thresholdY = 12 / Math.max(1, content.height);
+      const corner = cornerFromPoint(p.x, p.y, rect, thresholdX, thresholdY);
       if (corner) {
         setCursor(cursorForCorner(corner));
         return;
       }
-      const edge = edgeFromPoint(p.x, p.y, rect, threshold);
+      const edge = edgeFromPoint(p.x, p.y, rect, thresholdX, thresholdY);
       if (edge) {
         setCursor(cursorForEdge(edge));
         return;
@@ -354,8 +367,8 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     }
 
     if (mode.kind === "draw") {
-      if (aspect.locked && aspect.ratio) {
-        const d = applyAspect({ x: mode.anchorX, y: mode.anchorY }, p, aspect.ratio);
+      if (normalizedAspectRatio) {
+        const d = applyAspect({ x: mode.anchorX, y: mode.anchorY }, p, normalizedAspectRatio);
         setRect(normalizeRect({ x: mode.anchorX, y: mode.anchorY, w: d.w, h: d.h }));
         return;
       }
@@ -364,8 +377,8 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     }
 
     if (mode.kind === "resize") {
-      if (aspect.locked && aspect.ratio) {
-        setRect(resizeWithAspect(mode.corner, mode.anchor, p.x, p.y, aspect.ratio));
+      if (normalizedAspectRatio) {
+        setRect(resizeWithAspect(mode.corner, mode.anchor, p.x, p.y, normalizedAspectRatio));
         return;
       }
 
@@ -391,7 +404,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     }
 
     if (mode.kind === "resize-edge") {
-      if (aspect.locked && aspect.ratio) {
+      if (normalizedAspectRatio) {
         const a = mode.anchor;
         const x1 = a.x;
         const y1 = a.y;
@@ -412,7 +425,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
           }
         })();
         setCursor(cursorForCorner(corner));
-        setRect(resizeWithAspect(corner, mode.anchor, p.x, p.y, aspect.ratio));
+        setRect(resizeWithAspect(corner, mode.anchor, p.x, p.y, normalizedAspectRatio));
         return;
       }
 
@@ -593,6 +606,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
           className="vfl-video"
           ref={videoRef}
           src={src}
+          aria-label="Video preview"
           style={colorFilter ? { filter: colorFilter } : undefined}
           preload="auto"
           playsInline
@@ -600,6 +614,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
         {cropEnabled ? (
           <div
             className="vfl-overlay"
+            aria-hidden="true"
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}

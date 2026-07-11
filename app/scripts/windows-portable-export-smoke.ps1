@@ -32,6 +32,7 @@ function New-SmokeScreenshotPath {
 }
 
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 
 Add-Type @"
 using System;
@@ -128,6 +129,49 @@ function Get-JsonFileOrNull {
   }
 }
 
+function Send-SmokeKeySequence {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string[]]$Keys
+  )
+
+  $handle = [IntPtr]::Zero
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $Process.Refresh()
+    $handle = $Process.MainWindowHandle
+    if ($handle -and $handle -ne [IntPtr]::Zero) {
+      break
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  if (-not $handle -or $handle -eq [IntPtr]::Zero) {
+    throw "Portable export smoke could not find the app window for real keyboard input."
+  }
+
+  [void][VflPortableExportSmokeNative]::ShowWindowAsync($handle, 9)
+  $foreground = $false
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    if ([VflPortableExportSmokeNative]::SetForegroundWindow($handle)) {
+      $foreground = $true
+      break
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  if (-not $foreground) {
+    $shell = New-Object -ComObject WScript.Shell
+    $foreground = $shell.AppActivate($Process.Id)
+  }
+  if (-not $foreground) {
+    throw "Portable export smoke could not foreground the app for real keyboard input."
+  }
+
+  Start-Sleep -Milliseconds 180
+  foreach ($key in $Keys) {
+    [System.Windows.Forms.SendKeys]::SendWait($key)
+    Start-Sleep -Milliseconds 180
+  }
+}
+
 $portableRoot = [System.IO.Path]::GetFullPath($PortableDir)
 $exePath = Join-Path $portableRoot "Video_For_Lazies.exe"
 $ffmpegPath = Join-Path $portableRoot "ffmpeg-sidecar\\ffmpeg.exe"
@@ -208,7 +252,24 @@ if (-not $process) {
 
 $lastStatus = $null
 $lastStageName = $null
-$requiredStages = @("input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding", "success")
+$sentKeyboardStages = @{}
+$requiredStages = @(
+  "input-applied",
+  "probe-ready",
+  "preview-ready",
+  "keyboard-trim-ready",
+  "keyboard-trim-incremented",
+  "keyboard-trim-complete",
+  "keyboard-crop-ready",
+  "keyboard-crop-complete",
+  "keyboard-modal-ready",
+  "keyboard-modal-open",
+  "keyboard-complete",
+  "accessibility-ready",
+  "interaction-ready",
+  "encoding",
+  "success"
+)
 
 try {
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -221,6 +282,30 @@ try {
       if ($status.stage -ne $lastStageName) {
         Write-Host ("Portable export smoke stage: {0}" -f $status.stage)
         $lastStageName = $status.stage
+      }
+      if (-not $sentKeyboardStages.ContainsKey($status.stage)) {
+        switch ($status.stage) {
+          "keyboard-trim-ready" {
+            $sentKeyboardStages[$status.stage] = $true
+            Send-SmokeKeySequence -Process $process -Keys @("{RIGHT}")
+          }
+          "keyboard-trim-incremented" {
+            $sentKeyboardStages[$status.stage] = $true
+            Send-SmokeKeySequence -Process $process -Keys @("{LEFT}", "{TAB}")
+          }
+          "keyboard-crop-ready" {
+            $sentKeyboardStages[$status.stage] = $true
+            Send-SmokeKeySequence -Process $process -Keys @("{UP}")
+          }
+          "keyboard-modal-ready" {
+            $sentKeyboardStages[$status.stage] = $true
+            Send-SmokeKeySequence -Process $process -Keys @("{ENTER}")
+          }
+          "keyboard-modal-open" {
+            $sentKeyboardStages[$status.stage] = $true
+            Send-SmokeKeySequence -Process $process -Keys @("{ESC}")
+          }
+        }
       }
       if ($status.stage -eq "success") {
         break

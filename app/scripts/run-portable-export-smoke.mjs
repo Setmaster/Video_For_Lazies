@@ -8,7 +8,23 @@ import { ffmpegSidecarResourceTarget, getPortableOutputDir } from "./ffmpegBundl
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const __filename = url.fileURLToPath(import.meta.url);
-const requiredSmokeStages = ["input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding", "success"];
+const requiredSmokeStages = [
+  "input-applied",
+  "probe-ready",
+  "preview-ready",
+  "keyboard-trim-ready",
+  "keyboard-trim-incremented",
+  "keyboard-trim-complete",
+  "keyboard-crop-ready",
+  "keyboard-crop-complete",
+  "keyboard-modal-ready",
+  "keyboard-modal-open",
+  "keyboard-complete",
+  "accessibility-ready",
+  "interaction-ready",
+  "encoding",
+  "success",
+];
 const supportedSmokeOutputFormats = new Set(["mp4", "webm", "mp3"]);
 const codecFixtures = Object.freeze({
   "vp8-vorbis-webm": Object.freeze({
@@ -425,7 +441,9 @@ async function runLinuxPortableExportSmoke({
       throw new Error("Portable export smoke reported success without any persisted stageHistory.");
     }
 
-    const linuxRequiredSmokeStages = requiredSmokeStages.filter((stage) => stage !== "preview-ready");
+    const linuxRequiredSmokeStages = requiredSmokeStages.filter(
+      (stage) => stage !== "preview-ready" && stage !== "accessibility-ready" && !stage.startsWith("keyboard-"),
+    );
     const missingStages = linuxRequiredSmokeStages.filter((stage) => !stageHistory.includes(stage));
     if (missingStages.length > 0) {
       throw new Error(`Portable export smoke missed required app stages: ${missingStages.join(", ")}. Saw: ${stageHistory.join(" -> ")}`);

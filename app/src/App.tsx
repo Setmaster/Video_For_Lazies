@@ -5,6 +5,9 @@ import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { confirm as confirmDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { CropPixelFields } from "./components/CropPixelFields";
+import { ModalDialog } from "./components/ModalDialog";
+import { TrimSliderHandle } from "./components/TrimSliderHandle";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
 import type {
   AppSmokeConfig,
@@ -49,6 +52,7 @@ import {
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import { EXPORT_RECIPES, findMatchingExportRecipe, normalizeRecipeResizeSettings, type ExportRecipe } from "./lib/exportRecipes";
 import { buildPreviewColorFilter } from "./lib/previewFilter";
+import { cropRectToPixels } from "./lib/accessibility";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
@@ -101,7 +105,23 @@ const TRIM_FINE_NUDGE_S = 0.1;
 const TRIM_COARSE_NUDGE_S = 1;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
-const SMOKE_STAGE_ORDER = ["detected", "input-applied", "probe-ready", "preview-ready", "interaction-ready", "encoding"] as const;
+const SMOKE_STAGE_ORDER = [
+  "detected",
+  "input-applied",
+  "probe-ready",
+  "preview-ready",
+  "keyboard-trim-ready",
+  "keyboard-trim-incremented",
+  "keyboard-trim-complete",
+  "keyboard-crop-ready",
+  "keyboard-crop-complete",
+  "keyboard-modal-ready",
+  "keyboard-modal-open",
+  "keyboard-complete",
+  "accessibility-ready",
+  "interaction-ready",
+  "encoding",
+] as const;
 const APP_VERSION = "1.9.1";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
@@ -161,6 +181,20 @@ type ComposeShortcutAction =
 type StartEncodeResult =
   | { ok: true; jobId: number }
   | { ok: false; message: string };
+
+type SmokeAccessibilityResult =
+  | { ok: true; message: string }
+  | { ok: false; message: string };
+
+type SmokeInteractionResult =
+  | { ok: false; message: string }
+  | {
+      ok: true;
+      message: string;
+      trimStartS: number;
+      trimEndS: number;
+      expectedDurationS: number;
+    };
 
 type LastExportResult = {
   outputPath: string;
@@ -243,6 +277,15 @@ function waitMs(ms: number) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+async function waitForSmokeCondition(check: () => boolean, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await waitMs(40);
+  }
+  return check();
 }
 
 function smokeStageRank(stage: string | null) {
@@ -456,6 +499,7 @@ function App() {
   // update; the app applies it immediately and restarts on its own.
   const [elevatedUpdateRun, setElevatedUpdateRun] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const modalOpen = elevatedUpdateRun || aboutOpen;
 
   const jobIdRef = useRef<number | null>(null);
   const attemptIdRef = useRef(Math.floor(Date.now() * 1000));
@@ -471,6 +515,7 @@ function App() {
   const exportQueueRef = useRef<ExportQueueItem[]>([]);
   const queueRunningRef = useRef(false);
   const queueActiveItemIdRef = useRef<number | null>(null);
+  const modalOpenRef = useRef(false);
   const queueIdRef = useRef(1);
   const smokeConfigRef = useRef<AppSmokeConfig | null>(null);
   const smokeStageRef = useRef<string | null>(null);
@@ -580,17 +625,10 @@ function App() {
   }, [activeTrimTarget]);
 
   useEffect(() => {
-    if (!aboutOpen) return;
-
-    function handleKeydown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        setAboutOpen(false);
-      }
-    }
-
-    window.addEventListener("keydown", handleKeydown);
-    return () => window.removeEventListener("keydown", handleKeydown);
-  }, [aboutOpen]);
+    modalOpenRef.current = modalOpen;
+    if (modalOpen) setDragActive(false);
+    if (elevatedUpdateRun && aboutOpen) setAboutOpen(false);
+  }, [aboutOpen, elevatedUpdateRun, modalOpen]);
 
   useEffect(() => {
     if (activeTrimTarget === "preview" || previewPlaying) {
@@ -1178,21 +1216,24 @@ function App() {
   const trimDragSnapInputMaxS = probe ? Math.min(TRIM_DRAG_SNAP_MAX_S, Math.max(0, Math.floor(probe.durationS))) : TRIM_DRAG_SNAP_MAX_S;
   const trimDragSnapIntervalS = Number(normalizeTrimDragSnapInput(trimDragSnapS, probe?.durationS ?? null));
 
-  const cropSummary = useMemo(() => {
-    if (!probe || !cropEnabled) return null;
+  const cropPixelRect = useMemo(
+    () => (probe ? cropRectToPixels(cropRect, probe.width, probe.height) : null),
+    [cropRect, probe],
+  );
 
-    const cropPx = {
-      x: Math.round(cropRect.x * probe.width),
-      y: Math.round(cropRect.y * probe.height),
-      width: Math.round(cropRect.w * probe.width),
-      height: Math.round(cropRect.h * probe.height),
-    };
+  const cropSummary = useMemo(() => {
+    if (!probe || !cropEnabled || !cropPixelRect) return null;
 
     const isFull =
-      cropPx.x <= 1 && cropPx.y <= 1 && cropPx.width >= probe.width - 2 && cropPx.height >= probe.height - 2;
+      cropPixelRect.x <= 1 &&
+      cropPixelRect.y <= 1 &&
+      cropPixelRect.width >= probe.width - 2 &&
+      cropPixelRect.height >= probe.height - 2;
 
-    return isFull ? "Full frame selected." : `${cropPx.width}x${cropPx.height} at ${cropPx.x},${cropPx.y}.`;
-  }, [probe, cropEnabled, cropRect]);
+    return isFull
+      ? "Full frame selected."
+      : `${cropPixelRect.width}x${cropPixelRect.height} at ${cropPixelRect.x},${cropPixelRect.y}.`;
+  }, [probe, cropEnabled, cropPixelRect]);
 
   const inputSummary = useMemo(() => {
     if (!inputPath) return "Drop a video anywhere in the window or browse for one below.";
@@ -1705,9 +1746,11 @@ function App() {
     if (!hasTauriRuntime()) return;
 
     const cleanupWindowDrop = bindWindowFileDrop(window, {
-      isDropAllowed: () => jobIdRef.current === null && pendingEncodeRef.current === null,
+      isDropAllowed: () => !modalOpenRef.current && jobIdRef.current === null && pendingEncodeRef.current === null,
       onDragActiveChange: setDragActive,
-      onPathsDropped: handleDroppedPaths,
+      onPathsDropped: (paths) => {
+        if (!modalOpenRef.current) handleDroppedPaths(paths);
+      },
     });
 
     let unlisten: (() => void) | null = null;
@@ -1719,7 +1762,7 @@ function App() {
         unlisten = await getCurrentWebviewWindow().onDragDropEvent((event) => {
           const p = event.payload;
           if (p.type === "enter" || p.type === "over") {
-            if (jobIdRef.current === null && pendingEncodeRef.current === null) {
+            if (!modalOpenRef.current && jobIdRef.current === null && pendingEncodeRef.current === null) {
               setDragActive(true);
             }
             return;
@@ -1729,7 +1772,7 @@ function App() {
             return;
           }
           if (p.type !== "drop") return;
-          handleDroppedPaths(p.paths);
+          if (!modalOpenRef.current) handleDroppedPaths(p.paths);
         });
       } catch (e) {
         console.warn("Failed to register drag-drop handler:", e);
@@ -2336,14 +2379,7 @@ function App() {
     if (endS !== null && endS <= startS) throw new Error("Trim end (s) must be greater than trim start.");
     const trim = startS > 0 || endS !== null ? { startS, endS } : null;
 
-    const cropPx = cropEnabled
-      ? {
-          x: Math.round(cropRect.x * probe.width),
-          y: Math.round(cropRect.y * probe.height),
-          width: Math.round(cropRect.w * probe.width),
-          height: Math.round(cropRect.h * probe.height),
-        }
-      : null;
+    const cropPx = cropEnabled ? cropRectToPixels(cropRect, probe.width, probe.height) : null;
     const crop =
       cropPx &&
       !(cropPx.x <= 1 && cropPx.y <= 1 && cropPx.width >= probe.width - 2 && cropPx.height >= probe.height - 2)
@@ -2969,7 +3005,7 @@ function App() {
   }
 
   const handleComposeShortcutKeydown = useEffectEvent((event: KeyboardEvent) => {
-    if (!inputPath || aboutOpen) return;
+    if (!inputPath || modalOpen) return;
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
     if (blocksComposeShortcutTarget(event.target)) return;
 
@@ -3011,10 +3047,278 @@ function App() {
     };
   }, [handleComposeShortcutKeydown]);
 
-  async function runSmokeInteractionChecks() {
+  async function runSmokeAccessibilityChecks(): Promise<SmokeAccessibilityResult> {
+    if (!probe || !previewReady || !previewMediaReady) {
+      return { ok: false, message: "Accessibility smoke ran before the preview was ready." };
+    }
+
+    setOpenCards((cards) => ({ ...cards, crop: true }));
+    setCropEnabled(true);
+    setCropRect({ x: 0.08, y: 0.08, w: 0.84, h: 0.84 });
+    setCropDetectHint("Accessibility smoke crop status.");
+    await waitMs(220);
+
+    const startSlider = document.getElementById("vfl-trim-start-slider");
+    const endSlider = document.getElementById("vfl-trim-end-slider");
+    if (!(startSlider instanceof HTMLButtonElement) || !(endSlider instanceof HTMLButtonElement)) {
+      return { ok: false, message: "Accessibility smoke could not find both mounted trim sliders." };
+    }
+
+    for (const [slider, label] of [[startSlider, "Trim start"], [endSlider, "Trim end"]] as const) {
+      if (slider.getAttribute("role") !== "slider" || slider.getAttribute("aria-label") !== label) {
+        return { ok: false, message: `Accessibility smoke found incomplete role or name semantics for ${label}.` };
+      }
+      for (const attribute of ["aria-valuemin", "aria-valuemax", "aria-valuenow", "aria-valuetext"]) {
+        if (!slider.hasAttribute(attribute)) {
+          return { ok: false, message: `Accessibility smoke found ${label} without ${attribute}.` };
+        }
+      }
+      const bounds = slider.getBoundingClientRect();
+      if (bounds.width < 24 || bounds.height < 24) {
+        return {
+          ok: false,
+          message: `Accessibility smoke found ${label} target ${bounds.width.toFixed(1)}x${bounds.height.toFixed(1)} instead of at least 24x24 CSS pixels.`,
+        };
+      }
+    }
+
+    function dispatchKey(target: HTMLElement | Document | Window, key: string, options: { shiftKey?: boolean; code?: string } = {}) {
+      const event = new KeyboardEvent("keydown", {
+        key,
+        code: options.code ?? key,
+        shiftKey: options.shiftKey ?? false,
+        bubbles: true,
+        cancelable: true,
+      });
+      target.dispatchEvent(event);
+      return event;
+    }
+
+    startSlider.focus();
+    const beforeStart = Number(startSlider.getAttribute("aria-valuenow"));
+    await reportSmokeStatus("keyboard-trim-ready", {
+      message: "Waiting for real packaged keyboard input: Right on Trim start.",
+    });
+    const realTrimIncrementPassed = await waitForSmokeCondition(() => {
+      const currentStart = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
+      return Math.abs(currentStart - (beforeStart + TRIM_FINE_NUDGE_S)) <= 0.001;
+    });
+    if (!realTrimIncrementPassed) {
+      return { ok: false, message: "Accessibility smoke did not receive exactly one real Right step on Trim start." };
+    }
+    await reportSmokeStatus("keyboard-trim-incremented", {
+      message: "Real packaged Right moved Trim start by exactly 0.1s; waiting for Left then Tab.",
+    });
+    const realTrimKeysPassed = await waitForSmokeCondition(() => {
+      const currentStart = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
+      return Math.abs(currentStart - beforeStart) <= 0.001 && document.activeElement?.id === "vfl-trim-end-slider";
+    });
+    if (!realTrimKeysPassed) {
+      return { ok: false, message: "Accessibility smoke did not receive the real Right, Left, Tab trim keyboard sequence." };
+    }
+    await reportSmokeStatus("keyboard-trim-complete", {
+      message: "Real packaged trim keyboard sequence completed with the original value restored and focus on Trim end.",
+    });
+
+    startSlider.focus();
+    const startMaximum = Number(startSlider.getAttribute("aria-valuemax"));
+    const arrowEvent = dispatchKey(startSlider, "ArrowRight");
+    await waitMs(160);
+    const afterArrow = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
+    const expectedAfterArrow = Math.min(startMaximum, beforeStart + TRIM_FINE_NUDGE_S);
+    if (!arrowEvent.defaultPrevented || Math.abs(afterArrow - expectedAfterArrow) > 0.001) {
+      return {
+        ok: false,
+        message: `Accessibility smoke expected one Trim start ArrowRight step (${beforeStart} -> ${expectedAfterArrow}) but saw ${afterArrow}.`,
+      };
+    }
+
+    const arrowLeftEvent = dispatchKey(startSlider, "ArrowLeft");
+    await waitMs(160);
+    const afterArrowLeft = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
+    if (!arrowLeftEvent.defaultPrevented || Math.abs(afterArrowLeft - beforeStart) > 0.001) {
+      return {
+        ok: false,
+        message: `Accessibility smoke expected one Trim start ArrowLeft step back to ${beforeStart} but saw ${afterArrowLeft}.`,
+      };
+    }
+
+    for (const key of ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "End", "Home"]) {
+      const event = dispatchKey(document.getElementById("vfl-trim-start-slider") as HTMLElement, key);
+      if (!event.defaultPrevented) {
+        return { ok: false, message: `Accessibility smoke found unhandled Trim start key ${key}.` };
+      }
+      await waitMs(80);
+    }
+
+    const homeValue = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
+    if (Math.abs(homeValue) > 0.001) {
+      return { ok: false, message: `Accessibility smoke expected Home to move Trim start to 0s, saw ${homeValue}.` };
+    }
+
+    const cropInputs = Array.from(document.querySelectorAll<HTMLInputElement>("[data-crop-field]"));
+    if (cropInputs.length !== 4 || cropInputs.some((input) => !input.labels?.length || input.type !== "number")) {
+      return { ok: false, message: "Accessibility smoke did not find four labelled numeric crop fields." };
+    }
+    const cropX = document.getElementById("vfl-crop-x");
+    if (!(cropX instanceof HTMLInputElement)) {
+      return { ok: false, message: "Accessibility smoke could not find the Crop X input." };
+    }
+    cropX.focus();
+    const cropXBefore = Number(cropX.value);
+    await reportSmokeStatus("keyboard-crop-ready", {
+      message: "Waiting for real packaged keyboard input: Arrow Up on Crop X.",
+    });
+    const realCropKeyPassed = await waitForSmokeCondition(() => {
+      const current = Number((document.getElementById("vfl-crop-x") as HTMLInputElement | null)?.value);
+      return current === cropXBefore + 1;
+    });
+    if (!realCropKeyPassed) {
+      return { ok: false, message: `Accessibility smoke did not receive the real Crop X Arrow Up step from ${cropXBefore}.` };
+    }
+    await reportSmokeStatus("keyboard-crop-complete", {
+      message: `Real packaged crop keyboard sequence moved Crop X from ${cropXBefore} to ${cropXBefore + 1}.`,
+    });
+
+    const currentCropX = document.getElementById("vfl-crop-x");
+    if (!(currentCropX instanceof HTMLInputElement)) {
+      return { ok: false, message: "Accessibility smoke lost the Crop X input after real keyboard input." };
+    }
+    const cropKeyEvent = dispatchKey(currentCropX, "ArrowDown");
+    await waitMs(160);
+    const cropXAfter = Number((document.getElementById("vfl-crop-x") as HTMLInputElement | null)?.value);
+    if (!cropKeyEvent.defaultPrevented || cropXAfter !== cropXBefore) {
+      return { ok: false, message: `Accessibility smoke could not restore Crop X by its mounted ArrowDown handler (${cropXBefore + 1} -> ${cropXAfter}).` };
+    }
+
+    const cropStatus = document.getElementById("vfl-crop-detect-status");
+    if (
+      cropStatus?.getAttribute("role") !== "status" ||
+      cropStatus.getAttribute("aria-live") !== "polite" ||
+      cropStatus.getAttribute("aria-atomic") !== "true" ||
+      !cropStatus.textContent?.includes("Accessibility smoke crop status.")
+    ) {
+      return { ok: false, message: "Accessibility smoke found incomplete crop live-status semantics." };
+    }
+
+    const aboutTrigger = document.querySelector<HTMLButtonElement>('button[aria-label="About & updates"]');
+    if (!aboutTrigger) {
+      return { ok: false, message: "Accessibility smoke could not find the About trigger." };
+    }
+    aboutTrigger.focus();
+    await reportSmokeStatus("keyboard-modal-ready", {
+      message: "Waiting for real packaged keyboard input: Enter on About & updates.",
+    });
+    const realModalOpenPassed = await waitForSmokeCondition(() => {
+      const dialog = document.querySelector<HTMLElement>('.vfl-about-modal[role="dialog"]');
+      const close = dialog?.querySelector<HTMLButtonElement>('button[aria-label="Close about dialog"]');
+      return Boolean(dialog && close && document.activeElement === close);
+    });
+    if (!realModalOpenPassed) {
+      return { ok: false, message: "Accessibility smoke did not receive real Enter activation for About." };
+    }
+    await reportSmokeStatus("keyboard-modal-open", {
+      message: "Real packaged Enter opened About and moved focus to Close; waiting for real Escape.",
+    });
+    const realModalClosePassed = await waitForSmokeCondition(
+      () => !document.querySelector('.vfl-about-modal[role="dialog"]') && document.activeElement === aboutTrigger,
+    );
+    if (!realModalClosePassed) {
+      return { ok: false, message: "Accessibility smoke did not receive real Escape close with About trigger restoration." };
+    }
+    await reportSmokeStatus("keyboard-complete", {
+      message: "Real packaged keyboard flow passed for trim, crop, and About open/close focus restoration.",
+    });
+
+    aboutTrigger.click();
+    await waitMs(180);
+
+    const aboutDialog = document.querySelector<HTMLElement>('.vfl-about-modal[role="dialog"]');
+    const root = document.getElementById("root");
+    const closeButton = aboutDialog?.querySelector<HTMLButtonElement>('button[aria-label="Close about dialog"]');
+    const lastButton = aboutDialog?.querySelectorAll<HTMLButtonElement>("button:not([disabled])").item(
+      Math.max(0, (aboutDialog?.querySelectorAll<HTMLButtonElement>("button:not([disabled])").length ?? 1) - 1),
+    );
+    if (
+      !aboutDialog ||
+      aboutDialog.getAttribute("aria-modal") !== "true" ||
+      !root?.inert ||
+      root.getAttribute("aria-hidden") !== "true" ||
+      !closeButton ||
+      document.activeElement !== closeButton ||
+      !lastButton
+    ) {
+      return { ok: false, message: "Accessibility smoke found incomplete About modal focus or background isolation." };
+    }
+
+    const updateCheckButton = Array.from(aboutDialog.querySelectorAll<HTMLButtonElement>("button")).find((button) =>
+      button.textContent?.includes("Check for updates"),
+    );
+    if (!updateCheckButton) {
+      return { ok: false, message: "Accessibility smoke could not find the About update-check control." };
+    }
+    updateCheckButton.focus();
+    setManualUpdateBusy(true);
+    await waitMs(100);
+    if (!aboutDialog.contains(document.activeElement)) {
+      return { ok: false, message: "Accessibility smoke lost modal focus when the focused update-check control became disabled." };
+    }
+    setManualUpdateBusy(false);
+    await waitMs(100);
+
+    lastButton.focus();
+    const tabEvent = dispatchKey(lastButton, "Tab");
+    await waitMs(80);
+    if (!tabEvent.defaultPrevented || document.activeElement !== closeButton) {
+      return { ok: false, message: "Accessibility smoke could not wrap Tab from the last About control to Close." };
+    }
+    closeButton.focus();
+    const shiftTabEvent = dispatchKey(closeButton, "Tab", { shiftKey: true });
+    await waitMs(80);
+    if (!shiftTabEvent.defaultPrevented || document.activeElement !== lastButton) {
+      return { ok: false, message: "Accessibility smoke could not wrap Shift+Tab from Close to the last About control." };
+    }
+
+    const previewBeforeBlockedShortcut = previewTimeRef.current;
+    dispatchKey(window, "ArrowRight");
+    await waitMs(80);
+    if (Math.abs(previewTimeRef.current - previewBeforeBlockedShortcut) > 0.001) {
+      return { ok: false, message: "Accessibility smoke found a compose shortcut changing the preview behind About." };
+    }
+
+    const escapeEvent = dispatchKey(document, "Escape");
+    await waitMs(180);
+    if (
+      !escapeEvent.defaultPrevented ||
+      document.querySelector('.vfl-about-modal[role="dialog"]') ||
+      root?.inert ||
+      root?.getAttribute("aria-hidden") === "true" ||
+      document.activeElement !== aboutTrigger
+    ) {
+      return { ok: false, message: "Accessibility smoke found incomplete About Escape close or trigger-focus restoration." };
+    }
+
+    setCropDetectHint(null);
+    setTrimStart("0");
+    setTrimEnd("");
+    await waitMs(160);
+    await reportSmokeStatus("accessibility-ready", {
+      message: "Mounted accessibility checks passed for crop fields, trim sliders, live status, modal focus containment, background isolation, and focus restoration.",
+    });
+
+    return {
+      ok: true,
+      message: "Mounted accessibility checks passed.",
+    };
+  }
+
+  async function runSmokeInteractionChecks(): Promise<SmokeInteractionResult> {
     if (!probe || !previewReady || !previewMediaReady) {
       return { ok: false, message: "Packaged app smoke tried interaction checks before the preview was ready." };
     }
+
+    const accessibilityResult = await runSmokeAccessibilityChecks();
+    if (!accessibilityResult.ok) return accessibilityResult;
 
     syncPreviewToTime(0.5, "preview", { pause: true });
     await waitMs(160);
@@ -3118,7 +3422,7 @@ function App() {
 
     return {
       ok: true,
-      message: `Trim shortcuts kept start at ${afterStartShortcut.start.toFixed(2)}s, end at ${afterSelectedEndNudge.end.toFixed(2)}s, and crop-enabled playback advanced from ${startTime.toFixed(2)}s to ${advancedTime.toFixed(2)}s.`,
+      message: `Accessibility checks passed; trim shortcuts kept start at ${afterStartShortcut.start.toFixed(2)}s, end at ${afterSelectedEndNudge.end.toFixed(2)}s, and crop-enabled playback advanced from ${startTime.toFixed(2)}s to ${advancedTime.toFixed(2)}s.`,
       trimStartS: afterStartShortcut.start,
       trimEndS: afterSelectedEndNudge.end,
       expectedDurationS: Math.max(0, afterSelectedEndNudge.end - afterStartShortcut.start),
@@ -3216,43 +3520,46 @@ function App() {
       : null;
   const selectedTrimBoundary = activeTrimTarget === "preview" ? null : activeTrimTarget;
   const trimShortcutHint = selectedTrimBoundary
-    ? `Left/Right nudges ${formatTrimTargetLabel(selectedTrimBoundary)} by 0.1s. Shift uses 1s, [ sets Start, ] sets End, and Space plays.`
-    : "Click Start or End above to select that boundary. Left/Right nudges the preview by 0.1s, Shift uses 1s, [ sets Start, ] sets End, and Space plays.";
+    ? `Arrow keys nudge ${formatTrimTargetLabel(selectedTrimBoundary)} by 0.1s. Shift or Page Up/Down uses 1s; Home/End moves to the limit. [ sets Start, ] sets End, and Space plays.`
+    : "Select Start or End to edit that boundary. Arrow keys nudge by 0.1s, Shift uses 1s, [ sets Start, ] sets End, and Space plays.";
 
   return (
     <div className="vfl-app">
-      {dragActive && jobId === null ? (
+      {dragActive && jobId === null && !modalOpen ? (
         <div className="vfl-drop-overlay" aria-hidden="true">
           <div className="vfl-drop-overlay-card">Drop a video to open</div>
         </div>
       ) : null}
       {elevatedUpdateRun ? (
-        <div className="vfl-modal-backdrop" role="presentation">
-          <div className="vfl-elevated-update-card" role="alertdialog" aria-live="assertive" aria-label="Installing update">
-            <div className="vfl-about-title">Installing update</div>
-            <div className="vfl-muted">
-              {updateBusy
-                ? updateStatus ?? "Installing the update with administrator permission. The app restarts automatically."
-                : updateStatus ?? "Installing the update with administrator permission."}
-            </div>
-            {!updateBusy ? (
-              <div className="vfl-actions">
-                <button onClick={() => void applyUpdate()}>Try again</button>
-                <button onClick={() => setElevatedUpdateRun(false)}>Continue without updating</button>
-              </div>
-            ) : null}
+        <ModalDialog
+          role="alertdialog"
+          className="vfl-elevated-update-card"
+          labelledBy="vfl-elevated-update-title"
+          describedBy="vfl-elevated-update-status"
+          initialFocus={updateBusy ? "container" : "first"}
+          onRequestClose={updateBusy ? undefined : () => setElevatedUpdateRun(false)}
+        >
+          <div className="vfl-about-title" id="vfl-elevated-update-title">Installing update</div>
+          <div className="vfl-muted" id="vfl-elevated-update-status" role="status" aria-live="assertive" aria-atomic="true">
+            {updateBusy
+              ? updateStatus ?? "Installing the update with administrator permission. The app restarts automatically."
+              : updateStatus ?? "Installing the update with administrator permission."}
           </div>
-        </div>
-      ) : null}
-      {aboutOpen ? (
-        <div className="vfl-modal-backdrop" role="presentation" onClick={() => setAboutOpen(false)}>
-          <div
-            className="vfl-about-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="vfl-about-title"
-            onClick={(event) => event.stopPropagation()}
-          >
+          {!updateBusy ? (
+            <div className="vfl-actions">
+              <button onClick={() => void applyUpdate()}>Try again</button>
+              <button onClick={() => setElevatedUpdateRun(false)}>Continue without updating</button>
+            </div>
+          ) : null}
+        </ModalDialog>
+      ) : aboutOpen ? (
+        <ModalDialog
+          className="vfl-about-modal"
+          labelledBy="vfl-about-title"
+          initialFocus="first"
+          onRequestClose={() => setAboutOpen(false)}
+          closeOnBackdrop
+        >
             <div className="vfl-about-head">
               <div>
                 <div className="vfl-about-kicker">About & Legal</div>
@@ -3280,7 +3587,7 @@ function App() {
                     {manualUpdateBusy ? "Checking..." : "Check for updates"}
                   </button>
                   {manualUpdateStatus ? (
-                    <div className="vfl-update-inline-status" role="status" aria-live="polite">
+                    <div className="vfl-update-inline-status" role="status" aria-live="polite" aria-atomic="true">
                       {manualUpdateStatus}
                     </div>
                   ) : null}
@@ -3298,12 +3605,11 @@ function App() {
                 Security
               </button>
             </div>
-          </div>
-        </div>
+        </ModalDialog>
       ) : null}
       <header className="vfl-header">
         {updateNotice ? (
-          <div className="vfl-update-banner" role="status" aria-live="polite">
+          <div className="vfl-update-banner" role="status" aria-live="polite" aria-atomic="true" aria-busy={updateBusy}>
             <div className="vfl-update-copy">
               <div className="vfl-update-kicker">Update available</div>
               <div className="vfl-update-title">
@@ -3366,7 +3672,7 @@ function App() {
                   previewError ? (
                     <div className="vfl-error" role="alert">{previewError}</div>
                   ) : !previewReady ? (
-                    <div className="vfl-muted">Loading preview…</div>
+                    <div className="vfl-muted" role="status" aria-live="polite" aria-atomic="true">Loading preview…</div>
                   ) : (
                     <div className="vfl-preview-layout">
                       <div className="vfl-cropper-wrap">
@@ -3447,23 +3753,33 @@ function App() {
                             <div className="vfl-trim-timeline-rail" />
                             {trimSelectionStyle ? <div className="vfl-trim-timeline-selection" style={trimSelectionStyle} /> : null}
                             {trimPlayheadStyle ? <div className="vfl-trim-timeline-playhead" style={trimPlayheadStyle} /> : null}
-                            <button
-                              type="button"
-                              className={`vfl-trim-timeline-grab vfl-trim-timeline-grab-start ${activeTrimTarget === "start" ? "active" : ""}`}
-                              style={{ left: `${(trimTimeline.start / previewDurationS) * 100}%` }}
-                              onPointerDown={(e) => beginTrimHandleDrag("start", e)}
+                            <TrimSliderHandle
+                              id="vfl-trim-start-slider"
+                              label="Trim start"
+                              value={trimTimeline.start}
+                              valueText={`${formatClock(trimTimeline.start)}, ${trimTimeline.start.toFixed(2)} seconds`}
+                              min={0}
+                              max={Math.max(0, trimTimeline.end - trimTimeline.minGap)}
+                              leftPercent={(trimTimeline.start / previewDurationS) * 100}
+                              active={activeTrimTarget === "start"}
+                              onPointerDown={(event) => beginTrimHandleDrag("start", event)}
                               onFocus={() => focusTrimTarget("start")}
+                              onChange={(value) => updateTrimTarget("start", value, { pause: true })}
                               disabled={encodeBusy || !previewReady || !probe || previewDurationS <= 0}
-                              aria-label="Trim start"
                             />
-                            <button
-                              type="button"
-                              className={`vfl-trim-timeline-grab vfl-trim-timeline-grab-end ${activeTrimTarget === "end" ? "active" : ""}`}
-                              style={{ left: `${(trimTimeline.end / previewDurationS) * 100}%` }}
-                              onPointerDown={(e) => beginTrimHandleDrag("end", e)}
+                            <TrimSliderHandle
+                              id="vfl-trim-end-slider"
+                              label="Trim end"
+                              value={trimTimeline.end}
+                              valueText={`${formatClock(trimTimeline.end)}, ${trimTimeline.end.toFixed(2)} seconds`}
+                              min={Math.min(previewDurationS, trimTimeline.start + trimTimeline.minGap)}
+                              max={previewDurationS}
+                              leftPercent={(trimTimeline.end / previewDurationS) * 100}
+                              active={activeTrimTarget === "end"}
+                              onPointerDown={(event) => beginTrimHandleDrag("end", event)}
                               onFocus={() => focusTrimTarget("end")}
+                              onChange={(value) => updateTrimTarget("end", value, { pause: true })}
                               disabled={encodeBusy || !previewReady || !probe || previewDurationS <= 0}
-                              aria-label="Trim end"
                             />
                           </div>
                           <div className="vfl-trim-row">
@@ -3887,11 +4203,26 @@ function App() {
                 </select>
               </div>
             </div>
+            {probe ? (
+              <CropPixelFields
+                frameWidth={probe.width}
+                frameHeight={probe.height}
+                rect={cropRect}
+                onChange={(next) => {
+                  setCropRect(next);
+                  setCropDetectHint(null);
+                }}
+                disabled={encodeBusy || !cropEnabled}
+                aspectRatio={aspect.locked ? aspect.ratio : null}
+              />
+            ) : null}
             <div className="vfl-actions vfl-actions-wrap">
               <button
                 onClick={autoDetectCrop}
                 disabled={encodeBusy || !probe || !inputPath || cropDetecting}
                 title="Detect black bars and suggest a crop"
+                aria-busy={cropDetecting}
+                aria-describedby="vfl-crop-detect-status"
               >
                 {cropDetecting ? "Detecting…" : "Auto detect crop"}
               </button>
@@ -3909,7 +4240,15 @@ function App() {
             <div className="vfl-inline-hint">
               {cropEnabled ? "Drag directly on the preview to adjust the crop box." : "Enable crop to draw directly on the preview."}
             </div>
-            {cropDetectHint ? <div className="vfl-inline-hint">{cropDetectHint}</div> : null}
+            <div
+              className="vfl-inline-hint vfl-live-line"
+              id="vfl-crop-detect-status"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {cropDetecting ? "Detecting crop…" : cropDetectHint ?? ""}
+            </div>
             {cropEnabled && cropSummary ? <div className="vfl-inline-hint">Current crop: {cropSummary}</div> : null}
           </RailCard>
 
@@ -4580,7 +4919,7 @@ function App() {
         <div className="vfl-footer-main">
           <div className="vfl-footer-copy">
             <div className="vfl-footer-kicker">{footerKicker}</div>
-            <div className="vfl-footer-status" role="status" aria-live="polite">{displayedStatus}</div>
+            <div className="vfl-footer-status" role="status" aria-live="polite" aria-atomic="true">{displayedStatus}</div>
             <div className="vfl-footer-meta">{footerMetaText}</div>
           </div>
           <div className="vfl-footer-actions">

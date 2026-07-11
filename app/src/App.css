@@ -391,6 +391,7 @@ input[type="checkbox"] {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 24px;
   color: var(--text-secondary);
   font-size: 12.5px;
   cursor: pointer;
@@ -412,6 +413,31 @@ input[type="checkbox"] {
 
 .vfl-row2-compact {
   align-items: center;
+}
+
+.vfl-crop-pixel-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.vfl-crop-pixel-fields > legend {
+  margin-bottom: 6px;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.vfl-crop-pixel-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.vfl-live-line {
+  min-height: 1.45em;
 }
 
 .vfl-control-row {
@@ -918,18 +944,27 @@ input[type="range"]:focus-visible {
 .vfl-trim-timeline-grab {
   position: absolute;
   top: 50%;
-  width: 16px;
-  height: 16px;
+  width: 24px;
+  height: 24px;
   margin: 0;
   padding: 0;
   border-radius: 999px;
-  border: 2px solid rgba(255, 255, 255, 0.92);
-  background: rgb(var(--accent));
-  box-shadow: 0 0 0 2px rgba(10, 14, 20, 0.45);
+  border: 0;
+  background: transparent;
   transform: translate(-50%, -50%);
   cursor: ew-resize;
   touch-action: none;
   z-index: 4;
+}
+
+.vfl-trim-timeline-grab::before {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  background: rgb(var(--accent));
+  box-shadow: 0 0 0 2px rgba(10, 14, 20, 0.45);
 }
 
 /* Generic button hover/active transforms must not displace the centered grabs. */
@@ -1446,6 +1481,12 @@ input[type="range"]:focus-visible {
   scrollbar-color: var(--scrollbar) transparent;
 }
 
+.vfl-about-modal:focus-visible,
+.vfl-elevated-update-card:focus {
+  outline: 2px solid rgba(var(--accent), 0.7);
+  outline-offset: 3px;
+}
+
 .vfl-about-head {
   display: flex;
   justify-content: space-between;
@@ -1519,6 +1560,12 @@ input[type="range"]:focus-visible {
   display: flex;
   gap: 7px;
   flex-wrap: wrap;
+}
+
+@media (max-width: 1120px) {
+  .vfl-crop-pixel-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 /* ---------- drop overlay ---------- */
