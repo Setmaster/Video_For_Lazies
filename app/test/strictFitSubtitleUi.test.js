@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function read(relativePath) {
-  return fs.readFile(path.resolve(__dirname, relativePath), "utf8");
+  const source = await fs.readFile(path.resolve(__dirname, relativePath), "utf8");
+  return source.replace(/\r\n?/g, "\n");
 }
 
 function between(source, start, end) {
