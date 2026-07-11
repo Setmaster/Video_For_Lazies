@@ -36,6 +36,12 @@ const minimalContract = {
 };
 
 test("shipped FFmpeg contract has the stable Goal 3 feature schema", async () => {
+  const canonicalBytes = await fs.readFile(ffmpegCapabilityContractPath);
+  assert.equal(
+    canonicalBytes.includes(0x0d),
+    false,
+    "the canonical contract must use LF bytes so Windows and Linux packages are identical",
+  );
   const contract = await readFfmpegCapabilityContract();
   assert.deepEqual(JSON.parse(JSON.stringify(contract)), {
     schemaVersion: 1,

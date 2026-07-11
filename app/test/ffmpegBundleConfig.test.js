@@ -14,6 +14,16 @@ import {
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
+test("FFmpeg capability contract keeps canonical LF bytes on every platform", async () => {
+  const attributesPath = path.resolve(__dirname, "../../.gitattributes");
+  const attributes = await fs.readFile(attributesPath, "utf8");
+
+  assert.ok(
+    attributes.split(/\r?\n/).includes("app/ffmpeg-capabilities.json text eol=lf"),
+    "the packaged capability contract must not inherit Windows CRLF checkout conversion",
+  );
+});
+
 test("tauri build hooks prepare the bundled ffmpeg sidecar", async () => {
   const confPath = path.resolve(__dirname, "../src-tauri/tauri.conf.json");
   const bundleConfigPath = path.resolve(__dirname, "../scripts/ffmpegBundle.mjs");
