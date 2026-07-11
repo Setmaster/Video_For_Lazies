@@ -451,7 +451,7 @@ fn safe_failure_diagnostic_reason(request: &EncodeRequest, reason: &str) -> Stri
         }
     }
 
-    redactions.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+    redactions.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
     let mut redacted = first_line.to_string();
     for (path, replacement) in redactions {
         redacted = redacted.replace(&path, replacement);
