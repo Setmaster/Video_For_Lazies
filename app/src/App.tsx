@@ -3055,7 +3055,6 @@ function App() {
     setOpenCards((cards) => ({ ...cards, crop: true }));
     setCropEnabled(true);
     setCropRect({ x: 0.08, y: 0.08, w: 0.84, h: 0.84 });
-    setCropDetectHint("Accessibility smoke crop status.");
     await waitMs(220);
 
     const startSlider = document.getElementById("vfl-trim-start-slider");
@@ -3191,6 +3190,8 @@ function App() {
       return { ok: false, message: `Accessibility smoke could not restore Crop X by its mounted ArrowDown handler (${cropXBefore + 1} -> ${cropXAfter}).` };
     }
 
+    setCropDetectHint("Accessibility smoke crop status.");
+    await waitMs(100);
     const cropStatus = document.getElementById("vfl-crop-detect-status");
     if (
       cropStatus?.getAttribute("role") !== "status" ||
