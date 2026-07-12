@@ -1,7 +1,7 @@
 {
   "name": "video-for-lazies",
   "private": true,
-  "version": "1.10.0",
+  "version": "2.0.0",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
@@ -12,7 +12,6 @@
     "smoke:portable": "node scripts/run-portable-smoke.mjs",
     "smoke:portable:export": "node scripts/run-portable-export-smoke.mjs",
     "smoke:portable:codecs": "node scripts/run-portable-codec-plan-smoke.mjs",
-    "smoke:portable:g6": "node scripts/run-portable-g6-fast-trim-smoke.mjs",
     "smoke:portable:g7": "node scripts/run-portable-g7-operational-ux-smoke.mjs",
     "release:portable": "node scripts/run-release-portable.mjs",
     "release:notes": "node scripts/generate-release-notes.mjs",

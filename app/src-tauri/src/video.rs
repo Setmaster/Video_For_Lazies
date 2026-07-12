@@ -7549,24 +7549,6 @@ mod tests {
     }
 
     #[test]
-    fn trim_legacy_extras_are_ignored_and_not_reserialized() {
-        let trim: Trim = serde_json::from_value(serde_json::json!({
-            "startS": 1.25,
-            "endS": 2.5,
-            "mode": "fastCopy",
-            "fastCopyConsent": { "confirmationToken": "legacy" }
-        }))
-        .unwrap();
-
-        assert_eq!(trim.start_s, 1.25);
-        assert_eq!(trim.end_s, Some(2.5));
-        assert_eq!(
-            serde_json::to_value(trim).unwrap(),
-            serde_json::json!({ "startS": 1.25, "endS": 2.5 })
-        );
-    }
-
-    #[test]
     fn encode_execution_validates_base_scalars() {
         let mut request = base_request();
         request.size_limit_mb = 0.0;

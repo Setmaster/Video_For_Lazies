@@ -52,7 +52,7 @@ Both platforms verify:
 - the canonical FFmpeg capability contract and a real bundled `libx264` encode/probe
 - media-depth behavior for stream selection, HDR/high-depth policy, SAR/rotation geometry, and reverse/loop memory limits
 - exact-byte targets, opt-in Strict Fit, separate audio-removal consent, and one bounded external UTF-8 SRT
-- Exact trim plus explicitly accepted compatible copy-only Fast Trim
+- One frame-accurate trim workflow using decoded frame and sample boundaries
 - recipe privacy, queue retry and snapshot restoration, multi-file routing, reset/dialog accessibility, phase progress, rotation/speed/frame-rate-cap truth, active cancellation, queued drops, and export-lifecycle behavior
 - standard MP4, WebM, custom-size, and tight-target packaged exports
 
@@ -76,7 +76,6 @@ Useful targeted package checks:
 ```bash
 npm run smoke:portable:export
 npm run smoke:portable:codecs
-npm run smoke:portable:g6
 npm run smoke:portable:g7
 ```
 
@@ -87,8 +86,7 @@ The targeted smoke commands expect an already assembled portable folder and are 
 ### Workbench and editing
 
 - The preview, scrubber, trim sliders, and crop surface stay visible on the left. Source, recipes, export settings, crop, transform/color, advanced controls, current plan, and queue live in the collapsible right rail.
-- Trim sliders expose labelled keyboard semantics and 0.1-second or 1-second nudges. Exact trim is the default.
-- Fast Trim is a separate MP4/WebM copy-only mode. It requires an active trim, a backend-authoritative compatibility check, and explicit acceptance when the containing closed-GOP interval is wider than requested. It never silently re-encodes, falls back, or reuses stale consent.
+- Trim sliders expose labelled keyboard semantics and 0.1-second or 1-second nudges. Requested boundaries use decoded frames and samples; there is no alternate widened-boundary trim mode.
 - Crop uses labelled source-pixel inputs plus pointer drawing. Quarter-turn rotation keeps preview geometry and crop coordinates aligned.
 - Speed is applied before the optional frame-rate cap, and the current plan reports the post-speed rate and whether the cap applies.
 - One UTF-8 SRT can be burned into MP4 or WebM using source timing, a fixed embedded DejaVu Sans style, and private temporary staging. It forces video re-encoding and rejects inline styling/position overrides.
@@ -105,7 +103,7 @@ The targeted smoke commands expect an already assembled portable folder and are 
 
 - HDR10 and high-bit-depth SDR require an explicit standard-SDR conversion and supported MP4/H.264 capability. The result is 8-bit BT.709 SDR; HDR preservation is not supported.
 - HLG, Dolby Vision, incomplete or contradictory HDR/high-depth metadata, unknown component depth, and arbitrary source rotations fail closed for video export. Audio-only MP3 may remain available.
-- Non-square source pixels are normalized to square-pixel output while preserving display shape unless custom dimensions explicitly take authority. Fast Trim blocks non-square-pixel sources.
+- Non-square source pixels are normalized to square-pixel output while preserving display shape unless custom dimensions explicitly take authority.
 - Reverse and loop estimate decoded video/audio memory, warn above 512 MiB, and block above 2 GiB.
 
 ### Queue, recipes, privacy, and recovery
@@ -114,7 +112,7 @@ The targeted smoke commands expect an already assembled portable folder and are 
 - A single supported drop while idle replaces the current source. Multi-file drops and drops during active work queue accepted files in order using a settings-only snapshot; unsupported, duplicate, and overflow counts stay visible.
 - Device-local schema-v2 recipes save only format, size, resize, audio, Strict Fit, frame uniqueness, and encoder settings. They exclude every source/output/subtitle path and clip-scoped edit, title, metadata privacy, diagnostics, queue state, and job state.
 - Metadata stripping is on by default. User-facing errors and retained smoke/diagnostic evidence redact process-unique and clip-private paths where those paths are not needed for the local workflow.
-- Reset All uses a confirmation dialog and clears settings, trim, crop, color, subtitle selection, and Fast Trim authority without clearing source, output, queue, or recipes. Cancel is a separate one-shot active-export action.
+- Reset All uses a confirmation dialog and clears settings, trim, crop, color, and subtitle selection without clearing source, output, queue, or recipes. Cancel is a separate one-shot active-export action.
 - Signed portable updates show bounded progress, verify the selected payload, journal replacement state, preserve a verified backup, and attempt rollback/startup recovery after interruption. A manual portable download remains the fallback when recovery cannot complete.
 
 ### Accessibility baseline

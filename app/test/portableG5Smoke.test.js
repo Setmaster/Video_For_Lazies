@@ -91,7 +91,11 @@ function targetStatus({
   };
 }
 
-test("G5 packaged corpus is bounded and covers exact targets plus external SRT failures", () => {
+test("G5 packaged corpus is bounded and covers exact targets plus external SRT failures", async () => {
+  const g5SmokeSource = await fs.readFile(
+    path.resolve(__dirname, "../scripts/run-portable-g5-smoke.mjs"),
+    "utf8",
+  );
   assert.equal(G5_EVIDENCE_SCHEMA_VERSION, 1);
   assert.equal(G5_MAX_FIT_PLANS, 4);
   assert.deepEqual(REQUIRED_G5_SMOKE_STAGES, [
@@ -112,6 +116,7 @@ test("G5 packaged corpus is bounded and covers exact targets plus external SRT f
     "external-srt-unicode-source-timing",
     "external-srt-malformed-rejected",
     "external-srt-missing-capability",
+    "exact-trim-existing-output-refused",
   ]);
 
   const strictCase = g5SmokeCases.find((testCase) => testCase.id === "target-strict-bounded-correction");
@@ -152,6 +157,14 @@ test("G5 packaged corpus is bounded and covers exact targets plus external SRT f
   }
   const capabilityCase = g5SmokeCases.find((testCase) => testCase.id === "external-srt-missing-capability");
   assert.equal(capabilityCase.expectedErrorIncludes, "missing filter subtitles");
+  const noClobberCase = g5SmokeCases.find((testCase) => testCase.id === "exact-trim-existing-output-refused");
+  assert.equal(noClobberCase.preseedOutput, true);
+  assert.equal(noClobberCase.trimStartS, 1);
+  assert.equal(noClobberCase.trimEndS, 3);
+  assert.equal(noClobberCase.expectedErrorIncludes, "already exists");
+  assert.equal(noClobberCase.workflowQueueExport, undefined);
+  assert.match(g5SmokeSource, /entry\.name\.startsWith\("\.vfl-"\) && entry\.name\.includes\("\.tmp\."\)/);
+  assert.match(g5SmokeSource, /temporaryOutputCount: 0/);
 });
 
 test("G5 fixture commands and paths stay deterministic and use the bundled codec surface", () => {

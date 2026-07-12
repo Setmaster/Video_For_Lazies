@@ -22,7 +22,7 @@ The extracted-archive verification on both supported platforms checks:
 - a real `libx264` encode followed by a duration probe through the extracted FFprobe
 - packaged media-depth behavior for selected streams, attached pictures, HDR/high-depth policy, SAR/rotation geometry, and reverse/loop memory bounds
 - exact-byte targets, opt-in Strict Fit, separate audio-removal permission, and one bounded external UTF-8 SRT with the fixed embedded subtitle font
-- Exact trim and explicitly accepted compatible copy-only Fast Trim, including packet/boundary and metadata checks
+- frame-accurate trim, existing-destination no-clobber refusal, and metadata/privacy checks
 - recipe privacy, queue retry and snapshot restoration, multi-file routing, accessibility foundations, phase-aware progress, rotation/speed/frame-rate-cap behavior, Reset, Cancel, queued drops, and export-lifecycle behavior
 - normal MP4 and WebM exports, custom-size output, and a tight-target 1080p case
 

@@ -19,7 +19,7 @@ The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports 
 ### Edit in one workbench
 
 - Keep the preview, scrubber, trim controls, and crop surface visible while settings stay in a collapsible side rail.
-- Use frame-accurate **Exact trim** by default. An explicit **Fast Trim** mode can copy a compatible MP4 or WebM closed-GOP interval after the backend checks it and, when needed, you accept the disclosed wider boundaries. Fast Trim never silently re-encodes or falls back to Exact.
+- Use one frame-accurate trim workflow. Requested boundaries use decoded frames and samples so trimming never silently retains material outside the selected interval.
 - Crop by drawing over the preview, editing labelled source-pixel fields, or running crop detection. Quarter-turn rotation keeps the preview, pointer mapping, and source crop coordinates aligned.
 - Resize by original dimensions, max edge, or custom dimensions; rotate, reverse, create a forward-then-reverse loop, change playback speed, and adjust brightness, contrast, and saturation.
 - Apply a frame-rate cap to the post-speed frame rate. The current plan reports when the cap changes the output.
@@ -41,14 +41,14 @@ The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports 
 
 - Queue immutable export snapshots and run them sequentially with one FFmpeg job at a time. Completed, target-missed, failed, and canceled items keep bounded recent diagnostics and can be retried, duplicated, or applied back to the workbench with a fresh output path.
 - Add multiple files from the picker or drop them anywhere in the window. One supported file dropped while idle becomes the current source; multiple files, or files dropped during an export, are queued in order with the current reusable settings. Unsupported, duplicate, and overflow entries are reported.
-- Save, rename, apply, and delete up to 50 user recipes on the current device. Recipes use a privacy-bounded allowlist and never store media/output/subtitle paths, titles, trim or Fast Trim consent, crop, transforms, color/HDR choices, diagnostics, or queue/job state.
+- Save, rename, apply, and delete up to 50 user recipes on the current device. Recipes use a privacy-bounded allowlist and never store media/output/subtitle paths, titles, trim, crop, transforms, color/HDR choices, diagnostics, or queue/job state.
 - Use built-in starting points for quick sharing, size-limited uploads, archive-quality MP4, smaller WebM, and audio-only MP3.
 - Use the separate **Cancel** action to request cancellation of the active export. **Reset all settings** asks for confirmation and does not remove the current source, output path, queue, or saved recipes.
 
 ### Guard unsafe media assumptions
 
 - HDR10 and high-bit-depth SDR video require an explicit conversion to 8-bit BT.709 SDR MP4. HLG, Dolby Vision, contradictory/incomplete HDR metadata, unknown pixel depth, and unsupported rotation fail closed for video export; audio-only MP3 can remain available.
-- Non-square source pixels are normalized to square-pixel video while preserving visible shape unless custom dimensions explicitly take authority. Fast Trim requires square pixels and otherwise blocks.
+- Non-square source pixels are normalized to square-pixel video while preserving visible shape unless custom dimensions explicitly take authority.
 - Reverse and loop plans estimate decoded memory, warn above the soft bound, and refuse plans above the hard safety limit.
 - The tested accessibility baseline includes keyboard-operable trim sliders, labelled crop fields, focus-contained dialogs with background isolation and focus return, and live status or alerts for relevant asynchronous work. This is not a claim of WCAG conformance or complete assistive-technology coverage.
 
@@ -139,7 +139,7 @@ cd app
 npm run release:portable
 ```
 
-The release command creates a versioned x64 zip and `SHA256SUMS.txt`, validates the extracted payload manifest and legal/source inventory, verifies the pinned FFmpeg capability contract with a real encode/probe, and runs the cross-platform packaged media, workflow, Fast Trim, accessibility, progress, cancellation, and export-lifecycle smoke matrices. Linux also runs the complete codec-plan matrix; Windows also performs the native packaged-window startup and update-helper checks.
+The release command creates a versioned x64 zip and `SHA256SUMS.txt`, validates the extracted payload manifest and legal/source inventory, verifies the pinned FFmpeg capability contract with a real encode/probe, and runs the cross-platform packaged media, workflow, exact-trim, no-clobber, accessibility, progress, cancellation, and export-lifecycle smoke matrices. Linux also runs the complete codec-plan matrix; Windows also performs the native packaged-window startup and update-helper checks.
 
 Release process details are in [`docs/release.md`](docs/release.md).
 

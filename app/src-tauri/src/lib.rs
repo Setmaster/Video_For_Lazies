@@ -109,7 +109,6 @@ struct AppSmokeConfig {
     title: Option<String>,
     audio_enabled: bool,
     strip_metadata: bool,
-    source_mutation: bool,
     resize_mode: Option<video::ResizeMode>,
     resize_max_edge_px: Option<u32>,
     resize_width_px: Option<u32>,
@@ -349,7 +348,6 @@ fn parse_smoke_config_from_env(
     let title = video::validate_title_metadata(env.get("VFL_SMOKE_TITLE").map(String::as_str))?;
     let audio_enabled = parse_smoke_bool_with_default(env, "VFL_SMOKE_AUDIO_ENABLED", true)?;
     let strip_metadata = parse_smoke_bool_with_default(env, "VFL_SMOKE_STRIP_METADATA", true)?;
-    let source_mutation = parse_smoke_bool(env, "VFL_SMOKE_SOURCE_MUTATION")?;
     let resize_mode = env
         .get("VFL_SMOKE_RESIZE_MODE")
         .map(|raw| parse_smoke_resize_mode(raw))
@@ -457,7 +455,6 @@ fn parse_smoke_config_from_env(
         title,
         audio_enabled,
         strip_metadata,
-        source_mutation,
         resize_mode,
         resize_max_edge_px,
         resize_width_px,
@@ -913,7 +910,6 @@ mod tests {
                 title: None,
                 audio_enabled: true,
                 strip_metadata: true,
-                source_mutation: false,
                 resize_mode: None,
                 resize_max_edge_px: None,
                 resize_width_px: None,
@@ -948,7 +944,6 @@ mod tests {
             ("VFL_SMOKE_TITLE", "  Replacement title  "),
             ("VFL_SMOKE_AUDIO_ENABLED", "false"),
             ("VFL_SMOKE_STRIP_METADATA", "false"),
-            ("VFL_SMOKE_SOURCE_MUTATION", "true"),
             ("VFL_SMOKE_RESIZE_MODE", "custom"),
             ("VFL_SMOKE_RESIZE_WIDTH_PX", "320"),
             ("VFL_SMOKE_RESIZE_HEIGHT_PX", "180"),
@@ -977,7 +972,6 @@ mod tests {
                 title: Some("Replacement title".to_string()),
                 audio_enabled: false,
                 strip_metadata: false,
-                source_mutation: true,
                 resize_mode: Some(ResizeMode::Custom),
                 resize_max_edge_px: None,
                 resize_width_px: Some(320),
@@ -999,24 +993,21 @@ mod tests {
     }
 
     #[test]
-    fn smoke_g6_policy_fields_serialize_as_typed_camel_case_values() {
-        let status_path = temp_smoke_status_path("g6-policy-serialization");
+    fn smoke_policy_fields_serialize_as_typed_camel_case_values() {
+        let status_path = temp_smoke_status_path("policy-serialization");
         let env = smoke_env(&[
             ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
             ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
             ("VFL_SMOKE_STATUS", &status_path),
             ("VFL_SMOKE_AUDIO_ENABLED", "false"),
             ("VFL_SMOKE_STRIP_METADATA", "false"),
-            ("VFL_SMOKE_SOURCE_MUTATION", "true"),
         ]);
         let config = parse_smoke_config_from_env(&env).unwrap().unwrap();
         let serialized = serde_json::to_value(config).unwrap();
         assert_eq!(serialized["audioEnabled"], false);
         assert_eq!(serialized["stripMetadata"], false);
-        assert_eq!(serialized["sourceMutation"], true);
         assert!(serialized.get("audio_enabled").is_none());
         assert!(serialized.get("strip_metadata").is_none());
-        assert!(serialized.get("source_mutation").is_none());
     }
 
     #[test]
@@ -1084,18 +1075,14 @@ mod tests {
     }
 
     #[test]
-    fn smoke_g6_policy_fields_reject_invalid_boolean_values() {
-        let status_path = temp_smoke_status_path("bad-g6-policy-flags");
+    fn smoke_policy_fields_reject_invalid_boolean_values() {
+        let status_path = temp_smoke_status_path("bad-policy-flags");
         let base = [
             ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
             ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
             ("VFL_SMOKE_STATUS", status_path.as_str()),
         ];
-        for key in [
-            "VFL_SMOKE_AUDIO_ENABLED",
-            "VFL_SMOKE_STRIP_METADATA",
-            "VFL_SMOKE_SOURCE_MUTATION",
-        ] {
+        for key in ["VFL_SMOKE_AUDIO_ENABLED", "VFL_SMOKE_STRIP_METADATA"] {
             let mut env = smoke_env(&base);
             env.insert(key.to_string(), "maybe".to_string());
             assert!(parse_smoke_config_from_env(&env).unwrap_err().contains(key));

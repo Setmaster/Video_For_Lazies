@@ -392,11 +392,11 @@ test("G7 retained evidence rejects protected paths and basenames", () => {
   assert.doesNotThrow(() => assertTextExcludesPaths("path-free evidence", [protectedPath], "safe"));
   assert.throws(
     () => assertTextExcludesPaths(`failed at ${protectedPath}`, [protectedPath], "unsafe"),
-    /exposed a protected (?:G6 )?filesystem path/i,
+    /exposed a protected filesystem path/i,
   );
   assert.throws(
     () => assertTextExcludesPaths("input-private.mp4", [protectedPath], "unsafe basename"),
-    /exposed a protected (?:G6 )?filesystem path/i,
+    /exposed a protected filesystem path/i,
   );
 });
 
@@ -437,7 +437,7 @@ test("G7 privacy proof scans raw status, diagnostics, trim result, stdout, and s
         },
         [protectedPath, ".vfl-"],
       ),
-      /exposed a protected G6 filesystem path or basename/i,
+      /exposed a protected filesystem path or basename/i,
       label,
     );
   }
@@ -459,7 +459,7 @@ test("G7 privacy proof uses Windows-aware slash, case, and JSON matching", () =>
       [protectedPath],
       { platform: "win32" },
     ),
-    /exposed a protected G6 filesystem path or basename/i,
+    /exposed a protected filesystem path or basename/i,
   );
 });
 

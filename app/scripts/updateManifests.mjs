@@ -34,6 +34,7 @@ export const UPDATE_NOTES_SUMMARY_MAX_CHARS = 240;
 const DEFAULT_UPDATE_NOTES_SUMMARY = "See the GitHub release notes for changes.";
 const VERSIONED_UPDATE_NOTES_SUMMARIES = Object.freeze({
   "1.10.0": "Adds codec-aware exports, accessible crop and trim controls, in-memory queue tools and local recipes, Strict Fit, SRT subtitle burn-in, guarded Fast Trim, clearer phase progress, and journaled recovery for signed portable updates.",
+  "2.0.0": "Simplifies trimming to one frame-accurate workflow by removing Fast Trim and widened-boundary consent, while retaining crop, Strict Fit, SRT burn-in, queue and recipes, accessible controls, progress, and signed update recovery.",
 });
 
 const POSIX_SEP_PATTERN = /\\/g;

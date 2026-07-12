@@ -13,6 +13,7 @@ const __dirname = path.dirname(__filename);
 
 const G5_EVIDENCE_SCHEMA_VERSION = 1;
 const G5_MAX_FIT_PLANS = 4;
+const G5_NO_CLOBBER_SENTINEL = "VFL G5 EXACT TRIM NO-CLOBBER SENTINEL\n";
 const SUPPORTED_PLATFORMS = new Set(["linux", "win32"]);
 const MASKABLE_CAPABILITY_FILTERS = new Set(["subtitles"]);
 const REQUIRED_G5_SMOKE_STAGES = Object.freeze([
@@ -180,6 +181,18 @@ const g5SmokeCases = Object.freeze([
     expectedErrorIncludes: "missing filter subtitles",
     requiredStages: Object.freeze(["detected", "error"]),
     forbiddenStages: Object.freeze(["workflow-ready", "interaction-ready", "encoding", "success"]),
+  }),
+  Object.freeze({
+    id: "exact-trim-existing-output-refused",
+    fixtureId: "target-easy",
+    terminalStage: "error",
+    sizeLimitMb: 0,
+    strictFit: false,
+    strictFitAllowAudioRemoval: false,
+    trimStartS: 1,
+    trimEndS: 3,
+    preseedOutput: true,
+    expectedErrorIncludes: "already exists",
   }),
 ]);
 
@@ -1105,14 +1118,49 @@ async function verifySuccessfulCase({
   });
 }
 
-async function verifyErrorCase(testCase, status, outputPath) {
+async function verifyErrorCase(testCase, status, outputPath, caseRoot, preseed) {
   if (status.ok !== false) {
     throw new Error(`Portable G5 smoke ${testCase.id} error status did not report ok=false.`);
   }
   if (!String(status.message ?? "").includes(testCase.expectedErrorIncludes)) {
     throw new Error(`Portable G5 smoke ${testCase.id} error mismatch. expected=${testCase.expectedErrorIncludes} actual=${status.message ?? "none"}`);
   }
-  if (await exists(outputPath)) {
+  let noClobber = null;
+  if (testCase.preseedOutput) {
+    if (!preseed || !(await exists(outputPath))) {
+      throw new Error(`Portable G5 smoke ${testCase.id} lost the pre-seeded destination.`);
+    }
+    const bytes = await fs.readFile(outputPath);
+    const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+    if (bytes.length !== preseed.sizeBytes || sha256 !== preseed.sha256) {
+      throw new Error(`Portable G5 smoke ${testCase.id} changed the pre-seeded destination.`);
+    }
+    const temporaryOutputs = (await fs.readdir(caseRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.startsWith(".vfl-") && entry.name.includes(".tmp."))
+      .map((entry) => entry.name);
+    if (temporaryOutputs.length > 0) {
+      throw new Error(`Portable G5 smoke ${testCase.id} left temporary output files behind.`);
+    }
+    const diagnostics = status.diagnostics;
+    if (
+      !diagnostics ||
+      diagnostics.failureStage !== "backend" ||
+      !String(diagnostics.failureReason ?? "").includes(testCase.expectedErrorIncludes) ||
+      diagnostics.videoAction !== null ||
+      diagnostics.audioAction !== null ||
+      diagnostics.attempts !== 0 ||
+      diagnostics.passes !== 0 ||
+      !String(diagnostics.commandPreview ?? "").includes("No FFmpeg command")
+    ) {
+      throw new Error(`Portable G5 smoke ${testCase.id} did not prove a zero-execution no-clobber refusal.`);
+    }
+    noClobber = Object.freeze({
+      preserved: true,
+      sizeBytes: preseed.sizeBytes,
+      sha256: preseed.sha256,
+      temporaryOutputCount: 0,
+    });
+  } else if (await exists(outputPath)) {
     throw new Error(`Portable G5 smoke ${testCase.id} published output despite a required rejection.`);
   }
   return Object.freeze({
@@ -1123,10 +1171,19 @@ async function verifyErrorCase(testCase, status, outputPath) {
     queueOutcomeKind: null,
     targetResult: null,
     output: null,
-    diagnostics: null,
+    diagnostics: testCase.preseedOutput ? Object.freeze({
+      failureStage: status.diagnostics.failureStage,
+      attempts: status.diagnostics.attempts,
+      passes: status.diagnostics.passes,
+    }) : null,
     subtitleFontPreflight: null,
     subtitleTiming: null,
-    errorCategory: testCase.missingCapabilityFilters ? "missing-capability" : "malformed-srt",
+    errorCategory: testCase.preseedOutput
+      ? "no-clobber"
+      : testCase.missingCapabilityFilters
+        ? "missing-capability"
+        : "malformed-srt",
+    noClobber,
   });
 }
 
@@ -1197,6 +1254,15 @@ async function runPortableG5Smoke({
       const stdoutPath = path.resolve(caseRoot, "app.stdout.log");
       const stderrPath = path.resolve(caseRoot, "app.stderr.log");
       const subtitlePath = subtitleFixturePath(testCase.subtitleFixture, fixtureRoot);
+      let preseed = null;
+      if (testCase.preseedOutput) {
+        const bytes = Buffer.from(G5_NO_CLOBBER_SENTINEL, "utf8");
+        await fs.writeFile(outputPath, bytes);
+        preseed = Object.freeze({
+          sizeBytes: bytes.length,
+          sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+        });
+      }
       const smokeEnv = buildG5SmokeEnvironment(testCase, {
         inputPath,
         outputPath,
@@ -1254,7 +1320,7 @@ async function runPortableG5Smoke({
             caseRoot,
             embeddedSubtitleFont,
           })
-          : await verifyErrorCase(testCase, status, outputPath);
+          : await verifyErrorCase(testCase, status, outputPath, caseRoot, preseed);
         evidence.push(caseEvidence);
         const evidenceRaw = `${JSON.stringify({ ...caseEvidence, platform }, null, 2)}\n`;
         assertPrivacySafeStatusRaw(

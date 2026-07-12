@@ -207,7 +207,7 @@ const SMOKE_STAGE_ORDER = [
   "g7-drop-queued",
   "g7-cancel-requested",
 ] as const;
-const APP_VERSION = "1.10.0";
+const APP_VERSION = "2.0.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",

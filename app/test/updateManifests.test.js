@@ -221,6 +221,17 @@ test("v1.10.0 update manifest carries its bounded plain-text release summary", a
   }
 });
 
+test("v2.0.0 update manifest explains the trim simplification without rewriting v1.10.0", async () => {
+  const summary = getUpdateNotesSummary("2.0.0");
+  assert.equal(
+    summary,
+    "Simplifies trimming to one frame-accurate workflow by removing Fast Trim and widened-boundary consent, while retaining crop, Strict Fit, SRT burn-in, queue and recipes, accessible controls, progress, and signed update recovery.",
+  );
+  assert.ok(summary.length <= UPDATE_NOTES_SUMMARY_MAX_CHARS);
+  assert.doesNotMatch(summary, /[\u0000-\u001f\u007f]/);
+  assert.match(getUpdateNotesSummary("1.10.0"), /guarded Fast Trim/);
+});
+
 test("update manifest rejects a payload sidecar that differs from its embedded ZIP manifest", async () => {
   const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-update-sidecar-pairing-test-"));
   try {

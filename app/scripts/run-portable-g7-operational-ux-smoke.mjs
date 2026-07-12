@@ -13,7 +13,7 @@ import {
   assertTextExcludesPathValues,
   shutdownSmokeProcessAndLogs,
   verifyPortablePreflight,
-} from "./run-portable-g6-fast-trim-smoke.mjs";
+} from "./portable-smoke-support.mjs";
 
 const __filename = url.fileURLToPath(import.meta.url);
 
