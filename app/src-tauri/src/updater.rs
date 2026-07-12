@@ -2681,6 +2681,7 @@ fn publish_verified_update_file(
     remove_file_with_retries(&incoming)?;
     retry_copy_file(source, &incoming)?;
     set_mode_if_needed(&incoming, mode)?;
+    #[cfg(unix)]
     File::open(&incoming)
         .and_then(|file| file.sync_all())
         .map_err(|e| format!("Failed to persist verified update publication file: {e}"))?;
@@ -3403,7 +3404,7 @@ fn retry_copy_file(source: &Path, target: &Path) -> Result<(), String> {
                 #[cfg(windows)]
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     let mut permissions = fs::metadata(target)?.permissions();
-                    permissions.set_readonly(false);
+                    clear_windows_readonly(&mut permissions);
                     fs::set_permissions(target, permissions)?;
                     fs::remove_file(target)?;
                 }
@@ -3433,6 +3434,14 @@ fn retry_copy_file(source: &Path, target: &Path) -> Result<(), String> {
             )
         },
     )
+}
+
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_windows_readonly(permissions: &mut fs::Permissions) {
+    // This branch is Windows-only, where the generic API clears the DOS
+    // read-only attribute rather than widening Unix write permissions.
+    permissions.set_readonly(false);
 }
 
 fn remove_file_with_retries(path: &Path) -> Result<(), String> {
@@ -6282,6 +6291,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn test_verified_update_manifest_for_plan(plan: &UpdateApplyPlan) -> UpdateManifest {
         let payload_digest = sha256_file(&plan.stage_dir.join(PAYLOAD_MANIFEST_FILE_NAME)).unwrap();
         let file_name = format!("Video_For_Lazies-v{}-test.zip", plan.to_version);
