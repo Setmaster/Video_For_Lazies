@@ -995,10 +995,6 @@ function App() {
   }
 
   useEffect(() => {
-    jobIdRef.current = jobId;
-  }, [jobId]);
-
-  useEffect(() => {
     updateBusyRef.current = updateBusy;
   }, [updateBusy]);
 
@@ -5554,9 +5550,14 @@ function App() {
       const pending = pendingEncodeRef.current;
       return [
         `item=${item?.status ?? "missing"}`,
+        `outcome=${item?.lastOutcome?.kind ?? "none"}`,
+        `diagnostics=${item?.lastOutcome?.diagnostics ? "present" : "missing"}`,
         `active=${state.active?.itemId === itemId ? "matching" : state.active ? "other" : "none"}`,
         `autoRun=${state.autoRun ? "on" : "off"}`,
+        `jobRef=${jobIdRef.current ?? "none"}`,
         `pending=${pending ? (pending.jobId === null ? "starting" : "bound") : "none"}`,
+        `preparing=${queuePreparationCountRef.current}`,
+        `updateBusy=${updateBusyRef.current ? "on" : "off"}`,
         `listeners=${encodeEventsReadyRef.current ? "ready" : "not-ready"}`,
         `listenerError=${encodeEventsErrorRef.current ? "present" : "none"}`,
       ].join(", ");

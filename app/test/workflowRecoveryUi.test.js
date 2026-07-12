@@ -40,6 +40,13 @@ test("App uses one reducer-backed queue identity and closes queue continuation r
   assert.match(app, /const queuePreparationCountRef = useRef\(0\)/);
   assert.match(app, /queuePreparationCountRef\.current \+= 1/);
   assert.match(app, /queuePreparationCountRef\.current === 0[\s\S]*?startNextQueuedItem/);
+  assert.doesNotMatch(
+    app,
+    /useEffect\(\(\) => \{\s*jobIdRef\.current = jobId;\s*\}, \[jobId\]\)/,
+    "a stale passive jobId effect can strand auto-run after a fast terminal event",
+  );
+  assert.match(app, /setJobId\(null\);\s*jobIdRef\.current = null;/);
+  assert.match(app, /setJobId\(id\);\s*jobIdRef\.current = id;/);
   assert.match(app, /const encodeBusy =[\s\S]*?attemptUi\.isActive[\s\S]*?queueSnapshotApplying[\s\S]*?updateBusy;/);
 });
 
@@ -195,6 +202,7 @@ test("packaged export proof exercises restart, real queue failure, retry, succes
   assert.match(app, /runQueue\(\)/);
   assert.match(app, /item\?\.status === "failed" && item\.lastOutcome\?\.diagnostics/);
   assert.match(app, /function queueRuntimeSummary\(itemId: number\)/);
+  assert.match(app, /diagnostics=\$\{item\?\.lastOutcome\?\.diagnostics \? "present" : "missing"\}/);
   assert.match(app, /listeners=\$\{encodeEventsReadyRef\.current \? "ready" : "not-ready"\}/);
   assert.match(app, /item\?\.status === "done"/);
   assert.match(app, /item\.history\.some\(\(attempt\) => attempt\.kind === "failed" && attempt\.diagnostics\)/);
