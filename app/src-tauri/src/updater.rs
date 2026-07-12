@@ -4333,7 +4333,7 @@ fn acquire_recovery_global_lock(plan: &UpdateApplyPlan) -> Result<StagingLockGua
         .map_err(|e| format!("Failed to create the recovery lock directory: {e}"))?;
     match create_lock_guard(&path, &UpdateLockRecord::recovery_claim(plan)) {
         Ok(guard) => Ok(guard),
-        Err(error) if path.exists() => {
+        Err(_) if path.exists() => {
             let existing = read_lock_record(&path)?;
             if existing.schema != UPDATE_JOURNAL_SCHEMA
                 || existing.update_id.as_deref() != Some(plan.update_id.as_str())
