@@ -178,6 +178,8 @@ const TRIM_MIN_GAP_S = 0.05;
 const TRIM_DRAG_SNAP_MAX_S = 60;
 const TRIM_FINE_NUDGE_S = 0.1;
 const TRIM_COARSE_NUDGE_S = 1;
+const RECIPE_NOTIFICATION_FADE_START_MS = 800;
+const RECIPE_NOTIFICATION_CLEAR_MS = 1000;
 const SMOKE_SUCCESS_STAGE = "success";
 const SMOKE_ERROR_STAGE = "error";
 const SMOKE_WORKFLOW_SESSION_KEY = "vfl:smoke-workflow:v1";
@@ -742,6 +744,10 @@ function App() {
   const [recipeResetToCurrentSettings, setRecipeResetToCurrentSettings] = useState(false);
   const [recipeDialogError, setRecipeDialogError] = useState<string | null>(null);
   const [recipeStatus, setRecipeStatus] = useState<string | null>(null);
+  const [recipeNotification, setRecipeNotification] = useState<{
+    message: string;
+    isFading: boolean;
+  } | null>(null);
   const [resetConfirmationOpen, setResetConfirmationOpen] = useState(false);
   const [updateNotice, setUpdateNotice] = useState<UpdateCheckResponse | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -789,6 +795,8 @@ function App() {
     message: string | null;
   } | null>(null);
   const recipeSaveButtonRef = useRef<HTMLButtonElement | null>(null);
+  const recipeNotificationFadeTimerRef = useRef<number | null>(null);
+  const recipeNotificationClearTimerRef = useRef<number | null>(null);
   const queueFallbackButtonRef = useRef<HTMLButtonElement | null>(null);
   const queueRunButtonRef = useRef<HTMLButtonElement | null>(null);
   const queueStopButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -864,6 +872,41 @@ function App() {
       };
     }
   }
+
+  function clearRecipeNotificationTimers() {
+    if (recipeNotificationFadeTimerRef.current !== null) {
+      window.clearTimeout(recipeNotificationFadeTimerRef.current);
+      recipeNotificationFadeTimerRef.current = null;
+    }
+    if (recipeNotificationClearTimerRef.current !== null) {
+      window.clearTimeout(recipeNotificationClearTimerRef.current);
+      recipeNotificationClearTimerRef.current = null;
+    }
+  }
+
+  function showPersistentRecipeStatus(message: string | null) {
+    clearRecipeNotificationTimers();
+    setRecipeNotification(null);
+    setRecipeStatus(message);
+  }
+
+  function showRecipeNotification(message: string) {
+    clearRecipeNotificationTimers();
+    setRecipeStatus(null);
+    setRecipeNotification({ message, isFading: false });
+    recipeNotificationFadeTimerRef.current = window.setTimeout(() => {
+      recipeNotificationFadeTimerRef.current = null;
+      setRecipeNotification((current) =>
+        current?.message === message ? { ...current, isFading: true } : current,
+      );
+    }, RECIPE_NOTIFICATION_FADE_START_MS);
+    recipeNotificationClearTimerRef.current = window.setTimeout(() => {
+      recipeNotificationClearTimerRef.current = null;
+      setRecipeNotification((current) => current?.message === message ? null : current);
+    }, RECIPE_NOTIFICATION_CLEAR_MS);
+  }
+
+  useEffect(() => () => clearRecipeNotificationTimers(), []);
 
   function focusButtonWhenAvailable(
     ref: { current: HTMLButtonElement | null },
@@ -1260,7 +1303,7 @@ function App() {
     const loaded = loadUserRecipeStore(localStorage);
     setUserRecipeStore(loaded);
     if (loaded.warnings.length) {
-      setRecipeStatus(loaded.warnings.join(" "));
+      showPersistentRecipeStatus(loaded.warnings.join(" "));
     }
   }, []);
 
@@ -1478,8 +1521,7 @@ function App() {
       setOutputPath("");
       setOutputSuggestNonce((nonce) => nonce + 1);
     }
-    setStatus(`Applied ${label}.`);
-    setRecipeStatus(
+    showRecipeNotification(
       options.resetOutput
         ? `Applied ${label}. A fresh output path will be suggested; clip edits, color consent, and metadata privacy were unchanged.`
         : `Applied ${label}. Clip edits, color consent, and metadata privacy were unchanged. The output extension may follow the recipe format.`,
@@ -1509,7 +1551,7 @@ function App() {
       if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
       if (partialSettings.perturbFirstFrame !== undefined) setPerturbFirstFrame(partialSettings.perturbFirstFrame);
       if (partialSettings.strictFit !== undefined) setStrictFit(partialSettings.strictFit);
-      setStatus(`Applied ${recipe.label}.`);
+      showRecipeNotification(`Applied ${recipe.label}.`);
       return;
     }
     applyFullRecipeSettings(recipe.settings, recipe.label, { resetOutput: true });
@@ -1533,7 +1575,7 @@ function App() {
       queueSnapshotApplyingRef.current
     ) return;
     if (userRecipeStore.readOnly) {
-      setRecipeStatus("Saved recipes were created by a newer app version and cannot be changed here.");
+      showPersistentRecipeStatus("Saved recipes were created by a newer app version and cannot be changed here.");
       return;
     }
     setAboutOpen(false);
@@ -1599,12 +1641,11 @@ function App() {
     const persisted = persistUserRecipeStore(localStorage, userRecipeStore, nextRecipes);
     if (!persisted.ok) {
       setRecipeDialogError(persisted.error);
-      setRecipeStatus(persisted.error);
+      showPersistentRecipeStatus(persisted.error);
       return false;
     }
     setUserRecipeStore(persisted.store);
-    setRecipeStatus(successMessage);
-    setStatus(successMessage);
+    showRecipeNotification(successMessage);
     closeRecipeDialog();
     if (options.focusSaveButton) {
       window.setTimeout(() => focusButtonWhenAvailable(recipeSaveButtonRef), 0);
@@ -6122,7 +6163,7 @@ function App() {
           // The returned failure will identify persistence problems in the main path.
         }
         setUserRecipeStore(originalRecipeStore);
-        setRecipeStatus(originalRecipeStatus);
+        showPersistentRecipeStatus(originalRecipeStatus);
       }
     }
   }
@@ -7067,6 +7108,9 @@ function App() {
   const trimShortcutHint = selectedTrimBoundary
     ? `Arrow keys nudge ${formatTrimTargetLabel(selectedTrimBoundary)} by 0.1s. Shift or Page Up/Down uses 1s; Home/End moves to the limit. [ sets Start, ] sets End, and Space plays.`
     : "Select Start or End to edit that boundary. Arrow keys nudge by 0.1s, Shift uses 1s, [ sets Start, ] sets End, and Space plays.";
+  const visibleRecipeStatus = recipeStatus ?? recipeNotification?.message ?? null;
+  const recipeStatusIsError = recipeStatus !== null && userRecipeStore.readOnly;
+  const recipeStatusIsFading = recipeStatus === null && recipeNotification?.isFading === true;
 
   return (
     <div className="vfl-app">
@@ -7732,15 +7776,15 @@ function App() {
                 <span aria-hidden="true">+</span>
               </button>
             </div>
-            {recipeStatus ? (
+            {visibleRecipeStatus ? (
               <div
-                className={userRecipeStore.readOnly ? "vfl-error" : "vfl-inline-hint vfl-recipe-status"}
-                role={userRecipeStore.readOnly ? "alert" : "status"}
-                aria-live={userRecipeStore.readOnly ? "assertive" : "polite"}
+                className={`${recipeStatusIsError ? "vfl-error" : "vfl-inline-hint vfl-recipe-status"}${recipeStatusIsFading ? " is-fading" : ""}`}
+                role={recipeStatusIsError ? "alert" : "status"}
+                aria-live={recipeStatusIsError ? "assertive" : "polite"}
                 aria-atomic="true"
                 data-smoke-id="user-recipe-status"
               >
-                {recipeStatus}
+                {visibleRecipeStatus}
               </div>
             ) : null}
           </RailCard>

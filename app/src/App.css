@@ -764,6 +764,12 @@ button:focus-visible {
 
 .vfl-recipe-status {
   margin-top: 8px;
+  opacity: 1;
+  transition: opacity 200ms ease;
+}
+
+.vfl-recipe-status.is-fading {
+  opacity: 0;
 }
 
 /* ---------- preview pane ---------- */
