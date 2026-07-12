@@ -285,9 +285,17 @@ function Test-SmokeAutomationElementFocus {
       return $false
     }
     $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
-    return $null -ne $focused -and
-      $focused.Current.HasKeyboardFocus -and
-      [System.Windows.Automation.Automation]::Compare($Element, $focused)
+    if ($null -eq $focused) { return $false }
+    $expectedAutomationId = $Element.Current.AutomationId
+    $expectedName = $Element.Current.Name
+    $identityMatches = if ($expectedAutomationId) {
+      $focused.Current.AutomationId -eq $expectedAutomationId
+    } else {
+      $focused.Current.Name -eq $expectedName
+    }
+    return $focused.Current.HasKeyboardFocus -and
+      $focused.Current.ProcessId -eq $Element.Current.ProcessId -and
+      $identityMatches
   } catch {
     return $false
   }
@@ -532,7 +540,6 @@ $process = [System.Diagnostics.Process]::Start($startInfo)
 if (-not $process) {
   throw "Portable export smoke could not launch the packaged app."
 }
-$null = Set-SmokeProcessForeground -Process $process
 
 $lastStatus = $null
 $lastStageName = $null
@@ -561,6 +568,7 @@ $requiredStages = @(
 )
 
 try {
+  $null = Set-SmokeProcessForeground -Process $process
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   do {
     Start-Sleep -Milliseconds 500
@@ -588,7 +596,7 @@ try {
           }
           "keyboard-trim-incremented" {
             Send-SmokeKeySequence -Process $process -Keys @("{LEFT}") -AutomationId "vfl-trim-start-slider"
-            Send-SmokeKeySequence -Process $process -Keys @("{TAB}")
+            Send-SmokeKeySequence -Process $process -Keys @("{TAB}") -AutomationId "vfl-trim-start-slider"
             $sentKeyboardStages[$status.stage] = $true
           }
           "keyboard-crop-ready" {

@@ -192,14 +192,15 @@ test("portable export smoke enforces ordered workflow and interaction stage hist
   assert.match(raw, /AttachThreadInput\(currentThread, targetThread, true\)/);
   assert.match(raw, /ForceForegroundWindow\(\$handle\)/);
   assert.match(raw, /function Set-SmokeProcessForeground/);
-  assert.match(raw, /\$null = Set-SmokeProcessForeground -Process \$process/);
+  assert.match(raw, /try \{\s*\$null = Set-SmokeProcessForeground -Process \$process\s*\$deadline/);
   assert.match(raw, /UIAutomationClient/);
   assert.match(raw, /Invoke-SmokeAutomationElement/);
   assert.match(raw, /Set-SmokeAutomationElementFocus/);
   assert.match(raw, /Wait-SmokeStableAutomationElementFocus/);
   assert.match(raw, /\$stableSamples -eq 3/);
   assert.match(raw, /Current\.HasKeyboardFocus/);
-  assert.match(raw, /Automation\]::Compare\(\$Element, \$focused\)/);
+  assert.match(raw, /\$focused\.Current\.ProcessId -eq \$Element\.Current\.ProcessId/);
+  assert.match(raw, /\$focused\.Current\.AutomationId -eq \$expectedAutomationId/);
   assert.match(raw, /IsKeyboardFocusableProperty/);
   assert.match(raw, /InvokePattern/);
   assert.match(raw, /IsInvokePatternAvailableProperty/);
@@ -209,7 +210,7 @@ test("portable export smoke enforces ordered workflow and interaction stage hist
   assert.match(raw, /-AutomationId "vfl-crop-x"/);
   assert.match(raw, /Invoke-SmokeAutomationElement -Handle \$process\.MainWindowHandle -Name "About & updates"/);
   assert.match(raw, /Invoke-SmokeAutomationElement -Handle \$process\.MainWindowHandle -Name "Close about dialog"/);
-  assert.match(raw, /Send-SmokeKeySequence -Process \$process -Keys @\("\{TAB\}"\)/);
+  assert.match(raw, /Send-SmokeKeySequence -Process \$process -Keys @\("\{TAB\}"\) -AutomationId "vfl-trim-start-slider"/);
   assert.match(raw, /GetForegroundWindow\(\) -ne \$handle[\s\S]*?ForceForegroundWindow\(\$handle\)[\s\S]*?could not restore foreground before real keyboard input/);
   assert.match(raw, /VFL_SMOKE_TRIM_START_S"\] = "0\.25"/);
   assert.match(raw, /struct MOUSEINPUT[\s\S]*?struct KEYBDINPUT[\s\S]*?struct HARDWAREINPUT[\s\S]*?struct INPUTUNION[\s\S]*?struct INPUT/);
