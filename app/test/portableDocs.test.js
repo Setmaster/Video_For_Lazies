@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  resolveDeclaredSourceCommit,
   renderSourceNotice,
   renderThirdPartyNotices,
 } from "../scripts/generate-portable-docs.mjs";
@@ -21,6 +22,27 @@ import {
 } from "../scripts/ffmpegBundle.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
+
+test("portable source provenance accepts one exact declared commit and rejects ambiguity", () => {
+  const commit = "a".repeat(40);
+  assert.equal(resolveDeclaredSourceCommit({ VFL_SOURCE_COMMIT: commit }), commit);
+  assert.equal(resolveDeclaredSourceCommit({ GITHUB_SHA: commit.toUpperCase() }), commit);
+  assert.equal(
+    resolveDeclaredSourceCommit({ VFL_SOURCE_COMMIT: commit, GITHUB_SHA: commit }),
+    commit,
+  );
+  assert.throws(
+    () => resolveDeclaredSourceCommit({ VFL_SOURCE_COMMIT: "abc123" }),
+    /exact 40-character Git commit SHA/i,
+  );
+  assert.throws(
+    () => resolveDeclaredSourceCommit({
+      VFL_SOURCE_COMMIT: commit,
+      GITHUB_SHA: "b".repeat(40),
+    }),
+    /different source commits/i,
+  );
+});
 
 test("portable source notice describes app and FFmpeg source artifacts without local paths", () => {
   const notice = renderSourceNotice({

@@ -13,6 +13,7 @@ import {
   portableLinuxDesktopFileName,
   portableLinuxIconFileName,
 } from "./ffmpegBundle.mjs";
+import { getGitSourceContext } from "./generate-portable-docs.mjs";
 import { runPortableSmoke } from "./run-portable-smoke.mjs";
 import { runPortableExportSmoke } from "./run-portable-export-smoke.mjs";
 import { runPortableCodecPlanSmoke } from "./run-portable-codec-plan-smoke.mjs";
@@ -33,6 +34,7 @@ import {
   getPortableZipPath,
 } from "./portableRelease.mjs";
 import { getProjectVersion } from "./versioning.mjs";
+import { readVerifiedZipEntriesFromBuffer } from "./zipEntries.mjs";
 import {
   copyPayloadManifestSidecar,
   PAYLOAD_MANIFEST_FILE_NAME,
@@ -142,11 +144,15 @@ async function createZipArchive(portableDir, zipPath) {
     try {
       await fs.rm(zipPath, { force: true });
       if (process.platform === "win32") {
-        await runChecked("powershell.exe", [
-          "-NoProfile",
-          "-Command",
-          `$ErrorActionPreference='Stop'; Compress-Archive -LiteralPath ${psQuote(portableDir)} -DestinationPath ${psQuote(zipPath)} -Force`,
-        ]);
+        await runChecked("tar.exe", [
+          "-a",
+          "-c",
+          "-f",
+          zipPath,
+          path.basename(portableDir),
+        ], {
+          cwd: path.dirname(portableDir),
+        });
       } else {
         await runChecked("zip", ["-r", "-q", zipPath, path.basename(portableDir)], {
           cwd: path.dirname(portableDir),
@@ -164,6 +170,12 @@ async function createZipArchive(portableDir, zipPath) {
   }
 
   throw lastError ?? new Error("Zip creation failed.");
+}
+
+async function assertCanonicalZipArchive(zipPath) {
+  readVerifiedZipEntriesFromBuffer(await fs.readFile(zipPath), {
+    archiveLabel: path.basename(zipPath),
+  });
 }
 
 async function extractZipArchive(zipPath, extractRoot) {
@@ -315,6 +327,27 @@ async function assertPortableExecutable(portableDir, { platform = process.platfo
   await assertPortableFile(portableDir, platform === "win32" ? "vfl-update-helper.exe" : "vfl-update-helper");
 }
 
+export async function assertPortableSourceProvenance(portableDir, sourceCommit) {
+  if (!/^[0-9a-f]{40}$/.test(sourceCommit)) {
+    throw new Error("Portable release source commit must be an exact lowercase 40-character Git SHA.");
+  }
+  const sourceNotice = await fs.readFile(path.resolve(portableDir, "SOURCE.md"), "utf8");
+  const thirdPartyNotices = await fs.readFile(
+    path.resolve(portableDir, "THIRD_PARTY_NOTICES.md"),
+    "utf8",
+  );
+  const expectedSourceLine = `- Source commit: \`${sourceCommit}\``;
+  const expectedNoticesLine = `Generated for source commit \`${sourceCommit}\`.`;
+  if (!sourceNotice.split(/\r?\n/).includes(expectedSourceLine)) {
+    throw new Error(`Portable SOURCE.md does not identify exact source commit ${sourceCommit}.`);
+  }
+  if (!thirdPartyNotices.split(/\r?\n/).includes(expectedNoticesLine)) {
+    throw new Error(
+      `Portable THIRD_PARTY_NOTICES.md does not identify exact source commit ${sourceCommit}.`,
+    );
+  }
+}
+
 async function verifyWindowsUpdateHelperManifest(portableDir, { platform = process.platform } = {}) {
   if (platform !== "win32") return;
 
@@ -333,10 +366,15 @@ async function verifyWindowsUpdateHelperManifest(portableDir, { platform = proce
   ]);
 }
 
-async function verifyPortableArtifact(portableDir, label, { platform = process.platform } = {}) {
+async function verifyPortableArtifact(
+  portableDir,
+  label,
+  { platform = process.platform, sourceCommit } = {},
+) {
   console.log(`Verifying extracted ${label} artifact: ${portableDir}`);
   await assertPortableExecutable(portableDir, { platform });
   await assertPortableLegalPayload(portableDir, { platform });
+  await assertPortableSourceProvenance(portableDir, sourceCommit);
   await validatePayloadManifest({
     portableDir,
     version: await getProjectVersion(),
@@ -395,10 +433,12 @@ async function verifyPortableArtifact(portableDir, label, { platform = process.p
   });
 }
 
-async function runPortableBuild() {
+async function runPortableBuild({ sourceCommit }) {
+  const buildEnv = { ...process.env, VFL_SOURCE_COMMIT: sourceCommit };
   if (process.platform === "win32") {
     await runChecked("cmd.exe", ["/d", "/s", "/c", "npm run portable"], {
       cwd: appRoot,
+      env: buildEnv,
       timeoutMs: PORTABLE_BUILD_TIMEOUT_MS,
     });
     return;
@@ -406,6 +446,7 @@ async function runPortableBuild() {
 
   await runChecked("npm", ["run", "portable"], {
     cwd: appRoot,
+    env: buildEnv,
     timeoutMs: PORTABLE_BUILD_TIMEOUT_MS,
   });
 }
@@ -413,8 +454,14 @@ async function runPortableBuild() {
 async function main() {
   const version = await getProjectVersion();
   const targetLabel = getPortableTargetLabel();
+  const sourceCommit = (await getGitSourceContext({ version })).commitSha;
+  if (!/^[0-9a-f]{40}$/.test(sourceCommit)) {
+    throw new Error(
+      "Portable release requires an exact source commit from Git, VFL_SOURCE_COMMIT, or GITHUB_SHA.",
+    );
+  }
 
-  await runPortableBuild();
+  await runPortableBuild({ sourceCommit });
 
   const portableDir = getPortableOutputDir();
   if (!(await exists(portableDir))) {
@@ -430,6 +477,7 @@ async function main() {
   });
 
   await createZipArchive(portableDir, zipPath);
+  await assertCanonicalZipArchive(zipPath);
   await fs.writeFile(checksumPath, await buildChecksumLines([zipPath]));
 
   const extractRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-portable-release-"));
@@ -438,7 +486,9 @@ async function main() {
   try {
     const zipExtractRoot = path.resolve(extractRoot, "zip");
     await extractZipArchive(zipPath, zipExtractRoot);
-    await verifyPortableArtifact(await locateExtractedPortableDir(zipExtractRoot), "zip");
+    await verifyPortableArtifact(await locateExtractedPortableDir(zipExtractRoot), "zip", {
+      sourceCommit,
+    });
   } catch (error) {
     keepExtractRoot = true;
     console.error(`Portable release verification artifacts kept at: ${extractRoot}`);

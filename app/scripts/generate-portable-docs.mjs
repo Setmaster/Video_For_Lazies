@@ -28,6 +28,7 @@ const SUBTITLE_FONT_SOURCE_ARCHIVE_URL = "https://github.com/dejavu-fonts/dejavu
 const SUBTITLE_FONT_SOURCE_ARCHIVE_SHA256 = "7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a";
 const SUBTITLE_FONT_SHA256 = "7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954";
 const SUBTITLE_FONT_LICENSE_SHA256 = "7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93";
+const FULL_GIT_COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
 
 async function pathExists(targetPath) {
   try {
@@ -292,10 +293,34 @@ export function renderSourceNotice({ version, commitSha, releaseTag, tagAtHead =
   ].join("\n");
 }
 
-export async function getGitSourceContext({ version } = {}) {
+function normalizeDeclaredSourceCommit(value, label) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "") return "";
+  if (!FULL_GIT_COMMIT_PATTERN.test(normalized)) {
+    throw new Error(`${label} must be an exact 40-character Git commit SHA.`);
+  }
+  return normalized;
+}
+
+export function resolveDeclaredSourceCommit(env = process.env) {
+  const explicitCommit = normalizeDeclaredSourceCommit(env.VFL_SOURCE_COMMIT, "VFL_SOURCE_COMMIT");
+  const githubCommit = normalizeDeclaredSourceCommit(env.GITHUB_SHA, "GITHUB_SHA");
+  if (explicitCommit && githubCommit && explicitCommit !== githubCommit) {
+    throw new Error("VFL_SOURCE_COMMIT and GITHUB_SHA identify different source commits.");
+  }
+  return explicitCommit || githubCommit;
+}
+
+export async function getGitSourceContext({ version, env = process.env } = {}) {
   const normalizedVersion = version ?? await getProjectVersion();
   const expectedTag = `v${normalizedVersion}`;
-  const commitSha = await captureOptional("git", ["rev-parse", "HEAD"]);
+  const declaredCommit = resolveDeclaredSourceCommit(env);
+  const capturedCommitRaw = await captureOptional("git", ["rev-parse", "HEAD"]);
+  const capturedCommit = normalizeDeclaredSourceCommit(capturedCommitRaw, "git rev-parse HEAD");
+  if (declaredCommit && capturedCommit && declaredCommit !== capturedCommit) {
+    throw new Error("Declared source commit does not match the current Git checkout.");
+  }
+  const commitSha = declaredCommit || capturedCommit;
   const tagsAtHead = (await captureOptional("git", ["tag", "--points-at", "HEAD", "--list", "v[0-9]*"]))
     .split(/\r?\n/)
     .map((line) => line.trim())

@@ -123,6 +123,7 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   const codecSmokeScript = json?.scripts?.["smoke:portable:codecs"] ?? "";
   const releaseScript = json?.scripts?.["release:portable"] ?? "";
   const makePortableRaw = await fs.readFile(makePortablePath, "utf8");
+  const releaseRunnerRaw = await fs.readFile(releaseRunnerPath, "utf8");
   const smokePowerShellRaw = await fs.readFile(smokePowerShellPath, "utf8");
 
   await fs.access(smokeWrapperPath);
@@ -150,6 +151,12 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   assert.match(smokePowerShellRaw, /Start-Sleep -Milliseconds 250/);
   assert.match(makePortableRaw, /cleanupPaths:\s*listPortableLegacyPaths\(\)/);
   assert.match(makePortableRaw, /generatePortableDocs/);
+  assert.match(releaseRunnerRaw, /runChecked\("tar\.exe"/);
+  assert.match(releaseRunnerRaw, /readVerifiedZipEntriesFromBuffer/);
+  assert.match(releaseRunnerRaw, /assertCanonicalZipArchive\(zipPath\)/);
+  assert.match(releaseRunnerRaw, /VFL_SOURCE_COMMIT:\s*sourceCommit/);
+  assert.match(releaseRunnerRaw, /assertPortableSourceProvenance/);
+  assert.doesNotMatch(releaseRunnerRaw, /Compress-Archive/);
   assert.doesNotMatch(portableScript, /\bcargo build\b/);
 });
 

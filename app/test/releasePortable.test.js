@@ -13,6 +13,7 @@ import {
   getPortableZipPath,
 } from "../scripts/portableRelease.mjs";
 import { buildLinuxLaunchCommand } from "../scripts/run-portable-export-smoke.mjs";
+import { assertPortableSourceProvenance } from "../scripts/run-release-portable.mjs";
 
 test("portable release artifact names are stable and versioned for Windows x64", () => {
   const options = { platform: "win32", arch: "x64", version: "0.1.0" };
@@ -52,6 +53,33 @@ test("buildChecksumLines emits sorted sha256 entries", async () => {
     assert.equal(entries.length, 2);
     assert.match(entries[0], /\s+a\.zip$/);
     assert.match(entries[1], /\s+b\.zip$/);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("portable release provenance requires the exact commit in both generated notices", async () => {
+  const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-release-source-test-"));
+  const sourceCommit = "a".repeat(40);
+  try {
+    await fs.writeFile(
+      path.resolve(tempRoot, "SOURCE.md"),
+      `# Source Availability\n\n- Source commit: \`${sourceCommit}\`\n`,
+    );
+    await fs.writeFile(
+      path.resolve(tempRoot, "THIRD_PARTY_NOTICES.md"),
+      `# Third-Party Notices\n\nGenerated for source commit \`${sourceCommit}\`.\n`,
+    );
+    await assertPortableSourceProvenance(tempRoot, sourceCommit);
+
+    await fs.writeFile(
+      path.resolve(tempRoot, "SOURCE.md"),
+      "# Source Availability\n\n- Source commit: current checkout\n",
+    );
+    await assert.rejects(
+      assertPortableSourceProvenance(tempRoot, sourceCommit),
+      /does not identify exact source commit/i,
+    );
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
