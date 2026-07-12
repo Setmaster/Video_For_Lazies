@@ -400,7 +400,7 @@ test("G7 retained evidence rejects protected paths and basenames", () => {
   );
 });
 
-test("G7 privacy proof scans raw status, diagnostics, trim result, stdout, and stderr", () => {
+test("G7 privacy proof scans raw status, diagnostics, evidence, stdout, and stderr", () => {
   const testCase = caseById("copy-progress");
   const protectedPath = path.resolve(os.tmpdir(), "vfl-g7-private", "input-private.mp4");
   const safeStatus = {
@@ -409,7 +409,6 @@ test("G7 privacy proof scans raw status, diagnostics, trim result, stdout, and s
     message: null,
     outputPath: null,
     diagnostics: { failureReason: null, commandPreview: "ffmpeg -i <input> <output>" },
-    trimResult: { commandPreview: "ffmpeg -i <input> <output>" },
     g7Evidence: { operation: "copy-progress" },
   };
   assert.doesNotThrow(() => assertG7PrivacySurfaces(
@@ -421,7 +420,7 @@ test("G7 privacy proof scans raw status, diagnostics, trim result, stdout, and s
   for (const [label, surfaces] of [
     ["raw status", { rawStatus: JSON.stringify({ ...safeStatus, futureField: { leaked: protectedPath } }) }],
     ["diagnostics", { status: { ...safeStatus, diagnostics: { failureReason: protectedPath } } }],
-    ["trim result", { status: { ...safeStatus, trimResult: { commandPreview: protectedPath } } }],
+    ["G7 evidence", { status: { ...safeStatus, g7Evidence: { operation: "copy-progress", leaked: protectedPath } } }],
     ["stdout", { stdoutRaw: protectedPath }],
     ["stderr", { stderrRaw: "input-private.mp4" }],
   ]) {

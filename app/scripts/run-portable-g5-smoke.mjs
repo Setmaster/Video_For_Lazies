@@ -1152,7 +1152,7 @@ async function verifyErrorCase(testCase, status, outputPath, caseRoot, preseed) 
       diagnostics.passes !== 0 ||
       !String(diagnostics.commandPreview ?? "").includes("No FFmpeg command")
     ) {
-      throw new Error(`Portable G5 smoke ${testCase.id} did not prove a zero-execution no-clobber refusal.`);
+      throw new Error(`Portable G5 smoke ${testCase.id} did not report the expected early no-clobber refusal evidence.`);
     }
     noClobber = Object.freeze({
       preserved: true,

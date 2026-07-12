@@ -588,7 +588,6 @@ function assertG7PrivacySurfaces(
     ["raw status.json", rawStatus],
     ["terminal message", status?.message],
     ["diagnostics", JSON.stringify(status?.diagnostics ?? null)],
-    ["trim result", JSON.stringify(status?.trimResult ?? null)],
     ["G7 evidence", JSON.stringify(status?.g7Evidence ?? null)],
     ["stdout", stdoutRaw],
     ["stderr", stderrRaw],

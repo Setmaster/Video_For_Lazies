@@ -167,6 +167,22 @@ test("G5 packaged corpus is bounded and covers exact targets plus external SRT f
   assert.match(g5SmokeSource, /temporaryOutputCount: 0/);
 });
 
+test("existing-output refusal stays ahead of probing and FFmpeg execution", async () => {
+  const backendSource = await fs.readFile(
+    path.resolve(__dirname, "../src-tauri/src/video.rs"),
+    "utf8",
+  );
+  const runEncodeJobStart = backendSource.indexOf("pub fn run_encode_job(");
+  const outputValidation = backendSource.indexOf("let output_path = validate_output_path(", runEncodeJobStart);
+  const sourceProbe = backendSource.indexOf("let probe = probe_video(", runEncodeJobStart);
+  const firstFfmpegExecution = backendSource.indexOf("run_ffmpeg_with_progress(", runEncodeJobStart);
+
+  assert.ok(runEncodeJobStart >= 0, "run_encode_job must remain present");
+  assert.ok(outputValidation > runEncodeJobStart, "run_encode_job must validate the output destination");
+  assert.ok(sourceProbe > outputValidation, "output validation must happen before source probing");
+  assert.ok(firstFfmpegExecution > sourceProbe, "output validation must happen before FFmpeg execution");
+});
+
 test("G5 fixture commands and paths stay deterministic and use the bundled codec surface", () => {
   const root = path.resolve(os.tmpdir(), "vfl-g5-fixture-contract");
   const easy = buildG5FixtureCommand("target-easy", root);

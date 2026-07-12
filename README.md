@@ -32,7 +32,7 @@ The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports 
 - Auto-suggest a fresh `-N` destination, reserve queue destinations, write through a process-unique temporary file, and publish without replacing an existing file.
 - Treat decimal size limits as exact integer-byte targets. With **Strict Fit** off, the requested dimensions and audio are preserved and an oversized result is still published as a clearly marked target-miss artifact with exact byte counts.
 - Opt into **Strict Fit** for at most four ordered plans. It stops at the first result that fits, otherwise keeps the smallest measured miss. Audio removal is a separate opt-in permission; without it, Strict Fit retains audio.
-- Inspect the effective mode, stream actions, codecs, target and actual bytes, trim interval, color/SAR handling, and a redacted FFmpeg command preview after export.
+- Inspect the effective mode, stream actions, codecs, target and actual bytes, color/SAR handling, and a redacted FFmpeg command preview after export.
 - Override codec, quality, encode speed, frame-rate cap, audio bitrate, or channel layout when Auto is not the right fit, and optionally normalize quiet or uneven speech.
 - Strip GPS and capture metadata by default, with an explicit privacy toggle and optional title metadata.
 - Follow visible **Copying**, **Encoding**, and **Finalizing** progress. Active work stays below 100 percent until the backend reports a terminal result.
