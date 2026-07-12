@@ -115,6 +115,10 @@ test("workflow smoke waits for committed mounted controls instead of fixed rende
     workflow,
     /const renameDialogMounted = await waitForSmokeCondition[\s\S]*?document\.activeElement === input[\s\S]*?"Rename recipe"/,
   );
+  assert.match(workflow, /Smoke accessible activation did not open the save-recipe dialog/);
+  assert.match(workflow, /Workflow smoke did not open the save-recipe dialog/);
+  assert.match(workflow, /focusSmokeWebviewTarget\(saveRecipeButton\)/);
+  assert.match(workflow, /focusSmokeWebviewTarget\(runQueueButton\)/);
 
   for (const [startMarker, endMarker] of [
     ["function getRecipeNameDialogControls", "try {"],

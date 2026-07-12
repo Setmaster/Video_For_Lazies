@@ -8,6 +8,15 @@ import { ffmpegSidecarResourceTarget, getPortableOutputDir } from "./ffmpegBundl
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const __filename = url.fileURLToPath(import.meta.url);
+const WINDOWS_RETRYABLE_AUTOMATION_ERRORS = Object.freeze([
+  "Smoke accessible activation did not open the save-recipe dialog.",
+  "Portable export smoke could not foreground the app for real keyboard input.",
+  "Portable export smoke could not restore foreground before real keyboard input.",
+  "Portable export smoke could not establish stable WebView keyboard focus",
+  "Portable export smoke lost stable WebView keyboard focus",
+]);
+const WINDOWS_SMOKE_MAX_ATTEMPTS = 3;
+const WINDOWS_SMOKE_OUTPUT_TAIL_LIMIT = 64 * 1024;
 const requiredSmokeStages = [
   "input-applied",
   "probe-ready",
@@ -74,6 +83,30 @@ function normalizeSmokeOutputFormat(value) {
     throw new Error(`Unsupported portable export smoke format: ${value}`);
   }
   return outputFormat;
+}
+
+function appendOutputTail(current, chunk) {
+  const combined = `${current}${String(chunk)}`;
+  return combined.length > WINDOWS_SMOKE_OUTPUT_TAIL_LIMIT
+    ? combined.slice(-WINDOWS_SMOKE_OUTPUT_TAIL_LIMIT)
+    : combined;
+}
+
+function runWindowsPowerShellSmokeAttempt(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("powershell.exe", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let outputTail = "";
+    child.stdout.on("data", (chunk) => {
+      process.stdout.write(chunk);
+      outputTail = appendOutputTail(outputTail, chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      process.stderr.write(chunk);
+      outputTail = appendOutputTail(outputTail, chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code, signal) => resolve({ code, signal, outputTail }));
+  });
 }
 
 function resolveCodecFixture(name) {
@@ -626,18 +659,21 @@ async function runPortableExportSmoke({
     args.push(flag, String(value));
   }
 
-  await new Promise((resolve, reject) => {
-    const child = spawn("powershell.exe", args, { stdio: "inherit" });
-
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(`Portable export smoke exited with code ${code}`));
-    });
-  });
+  for (let attempt = 1; attempt <= WINDOWS_SMOKE_MAX_ATTEMPTS; attempt += 1) {
+    const result = await runWindowsPowerShellSmokeAttempt(args);
+    if (result.code === 0) return;
+    const retryableAutomationMiss = WINDOWS_RETRYABLE_AUTOMATION_ERRORS.some(
+      (message) => result.outputTail.includes(message),
+    );
+    if (retryableAutomationMiss && attempt < WINDOWS_SMOKE_MAX_ATTEMPTS) {
+      console.warn(
+        `Portable export smoke missed native UI automation on attempt ${attempt}; retrying the complete smoke in a fresh process and WebView profile.`,
+      );
+      continue;
+    }
+    const exitDescription = result.code === null ? `signal ${result.signal ?? "unknown"}` : `code ${result.code}`;
+    throw new Error(`Portable export smoke exited with ${exitDescription}`);
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {

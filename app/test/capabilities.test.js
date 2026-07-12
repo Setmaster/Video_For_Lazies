@@ -6,7 +6,7 @@ import url from "node:url";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
-test("default capabilities expose only the needed window, dialog, and opener permissions", async () => {
+test("default capabilities expose only the needed window, WebView, dialog, and opener permissions", async () => {
   const capabilitiesPath = path.resolve(__dirname, "../src-tauri/capabilities/default.json");
   const raw = await fs.readFile(capabilitiesPath, "utf8");
   const json = JSON.parse(raw);
@@ -22,6 +22,9 @@ test("default capabilities expose only the needed window, dialog, and opener per
     "core:window:allow-set-size",
     "core:window:allow-set-min-size",
     "core:window:allow-set-size-constraints",
+    // Native packaged keyboard smoke explicitly focuses the WebView before
+    // asserting real Windows input on mounted accessibility controls.
+    "core:webview:allow-set-webview-focus",
     "dialog:allow-open",
     "dialog:allow-save",
     // Close-confirm prompt while an export is running or queued.

@@ -1,6 +1,7 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { confirm as confirmDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -422,6 +423,16 @@ async function waitForSmokeCondition(check: () => boolean, timeoutMs = 10_000) {
     await waitMs(40);
   }
   return check();
+}
+
+async function focusSmokeWebviewTarget(target: HTMLElement) {
+  try {
+    await getCurrentWebview().setFocus();
+  } catch {
+    return false;
+  }
+  target.focus();
+  return waitForSmokeCondition(() => document.hasFocus() && document.activeElement === target, 2_000);
 }
 
 function smokeStageRank(stage: string | null) {
@@ -5591,10 +5602,17 @@ function App() {
         if (!saveRecipeMounted || !saveRecipeButton) {
           return { ok: false, message: "Workflow smoke could not find enabled Save current settings." };
         }
-        saveRecipeButton.focus();
+        if (
+          smokeConfig.workflowQueueExport &&
+          !smokeConfig.skipPreviewInteractions &&
+          !(await focusSmokeWebviewTarget(saveRecipeButton))
+        ) {
+          return { ok: false, message: "Workflow smoke could not focus the WebView and Save current settings control." };
+        }
+        if (!smokeConfig.workflowQueueExport || smokeConfig.skipPreviewInteractions) saveRecipeButton.focus();
         if (smokeConfig.workflowQueueExport) {
           await reportSmokeStatus("workflow-recipe-ready", {
-            message: "Waiting for packaged recipe activation on Save current settings.",
+            message: "Waiting for packaged accessible activation on Save current settings.",
           });
         }
         if (!smokeConfig.workflowQueueExport || smokeConfig.skipPreviewInteractions) {
@@ -5621,9 +5639,16 @@ function App() {
           privacySummary,
           valuesSummary,
         } = getRecipeNameDialogControls();
+        if (!saveDialog) {
+          return {
+            ok: false,
+            message: smokeConfig.workflowQueueExport && !smokeConfig.skipPreviewInteractions
+              ? "Smoke accessible activation did not open the save-recipe dialog."
+              : "Workflow smoke did not open the save-recipe dialog.",
+          };
+        }
         if (
           !saveDialogMounted ||
-          !saveDialog ||
           !saveNameInput ||
           !valuesSummary?.textContent?.includes("Current values:") ||
           !privacySummary?.textContent?.includes("Never saved:") ||
@@ -6023,9 +6048,12 @@ function App() {
         if (!isMountedEnabledButton(runQueueButton)) {
           return { ok: false, message: "Workflow smoke could not find enabled Run queue after retry." };
         }
-        runQueueButton.focus();
+        if (!smokeConfig.skipPreviewInteractions && !(await focusSmokeWebviewTarget(runQueueButton))) {
+          return { ok: false, message: "Workflow smoke could not focus the WebView and Run queue control." };
+        }
+        if (smokeConfig.skipPreviewInteractions) runQueueButton.focus();
         await reportSmokeStatus("workflow-queue-ready", {
-          message: "Waiting for packaged keyboard activation on Run queue after a real failure and retry.",
+          message: "Waiting for packaged accessible activation on Run queue after a real failure and retry.",
         });
         if (smokeConfig.skipPreviewInteractions) runQueueButton.click();
 
@@ -6483,27 +6511,52 @@ function App() {
       return event;
     }
 
-    startSlider.focus();
+    function captureTrustedSmokeKey(target: HTMLElement, expectedKey: string) {
+      let received = false;
+      const handler = (event: KeyboardEvent) => {
+        if (
+          event.isTrusted &&
+          event.key === expectedKey &&
+          document.hasFocus() &&
+          document.activeElement === target
+        ) {
+          received = true;
+        }
+      };
+      target.addEventListener("keydown", handler);
+      return {
+        received: () => received,
+        stop: () => target.removeEventListener("keydown", handler),
+      };
+    }
+
+    if (!(await focusSmokeWebviewTarget(startSlider))) {
+      return { ok: false, message: "Accessibility smoke could not focus the WebView and Trim start slider." };
+    }
     const beforeStart = Number(startSlider.getAttribute("aria-valuenow"));
+    const realTrimRight = captureTrustedSmokeKey(startSlider, "ArrowRight");
     await reportSmokeStatus("keyboard-trim-ready", {
       message: "Waiting for real packaged keyboard input: Right on Trim start.",
     });
     const realTrimIncrementPassed = await waitForSmokeCondition(() => {
       const currentStart = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
-      return Math.abs(currentStart - (beforeStart + TRIM_FINE_NUDGE_S)) <= 0.001;
+      return realTrimRight.received() && Math.abs(currentStart - (beforeStart + TRIM_FINE_NUDGE_S)) <= 0.001;
     });
+    realTrimRight.stop();
     if (!realTrimIncrementPassed) {
-      return { ok: false, message: "Accessibility smoke did not receive exactly one real Right step on Trim start." };
+      return { ok: false, message: "Accessibility smoke did not receive one trusted real Right step on Trim start." };
     }
+    const realTrimLeft = captureTrustedSmokeKey(startSlider, "ArrowLeft");
     await reportSmokeStatus("keyboard-trim-incremented", {
-      message: "Real packaged Right moved Trim start by exactly 0.1s; waiting for Left then Tab.",
+      message: "Real packaged Right moved Trim start by exactly 0.1s; waiting for Left and accessible focus transfer.",
     });
     const realTrimKeysPassed = await waitForSmokeCondition(() => {
       const currentStart = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
-      return Math.abs(currentStart - beforeStart) <= 0.001 && document.activeElement?.id === "vfl-trim-end-slider";
+      return realTrimLeft.received() && Math.abs(currentStart - beforeStart) <= 0.001 && document.activeElement?.id === "vfl-trim-end-slider";
     });
+    realTrimLeft.stop();
     if (!realTrimKeysPassed) {
-      return { ok: false, message: "Accessibility smoke did not receive the real Right, Left, Tab trim keyboard sequence." };
+      return { ok: false, message: "Accessibility smoke did not receive the trusted real Right, Left, and accessible trim focus sequence." };
     }
     await reportSmokeStatus("keyboard-trim-complete", {
       message: "Real packaged trim keyboard sequence completed with the original value restored and focus on Trim end.",
@@ -6556,17 +6609,21 @@ function App() {
     if (!(cropX instanceof HTMLInputElement)) {
       return { ok: false, message: "Accessibility smoke could not find the Crop X input." };
     }
-    cropX.focus();
+    if (!(await focusSmokeWebviewTarget(cropX))) {
+      return { ok: false, message: "Accessibility smoke could not focus the WebView and Crop X input." };
+    }
     const cropXBefore = Number(cropX.value);
+    const realCropUp = captureTrustedSmokeKey(cropX, "ArrowUp");
     await reportSmokeStatus("keyboard-crop-ready", {
       message: "Waiting for real packaged keyboard input: Arrow Up on Crop X.",
     });
     const realCropKeyPassed = await waitForSmokeCondition(() => {
       const current = Number((document.getElementById("vfl-crop-x") as HTMLInputElement | null)?.value);
-      return current === cropXBefore + 1;
+      return realCropUp.received() && current === cropXBefore + 1;
     });
+    realCropUp.stop();
     if (!realCropKeyPassed) {
-      return { ok: false, message: `Accessibility smoke did not receive the real Crop X Arrow Up step from ${cropXBefore}.` };
+      return { ok: false, message: `Accessibility smoke did not receive the trusted real Crop X Arrow Up step from ${cropXBefore}.` };
     }
     await reportSmokeStatus("keyboard-crop-complete", {
       message: `Real packaged crop keyboard sequence moved Crop X from ${cropXBefore} to ${cropXBefore + 1}.`,
@@ -6599,9 +6656,11 @@ function App() {
     if (!aboutTrigger) {
       return { ok: false, message: "Accessibility smoke could not find the About trigger." };
     }
-    aboutTrigger.focus();
+    if (!(await focusSmokeWebviewTarget(aboutTrigger))) {
+      return { ok: false, message: "Accessibility smoke could not focus the WebView and About trigger." };
+    }
     await reportSmokeStatus("keyboard-modal-ready", {
-      message: "Waiting for real packaged keyboard input: Enter on About & updates.",
+      message: "Waiting for packaged accessible activation on About & updates.",
     });
     const realModalOpenPassed = await waitForSmokeCondition(() => {
       const dialog = document.querySelector<HTMLElement>('.vfl-about-modal[role="dialog"]');
@@ -6609,19 +6668,19 @@ function App() {
       return Boolean(dialog && close && document.activeElement === close);
     });
     if (!realModalOpenPassed) {
-      return { ok: false, message: "Accessibility smoke did not receive real Enter activation for About." };
+      return { ok: false, message: "Accessibility smoke did not receive accessible activation for About." };
     }
     await reportSmokeStatus("keyboard-modal-open", {
-      message: "Real packaged Enter opened About and moved focus to Close; waiting for real Escape.",
+      message: "Packaged accessible activation opened About and moved focus to Close; waiting for accessible close activation.",
     });
     const realModalClosePassed = await waitForSmokeCondition(
       () => !document.querySelector('.vfl-about-modal[role="dialog"]') && document.activeElement === aboutTrigger,
     );
     if (!realModalClosePassed) {
-      return { ok: false, message: "Accessibility smoke did not receive real Escape close with About trigger restoration." };
+      return { ok: false, message: "Accessibility smoke did not receive accessible About close with trigger restoration." };
     }
     await reportSmokeStatus("keyboard-complete", {
-      message: "Real packaged keyboard flow passed for trim, crop, and About open/close focus restoration.",
+      message: "Packaged keyboard and accessible activation flow passed for trim, crop, and About focus restoration.",
     });
 
     aboutTrigger.click();

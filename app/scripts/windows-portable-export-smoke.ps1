@@ -32,8 +32,8 @@ function New-SmokeScreenshotPath {
 }
 
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Windows.Forms
-
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -55,6 +55,117 @@ public static class VflPortableExportSmokeNative {
 
   [DllImport("user32.dll")]
   public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+  [DllImport("kernel32.dll")]
+  public static extern uint GetCurrentThreadId();
+
+  [DllImport("user32.dll")]
+  public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+
+  [DllImport("user32.dll")]
+  public static extern bool BringWindowToTop(IntPtr hWnd);
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct MOUSEINPUT {
+    public int dx;
+    public int dy;
+    public uint mouseData;
+    public uint dwFlags;
+    public uint time;
+    public UIntPtr dwExtraInfo;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct KEYBDINPUT {
+    public ushort wVk;
+    public ushort wScan;
+    public uint dwFlags;
+    public uint time;
+    public UIntPtr dwExtraInfo;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct HARDWAREINPUT {
+    public uint uMsg;
+    public ushort wParamL;
+    public ushort wParamH;
+  }
+
+  [StructLayout(LayoutKind.Explicit)]
+  public struct INPUTUNION {
+    [FieldOffset(0)] public MOUSEINPUT mi;
+    [FieldOffset(0)] public KEYBDINPUT ki;
+    [FieldOffset(0)] public HARDWAREINPUT hi;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct INPUT {
+    public uint type;
+    public INPUTUNION data;
+  }
+
+  [DllImport("user32.dll", SetLastError = true)]
+  private static extern uint SendInput(uint inputCount, [In] INPUT[] inputs, int inputSize);
+
+  public static void SendVirtualKey(IntPtr expectedHandle, ushort virtualKey, bool extended) {
+    if (GetForegroundWindow() != expectedHandle) {
+      throw new InvalidOperationException("Portable export smoke lost foreground immediately before native keyboard input.");
+    }
+
+    const uint INPUT_KEYBOARD = 1;
+    const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+    const uint KEYEVENTF_KEYUP = 0x0002;
+    uint flags = extended ? KEYEVENTF_EXTENDEDKEY : 0;
+    INPUT[] inputs = new INPUT[1];
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].data.ki.wVk = virtualKey;
+    inputs[0].data.ki.dwFlags = flags;
+
+    uint downSent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+    if (downSent != (uint)inputs.Length) {
+      int error = Marshal.GetLastWin32Error();
+      throw new InvalidOperationException(
+        String.Format("Portable export smoke native keyboard input inserted {0}/1 key-down events (Win32 error {1}).", downSent, error)
+      );
+    }
+
+    System.Threading.Thread.Sleep(50);
+    inputs[0].data.ki.dwFlags = flags | KEYEVENTF_KEYUP;
+    uint upSent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+    if (upSent != (uint)inputs.Length) {
+      int error = Marshal.GetLastWin32Error();
+      throw new InvalidOperationException(
+        String.Format("Portable export smoke native keyboard input inserted {0}/1 key-up events (Win32 error {1}).", upSent, error)
+      );
+    }
+  }
+
+  public static bool ForceForegroundWindow(IntPtr hWnd) {
+    IntPtr foreground = GetForegroundWindow();
+    uint ignored;
+    uint foregroundThread = GetWindowThreadProcessId(foreground, out ignored);
+    uint targetThread = GetWindowThreadProcessId(hWnd, out ignored);
+    uint currentThread = GetCurrentThreadId();
+    bool attachedForeground = foregroundThread != 0 && foregroundThread != currentThread &&
+      AttachThreadInput(currentThread, foregroundThread, true);
+    bool attachedTarget = targetThread != 0 && targetThread != currentThread && targetThread != foregroundThread &&
+      AttachThreadInput(currentThread, targetThread, true);
+    try {
+      ShowWindowAsync(hWnd, 9);
+      BringWindowToTop(hWnd);
+      SetForegroundWindow(hWnd);
+      return GetForegroundWindow() == hWnd;
+    } finally {
+      if (attachedTarget) AttachThreadInput(currentThread, targetThread, false);
+      if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+    }
+  }
 
   [DllImport("user32.dll")]
   public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, int nFlags);
@@ -129,10 +240,120 @@ function Get-JsonFileOrNull {
   }
 }
 
+function Invoke-SmokeAutomationElement {
+  param(
+    [IntPtr]$Handle,
+    [string]$Name
+  )
+
+  $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+  $condition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NameProperty,
+    $Name
+  )
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    if ($element) {
+      try {
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        if ($pattern) {
+          ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+          return
+        }
+      } catch {
+        # Retry while WebView accessibility state catches up with the mounted control.
+      }
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  throw ("Portable export smoke could not invoke accessible control: {0}" -f $Name)
+}
+
+function Test-SmokeAutomationElementFocus {
+  param(
+    [IntPtr]$Handle,
+    [System.Windows.Automation.AutomationElement]$Element
+  )
+
+  try {
+    if ([VflPortableExportSmokeNative]::GetForegroundWindow() -ne $Handle) {
+      return $false
+    }
+    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+    return $null -ne $focused -and
+      $focused.Current.HasKeyboardFocus -and
+      [System.Windows.Automation.Automation]::Compare($Element, $focused)
+  } catch {
+    return $false
+  }
+}
+
+function Wait-SmokeStableAutomationElementFocus {
+  param(
+    [IntPtr]$Handle,
+    [System.Windows.Automation.AutomationElement]$Element
+  )
+
+  $stableSamples = 0
+  for ($attempt = 0; $attempt -lt 12; $attempt++) {
+    if (Test-SmokeAutomationElementFocus -Handle $Handle -Element $Element) {
+      $stableSamples++
+      if ($stableSamples -eq 3) {
+        return $true
+      }
+    } else {
+      $stableSamples = 0
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  return $false
+}
+
+function Set-SmokeAutomationElementFocus {
+  param(
+    [IntPtr]$Handle,
+    [string]$Name,
+    [string]$AutomationId
+  )
+
+  $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+  $property = if ($AutomationId) {
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty
+  } else {
+    [System.Windows.Automation.AutomationElement]::NameProperty
+  }
+  $expected = if ($AutomationId) { $AutomationId } else { $Name }
+  $condition = New-Object System.Windows.Automation.PropertyCondition($property, $expected)
+  $element = $null
+  for ($attempt = 0; $attempt -lt 20 -and -not $element; $attempt++) {
+    $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    if (-not $element) { Start-Sleep -Milliseconds 100 }
+  }
+  if (-not $element) {
+    throw ("Portable export smoke could not find accessible keyboard target: {0}" -f $expected)
+  }
+
+  if (Wait-SmokeStableAutomationElementFocus -Handle $Handle -Element $element) {
+    return $element
+  }
+
+  try {
+    $element.SetFocus()
+  } catch {
+    throw ("Portable export smoke could not request focus for accessible keyboard target: {0}" -f $expected)
+  }
+  if (Wait-SmokeStableAutomationElementFocus -Handle $Handle -Element $element) {
+    return $element
+  }
+  throw ("Portable export smoke could not establish stable WebView keyboard focus: {0}" -f $expected)
+}
+
 function Send-SmokeKeySequence {
   param(
     [System.Diagnostics.Process]$Process,
-    [string[]]$Keys
+    [string[]]$Keys,
+    [string]$AutomationName,
+    [string]$AutomationId
   )
 
   $handle = [IntPtr]::Zero
@@ -151,23 +372,64 @@ function Send-SmokeKeySequence {
   [void][VflPortableExportSmokeNative]::ShowWindowAsync($handle, 9)
   $foreground = $false
   for ($attempt = 0; $attempt -lt 10; $attempt++) {
-    if ([VflPortableExportSmokeNative]::SetForegroundWindow($handle)) {
+    [void][VflPortableExportSmokeNative]::SetForegroundWindow($handle)
+    Start-Sleep -Milliseconds 100
+    if ([VflPortableExportSmokeNative]::GetForegroundWindow() -eq $handle) {
       $foreground = $true
       break
     }
-    Start-Sleep -Milliseconds 100
   }
   if (-not $foreground) {
     $shell = New-Object -ComObject WScript.Shell
-    $foreground = $shell.AppActivate($Process.Id)
+    [void]$shell.AppActivate($Process.Id)
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+      Start-Sleep -Milliseconds 100
+      if ([VflPortableExportSmokeNative]::GetForegroundWindow() -eq $handle) {
+        $foreground = $true
+        break
+      }
+    }
+  }
+  if (-not $foreground) {
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+      if ([VflPortableExportSmokeNative]::ForceForegroundWindow($handle)) {
+        $foreground = $true
+        break
+      }
+      Start-Sleep -Milliseconds 100
+    }
   }
   if (-not $foreground) {
     throw "Portable export smoke could not foreground the app for real keyboard input."
   }
-
-  Start-Sleep -Milliseconds 180
+  Start-Sleep -Milliseconds 50
   foreach ($key in $Keys) {
-    [System.Windows.Forms.SendKeys]::SendWait($key)
+    $targetElement = $null
+    if ([VflPortableExportSmokeNative]::GetForegroundWindow() -ne $handle) {
+      [void][VflPortableExportSmokeNative]::ForceForegroundWindow($handle)
+      Start-Sleep -Milliseconds 100
+      if ([VflPortableExportSmokeNative]::GetForegroundWindow() -ne $handle) {
+        throw "Portable export smoke could not restore foreground before real keyboard input."
+      }
+    }
+    if ($AutomationName -or $AutomationId) {
+      $targetElement = Set-SmokeAutomationElementFocus -Handle $handle -Name $AutomationName -AutomationId $AutomationId
+      if (-not (Test-SmokeAutomationElementFocus -Handle $handle -Element $targetElement)) {
+        throw "Portable export smoke lost stable WebView keyboard focus immediately before native input."
+      }
+    }
+    $virtualKeys = @{
+      "{LEFT}" = [UInt16]0x25
+      "{UP}" = [UInt16]0x26
+      "{RIGHT}" = [UInt16]0x27
+    }
+    if (-not $virtualKeys.ContainsKey($key)) {
+      throw ("Portable export smoke does not support keyboard token: {0}" -f $key)
+    }
+    [VflPortableExportSmokeNative]::SendVirtualKey($handle, [UInt16]$virtualKeys[$key], $true)
+    if ($targetElement -and -not (Test-SmokeAutomationElementFocus -Handle $handle -Element $targetElement)) {
+      throw "Portable export smoke lost stable WebView keyboard focus during native input."
+    }
     Start-Sleep -Milliseconds 180
   }
 }
@@ -233,7 +495,7 @@ $startInfo.EnvironmentVariables["VFL_SMOKE_OUTPUT"] = $outputPath
 $startInfo.EnvironmentVariables["VFL_SMOKE_STATUS"] = $statusPath
 $startInfo.EnvironmentVariables["VFL_SMOKE_FORMAT"] = $OutputFormat
 $startInfo.EnvironmentVariables["VFL_SMOKE_SIZE_LIMIT_MB"] = $SizeLimitMb.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-$startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_START_S"] = "0"
+$startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_START_S"] = "0.25"
 $startInfo.EnvironmentVariables["VFL_SMOKE_TRIM_END_S"] = $TrimEndSeconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $startInfo.EnvironmentVariables["VFL_SMOKE_WORKFLOW_QUEUE"] = "1"
 $startInfo.EnvironmentVariables["WEBVIEW2_USER_DATA_FOLDER"] = $webViewDataRoot
@@ -296,32 +558,33 @@ try {
       if (-not $sentKeyboardStages.ContainsKey($status.stage)) {
         switch ($status.stage) {
           "workflow-recipe-ready" {
+            Invoke-SmokeAutomationElement -Handle $process.MainWindowHandle -Name "Save current settings"
             $sentKeyboardStages[$status.stage] = $true
-            Send-SmokeKeySequence -Process $process -Keys @("{ENTER}")
           }
           "workflow-queue-ready" {
+            Invoke-SmokeAutomationElement -Handle $process.MainWindowHandle -Name "Run queue"
             $sentKeyboardStages[$status.stage] = $true
-            Send-SmokeKeySequence -Process $process -Keys @("{ENTER}")
           }
           "keyboard-trim-ready" {
+            Send-SmokeKeySequence -Process $process -Keys @("{RIGHT}") -AutomationId "vfl-trim-start-slider"
             $sentKeyboardStages[$status.stage] = $true
-            Send-SmokeKeySequence -Process $process -Keys @("{RIGHT}")
           }
           "keyboard-trim-incremented" {
+            Send-SmokeKeySequence -Process $process -Keys @("{LEFT}") -AutomationId "vfl-trim-start-slider"
+            $null = Set-SmokeAutomationElementFocus -Handle $process.MainWindowHandle -AutomationId "vfl-trim-end-slider"
             $sentKeyboardStages[$status.stage] = $true
-            Send-SmokeKeySequence -Process $process -Keys @("{LEFT}", "{TAB}")
           }
           "keyboard-crop-ready" {
+            Send-SmokeKeySequence -Process $process -Keys @("{UP}") -AutomationId "vfl-crop-x"
             $sentKeyboardStages[$status.stage] = $true
-            Send-SmokeKeySequence -Process $process -Keys @("{UP}")
           }
           "keyboard-modal-ready" {
+            Invoke-SmokeAutomationElement -Handle $process.MainWindowHandle -Name "About & updates"
             $sentKeyboardStages[$status.stage] = $true
-            Send-SmokeKeySequence -Process $process -Keys @("{ENTER}")
           }
           "keyboard-modal-open" {
+            Invoke-SmokeAutomationElement -Handle $process.MainWindowHandle -Name "Close about dialog"
             $sentKeyboardStages[$status.stage] = $true
-            Send-SmokeKeySequence -Process $process -Keys @("{ESC}")
           }
         }
       }
