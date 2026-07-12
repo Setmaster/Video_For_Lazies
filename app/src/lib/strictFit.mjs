@@ -52,16 +52,10 @@ export function exactTargetBytesFromMegabytes(value) {
   return isPositiveSafeInteger(bytes) ? bytes : null;
 }
 
-/**
- * Canonicalizes the two request flags without accepting truthy strings or
- * allowing the nested audio-removal permission to escape Strict Fit.
- */
+/** Canonicalizes Strict Fit without accepting truthy strings. */
 export function canonicalizeStrictFitOptions(value) {
-  const strictFit = value?.strictFit === true;
   return Object.freeze({
-    strictFit,
-    strictFitAllowAudioRemoval:
-      strictFit && value?.strictFitAllowAudioRemoval === true,
+    strictFit: value?.strictFit === true,
   });
 }
 
@@ -211,9 +205,7 @@ export function summarizeStrictFitPolicy(value) {
 
   const audioPolicy = value?.audioEnabled === false
     ? "The final audio plan is skipped because audio is not included."
-    : options.strictFitAllowAudioRemoval
-      ? "The final applicable plan may remove audio instead of reducing its bitrate."
-      : `The final applicable plan keeps audio at ${STRICT_FIT_REDUCED_AUDIO_KBPS} kbps.`;
+    : `The final applicable plan keeps audio at ${STRICT_FIT_REDUCED_AUDIO_KBPS} kbps.`;
   return `Strict Fit may run at most ${STRICT_FIT_MAX_PLANS} plans in order: the requested plan, a bitrate correction, one lower max-edge tier, then the applicable final audio plan. No-op plans are skipped. ${audioPolicy}`;
 }
 

@@ -123,7 +123,6 @@ export interface EncodeRequest {
   // the output duration; N/A for audio-only mp3.
   loopVideo: boolean;
   strictFit: boolean;
-  strictFitAllowAudioRemoval: boolean;
   subtitlePath?: string | null;
 }
 
@@ -232,7 +231,6 @@ export interface ExportDiagnostics {
   actualSizeBytes?: number | null;
   passes: number;
   attempts: number;
-  audioRemovedForSizeTarget: boolean;
   subtitleBurnedIn: boolean;
   subtitleCueCount?: number | null;
   copyFallbackReason?: string | null;
@@ -268,7 +266,6 @@ export interface AppSmokeConfig {
   colorPolicy?: ColorPolicy | null;
   reverse?: boolean | null;
   strictFit?: boolean | null;
-  strictFitAllowAudioRemoval?: boolean | null;
   // Launch-only input. It is never copied into AppSmokeStatus.
   subtitlePath?: string | null;
   g7Operation?: "copy-progress" | "rotate-speed-cap" | "cancel-drop" | null;

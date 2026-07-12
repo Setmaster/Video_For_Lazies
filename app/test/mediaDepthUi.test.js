@@ -44,7 +44,7 @@ test("media-depth policy is wired through requests, resets, capability gating, a
   assert.doesNotMatch(app, /sizeTargetRetainsAudio\(\{/);
   assert.match(app, /const audioIncluded = audioEnabled && probe\.hasAudio;/);
   assert.match(app, /requested dimensions and audio are preserved/);
-  assert.match(app, /strictFitAllowAudioRemoval/);
+  assert.doesNotMatch(app, /strictFitAllowAudioRemoval/);
   const audioEncoderGate = app.match(/const currentPlanRequiresAudioEncoder =([\s\S]*?);\r?\n/);
   assert.ok(audioEncoderGate, "request-specific audio encoder gate must exist");
   assert.doesNotMatch(audioEncoderGate[1], /sizeLimitEnabled/);

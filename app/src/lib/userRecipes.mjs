@@ -1,7 +1,8 @@
 export const USER_RECIPE_STORAGE_KEY = "vfl:user-recipes";
-export const USER_RECIPE_SCHEMA_VERSION = 2;
+export const USER_RECIPE_SCHEMA_VERSION = 3;
 export const USER_RECIPE_MAX_COUNT = 50;
 export const USER_RECIPE_NAME_MAX_LENGTH = 64;
+export const USER_RECIPE_DESCRIPTION_MAX_LENGTH = 160;
 
 const USER_RECIPE_ID_MAX_LENGTH = 128;
 const OUTPUT_DIMENSION_MIN_PX = 16;
@@ -28,6 +29,13 @@ function normalizeName(value) {
   const normalized = value.trim().replace(/\s+/g, " ");
   if (!normalized || normalized.length > USER_RECIPE_NAME_MAX_LENGTH) return null;
   return normalized;
+}
+
+function normalizeDescription(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().replace(/\s+/g, " ");
+  return normalized.length <= USER_RECIPE_DESCRIPTION_MAX_LENGTH ? normalized : null;
 }
 
 function normalizeId(value) {
@@ -186,18 +194,9 @@ export function normalizeUserRecipeSettings(value, options = {}) {
   if (value.normalizeAudio !== undefined && typeof value.normalizeAudio !== "boolean") return null;
   if (value.perturbFirstFrame !== undefined && typeof value.perturbFirstFrame !== "boolean") return null;
   if (value.strictFit !== undefined && typeof value.strictFit !== "boolean") return null;
-  if (
-    value.strictFitAllowAudioRemoval !== undefined &&
-    typeof value.strictFitAllowAudioRemoval !== "boolean"
-  ) {
-    return null;
-  }
-
   const audioEnabled = format === "mp3" ? true : value.audioEnabled;
   const hasPositiveSizeTarget = Number(sizeLimitMb) > 0;
   const strictFit = format !== "mp3" && hasPositiveSizeTarget && value.strictFit === true;
-  const strictFitAllowAudioRemoval =
-    strictFit && audioEnabled && value.strictFitAllowAudioRemoval === true;
 
   return {
     format,
@@ -207,7 +206,6 @@ export function normalizeUserRecipeSettings(value, options = {}) {
     normalizeAudio: value.normalizeAudio === true,
     perturbFirstFrame: format === "mp3" ? false : value.perturbFirstFrame === true,
     strictFit,
-    strictFitAllowAudioRemoval,
     advanced,
   };
 }
@@ -235,7 +233,6 @@ export function reusableSettingsFromEncodeRequest(request) {
     normalizeAudio: request.normalizeAudio,
     perturbFirstFrame: request.perturbFirstFrame,
     strictFit: request.strictFit,
-    strictFitAllowAudioRemoval: request.strictFitAllowAudioRemoval,
     advanced: request.advanced,
   });
 }
@@ -265,12 +262,11 @@ function migrateSchemaZeroRecipe(value, index) {
     {
       ...rawSettings,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
     },
     { legacyMaxEdgePx },
   );
   if (!name || !settings) return null;
-  return { id, name, settings };
+  return { id, name, description: "", settings };
 }
 
 function migrateSchemaOneRecipe(value) {
@@ -280,19 +276,28 @@ function migrateSchemaOneRecipe(value) {
   const settings = normalizeUserRecipeSettings({
     ...value.settings,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
   });
   if (!id || !name || !settings) return null;
-  return { id, name, settings };
+  return { id, name, description: "", settings };
 }
 
-function normalizeSchemaTwoRecipe(value) {
+function migrateSchemaTwoRecipe(value) {
   if (!isRecord(value)) return null;
   const id = normalizeId(value.id);
   const name = normalizeName(value.name);
   const settings = normalizeUserRecipeSettings(value.settings);
   if (!id || !name || !settings) return null;
-  return { id, name, settings };
+  return { id, name, description: "", settings };
+}
+
+function normalizeSchemaThreeRecipe(value) {
+  if (!isRecord(value)) return null;
+  const id = normalizeId(value.id);
+  const name = normalizeName(value.name);
+  const description = normalizeDescription(value.description);
+  const settings = normalizeUserRecipeSettings(value.settings);
+  if (!id || !name || description === null || !settings) return null;
+  return { id, name, description, settings };
 }
 
 function salvageRecipes(values, normalizeRecipe) {
@@ -366,6 +371,7 @@ export function parseUserRecipeStore(raw) {
   if (
     sourceSchemaVersion !== 0 &&
     sourceSchemaVersion !== 1 &&
+    sourceSchemaVersion !== 2 &&
     sourceSchemaVersion !== USER_RECIPE_SCHEMA_VERSION
   ) {
     return makeStore([], {
@@ -375,12 +381,14 @@ export function parseUserRecipeStore(raw) {
   }
 
   const values = isUnversionedArray ? parsed : parsed.recipes;
-  const migrating = sourceSchemaVersion === 0 || sourceSchemaVersion === 1;
+  const migrating = sourceSchemaVersion !== USER_RECIPE_SCHEMA_VERSION;
   const normalizeRecipe = sourceSchemaVersion === 0
     ? migrateSchemaZeroRecipe
     : sourceSchemaVersion === 1
       ? migrateSchemaOneRecipe
-      : normalizeSchemaTwoRecipe;
+      : sourceSchemaVersion === 2
+        ? migrateSchemaTwoRecipe
+        : normalizeSchemaThreeRecipe;
   const salvaged = salvageRecipes(values, normalizeRecipe);
   if (migrating) {
     salvaged.warnings.unshift("Saved recipes were migrated to the current format.");
@@ -412,7 +420,7 @@ function normalizeRecipeListForWrite(recipes) {
   const ids = new Set();
   const names = new Set();
   for (const value of recipes) {
-    const recipe = normalizeSchemaTwoRecipe(value);
+    const recipe = normalizeSchemaThreeRecipe(value);
     if (!recipe) throw new TypeError("A recipe contains invalid data.");
     const idKey = recipe.id.toLowerCase();
     const nameKey = recipe.name.toLowerCase();
@@ -479,7 +487,7 @@ function mutationError(error) {
   return { ok: false, error };
 }
 
-export function createUserRecipe(recipes, name, settings, options = {}) {
+export function createUserRecipe(recipes, name, description, settings, options = {}) {
   if (!Array.isArray(recipes)) return mutationError("Recipes are unavailable.");
   if (recipes.length >= USER_RECIPE_MAX_COUNT) {
     return mutationError(`No more than ${USER_RECIPE_MAX_COUNT} recipes can be saved.`);
@@ -493,6 +501,11 @@ export function createUserRecipe(recipes, name, settings, options = {}) {
     return mutationError("Recipe names must be unique.");
   }
 
+  const normalizedDescription = normalizeDescription(description);
+  if (normalizedDescription === null) {
+    return mutationError(`Recipe descriptions must contain no more than ${USER_RECIPE_DESCRIPTION_MAX_LENGTH} characters.`);
+  }
+
   const normalizedSettings = normalizeUserRecipeSettings(settings);
   if (!normalizedSettings) return mutationError("The current settings cannot be saved as a recipe.");
   const id = normalizeId(options.id ?? generateUserRecipeId(recipes, options.nowMs));
@@ -501,17 +514,19 @@ export function createUserRecipe(recipes, name, settings, options = {}) {
     return mutationError("Recipe identifiers must be unique.");
   }
 
-  const recipe = { id, name: normalizedName, settings: normalizedSettings };
+  const recipe = { id, name: normalizedName, description: normalizedDescription, settings: normalizedSettings };
   return { ok: true, recipe, recipes: [...recipes, recipe] };
 }
 
-export function renameUserRecipe(recipes, id, name) {
+export function updateUserRecipe(recipes, id, updates) {
   if (!Array.isArray(recipes)) return mutationError("Recipes are unavailable.");
   const idKey = String(id ?? "").toLowerCase();
   const index = recipes.findIndex((recipe) => recipe.id.toLowerCase() === idKey);
   if (index < 0) return mutationError("Recipe not found.");
 
-  const normalizedName = normalizeName(name);
+  if (!isRecord(updates)) return mutationError("Recipe changes are unavailable.");
+
+  const normalizedName = normalizeName(updates.name);
   if (!normalizedName) {
     return mutationError(`Recipe names must contain 1 to ${USER_RECIPE_NAME_MAX_LENGTH} characters.`);
   }
@@ -524,7 +539,22 @@ export function renameUserRecipe(recipes, id, name) {
     return mutationError("Recipe names must be unique.");
   }
 
-  const recipe = { ...recipes[index], name: normalizedName };
+  const normalizedDescription = normalizeDescription(updates.description);
+  if (normalizedDescription === null) {
+    return mutationError(`Recipe descriptions must contain no more than ${USER_RECIPE_DESCRIPTION_MAX_LENGTH} characters.`);
+  }
+
+  const normalizedSettings = updates.settings === undefined
+    ? normalizeUserRecipeSettings(recipes[index].settings)
+    : normalizeUserRecipeSettings(updates.settings);
+  if (!normalizedSettings) return mutationError("The current settings cannot be saved as a recipe.");
+
+  const recipe = {
+    ...recipes[index],
+    name: normalizedName,
+    description: normalizedDescription,
+    settings: normalizedSettings,
+  };
   const next = [...recipes];
   next[index] = recipe;
   return { ok: true, recipe, recipes: next };

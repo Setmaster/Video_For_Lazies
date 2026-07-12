@@ -24,14 +24,10 @@ test("findMatchingExportRecipe matches a full recipe settings snapshot", () => {
   assert.equal(findMatchingExportRecipe(recipe.settings)?.id, "discord-10mb");
 });
 
-test("full built-in recipes explicitly default both Strict Fit fields off", () => {
+test("full built-in recipes default Strict Fit off and omit the retired permission", () => {
   for (const recipe of EXPORT_RECIPES.filter(({ partial }) => !partial)) {
     assert.equal(recipe.settings.strictFit, false, `${recipe.id} must default Strict Fit off`);
-    assert.equal(
-      recipe.settings.strictFitAllowAudioRemoval,
-      false,
-      `${recipe.id} must default Strict Fit audio removal off`,
-    );
+    assert.equal("strictFitAllowAudioRemoval" in recipe.settings, false);
   }
 });
 
@@ -71,7 +67,7 @@ test("partial forum recipe matches a 4 MB cap with audio off and frame uniquify 
   assert.equal(findMatchingExportRecipe({ ...base, sizeLimitMb: "4", audioEnabled: false }), null);
 });
 
-test("partial recipes only match Strict Fit fields when they explicitly list them", () => {
+test("partial recipes only match Strict Fit when they explicitly list it", () => {
   const base = findExportRecipe("quick-share").settings;
   const forumSettings = {
     ...base,
@@ -79,7 +75,6 @@ test("partial recipes only match Strict Fit fields when they explicitly list the
     audioEnabled: false,
     perturbFirstFrame: true,
     strictFit: true,
-    strictFitAllowAudioRemoval: true,
   };
   assert.equal(findMatchingExportRecipe(forumSettings)?.id, "forum-4mb");
 
@@ -87,41 +82,18 @@ test("partial recipes only match Strict Fit fields when they explicitly list the
   assert.equal(recipeMatchesSettings(strictOnly, forumSettings), true);
   assert.equal(recipeMatchesSettings(strictOnly, { ...forumSettings, strictFit: false }), false);
 
-  const allowRemovalOnly = {
-    partial: true,
-    settings: { strictFitAllowAudioRemoval: true },
-  };
-  const discord = findExportRecipe("discord-10mb").settings;
-  assert.equal(
-    recipeMatchesSettings(allowRemovalOnly, {
-      ...discord,
-      strictFit: true,
-      strictFitAllowAudioRemoval: true,
-    }),
-    true,
-  );
-  assert.equal(
-    recipeMatchesSettings(allowRemovalOnly, {
-      ...discord,
-      strictFit: false,
-      strictFitAllowAudioRemoval: true,
-    }),
-    false,
-  );
 });
 
-test("full recipe matching canonicalizes Strict Fit defaults and invalid combinations", () => {
+test("full recipe matching canonicalizes Strict Fit defaults and applicability", () => {
   const quickShare = findExportRecipe("quick-share");
-  const withoutStrictFitFields = { ...quickShare.settings };
-  delete withoutStrictFitFields.strictFit;
-  delete withoutStrictFitFields.strictFitAllowAudioRemoval;
+  const withoutStrictFit = { ...quickShare.settings };
+  delete withoutStrictFit.strictFit;
 
-  assert.equal(findMatchingExportRecipe(withoutStrictFitFields)?.id, "quick-share");
+  assert.equal(findMatchingExportRecipe(withoutStrictFit)?.id, "quick-share");
   assert.equal(
     findMatchingExportRecipe({
       ...quickShare.settings,
       strictFit: true,
-      strictFitAllowAudioRemoval: true,
     })?.id,
     "quick-share",
   );
@@ -131,7 +103,6 @@ test("full recipe matching canonicalizes Strict Fit defaults and invalid combina
     findMatchingExportRecipe({
       ...discord.settings,
       strictFit: true,
-      strictFitAllowAudioRemoval: true,
     }),
     null,
   );

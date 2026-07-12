@@ -108,15 +108,15 @@ test("workflow smoke waits for committed mounted controls instead of fixed rende
   const applyClick = workflow.indexOf("applyRecipeButton.click();");
   const applyWait = workflow.indexOf("const applyCommitted = await waitForSmokeCondition", applyClick);
   const committedStatus = workflow.indexOf("status.textContent?.startsWith(`Applied ${smokeRecipeName}.`)", applyWait);
-  const freshRename = workflow.indexOf("const renameRecipeButton = getRecipeActions(smokeRecipeName).rename", committedStatus);
-  assert.ok(applyClick >= 0 && applyWait > applyClick && committedStatus > applyWait && freshRename > committedStatus);
-  assert.doesNotMatch(workflow.slice(0, applyClick), /const renameRecipeButton\s*=/);
+  const freshEdit = workflow.indexOf("const editRecipeButton = getRecipeActions(smokeRecipeName).edit", committedStatus);
+  assert.ok(applyClick >= 0 && applyWait > applyClick && committedStatus > applyWait && freshEdit > committedStatus);
+  assert.doesNotMatch(workflow.slice(0, applyClick), /const editRecipeButton\s*=/);
   assert.match(
     workflow,
-    /const renameDialogMounted = await waitForSmokeCondition[\s\S]*?document\.activeElement === input[\s\S]*?"Rename recipe"/,
+    /const editDialogMounted = await waitForSmokeCondition[\s\S]*?document\.activeElement === input[\s\S]*?"Save changes"/,
   );
-  assert.match(workflow, /Smoke accessible activation did not open the save-recipe dialog/);
-  assert.match(workflow, /Workflow smoke did not open the save-recipe dialog/);
+  assert.match(workflow, /Smoke accessible activation did not open the (?:save|create)-recipe dialog/);
+  assert.match(workflow, /Workflow smoke did not open the (?:save|create)-recipe dialog/);
   assert.match(workflow, /focusSmokeWebviewTarget\(saveRecipeButton\)/);
   assert.match(workflow, /focusSmokeWebviewTarget\(runQueueButton\)/);
 
@@ -144,7 +144,7 @@ test("workflow smoke waits for committed mounted controls instead of fixed rende
   assert.match(workflow, /if \(!isMountedEnabledButton\(runQueueButton\)\)/);
 });
 
-test("user recipe management is accessible, persist-first, and explicit about privacy", async () => {
+test("user recipes share the main grid and provide accessible persist-first create and edit flows", async () => {
   const [app, dialog, recipes] = await Promise.all([
     read("../src/App.tsx"),
     read("../src/components/UserRecipeDialog.tsx"),
@@ -154,26 +154,26 @@ test("user recipe management is accessible, persist-first, and explicit about pr
   assert.match(app, /persistUserRecipeStore\(localStorage, userRecipeStore, nextRecipes\)/);
   assert.match(app, /if \(!persisted\.ok\)/);
   assert.match(app, /setUserRecipeStore\(persisted\.store\)/);
-  assert.match(app, /Save current settings/);
-  assert.match(app, /currentSettingsSummary=\{currentRecipeSettingsSummary\}/);
+  assert.match(app, /className="vfl-recipe-add"/);
+  assert.match(app, /aria-label="Create recipe from current settings"/);
+  assert.doesNotMatch(app, /Your recipes/);
   assert.match(app, /audioEnabled: reusableAudioEnabled/);
-  assert.match(app, /cloneUserRecipeSettings\(currentRecipeSettings\) \?\? currentRecipeSettings/);
-  assert.match(app, /canonicalCurrentRecipeSettings\.sizeLimitMb/);
   assert.match(app, /recipe\.partial && format === "mp3"/);
   assert.match(app, /if \(format === "mp3"\) \{[\s\S]*?available only for MP4 or WebM video exports/);
-  assert.match(app, /aria-label=\{`Apply \$\{recipe\.name\}`\}/);
-  assert.match(app, /aria-label=\{`Rename \$\{recipe\.name\}`\}/);
-  assert.match(app, /aria-label=\{`Delete \$\{recipe\.name\}`\}/);
+  assert.match(app, /data-recipe-action="apply"/);
+  assert.match(app, /aria-labelledby=\{recipeTitleId\}/);
+  assert.match(app, /aria-describedby=\{recipeDescriptionId\}/);
+  assert.match(app, /aria-label=\{`Edit \$\{recipe\.name\}`\}/);
+  assert.match(app, /updateUserRecipe\(userRecipeStore\.recipes, recipeDialog\.recipeId/);
   assert.match(dialog, /role="alertdialog"/);
   assert.match(dialog, /label htmlFor="vfl-user-recipe-name"/);
-  assert.match(dialog, /currentSettingsSummary: string/);
-  assert.match(dialog, /saving[\s\S]*?"vfl-recipe-dialog-description vfl-recipe-values-summary vfl-recipe-privacy-summary"[\s\S]*?: "vfl-recipe-dialog-description"/);
-  assert.match(dialog, /id="vfl-recipe-values-summary"/);
-  assert.match(dialog, /<strong>Current values:<\/strong> \{currentSettingsSummary\}/);
-  assert.match(dialog, /Saved fields:/);
-  assert.match(dialog, /Never saved:/);
-  assert.match(dialog, /Metadata privacy remains a separate global setting/);
+  assert.match(dialog, /label htmlFor="vfl-user-recipe-description"/);
+  assert.match(dialog, /The new recipe will use your current settings\./);
+  assert.match(dialog, /Replace saved settings with current settings/);
+  assert.match(dialog, /Delete recipe/);
+  assert.doesNotMatch(dialog, /Saved fields:|Never saved:|Current values:/);
   assert.match(recipes, /USER_RECIPE_STORAGE_KEY = "vfl:user-recipes"/);
+  assert.match(recipes, /USER_RECIPE_SCHEMA_VERSION = 3/);
   assert.doesNotMatch(app, /vfl:queue|localStorage\.(?:setItem|getItem)\([^\n]*queue/i);
 });
 

@@ -191,7 +191,6 @@ test("packaged smoke environment exposes strict color and Reverse hooks", () => 
     videoAction: "encode",
     audioAction: "encode",
     audioCodec: "aac",
-    audioRemovedForSizeTarget: false,
   });
   const compatibleSizeCase = mediaDepthSmokeCases.find((candidate) => candidate.id === "size-target-preserves-compatible-av-copy");
   assert.equal(compatibleSizeCase.sizeLimitMb, 0.1);

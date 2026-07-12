@@ -28,7 +28,6 @@ test("frontend types and request builders carry the typed G5 contract", async ()
 
   for (const field of [
     "strictFit: boolean",
-    "strictFitAllowAudioRemoval: boolean",
     "subtitlePath?: string | null",
     "targetResult?: TargetResult | null",
     "subtitleBurnedIn: boolean",
@@ -39,11 +38,12 @@ test("frontend types and request builders carry the typed G5 contract", async ()
   assert.match(types, /export interface TargetResult[\s\S]*?status: SizeTargetStatus[\s\S]*?targetBytes: number[\s\S]*?actualBytes: number[\s\S]*?overshootBytes: number[\s\S]*?selectedPlanNumber: number[\s\S]*?plans: FitPlanResult\[\]/);
   assert.match(types, /export interface SubtitleInspection[\s\S]*?cueCount: number[\s\S]*?firstCueStartS: number[\s\S]*?lastCueEndS: number/);
   assert.match(recipes, /strictFit: boolean/);
-  assert.match(recipes, /strictFitAllowAudioRemoval: boolean/);
+  assert.doesNotMatch(types, /strictFitAllowAudioRemoval/);
+  assert.doesNotMatch(recipes, /strictFitAllowAudioRemoval/);
 
   const batchBuilder = between(app, "function buildSettingsOnlyRequest", "function buildRequest");
   assert.match(batchBuilder, /strictFit: requestStrictFit/);
-  assert.match(batchBuilder, /strictFitAllowAudioRemoval:/);
+  assert.doesNotMatch(batchBuilder, /strictFitAllowAudioRemoval/);
   assert.match(batchBuilder, /subtitlePath: null/);
 
   const fullBuilder = between(app, "function buildRequest", "function claimedOutputPathsForPreparation");
@@ -112,7 +112,8 @@ test("Strict Fit and subtitle controls preserve accessible status, focus, and ex
   assert.match(app, /role="alert"[\s\S]*?subtitleError \?\? externalSubtitleBlockingReason/);
   assert.match(app, /Inline HTML or ASS styling tags are rejected\./);
   assert.match(app, /fixed bottom-centered white text with a black outline/);
-  assert.match(app, /Allow the final applicable plan to remove audio/);
+  assert.doesNotMatch(app, /Allow the final applicable plan to remove audio/);
+  assert.match(app, /<label className="vfl-check vfl-strict-fit-toggle">[\s\S]*?id="vfl-strict-fit"[\s\S]*?<span>Strict Fit<\/span>[\s\S]*?<\/label>/);
   assert.match(app, /subtitleInspecting \? "Wait for external subtitle validation to finish\." : null/);
   assert.match(app, /const encodeBusy =[^;]*subtitleInspecting/);
   assert.match(app, /if \(subtitleInspecting\) throw new Error\("Wait for external subtitle validation to finish\."\)/);

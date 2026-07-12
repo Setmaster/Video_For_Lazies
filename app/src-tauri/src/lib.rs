@@ -118,7 +118,6 @@ struct AppSmokeConfig {
     g5_queue_target_miss: bool,
     perturb_first_frame: bool,
     strict_fit: bool,
-    strict_fit_allow_audio_removal: bool,
     subtitle_path: Option<String>,
     color_policy: video::ColorPolicy,
     reverse: bool,
@@ -360,8 +359,6 @@ fn parse_smoke_config_from_env(
     let g5_queue_target_miss = parse_smoke_bool(env, "VFL_SMOKE_G5_QUEUE_TARGET_MISS")?;
     let perturb_first_frame = parse_smoke_bool(env, "VFL_SMOKE_PERTURB_FIRST_FRAME")?;
     let strict_fit = parse_smoke_bool(env, "VFL_SMOKE_STRICT_FIT")?;
-    let strict_fit_allow_audio_removal =
-        parse_smoke_bool(env, "VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL")?;
     let subtitle_path = env
         .get("VFL_SMOKE_SUBTITLE_PATH")
         .map(|value| value.trim())
@@ -387,11 +384,6 @@ fn parse_smoke_config_from_env(
 
     if size_limit_mb < 0.0 {
         return Err("VFL_SMOKE_SIZE_LIMIT_MB must be >= 0.".to_string());
-    }
-    if strict_fit_allow_audio_removal && !strict_fit {
-        return Err(
-            "VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL requires VFL_SMOKE_STRICT_FIT.".to_string(),
-        );
     }
     if strict_fit && (size_limit_mb <= 0.0 || format == video::OutputFormat::Mp3) {
         return Err(
@@ -464,7 +456,6 @@ fn parse_smoke_config_from_env(
         g5_queue_target_miss,
         perturb_first_frame,
         strict_fit,
-        strict_fit_allow_audio_removal,
         subtitle_path,
         color_policy,
         reverse,
@@ -919,7 +910,6 @@ mod tests {
                 g5_queue_target_miss: false,
                 perturb_first_frame: false,
                 strict_fit: false,
-                strict_fit_allow_audio_removal: false,
                 subtitle_path: None,
                 color_policy: ColorPolicy::Auto,
                 reverse: false,
@@ -952,7 +942,6 @@ mod tests {
             ("VFL_SMOKE_G5_QUEUE_TARGET_MISS", "true"),
             ("VFL_SMOKE_PERTURB_FIRST_FRAME", "true"),
             ("VFL_SMOKE_STRICT_FIT", "true"),
-            ("VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL", "true"),
             ("VFL_SMOKE_SUBTITLE_PATH", r"C:\tmp\captions 字幕.srt"),
             ("VFL_SMOKE_COLOR_POLICY", "standardSdr"),
             ("VFL_SMOKE_REVERSE", "true"),
@@ -981,7 +970,6 @@ mod tests {
                 g5_queue_target_miss: true,
                 perturb_first_frame: true,
                 strict_fit: true,
-                strict_fit_allow_audio_removal: true,
                 subtitle_path: Some(r"C:\tmp\captions 字幕.srt".to_string()),
                 color_policy: ColorPolicy::StandardSdr,
                 reverse: true,
@@ -1241,17 +1229,6 @@ mod tests {
             ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
             ("VFL_SMOKE_STATUS", status_path.as_str()),
         ];
-
-        let mut allow_without_strict = smoke_env(&base);
-        allow_without_strict.insert(
-            "VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL".to_string(),
-            "1".to_string(),
-        );
-        assert!(
-            parse_smoke_config_from_env(&allow_without_strict)
-                .unwrap_err()
-                .contains("requires VFL_SMOKE_STRICT_FIT")
-        );
 
         let mut strict_without_target = smoke_env(&base);
         strict_without_target.insert("VFL_SMOKE_STRICT_FIT".to_string(), "1".to_string());

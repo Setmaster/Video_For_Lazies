@@ -30,7 +30,6 @@ export interface TargetResultFormatData extends CanonicalTargetResult {
 
 export interface StrictFitOptions {
   strictFit?: boolean;
-  strictFitAllowAudioRemoval?: boolean;
 }
 
 export interface StrictFitPolicyOptions extends StrictFitOptions {
@@ -39,7 +38,6 @@ export interface StrictFitPolicyOptions extends StrictFitOptions {
 
 export interface CanonicalStrictFitOptions {
   strictFit: boolean;
-  strictFitAllowAudioRemoval: boolean;
 }
 
 export function exactTargetBytesFromMegabytes(value: number): number | null;

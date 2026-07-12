@@ -39,30 +39,18 @@ test("Strict Fit policy constants are fixed and immutable", () => {
   assert.throws(() => STRICT_FIT_MAX_EDGE_TIERS.push(240), TypeError);
 });
 
-test("strict options require literal booleans and nest audio removal under Strict Fit", () => {
+test("strict options require literal booleans and expose only Strict Fit", () => {
   assert.deepEqual(canonicalizeStrictFitOptions(), {
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
   });
-  assert.deepEqual(canonicalizeStrictFitOptions({
+  assert.deepEqual(canonicalizeStrictFitOptions({ strictFit: false }), {
     strictFit: false,
-    strictFitAllowAudioRemoval: true,
-  }), {
+  });
+  assert.deepEqual(canonicalizeStrictFitOptions({ strictFit: "true" }), {
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
   });
-  assert.deepEqual(canonicalizeStrictFitOptions({
-    strictFit: "true",
-    strictFitAllowAudioRemoval: 1,
-  }), {
-    strictFit: false,
-    strictFitAllowAudioRemoval: false,
-  });
-  const enabled = canonicalizeStrictFitOptions({
-    strictFit: true,
-    strictFitAllowAudioRemoval: true,
-  });
-  assert.deepEqual(enabled, { strictFit: true, strictFitAllowAudioRemoval: true });
+  const enabled = canonicalizeStrictFitOptions({ strictFit: true });
+  assert.deepEqual(enabled, { strictFit: true });
   assert.equal(Object.isFrozen(enabled), true);
   assert.throws(() => { enabled.strictFit = false; }, TypeError);
 });
@@ -257,13 +245,11 @@ test("policy and exact result summaries disclose limits without rounded classifi
   assert.match(summarizeStrictFitPolicy({ strictFit: true }), /at most 4 plans/);
   assert.match(summarizeStrictFitPolicy({ strictFit: true }), /bitrate correction/);
   assert.match(summarizeStrictFitPolicy({ strictFit: true }), /32 kbps/);
+  const retainedAudioPolicy = summarizeStrictFitPolicy({ strictFit: true });
+  assert.match(retainedAudioPolicy, /keeps audio at 32 kbps/);
+  assert.doesNotMatch(retainedAudioPolicy, /remove audio/);
   assert.match(summarizeStrictFitPolicy({
     strictFit: true,
-    strictFitAllowAudioRemoval: true,
-  }), /may remove audio/);
-  assert.match(summarizeStrictFitPolicy({
-    strictFit: true,
-    strictFitAllowAudioRemoval: true,
     audioEnabled: false,
   }), /audio plan is skipped/);
 

@@ -51,7 +51,7 @@ Both platforms verify:
 - executable, legal/source, and exact payload-manifest ownership, hash, size, and mode contracts
 - the canonical FFmpeg capability contract and a real bundled `libx264` encode/probe
 - media-depth behavior for stream selection, HDR/high-depth policy, SAR/rotation geometry, and reverse/loop memory limits
-- exact-byte targets, opt-in Strict Fit, separate audio-removal consent, and one bounded external UTF-8 SRT
+- exact-byte targets, opt-in audio-preserving Strict Fit, and one bounded external UTF-8 SRT
 - One frame-accurate trim workflow using decoded frame and sample boundaries
 - recipe privacy, queue retry and snapshot restoration, multi-file routing, reset/dialog accessibility, phase progress, rotation/speed/frame-rate-cap truth, active cancellation, queued drops, and export-lifecycle behavior
 - standard MP4, WebM, custom-size, and tight-target packaged exports
@@ -95,7 +95,7 @@ The targeted smoke commands expect an already assembled portable folder and are 
 
 - Probe selection is container and codec aware. Attached pictures are excluded from primary-video selection; compatible audio and video may be copied independently.
 - Exact target classification uses backend-reported integer bytes. With Strict Fit off, the requested dimensions and audio are preserved, and a measured overshoot is retained as an openable target-miss artifact.
-- Strict Fit is opt-in and globally bounded to four ordered plans. It stops at the first fit or retains the smallest miss. Audio removal is separately permitted and is off by default.
+- Strict Fit is opt-in and globally bounded to four ordered plans. It stops at the first fit or retains the smallest miss. When audio is included, every plan retains it and the final applicable fallback uses 32 kbps audio.
 - Every output uses a unique temporary path and exclusive no-clobber publication. Suggested paths and queue reservations also advance the `-N` suffix.
 - Progress is attempt/job bound, monotonic, and phase aware (`copying`, `encoding`, `finalizing`). The UI does not show 100 percent before the matching terminal event.
 
@@ -110,7 +110,7 @@ The targeted smoke commands expect an already assembled portable folder and are 
 
 - The queue owns immutable snapshots, one active FFmpeg job, exact item/run identity, stale-event rejection, a 100-item bound, and up to 10 retained outcomes per item. Retry, duplicate, apply snapshot, stop-after-current, and clear-finished paths preserve focus and allocate fresh outputs.
 - A single supported drop while idle replaces the current source. Multi-file drops and drops during active work queue accepted files in order using a settings-only snapshot; unsupported, duplicate, and overflow counts stay visible.
-- Device-local schema-v2 recipes save only format, size, resize, audio, Strict Fit, frame uniqueness, and encoder settings. They exclude every source/output/subtitle path and clip-scoped edit, title, metadata privacy, diagnostics, queue state, and job state.
+- Device-local schema-v3 recipes store a short description alongside the recipe name and reusable format, size, resize, audio, Strict Fit, frame uniqueness, and encoder settings. They exclude every source/output/subtitle path and clip-scoped edit, title, metadata privacy, diagnostics, queue state, and job state.
 - Metadata stripping is on by default. User-facing errors and retained smoke/diagnostic evidence redact process-unique and clip-private paths where those paths are not needed for the local workflow.
 - Reset All uses a confirmation dialog and clears settings, trim, crop, color, and subtitle selection without clearing source, output, queue, or recipes. Cancel is a separate one-shot active-export action.
 - Signed portable updates show bounded progress, verify the selected payload, journal replacement state, preserve a verified backup, and attempt rollback/startup recovery after interruption. A manual portable download remains the fallback when recovery cannot complete.

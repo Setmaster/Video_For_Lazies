@@ -195,7 +195,6 @@ const mediaDepthSmokeCases = Object.freeze([
       videoAction: "encode",
       audioAction: "encode",
       audioCodec: "aac",
-      audioRemovedForSizeTarget: false,
     }),
   }),
   Object.freeze({
@@ -1004,11 +1003,6 @@ function assertMediaDepthStatus(testCase, status, outputSizeBytes) {
   assertEqualFact(status?.diagnostics?.videoAction, expected.videoAction, `${testCase.id} diagnostic video action`);
   assertEqualFact(status?.diagnostics?.audioAction, expected.audioAction, `${testCase.id} diagnostic audio action`);
   assertEqualFact(status?.diagnostics?.audioCodec, expected.audioCodec, `${testCase.id} diagnostic audio codec`);
-  assertEqualFact(
-    status?.diagnostics?.audioRemovedForSizeTarget,
-    expected.audioRemovedForSizeTarget,
-    `${testCase.id} diagnostic audio-removal flag`,
-  );
 }
 
 async function runPortableMediaDepthSmoke({

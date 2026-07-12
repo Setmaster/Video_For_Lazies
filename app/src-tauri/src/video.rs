@@ -303,8 +303,6 @@ pub struct EncodeRequest {
     #[serde(default)]
     pub strict_fit: bool,
     #[serde(default)]
-    pub strict_fit_allow_audio_removal: bool,
-    #[serde(default)]
     pub subtitle_path: Option<String>,
     #[serde(default)]
     pub normalize_audio: bool,
@@ -438,7 +436,6 @@ pub struct ExportDiagnostics {
     pub actual_size_bytes: Option<u64>,
     pub passes: u8,
     pub attempts: u32,
-    pub audio_removed_for_size_target: bool,
     pub subtitle_burned_in: bool,
     pub subtitle_cue_count: Option<u32>,
     pub copy_fallback_reason: Option<String>,
@@ -483,7 +480,6 @@ pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> Expor
         actual_size_bytes: None,
         passes: 0,
         attempts: 0,
-        audio_removed_for_size_target: false,
         subtitle_burned_in: false,
         subtitle_cue_count: None,
         copy_fallback_reason: None,
@@ -4156,12 +4152,7 @@ fn validate_base_request_scalars(request: &EncodeRequest) -> Result<(), String> 
     if size_limit_enabled && request.size_limit_mb < 0.1 {
         return Err("Size limit must be >= 0.1 MB (or 0 to disable).".to_string());
     }
-    validate_strict_fit_options(
-        request.strict_fit,
-        request.strict_fit_allow_audio_removal,
-        size_limit_enabled,
-        request.format,
-    )
+    validate_strict_fit_options(request.strict_fit, size_limit_enabled, request.format)
 }
 
 fn select_primary_video_stream(streams: &[FFProbeStream]) -> Option<&FFProbeStream> {
@@ -6111,15 +6102,22 @@ fn exact_target_message(status: SizeTargetStatus, actual_bytes: u64, target_byte
 
 fn validate_strict_fit_options(
     strict_fit: bool,
-    allow_audio_removal: bool,
     size_limit_enabled: bool,
     format: OutputFormat,
 ) -> Result<(), String> {
-    if allow_audio_removal && !strict_fit {
-        return Err("Audio-removal permission requires Strict Fit.".to_string());
-    }
     if strict_fit && (!size_limit_enabled || format == OutputFormat::Mp3) {
         return Err("Strict Fit requires an MP4 or WebM size target.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_requested_audio_preserved(
+    audio_enabled: bool,
+    source_has_audio: bool,
+    audio_action: StreamAction,
+) -> Result<(), String> {
+    if audio_enabled && source_has_audio && audio_action == StreamAction::Drop {
+        return Err("A size-targeted export cannot remove requested audio.".to_string());
     }
     Ok(())
 }
@@ -6363,7 +6361,6 @@ pub fn run_encode_job(
                 actual_size_bytes: Some(out_size),
                 passes: 1,
                 attempts: 1,
-                audio_removed_for_size_target: false,
                 subtitle_burned_in: subtitle_inspection.is_some(),
                 subtitle_cue_count: subtitle_inspection
                     .as_ref()
@@ -6465,9 +6462,11 @@ pub fn run_encode_job(
                         if cancel.load(Ordering::Relaxed) {
                             return Err("Canceled.".to_string());
                         }
-                        let audio_removed_for_size_target = request.audio_enabled
-                            && probe.has_audio
-                            && candidate.audio_action == StreamAction::Drop;
+                        validate_requested_audio_preserved(
+                            request.audio_enabled,
+                            probe.has_audio,
+                            candidate.audio_action,
+                        )?;
                         let target_result = TargetResult {
                             status: SizeTargetStatus::Met,
                             target_bytes,
@@ -6504,7 +6503,6 @@ pub fn run_encode_job(
                                 actual_size_bytes: Some(out_size),
                                 passes: 1,
                                 attempts: (candidate_index + 1) as u32,
-                                audio_removed_for_size_target,
                                 subtitle_burned_in: subtitle_inspection.is_some(),
                                 subtitle_cue_count: subtitle_inspection
                                     .as_ref()
@@ -6680,7 +6678,6 @@ pub fn run_encode_job(
                             actual_size_bytes: Some(out_size),
                             passes: 1,
                             attempts: execution_attempts,
-                            audio_removed_for_size_target: false,
                             subtitle_burned_in: subtitle_inspection.is_some(),
                             subtitle_cue_count: subtitle_inspection
                                 .as_ref()
@@ -7108,33 +7105,7 @@ pub fn run_encode_job(
                     if !request.audio_enabled || !probe.has_audio || !active_request.audio_enabled {
                         continue;
                     }
-                    if request.strict_fit_allow_audio_removal {
-                        let mut next_request = active_request.clone();
-                        next_request.audio_enabled = false;
-                        let next_command_plan = build_mutated_size_reencode_plan(
-                            &next_request,
-                            &probe,
-                            codec_selection,
-                            resolved_perturb_seed,
-                        )?;
-                        require_encode_plan_capabilities(
-                            &next_command_plan,
-                            &capability_contract,
-                            &runtime_capabilities,
-                        )?;
-                        let next_contract =
-                            next_command_plan.size_contract.clone().ok_or_else(|| {
-                                "Strict Fit audio-removal plan has no size contract.".to_string()
-                            })?;
-                        active_request = next_request;
-                        active_command_plan = next_command_plan;
-                        active_plan = next_contract.plan.clone();
-                        active_contract = next_contract;
-                        current_label = "Permitted audio removal".to_string();
-                        current_mutations
-                            .push("Audio removed with explicit Strict Fit permission.".to_string());
-                        prepared_next_plan = true;
-                    } else if active_plan.include_audio
+                    if active_plan.include_audio
                         && active_plan.audio_bitrate_kbps > STRICT_FIT_REDUCED_AUDIO_KBPS
                     {
                         let previous_audio_kbps = active_plan.audio_bitrate_kbps;
@@ -7159,6 +7130,11 @@ pub fn run_encode_job(
     if cancel.load(Ordering::Relaxed) {
         return Err("Canceled.".to_string());
     }
+    validate_requested_audio_preserved(
+        request.audio_enabled,
+        probe.has_audio,
+        selected.audio_action,
+    )?;
     for plan_result in &mut fit_plan_history {
         plan_result.selected = plan_result.plan_number == selected.plan_number;
     }
@@ -7172,8 +7148,6 @@ pub fn run_encode_job(
         selected_plan_number: selected.plan_number,
         plans: fit_plan_history,
     };
-    let audio_removed_for_size_target =
-        request.audio_enabled && probe.has_audio && selected.audio_action == StreamAction::Drop;
     let selected_audio_codec = selected
         .audio_bitrate_kbps
         .and(selected.command_plan.audio_encoder)
@@ -7198,7 +7172,6 @@ pub fn run_encode_job(
         actual_size_bytes: Some(selected.actual_size_bytes),
         passes: selected.passes,
         attempts: target_result.plans.len() as u32,
-        audio_removed_for_size_target,
         subtitle_burned_in: subtitle_inspection.is_some(),
         subtitle_cue_count: subtitle_inspection
             .as_ref()
@@ -7255,7 +7228,6 @@ mod tests {
             size_limit_mb: 8.0,
             audio_enabled: true,
             strict_fit: false,
-            strict_fit_allow_audio_removal: false,
             subtitle_path: None,
             normalize_audio: false,
             strip_metadata: false,
@@ -7273,6 +7245,31 @@ mod tests {
             perturb_seed: None,
             loop_video: false,
         }
+    }
+
+    #[test]
+    fn strict_fit_legacy_audio_removal_permission_is_ignored() {
+        let request: EncodeRequest = serde_json::from_value(serde_json::json!({
+            "inputPath": "in.mp4",
+            "outputPath": "out.mp4",
+            "format": "mp4",
+            "title": null,
+            "sizeLimitMb": 8.0,
+            "audioEnabled": true,
+            "strictFit": true,
+            "strictFitAllowAudioRemoval": true,
+            "trim": null,
+            "crop": null,
+            "reverse": false,
+            "speed": 1.0,
+            "rotateDeg": 0,
+            "color": null
+        }))
+        .unwrap();
+
+        assert!(request.audio_enabled);
+        assert!(request.strict_fit);
+        assert!(validate_base_request_scalars(&request).is_ok());
     }
 
     #[test]
@@ -7579,13 +7576,6 @@ mod tests {
                     .contains("Speed")
             );
         }
-        let mut orphan_audio_removal = request.clone();
-        orphan_audio_removal.strict_fit_allow_audio_removal = true;
-        assert!(
-            validate_base_request_scalars(&orphan_audio_removal)
-                .unwrap_err()
-                .contains("requires Strict Fit")
-        );
         let mut strict_without_target = request;
         strict_without_target.strict_fit = true;
         assert!(
@@ -9184,24 +9174,32 @@ Encoders:
 
     #[test]
     fn strict_fit_flags_require_an_explicit_video_target() {
-        assert!(validate_strict_fit_options(false, false, false, OutputFormat::Mp4).is_ok());
-        assert!(validate_strict_fit_options(true, false, true, OutputFormat::Mp4).is_ok());
-        assert!(validate_strict_fit_options(true, true, true, OutputFormat::Webm).is_ok());
+        assert!(validate_strict_fit_options(false, false, OutputFormat::Mp4).is_ok());
+        assert!(validate_strict_fit_options(true, true, OutputFormat::Mp4).is_ok());
+        assert!(validate_strict_fit_options(true, true, OutputFormat::Webm).is_ok());
         assert!(
-            validate_strict_fit_options(false, true, true, OutputFormat::Mp4)
-                .unwrap_err()
-                .contains("requires Strict Fit")
-        );
-        assert!(
-            validate_strict_fit_options(true, false, false, OutputFormat::Mp4)
+            validate_strict_fit_options(true, false, OutputFormat::Mp4)
                 .unwrap_err()
                 .contains("size target")
         );
         assert!(
-            validate_strict_fit_options(true, false, true, OutputFormat::Mp3)
+            validate_strict_fit_options(true, true, OutputFormat::Mp3)
                 .unwrap_err()
                 .contains("MP4 or WebM")
         );
+    }
+
+    #[test]
+    fn strict_fit_size_target_audio_preservation_is_fail_closed() {
+        assert!(validate_requested_audio_preserved(true, true, StreamAction::Encode).is_ok());
+        assert!(validate_requested_audio_preserved(true, true, StreamAction::Copy).is_ok());
+        assert!(
+            validate_requested_audio_preserved(true, true, StreamAction::Drop)
+                .unwrap_err()
+                .contains("cannot remove requested audio")
+        );
+        assert!(validate_requested_audio_preserved(false, true, StreamAction::Drop).is_ok());
+        assert!(validate_requested_audio_preserved(true, false, StreamAction::Drop).is_ok());
     }
 
     #[test]

@@ -62,7 +62,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "success",
     sizeLimitMb: 0.5,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     expectedTargetStatus: "met",
     expectedMinFitPlans: 1,
     expectedAudioPresent: true,
@@ -73,7 +72,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "success",
     sizeLimitMb: 0.1,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     expectedTargetStatus: "missed",
     expectedMinFitPlans: 1,
     expectedAudioPresent: true,
@@ -84,22 +82,9 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "success",
     sizeLimitMb: 0.1,
     strictFit: true,
-    strictFitAllowAudioRemoval: false,
     expectedTargetStatus: "missed",
     expectedMinFitPlans: 2,
     expectedAudioPresent: true,
-  }),
-  Object.freeze({
-    id: "target-strict-audio-removal-permitted",
-    fixtureId: "target-hard",
-    terminalStage: "success",
-    sizeLimitMb: 0.1,
-    strictFit: true,
-    strictFitAllowAudioRemoval: true,
-    expectedTargetStatus: "missed",
-    expectedMinFitPlans: 3,
-    expectedAudioPresent: false,
-    expectedAudioRemoved: true,
   }),
   Object.freeze({
     id: "target-missed-queue-recovery",
@@ -107,7 +92,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "success",
     sizeLimitMb: 0.1,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     workflowQueueExport: true,
     g5QueueTargetMiss: true,
     expectedTargetStatus: "missed",
@@ -134,7 +118,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "success",
     sizeLimitMb: 0.1,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     expectedTargetStatus: "missed",
     expectedMinFitPlans: 1,
     expectedAudioPresent: true,
@@ -145,7 +128,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "success",
     sizeLimitMb: 0,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     trimStartS: 3,
     trimEndS: 6,
     subtitleFixture: "valid",
@@ -159,7 +141,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "error",
     sizeLimitMb: 0,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     trimStartS: 3,
     trimEndS: 6,
     subtitleFixture: "malformed",
@@ -173,7 +154,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "error",
     sizeLimitMb: 0,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     trimStartS: 3,
     trimEndS: 6,
     subtitleFixture: "valid",
@@ -188,7 +168,6 @@ const g5SmokeCases = Object.freeze([
     terminalStage: "error",
     sizeLimitMb: 0,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     trimStartS: 1,
     trimEndS: 3,
     preseedOutput: true,
@@ -374,7 +353,6 @@ function buildG5SmokeEnvironment(testCase, {
     VFL_SMOKE_WORKFLOW_QUEUE: testCase.workflowQueueExport ? "1" : "0",
     VFL_SMOKE_G5_QUEUE_TARGET_MISS: testCase.g5QueueTargetMiss ? "1" : "0",
     VFL_SMOKE_STRICT_FIT: testCase.strictFit ? "1" : "0",
-    VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL: testCase.strictFitAllowAudioRemoval ? "1" : "0",
     ...(subtitlePath ? { VFL_SMOKE_SUBTITLE_PATH: path.resolve(subtitlePath) } : {}),
     ...(missingCapabilityFilters ? { VFL_SMOKE_MISSING_CAPABILITY_FILTERS: missingCapabilityFilters } : {}),
   };
@@ -505,8 +483,8 @@ function validateTargetResultEvidence(testCase, status, outputSizeBytes) {
       throw new Error(`Portable G5 smoke ${testCase.id} fit plan ${expectedPlanNumber} status is not exact-byte derived.`);
     }
     if (plan.status === "met" && firstMetPlanIndex < 0) firstMetPlanIndex = index;
-    if (!testCase.strictFitAllowAudioRemoval && plan.audioAction === "drop") {
-      throw new Error(`Portable G5 smoke ${testCase.id} dropped audio without explicit Strict Fit permission.`);
+    if (plan.audioAction === "drop") {
+      throw new Error(`Portable G5 smoke ${testCase.id} dropped audio while Include audio remained enabled.`);
     }
     if (plan.selected) selectedPlans.push(plan);
   }
@@ -518,18 +496,6 @@ function validateTargetResultEvidence(testCase, status, outputSizeBytes) {
   }
   if (testCase.strictFit && targetResult.plans.slice(1).some((plan) => plan.mutations.length === 0)) {
     throw new Error(`Portable G5 smoke ${testCase.id} retained a no-op corrective fit plan.`);
-  }
-  const audioDropPlans = targetResult.plans.filter((plan) => plan.audioAction === "drop");
-  if (audioDropPlans.length > 0) {
-    const finalPlan = targetResult.plans.at(-1);
-    if (
-      !testCase.strictFitAllowAudioRemoval ||
-      audioDropPlans.length !== 1 ||
-      audioDropPlans[0] !== finalPlan ||
-      finalPlan.selected !== true
-    ) {
-      throw new Error(`Portable G5 smoke ${testCase.id} may drop audio only on the final selected plan with explicit Strict Fit permission.`);
-    }
   }
   if (selectedPlans.length !== 1 || selectedPlans[0].planNumber !== targetResult.selectedPlanNumber) {
     throw new Error(`Portable G5 smoke ${testCase.id} must identify exactly one selected fit plan.`);
@@ -1032,18 +998,6 @@ async function verifySuccessfulCase({
   if (testCase.expectedAudioPresent && diagnostics.audioAction === "drop") {
     throw new Error(`Portable G5 smoke ${testCase.id} reported dropped audio despite the preservation contract.`);
   }
-  if (testCase.expectedAudioRemoved) {
-    const selectedPlan = targetEvidence.targetResult?.plans.find((plan) => plan.selected);
-    if (
-      audioStreamCount !== 0 ||
-      diagnostics.audioAction !== "drop" ||
-      selectedPlan?.audioAction !== "drop" ||
-      !selectedPlan.mutations.some((mutation) => /audio removed.*explicit/i.test(mutation))
-    ) {
-      throw new Error(`Portable G5 smoke ${testCase.id} did not prove explicitly permitted audio removal.`);
-    }
-  }
-
   let subtitleTiming = null;
   let subtitleFontPreflight = null;
   if (testCase.expectedSubtitleBurnedIn) {

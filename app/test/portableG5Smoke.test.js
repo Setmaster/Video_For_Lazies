@@ -110,7 +110,6 @@ test("G5 packaged corpus is bounded and covers exact targets plus external SRT f
     "target-first-plan-met",
     "target-best-effort-missed",
     "target-strict-bounded-correction",
-    "target-strict-audio-removal-permitted",
     "target-missed-queue-recovery",
     "mp3-impossible-target-missed",
     "external-srt-unicode-source-timing",
@@ -121,16 +120,9 @@ test("G5 packaged corpus is bounded and covers exact targets plus external SRT f
 
   const strictCase = g5SmokeCases.find((testCase) => testCase.id === "target-strict-bounded-correction");
   assert.equal(strictCase.strictFit, true);
-  assert.equal(strictCase.strictFitAllowAudioRemoval, false);
   assert.equal(strictCase.expectedMinFitPlans, 2);
   assert.equal(strictCase.expectedAudioPresent, true);
   assert.equal(strictCase.expectedTargetStatus, "missed");
-  const removalCase = g5SmokeCases.find((testCase) => testCase.id === "target-strict-audio-removal-permitted");
-  assert.equal(removalCase.strictFit, true);
-  assert.equal(removalCase.strictFitAllowAudioRemoval, true);
-  assert.equal(removalCase.expectedMinFitPlans, 3);
-  assert.equal(removalCase.expectedAudioPresent, false);
-  assert.equal(removalCase.expectedAudioRemoved, true);
   const queueCase = g5SmokeCases.find((testCase) => testCase.id === "target-missed-queue-recovery");
   assert.equal(queueCase.workflowQueueExport, true);
   assert.equal(queueCase.g5QueueTargetMiss, true);
@@ -224,7 +216,7 @@ test("G5 smoke environment carries strict/subtitle controls without putting priv
   });
 
   assert.equal(env.VFL_SMOKE_STRICT_FIT, "0");
-  assert.equal(env.VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL, "0");
+  assert.equal("VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL" in env, false);
   assert.equal(env.VFL_SMOKE_SUBTITLE_PATH, subtitlePath);
   assert.equal(env.VFL_SMOKE_MISSING_CAPABILITY_FILTERS, "subtitles");
   assert.equal(env.VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS, "1");
@@ -425,36 +417,9 @@ test("exact target evidence agrees with filesystem bytes, plan history, and queu
   );
   const unpermittedDrop = structuredClone(missedStatus);
   unpermittedDrop.targetResult.plans[1].audioAction = "drop";
-  assert.throws(() => validateTargetResultEvidence(strictCase, unpermittedDrop, 120_000), /dropped audio without explicit/i);
-  const removalCase = g5SmokeCases.find((testCase) => testCase.id === "target-strict-audio-removal-permitted");
-  const prematureDropPlans = [
-    fitPlan({ planNumber: 1, actualSizeBytes: 160_000, targetBytes: 100_000 }),
-    fitPlan({
-      planNumber: 2,
-      actualSizeBytes: 140_000,
-      targetBytes: 100_000,
-      mutations: ["Video bitrate 64 to 32 kbps"],
-      audioAction: "drop",
-    }),
-    fitPlan({
-      planNumber: 3,
-      actualSizeBytes: 120_000,
-      targetBytes: 100_000,
-      selected: true,
-      mutations: ["Audio removed with explicit Strict Fit permission"],
-      audioAction: "drop",
-    }),
-  ];
-  const prematureDrop = targetStatus({
-    targetBytes: 100_000,
-    actualBytes: 120_000,
-    strictFit: true,
-    plans: prematureDropPlans,
-    queueOutcomeKind: "target-missed",
-  });
   assert.throws(
-    () => validateTargetResultEvidence(removalCase, prematureDrop, 120_000),
-    /drop audio only on the final selected plan/i,
+    () => validateTargetResultEvidence(strictCase, unpermittedDrop, 120_000),
+    /dropped audio while Include audio remained enabled/i,
   );
   const selectedLargerMiss = structuredClone(missedStatus);
   selectedLargerMiss.targetResult.plans[0].actualSizeBytes = 110_000;
@@ -591,7 +556,7 @@ test("G5 corpus is wired into extracted portable verification", async () => {
   assert.match(release, /import \{ runPortableG5Smoke \} from "\.\/run-portable-g5-smoke\.mjs"/);
   assert.match(release, /await runPortableG5Smoke\(\{ portableDir, platform \}\)/);
   assert.match(runner, /VFL_SMOKE_STRICT_FIT/);
-  assert.match(runner, /VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL/);
+  assert.doesNotMatch(runner, /VFL_SMOKE_STRICT_FIT_ALLOW_AUDIO_REMOVAL/);
   assert.match(runner, /VFL_SMOKE_SUBTITLE_PATH/);
   assert.match(runner, /VFL_SMOKE_MISSING_CAPABILITY_FILTERS/);
   assert.match(runner, /queueOutcomeKind/);

@@ -211,7 +211,7 @@ test("portable export smoke enforces ordered workflow and interaction stage hist
   assert.match(raw, /IsKeyboardFocusableProperty/);
   assert.match(raw, /InvokePattern/);
   assert.match(raw, /IsInvokePatternAvailableProperty/);
-  assert.match(raw, /-Name "Save current settings"/);
+  assert.match(raw, /-Name "Create recipe from current settings"/);
   assert.match(raw, /-Name "Run queue"/);
   assert.match(raw, /-AutomationId "vfl-trim-start-slider"/);
   assert.match(raw, /-AutomationId "vfl-crop-x"/);
@@ -230,7 +230,7 @@ test("portable export smoke enforces ordered workflow and interaction stage hist
   assert.match(raw, /upSent != \(uint\)inputs\.Length/);
   assert.doesNotMatch(raw, /keybd_event/);
   assert.match(raw, /taskkill\.exe" \/PID \$process\.Id \/T \/F/);
-  assert.match(raw, /"workflow-recipe-ready"\s*\{\s*Invoke-SmokeAutomationElement -Handle \$process\.MainWindowHandle -Name "Save current settings"\s*\$sentKeyboardStages\[\$status\.stage\] = \$true/);
+  assert.match(raw, /"workflow-recipe-ready"\s*\{\s*Invoke-SmokeAutomationElement -Handle \$process\.MainWindowHandle -Name "Create recipe from current settings"\s*\$sentKeyboardStages\[\$status\.stage\] = \$true/);
   assert.match(raw, /"workflow-queue-ready"\s*\{\s*Invoke-SmokeAutomationElement -Handle \$process\.MainWindowHandle -Name "Run queue"\s*\$sentKeyboardStages\[\$status\.stage\] = \$true/);
   assert.match(raw, /stageHistory/);
   assert.match(raw, /missed required app stages/);

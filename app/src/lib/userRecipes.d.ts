@@ -4,11 +4,12 @@ import type { ExportRecipeSettings } from "./exportRecipes";
 export type UserRecipe = {
   id: string;
   name: string;
+  description: string;
   settings: ExportRecipeSettings;
 };
 
 export type UserRecipeStore = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   recipes: UserRecipe[];
   warnings: string[];
   migrated: boolean;
@@ -25,9 +26,10 @@ export type UserRecipePersistResult =
   | { ok: false; error: string };
 
 export const USER_RECIPE_STORAGE_KEY: "vfl:user-recipes";
-export const USER_RECIPE_SCHEMA_VERSION: 2;
+export const USER_RECIPE_SCHEMA_VERSION: 3;
 export const USER_RECIPE_MAX_COUNT: 50;
 export const USER_RECIPE_NAME_MAX_LENGTH: 64;
+export const USER_RECIPE_DESCRIPTION_MAX_LENGTH: 160;
 
 export function normalizeUserRecipeSettings(
   value: unknown,
@@ -51,10 +53,15 @@ export function generateUserRecipeId(recipes: UserRecipe[], nowMs?: number): str
 export function createUserRecipe(
   recipes: UserRecipe[],
   name: string,
+  description: string,
   settings: unknown,
   options?: { id?: string; nowMs?: number },
 ): UserRecipeMutationResult;
-export function renameUserRecipe(recipes: UserRecipe[], id: string, name: string): UserRecipeMutationResult;
+export function updateUserRecipe(
+  recipes: UserRecipe[],
+  id: string,
+  updates: { name: string; description: string; settings?: unknown },
+): UserRecipeMutationResult;
 export function deleteUserRecipe(recipes: UserRecipe[], id: string): UserRecipeMutationResult;
 export function userRecipeMatchesSettings(recipe: UserRecipe | null | undefined, settings: unknown): boolean;
 export function findMatchingUserRecipe(recipes: UserRecipe[], settings: unknown): UserRecipe | null;

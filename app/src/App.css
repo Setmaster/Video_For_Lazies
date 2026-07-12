@@ -490,9 +490,8 @@ input[type="checkbox"] {
   margin-bottom: 4px;
 }
 
-.vfl-nested-check {
-  margin-left: 16px;
-  border-left-color: rgba(var(--accent), 0.42);
+.vfl-strict-fit-toggle {
+  align-self: flex-start;
 }
 
 .vfl-output-dimensions-panel {
@@ -712,69 +711,59 @@ button:focus-visible {
   line-height: 1.35;
 }
 
-.vfl-user-recipes {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-}
-
-.vfl-user-recipes-head,
-.vfl-user-recipe {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.vfl-user-recipes-head > div,
-.vfl-user-recipe-copy {
+.vfl-user-recipe-tile {
+  position: relative;
   min-width: 0;
 }
 
-.vfl-user-recipes-head button,
-.vfl-user-recipe-actions button {
-  font-size: 11px;
-  padding: 5px 8px;
+.vfl-user-recipe-apply {
+  width: 100%;
+  height: 100%;
+  padding-right: 36px;
 }
 
-.vfl-user-recipe-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.vfl-user-recipe-edit {
+  position: absolute;
+  z-index: 1;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--panel);
 }
 
-.vfl-user-recipe {
-  padding: 7px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+.vfl-user-recipe-edit svg {
+  width: 13px;
+  height: 13px;
+  fill: currentColor;
+}
+
+.vfl-recipe-add {
+  display: grid;
+  min-height: 58px;
+  place-items: center;
+  border-style: dashed;
   background: var(--inset);
-}
-
-.vfl-user-recipe.active {
-  border-color: rgba(var(--accent), 0.55);
-  background: rgba(var(--accent), 0.1);
-}
-
-.vfl-user-recipe-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 5px;
-}
-
-.vfl-recipe-privacy {
   color: var(--text-muted);
-  font-size: 11px;
-  line-height: 1.5;
 }
 
-.vfl-recipe-privacy-compact {
-  padding: 7px 8px;
-  border-radius: var(--radius-sm);
-  background: var(--inset);
+.vfl-recipe-add span {
+  font-size: 28px;
+  font-weight: 300;
+  line-height: 1;
+}
+
+.vfl-recipe-add:hover:enabled {
+  color: var(--accent-strong);
+  background: rgba(var(--accent), 0.08);
+}
+
+.vfl-recipe-status {
+  margin-top: 8px;
 }
 
 /* ---------- preview pane ---------- */
@@ -1781,6 +1770,14 @@ input[type="range"]:focus-visible {
 
 .vfl-recipe-dialog-actions {
   justify-content: flex-end;
+}
+
+.vfl-recipe-delete-action {
+  margin-right: auto;
+}
+
+.vfl-recipe-modal textarea {
+  resize: vertical;
 }
 
 .vfl-elevated-update-card {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   USER_RECIPE_MAX_COUNT,
+  USER_RECIPE_DESCRIPTION_MAX_LENGTH,
   USER_RECIPE_NAME_MAX_LENGTH,
   USER_RECIPE_SCHEMA_VERSION,
   USER_RECIPE_STORAGE_KEY,
@@ -15,9 +16,9 @@ import {
   normalizeUserRecipeSettings,
   parseUserRecipeStore,
   persistUserRecipeStore,
-  renameUserRecipe,
   reusableSettingsFromEncodeRequest,
   serializeUserRecipeStore,
+  updateUserRecipe,
   userRecipeMatchesSettings,
 } from "../src/lib/userRecipes.mjs";
 
@@ -36,7 +37,6 @@ function baseSettings(overrides = {}) {
     normalizeAudio: false,
     perturbFirstFrame: false,
     strictFit: false,
-    strictFitAllowAudioRemoval: false,
     advanced: {
       videoCodec: "h264",
       audioBitrateKbps: 128,
@@ -49,8 +49,8 @@ function baseSettings(overrides = {}) {
   };
 }
 
-function recipe(id = "user:one", name = "Share") {
-  return { id, name, settings: baseSettings() };
+function recipe(id = "user:one", name = "Share", description = "") {
+  return { id, name, description, settings: baseSettings() };
 }
 
 function memoryStorage(initial = new Map()) {
@@ -156,7 +156,6 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
     normalizeAudio: true,
     perturbFirstFrame: true,
     strictFit: true,
-    strictFitAllowAudioRemoval: true,
     advanced: {
       videoCodec: "mpeg4",
       audioBitrateKbps: 192,
@@ -171,6 +170,7 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
   assert.equal(reusableRaw.includes(subtitlePath), false);
   assert.equal(reusableRaw.includes(JSON.stringify(subtitlePath).slice(1, -1)), false);
   assert.equal(reusableRaw.includes("subtitlePath"), false);
+  assert.equal(reusableRaw.includes("strictFitAllowAudioRemoval"), false);
 });
 
 test("MP3 recipes canonicalize video-only settings and always retain audio", () => {
@@ -180,7 +180,6 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
       audioEnabled: false,
       perturbFirstFrame: true,
       strictFit: true,
-      strictFitAllowAudioRemoval: true,
       resize: {
         mode: "custom",
         maxEdgePx: "",
@@ -211,7 +210,6 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
       normalizeAudio: false,
       perturbFirstFrame: false,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "auto",
         audioBitrateKbps: 192,
@@ -224,7 +222,7 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
   );
 });
 
-test("Strict Fit fields canonicalize against format, size target, and retained audio", () => {
+test("Strict Fit canonicalizes against format and size target while ignoring the removed permission", () => {
   assert.deepEqual(
     normalizeUserRecipeSettings(baseSettings({
       strictFit: true,
@@ -232,7 +230,6 @@ test("Strict Fit fields canonicalize against format, size target, and retained a
     })),
     baseSettings({
       strictFit: true,
-      strictFitAllowAudioRemoval: true,
     }),
   );
 
@@ -243,7 +240,6 @@ test("Strict Fit fields canonicalize against format, size target, and retained a
     })),
     baseSettings({
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
     }),
   );
 
@@ -251,12 +247,10 @@ test("Strict Fit fields canonicalize against format, size target, and retained a
     normalizeUserRecipeSettings(baseSettings({
       audioEnabled: false,
       strictFit: true,
-      strictFitAllowAudioRemoval: true,
     })),
     baseSettings({
       audioEnabled: false,
       strictFit: true,
-      strictFitAllowAudioRemoval: false,
     }),
   );
 
@@ -264,10 +258,8 @@ test("Strict Fit fields canonicalize against format, size target, and retained a
     const normalized = normalizeUserRecipeSettings(baseSettings({
       sizeLimitMb,
       strictFit: true,
-      strictFitAllowAudioRemoval: true,
     }));
     assert.equal(normalized.strictFit, false);
-    assert.equal(normalized.strictFitAllowAudioRemoval, false);
   }
 });
 
@@ -276,7 +268,6 @@ test("invalid reusable values fail closed instead of becoming auto defaults", ()
   assert.equal(normalizeUserRecipeSettings(baseSettings({ sizeLimitMb: "not-a-number" })), null);
   assert.equal(normalizeUserRecipeSettings(baseSettings({ audioEnabled: "yes" })), null);
   assert.equal(normalizeUserRecipeSettings(baseSettings({ strictFit: "yes" })), null);
-  assert.equal(normalizeUserRecipeSettings(baseSettings({ strictFitAllowAudioRemoval: 1 })), null);
   assert.equal(normalizeUserRecipeSettings(baseSettings({ advanced: "auto" })), null);
   assert.equal(
     normalizeUserRecipeSettings(baseSettings({
@@ -293,7 +284,7 @@ test("invalid reusable values fail closed instead of becoming auto defaults", ()
   );
 });
 
-test("schema v2 serialization has a stable exact shape and round trips", () => {
+test("schema v3 serialization has a stable exact shape and round trips", () => {
   const input = [recipe()];
   const raw = serializeUserRecipeStore(input);
   assert.equal(
@@ -306,33 +297,32 @@ test("schema v2 serialization has a stable exact shape and round trips", () => {
 
   const parsed = parseUserRecipeStore(raw);
   assert.deepEqual(parsed, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     recipes: input,
     warnings: [],
     migrated: false,
     readOnly: false,
-    sourceSchemaVersion: 2,
+    sourceSchemaVersion: 3,
   });
 });
 
-test("schema v1 records migrate to v2 with Strict Fit disabled", () => {
+test("schema v1 records migrate to v3 with Strict Fit disabled and an empty description", () => {
   const schemaOneSettings = baseSettings();
   delete schemaOneSettings.strictFit;
-  delete schemaOneSettings.strictFitAllowAudioRemoval;
   const parsed = parseUserRecipeStore(JSON.stringify({
     schemaVersion: 1,
     recipes: [{ id: "user:old", name: "Old", settings: schemaOneSettings }],
   }));
 
-  assert.equal(parsed.schemaVersion, 2);
+  assert.equal(parsed.schemaVersion, 3);
   assert.equal(parsed.sourceSchemaVersion, 1);
   assert.equal(parsed.migrated, true);
   assert.match(parsed.warnings[0], /migrated/);
+  assert.equal(parsed.recipes[0].description, "");
   assert.equal(parsed.recipes[0].settings.strictFit, false);
-  assert.equal(parsed.recipes[0].settings.strictFitAllowAudioRemoval, false);
 });
 
-test("unversioned label/maxEdge records migrate to schema v2", () => {
+test("unversioned label/maxEdge records migrate to schema v3", () => {
   const parsed = parseUserRecipeStore(JSON.stringify([
     {
       id: "legacy-one",
@@ -361,6 +351,7 @@ test("unversioned label/maxEdge records migrate to schema v2", () => {
   assert.deepEqual(parsed.recipes[0], {
     id: "legacy-one",
     name: "Legacy 720p",
+    description: "",
     settings: baseSettings(),
   });
   assert.equal(parsed.recipes[1].id, "user:migrated-2");
@@ -390,12 +381,44 @@ test("explicit schema zero objects migrate label and record-level maxEdge fields
   assert.equal(parsed.recipes[0].settings.resize.mode, "maxEdge");
   assert.equal(parsed.recipes[0].settings.resize.maxEdgePx, "540");
   assert.equal(parsed.recipes[0].settings.strictFit, false);
-  assert.equal(parsed.recipes[0].settings.strictFitAllowAudioRemoval, false);
+  assert.equal(parsed.recipes[0].description, "");
+});
+
+test("schema v2 records migrate to v3, add descriptions, and discard the removed Strict Fit permission", () => {
+  const parsed = parseUserRecipeStore(JSON.stringify({
+    schemaVersion: 2,
+    recipes: [{
+      id: "user:v2",
+      name: "Version two",
+      description: 123,
+      settings: { ...baseSettings({ strictFit: true }), strictFitAllowAudioRemoval: true },
+    }],
+  }));
+
+  assert.equal(parsed.schemaVersion, 3);
+  assert.equal(parsed.sourceSchemaVersion, 2);
+  assert.equal(parsed.migrated, true);
+  assert.equal(parsed.recipes[0].description, "");
+  assert.equal(parsed.recipes[0].settings.strictFit, true);
+  assert.equal("strictFitAllowAudioRemoval" in parsed.recipes[0].settings, false);
+});
+
+test("schema v3 validates descriptions instead of silently accepting malformed current records", () => {
+  const parsed = parseUserRecipeStore(JSON.stringify({
+    schemaVersion: 3,
+    recipes: [
+      recipe("user:valid", "Valid", "Short description"),
+      { ...recipe("user:invalid", "Invalid"), description: 123 },
+    ],
+  }));
+
+  assert.deepEqual(parsed.recipes.map(({ id }) => id), ["user:valid"]);
+  assert.match(parsed.warnings[0], /invalid/);
 });
 
 test("supported stores salvage valid records and report invalid and duplicate records", () => {
   const parsed = parseUserRecipeStore(JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 3,
     recipes: [
       recipe("User:One", "Share"),
       { ...recipe("user:one", "Different"), name: "Different" },
@@ -419,7 +442,7 @@ test("malformed and structurally corrupt stores recover without throwing", () =>
   assert.match(malformed.warnings[0], /could not be read/);
   assert.equal(malformed.readOnly, false);
 
-  const missingList = parseUserRecipeStore(JSON.stringify({ schemaVersion: 2, recipes: {} }));
+  const missingList = parseUserRecipeStore(JSON.stringify({ schemaVersion: 3, recipes: {} }));
   assert.deepEqual(missingList.recipes, []);
   assert.match(missingList.warnings[0], /did not contain a recipe list/);
 
@@ -432,12 +455,12 @@ test("malformed and structurally corrupt stores recover without throwing", () =>
 });
 
 test("future schemas are read-only and persist never overwrites them", () => {
-  const raw = JSON.stringify({ schemaVersion: 3, recipes: [recipe()] });
+  const raw = JSON.stringify({ schemaVersion: 4, recipes: [recipe()] });
   const current = parseUserRecipeStore(raw);
   const storage = memoryStorage(new Map([[USER_RECIPE_STORAGE_KEY, raw]]));
 
   assert.equal(current.readOnly, true);
-  assert.equal(current.sourceSchemaVersion, 3);
+  assert.equal(current.sourceSchemaVersion, 4);
   assert.match(current.warnings[0], /newer app version/);
 
   const result = persistUserRecipeStore(storage, current, []);
@@ -483,56 +506,68 @@ test("serializer rejects invalid, duplicate, and oversized stores", () => {
 
 test("parser caps supported stores at 50 valid records with a warning", () => {
   const recipes = Array.from({ length: USER_RECIPE_MAX_COUNT + 2 }, (_, index) => recipe(`user:${index}`, `Recipe ${index}`));
-  const parsed = parseUserRecipeStore(JSON.stringify({ schemaVersion: 2, recipes }));
+  const parsed = parseUserRecipeStore(JSON.stringify({ schemaVersion: 3, recipes }));
 
   assert.equal(parsed.recipes.length, USER_RECIPE_MAX_COUNT);
   assert.match(parsed.warnings.at(-1), /first 50/);
 });
 
-test("create, rename, and delete enforce normalized case-insensitive identity", () => {
-  const created = createUserRecipe([], "  My\nshare   recipe  ", baseSettings(), {
+test("create, update, reset, and delete enforce normalized case-insensitive identity", () => {
+  const created = createUserRecipe([], "  My\nshare   recipe  ", "  Quick\nshare  ", baseSettings(), {
     id: "User:One",
   });
   assert.equal(created.ok, true);
   assert.equal(created.recipe.name, "My share recipe");
+  assert.equal(created.recipe.description, "Quick share");
 
-  const duplicateName = createUserRecipe(created.recipes, "my SHARE recipe", baseSettings(), {
+  const duplicateName = createUserRecipe(created.recipes, "my SHARE recipe", "", baseSettings(), {
     id: "user:two",
   });
   assert.equal(duplicateName.ok, false);
   assert.match(duplicateName.error, /names must be unique/);
 
-  const duplicateId = createUserRecipe(created.recipes, "Another", baseSettings(), {
+  const duplicateId = createUserRecipe(created.recipes, "Another", "", baseSettings(), {
     id: "user:one",
   });
   assert.equal(duplicateId.ok, false);
   assert.match(duplicateId.error, /identifiers must be unique/);
 
-  const second = createUserRecipe(created.recipes, "Archive", baseSettings({ sizeLimitMb: "" }), {
+  const second = createUserRecipe(created.recipes, "Archive", "Old settings", baseSettings({ sizeLimitMb: "" }), {
     id: "user:two",
   });
   assert.equal(second.ok, true);
 
-  const duplicateRename = renameUserRecipe(second.recipes, "USER:TWO", "my share recipe");
-  assert.equal(duplicateRename.ok, false);
-  assert.match(duplicateRename.error, /names must be unique/);
+  const duplicateUpdate = updateUserRecipe(second.recipes, "USER:TWO", {
+    name: "my share recipe",
+    description: "Duplicate",
+  });
+  assert.equal(duplicateUpdate.ok, false);
+  assert.match(duplicateUpdate.error, /names must be unique/);
 
-  const renamed = renameUserRecipe(second.recipes, "USER:TWO", "  Archive master  ");
-  assert.equal(renamed.ok, true);
-  assert.equal(renamed.recipe.name, "Archive master");
+  const updated = updateUserRecipe(second.recipes, "USER:TWO", {
+    name: "  Archive master  ",
+    description: "  Fresh\nsettings  ",
+    settings: baseSettings({ sizeLimitMb: "25" }),
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(updated.recipe.name, "Archive master");
+  assert.equal(updated.recipe.description, "Fresh settings");
+  assert.equal(updated.recipe.settings.sizeLimitMb, "25");
 
-  const deleted = deleteUserRecipe(renamed.recipes, "USER:ONE");
+  const deleted = deleteUserRecipe(updated.recipes, "USER:ONE");
   assert.equal(deleted.ok, true);
   assert.deepEqual(deleted.recipes.map(({ id }) => id), ["user:two"]);
 });
 
 test("name and count bounds are enforced by mutations", () => {
   const validMaxName = "x".repeat(USER_RECIPE_NAME_MAX_LENGTH);
-  assert.equal(createUserRecipe([], validMaxName, baseSettings(), { id: "user:max" }).ok, true);
-  assert.equal(createUserRecipe([], `${validMaxName}x`, baseSettings(), { id: "user:too-long" }).ok, false);
+  const validMaxDescription = "y".repeat(USER_RECIPE_DESCRIPTION_MAX_LENGTH);
+  assert.equal(createUserRecipe([], validMaxName, validMaxDescription, baseSettings(), { id: "user:max" }).ok, true);
+  assert.equal(createUserRecipe([], `${validMaxName}x`, "", baseSettings(), { id: "user:too-long" }).ok, false);
+  assert.equal(createUserRecipe([], "Description", `${validMaxDescription}y`, baseSettings(), { id: "user:description-too-long" }).ok, false);
 
   const full = Array.from({ length: USER_RECIPE_MAX_COUNT }, (_, index) => recipe(`user:${index}`, `Recipe ${index}`));
-  const result = createUserRecipe(full, "Overflow", baseSettings(), { id: "user:overflow" });
+  const result = createUserRecipe(full, "Overflow", "", baseSettings(), { id: "user:overflow" });
   assert.equal(result.ok, false);
   assert.match(result.error, /No more than 50/);
 });
@@ -564,7 +599,7 @@ test("hostile raw and JSON-escaped subtitle paths never enter stores or matching
   const withRawSentinel = { ...baseSettings(), subtitlePath };
   const withEscapedSentinel = { ...baseSettings(), subtitlePath: escapedSubtitlePath };
 
-  const created = createUserRecipe([], "Subtitle safe", withRawSentinel, { id: "user:subtitle-safe" });
+  const created = createUserRecipe([], "Subtitle safe", "", withRawSentinel, { id: "user:subtitle-safe" });
   assert.equal(created.ok, true);
   assert.equal(userRecipeMatchesSettings(created.recipe, withEscapedSentinel), true);
 
@@ -579,7 +614,7 @@ test("hostile raw and JSON-escaped subtitle paths never enter stores or matching
 
 test("exact serialized recipe JSON cannot contain forbidden request sentinels", () => {
   const sentinel = "DO_NOT_PERSIST_C:/People/Alice/private.mov";
-  const created = createUserRecipe([], "Safe", {
+  const created = createUserRecipe([], "Safe", "", {
     ...baseSettings(),
     inputPath: sentinel,
     outputPath: `${sentinel}.mp4`,

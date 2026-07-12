@@ -9,7 +9,7 @@ import { ffmpegSidecarResourceTarget, getPortableOutputDir } from "./ffmpegBundl
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const __filename = url.fileURLToPath(import.meta.url);
 const WINDOWS_RETRYABLE_AUTOMATION_ERRORS = Object.freeze([
-  "Smoke accessible activation did not open the save-recipe dialog.",
+  "Smoke accessible activation did not open the create-recipe dialog.",
   "Portable export smoke could not foreground the app for real keyboard input.",
   "Portable export smoke could not restore foreground before real keyboard input.",
   "Portable export smoke could not establish stable WebView keyboard focus",

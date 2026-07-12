@@ -87,7 +87,6 @@ import {
 } from "./lib/exportRecipes";
 import {
   USER_RECIPE_STORAGE_KEY,
-  cloneUserRecipeSettings,
   createEmptyUserRecipeStore,
   createUserRecipe,
   deleteUserRecipe,
@@ -95,8 +94,8 @@ import {
   loadUserRecipeStore,
   parseUserRecipeStore,
   persistUserRecipeStore,
-  renameUserRecipe,
   reusableSettingsFromEncodeRequest,
+  updateUserRecipe,
   type UserRecipe,
   type UserRecipeStore,
 } from "./lib/userRecipes";
@@ -582,11 +581,6 @@ function QueueDiagnosticsDetails({
           External subtitles burned in{diagnostics.subtitleCueCount ? ` (${diagnostics.subtitleCueCount} cues)` : ""}.
         </div>
       ) : null}
-      {diagnostics.audioRemovedForSizeTarget ? (
-        <div className="vfl-export-result-note">
-          Audio was removed by the explicitly permitted final Strict Fit plan.
-        </div>
-      ) : null}
       {diagnostics.failureStage ? (
         <div className="vfl-export-result-note">Failure stage: {diagnostics.failureStage}</div>
       ) : null}
@@ -683,7 +677,6 @@ function App() {
   const [outputAspectLocked, setOutputAspectLocked] = useState(true);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [strictFit, setStrictFit] = useState(false);
-  const [strictFitAllowAudioRemoval, setStrictFitAllowAudioRemoval] = useState(false);
   const [subtitlePath, setSubtitlePath] = useState("");
   const [subtitleInspection, setSubtitleInspection] = useState<SubtitleInspection | null>(null);
   const [subtitleInspecting, setSubtitleInspecting] = useState(false);
@@ -745,6 +738,8 @@ function App() {
   const [userRecipeStore, setUserRecipeStore] = useState<UserRecipeStore>(() => createEmptyUserRecipeStore());
   const [recipeDialog, setRecipeDialog] = useState<UserRecipeDialogState | null>(null);
   const [recipeNameDraft, setRecipeNameDraft] = useState("");
+  const [recipeDescriptionDraft, setRecipeDescriptionDraft] = useState("");
+  const [recipeResetToCurrentSettings, setRecipeResetToCurrentSettings] = useState(false);
   const [recipeDialogError, setRecipeDialogError] = useState<string | null>(null);
   const [recipeStatus, setRecipeStatus] = useState<string | null>(null);
   const [resetConfirmationOpen, setResetConfirmationOpen] = useState(false);
@@ -1414,7 +1409,6 @@ function App() {
     setOutputAspectLocked(true);
     setAudioEnabled(true);
     setStrictFit(false);
-    setStrictFitAllowAudioRemoval(false);
     clearExternalSubtitle("External subtitles cleared by Reset.");
     setNormalizeAudio(false);
     setPerturbFirstFrame(false);
@@ -1473,7 +1467,6 @@ function App() {
     setNormalizeAudio(Boolean(recipeSettings.normalizeAudio));
     setPerturbFirstFrame(Boolean(recipeSettings.perturbFirstFrame));
     setStrictFit(Boolean(recipeSettings.strictFit));
-    setStrictFitAllowAudioRemoval(Boolean(recipeSettings.strictFitAllowAudioRemoval));
     setAdvancedVideoCodec(recipeAdvanced.videoCodec);
     setAdvancedAudioBitrateKbps(recipeAdvanced.audioBitrateKbps === null ? "auto" : String(recipeAdvanced.audioBitrateKbps));
     setAdvancedVideoQuality(recipeAdvanced.videoQuality);
@@ -1516,9 +1509,6 @@ function App() {
       if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
       if (partialSettings.perturbFirstFrame !== undefined) setPerturbFirstFrame(partialSettings.perturbFirstFrame);
       if (partialSettings.strictFit !== undefined) setStrictFit(partialSettings.strictFit);
-      if (partialSettings.strictFitAllowAudioRemoval !== undefined) {
-        setStrictFitAllowAudioRemoval(partialSettings.strictFitAllowAudioRemoval);
-      }
       setStatus(`Applied ${recipe.label}.`);
       return;
     }
@@ -1535,7 +1525,7 @@ function App() {
     applyFullRecipeSettings(recipe.settings, recipe.name, { resetOutput: false });
   }
 
-  function openSaveRecipeDialog() {
+  function openCreateRecipeDialog() {
     if (
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
@@ -1548,11 +1538,13 @@ function App() {
     }
     setAboutOpen(false);
     setRecipeNameDraft(`Custom recipe ${userRecipeStore.recipes.length + 1}`);
+    setRecipeDescriptionDraft("");
+    setRecipeResetToCurrentSettings(false);
     setRecipeDialogError(null);
-    setRecipeDialog({ kind: "save" });
+    setRecipeDialog({ kind: "create" });
   }
 
-  function openRenameRecipeDialog(recipe: UserRecipe) {
+  function openEditRecipeDialog(recipe: UserRecipe) {
     if (
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
@@ -1562,26 +1554,40 @@ function App() {
     ) return;
     setAboutOpen(false);
     setRecipeNameDraft(recipe.name);
+    setRecipeDescriptionDraft(recipe.description);
+    setRecipeResetToCurrentSettings(false);
     setRecipeDialogError(null);
-    setRecipeDialog({ kind: "rename", recipeId: recipe.id, recipeName: recipe.name });
+    setRecipeDialog({ kind: "edit", recipeId: recipe.id, recipeName: recipe.name });
   }
 
-  function openDeleteRecipeDialog(recipe: UserRecipe) {
-    if (
-      jobIdRef.current !== null ||
-      pendingEncodeRef.current !== null ||
-      exportQueueStateRef.current.autoRun ||
-      queueSnapshotApplyingRef.current ||
-      userRecipeStore.readOnly
-    ) return;
-    setAboutOpen(false);
-    setRecipeNameDraft("");
+  function requestDeleteRecipe() {
+    if (!recipeDialog || recipeDialog.kind !== "edit") return;
     setRecipeDialogError(null);
-    setRecipeDialog({ kind: "delete", recipeId: recipe.id, recipeName: recipe.name });
+    setRecipeDialog({
+      kind: "delete",
+      recipeId: recipeDialog.recipeId,
+      recipeName: recipeNameDraft.trim() || recipeDialog.recipeName,
+    });
+  }
+
+  function cancelRecipeDialog() {
+    if (recipeDialog?.kind === "delete") {
+      setRecipeDialogError(null);
+      setRecipeDialog({
+        kind: "edit",
+        recipeId: recipeDialog.recipeId,
+        recipeName: recipeDialog.recipeName,
+      });
+      return;
+    }
+    closeRecipeDialog();
   }
 
   function closeRecipeDialog() {
     setRecipeDialog(null);
+    setRecipeNameDraft("");
+    setRecipeDescriptionDraft("");
+    setRecipeResetToCurrentSettings(false);
     setRecipeDialogError(null);
   }
 
@@ -1609,8 +1615,13 @@ function App() {
   function confirmRecipeDialog() {
     if (!recipeDialog) return;
 
-    if (recipeDialog.kind === "save") {
-      const created = createUserRecipe(userRecipeStore.recipes, recipeNameDraft, currentRecipeSettings);
+    if (recipeDialog.kind === "create") {
+      const created = createUserRecipe(
+        userRecipeStore.recipes,
+        recipeNameDraft,
+        recipeDescriptionDraft,
+        currentRecipeSettings,
+      );
       if (!created.ok) {
         setRecipeDialogError(created.error);
         return;
@@ -1619,13 +1630,17 @@ function App() {
       return;
     }
 
-    if (recipeDialog.kind === "rename") {
-      const renamed = renameUserRecipe(userRecipeStore.recipes, recipeDialog.recipeId, recipeNameDraft);
-      if (!renamed.ok) {
-        setRecipeDialogError(renamed.error);
+    if (recipeDialog.kind === "edit") {
+      const updated = updateUserRecipe(userRecipeStore.recipes, recipeDialog.recipeId, {
+        name: recipeNameDraft,
+        description: recipeDescriptionDraft,
+        ...(recipeResetToCurrentSettings ? { settings: currentRecipeSettings } : {}),
+      });
+      if (!updated.ok) {
+        setRecipeDialogError(updated.error);
         return;
       }
-      persistRecipeMutation(renamed.recipes, `Renamed recipe to ${renamed.recipe.name}.`);
+      persistRecipeMutation(updated.recipes, `Updated ${updated.recipe.name}.`);
       return;
     }
 
@@ -1641,11 +1656,6 @@ function App() {
     if (format !== "mp3") return;
     setAudioEnabled(true);
   }, [format]);
-
-  useEffect(() => {
-    if (strictFit && audioEnabled && probe?.hasAudio !== false) return;
-    setStrictFitAllowAudioRemoval(false);
-  }, [strictFit, audioEnabled, probe?.hasAudio]);
 
   useEffect(() => {
     if (isVideoCodecCompatible(format, advancedVideoCodec)) return;
@@ -1709,7 +1719,6 @@ function App() {
     setStripMetadata(smokeConfig.stripMetadata !== false);
     const smokeStrictFit = smokeConfig.format !== "mp3" && smokeConfig.sizeLimitMb > 0 && smokeConfig.strictFit === true;
     setStrictFit(smokeStrictFit);
-    setStrictFitAllowAudioRemoval(smokeStrictFit && smokeConfig.strictFitAllowAudioRemoval === true);
     clearExternalSubtitle("No external subtitles selected.");
     if (smokeConfig.subtitlePath) {
       const configuredSubtitlePath = smokeConfig.subtitlePath;
@@ -1782,7 +1791,6 @@ function App() {
   useEffect(() => {
     if (format !== "mp3" && sizeLimitEnabled) return;
     setStrictFit(false);
-    setStrictFitAllowAudioRemoval(false);
   }, [format, sizeLimitEnabled]);
   const shapedVideoDimensions = useMemo(() => {
     if (!probe) return null;
@@ -2225,7 +2233,6 @@ function App() {
       normalizeAudio,
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       strictFit,
-      strictFitAllowAudioRemoval,
       advanced: {
         videoCodec: advancedVideoCodec,
         audioBitrateKbps: advancedAudioBitrateRequest,
@@ -2247,7 +2254,6 @@ function App() {
       normalizeAudio,
       perturbFirstFrame,
       strictFit,
-      strictFitAllowAudioRemoval,
       advancedVideoCodec,
       advancedAudioBitrateRequest,
       advancedVideoQuality,
@@ -2256,35 +2262,6 @@ function App() {
       advancedAudioChannels,
     ],
   );
-  const canonicalCurrentRecipeSettings = useMemo(
-    () => cloneUserRecipeSettings(currentRecipeSettings) ?? currentRecipeSettings,
-    [currentRecipeSettings],
-  );
-  const currentRecipeSettingsSummary = useMemo(() => {
-    const resize = canonicalCurrentRecipeSettings.resize;
-    const resizeSummary = resize.mode === "source"
-      ? "source size"
-      : resize.mode === "maxEdge"
-        ? `max edge ${resize.maxEdgePx}px`
-        : `${resize.widthPx}x${resize.heightPx}, aspect ${resize.lockAspect ? "locked" : "unlocked"}`;
-    const advanced = canonicalCurrentRecipeSettings.advanced;
-    return [
-      `format ${canonicalCurrentRecipeSettings.format.toUpperCase()}`,
-      `size ${canonicalCurrentRecipeSettings.sizeLimitMb ? `${canonicalCurrentRecipeSettings.sizeLimitMb} MB` : "no limit"}`,
-      `resize ${resizeSummary}`,
-      `audio ${canonicalCurrentRecipeSettings.audioEnabled ? "included" : "removed"}`,
-      `normalization ${canonicalCurrentRecipeSettings.normalizeAudio ? "on" : "off"}`,
-      `first-frame uniqueness ${canonicalCurrentRecipeSettings.perturbFirstFrame ? "on" : "off"}`,
-      `Strict Fit ${canonicalCurrentRecipeSettings.strictFit ? "on" : "off"}`,
-      `Strict Fit audio removal ${canonicalCurrentRecipeSettings.strictFitAllowAudioRemoval ? "allowed" : "not allowed"}`,
-      `video codec ${VIDEO_CODEC_LABELS[advanced.videoCodec]}`,
-      `quality ${VIDEO_QUALITY_LABELS[advanced.videoQuality]}`,
-      `encode speed ${ENCODE_SPEED_LABELS[advanced.encodeSpeed]}`,
-      `frame-rate cap ${advanced.frameRateCapFps ? `${advanced.frameRateCapFps} fps` : "auto"}`,
-      `audio bitrate ${advanced.audioBitrateKbps ? `${advanced.audioBitrateKbps} kbps` : "auto"}`,
-      `channels ${AUDIO_CHANNEL_LABELS[advanced.audioChannels]}`,
-    ].join("; ");
-  }, [canonicalCurrentRecipeSettings]);
   const matchingFullBuiltInRecipe = useMemo(
     () => EXPORT_RECIPES.find((recipe) => !recipe.partial && recipeMatchesSettings(recipe, currentRecipeSettings)) ?? null,
     [currentRecipeSettings],
@@ -2297,7 +2274,7 @@ function App() {
     () => EXPORT_RECIPES.find((recipe) => recipe.partial && recipeMatchesSettings(recipe, currentRecipeSettings)) ?? null,
     [currentRecipeSettings],
   );
-  const matchingRecipeLabel = matchingFullBuiltInRecipe?.label ?? matchingUserRecipe?.name ?? matchingPartialBuiltInRecipe?.label ?? null;
+  const matchingRecipeLabel = matchingUserRecipe?.name ?? matchingFullBuiltInRecipe?.label ?? matchingPartialBuiltInRecipe?.label ?? null;
   const videoCodecCapabilitiesForFormat = useMemo(
     () => encodeCapabilities?.videoCodecs.filter((codec) => codec.format === format) ?? [],
     [encodeCapabilities, format],
@@ -2536,8 +2513,6 @@ function App() {
   ]);
   const strictFitPolicySummary = summarizeStrictFitPolicy({
     strictFit: format !== "mp3" && sizeLimitEnabled && strictFit,
-    strictFitAllowAudioRemoval:
-      format !== "mp3" && sizeLimitEnabled && strictFit && audioEnabled && strictFitAllowAudioRemoval,
     audioEnabled: format !== "mp3" && audioEnabled && probe?.hasAudio !== false,
   });
   const subtitlePlanSummary = subtitlePath && subtitleInspection
@@ -4283,8 +4258,6 @@ function App() {
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       loopVideo: false,
       strictFit: requestStrictFit,
-      strictFitAllowAudioRemoval:
-        requestStrictFit && (audioEnabled || autoMutedRef.current) && strictFitAllowAudioRemoval,
       // Same-settings batches intentionally exclude clip-scoped subtitles.
       subtitlePath: null,
     };
@@ -4355,8 +4328,6 @@ function App() {
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       loopVideo: format === "mp3" ? false : loopVideo,
       strictFit: requestStrictFit,
-      strictFitAllowAudioRemoval:
-        requestStrictFit && audioEnabled && probe.hasAudio && strictFitAllowAudioRemoval,
       subtitlePath: subtitlePath || null,
     };
     return request;
@@ -4526,10 +4497,6 @@ function App() {
     setNormalizeAudio(request.normalizeAudio);
     setPerturbFirstFrame(request.format === "mp3" ? false : request.perturbFirstFrame);
     setStrictFit(request.format !== "mp3" && request.sizeLimitMb > 0 && request.strictFit === true);
-    setStrictFitAllowAudioRemoval(
-      request.format !== "mp3" && request.sizeLimitMb > 0 && request.strictFit === true &&
-      request.audioEnabled && request.strictFitAllowAudioRemoval === true,
-    );
     subtitleInspectionTokenRef.current += 1;
     setSubtitlePath(request.subtitlePath ?? "");
     setSubtitleInspection(inspectedSubtitle);
@@ -5225,7 +5192,6 @@ function App() {
     } else if (action.kind === "removeAudio") {
       autoMutedRef.current = false;
       setAudioEnabled(false);
-      setStrictFitAllowAudioRemoval(false);
     } else if (action.kind === "enableStrictFit") {
       setStrictFit(true);
     }
@@ -5577,15 +5543,13 @@ function App() {
     function getRecipeNameDialogControls() {
       const dialog = document.querySelector<HTMLElement>('.vfl-recipe-modal[role="dialog"]');
       const input = document.getElementById("vfl-user-recipe-name");
+      const description = document.getElementById("vfl-user-recipe-description");
       const confirm = document.querySelector<HTMLButtonElement>('[data-smoke-id="user-recipe-confirm"]');
-      const privacySummary = document.getElementById("vfl-recipe-privacy-summary");
-      const valuesSummary = document.getElementById("vfl-recipe-values-summary");
       return {
         dialog: dialog?.isConnected ? dialog : null,
         input: input instanceof HTMLInputElement && input.isConnected ? input : null,
+        description: description instanceof HTMLTextAreaElement && description.isConnected ? description : null,
         confirm: isMountedEnabledButton(confirm) ? confirm : null,
-        privacySummary: privacySummary?.isConnected ? privacySummary : null,
-        valuesSummary: valuesSummary?.isConnected ? valuesSummary : null,
       };
     }
 
@@ -5600,19 +5564,19 @@ function App() {
         const saveRecipeMounted = await waitForSmokeCondition(() => getSaveRecipeButton() !== null);
         const saveRecipeButton = getSaveRecipeButton();
         if (!saveRecipeMounted || !saveRecipeButton) {
-          return { ok: false, message: "Workflow smoke could not find enabled Save current settings." };
+          return { ok: false, message: "Workflow smoke could not find the enabled create-recipe tile." };
         }
         if (
           smokeConfig.workflowQueueExport &&
           !smokeConfig.skipPreviewInteractions &&
           !(await focusSmokeWebviewTarget(saveRecipeButton))
         ) {
-          return { ok: false, message: "Workflow smoke could not focus the WebView and Save current settings control." };
+          return { ok: false, message: "Workflow smoke could not focus the WebView and create-recipe tile." };
         }
         if (!smokeConfig.workflowQueueExport || smokeConfig.skipPreviewInteractions) saveRecipeButton.focus();
         if (smokeConfig.workflowQueueExport) {
           await reportSmokeStatus("workflow-recipe-ready", {
-            message: "Waiting for packaged accessible activation on Save current settings.",
+            message: "Waiting for packaged accessible activation on the create-recipe tile.",
           });
         }
         if (!smokeConfig.workflowQueueExport || smokeConfig.skipPreviewInteractions) {
@@ -5620,41 +5584,36 @@ function App() {
         }
 
         const saveDialogMounted = await waitForSmokeCondition(() => {
-          const { dialog, input, confirm, privacySummary, valuesSummary } = getRecipeNameDialogControls();
+          const { dialog, input, description, confirm } = getRecipeNameDialogControls();
           return Boolean(
             dialog &&
             input &&
-            confirm?.textContent?.trim() === "Save recipe" &&
+            description &&
+            confirm?.textContent?.trim() === "Create recipe" &&
             document.activeElement === input &&
-            valuesSummary?.isConnected &&
-            valuesSummary.textContent?.includes("Current values:") &&
-            privacySummary?.isConnected &&
-            privacySummary.textContent?.includes("Never saved:") &&
-            privacySummary.textContent.includes("Metadata privacy remains a separate global setting"),
+            dialog.textContent?.includes("The new recipe will use your current settings."),
           );
         });
         const {
           dialog: saveDialog,
           input: saveNameInput,
-          privacySummary,
-          valuesSummary,
+          description: saveDescriptionInput,
         } = getRecipeNameDialogControls();
         if (!saveDialog) {
           return {
             ok: false,
             message: smokeConfig.workflowQueueExport && !smokeConfig.skipPreviewInteractions
-              ? "Smoke accessible activation did not open the save-recipe dialog."
-              : "Workflow smoke did not open the save-recipe dialog.",
+              ? "Smoke accessible activation did not open the create-recipe dialog."
+              : "Workflow smoke did not open the create-recipe dialog.",
           };
         }
         if (
           !saveDialogMounted ||
           !saveNameInput ||
-          !valuesSummary?.textContent?.includes("Current values:") ||
-          !privacySummary?.textContent?.includes("Never saved:") ||
-          !privacySummary.textContent.includes("Metadata privacy remains a separate global setting")
+          !saveDescriptionInput ||
+          !saveDialog.textContent?.includes("The new recipe will use your current settings.")
         ) {
-          return { ok: false, message: "Workflow smoke found incomplete save-recipe values, dialog semantics, or privacy copy." };
+          return { ok: false, message: "Workflow smoke found incomplete create-recipe controls or dialog semantics." };
         }
         setMountedInputValue(saveNameInput, smokeRecipeName);
         const saveReady = await waitForSmokeCondition(() => {
@@ -5662,18 +5621,18 @@ function App() {
           return Boolean(
             input?.value === smokeRecipeName &&
             document.activeElement === input &&
-            confirm?.textContent?.trim() === "Save recipe",
+            confirm?.textContent?.trim() === "Create recipe",
           );
         });
         const saveConfirm = getRecipeNameDialogControls().confirm;
         if (!saveReady || !saveConfirm) {
-          return { ok: false, message: "Workflow smoke could not find the committed Save recipe action." };
+          return { ok: false, message: "Workflow smoke could not find the committed Create recipe action." };
         }
         saveConfirm.click();
         const savePassed = await waitForSmokeCondition(
           () => loadUserRecipeStore(localStorage).recipes.some((recipe) => recipe.name === smokeRecipeName),
         );
-        if (!savePassed) return { ok: false, message: "Workflow smoke did not persist through the mounted Save recipe action." };
+        if (!savePassed) return { ok: false, message: "Workflow smoke did not persist through the mounted Create recipe action." };
         const savedRecipe = loadUserRecipeStore(localStorage).recipes.find((recipe) => recipe.name === smokeRecipeName);
         if (!savedRecipe) return { ok: false, message: "Workflow smoke could not recover the saved recipe identity." };
         smokeRecipeId = savedRecipe.id;
@@ -5685,7 +5644,7 @@ function App() {
             originalRecipeRaw,
           }));
           await reportSmokeStatus("workflow-recipe-saved", {
-            message: "Mounted Save persisted the recipe; reloading the packaged WebView to verify restoration.",
+            message: "Mounted Create persisted the recipe; reloading the packaged WebView to verify restoration.",
           });
           workflowReloading = true;
           window.location.reload();
@@ -5703,22 +5662,23 @@ function App() {
         const buttons = row?.isConnected
           ? Array.from(row.querySelectorAll<HTMLButtonElement>("button"))
           : [];
-        const action = (name: "Apply" | "Rename" | "Delete") => {
+        const action = (name: "Apply" | "Edit") => {
           const button = buttons.find(
-            (candidate) => candidate.getAttribute("aria-label") === `${name} ${recipeName}`,
+            (candidate) => name === "Apply"
+              ? candidate.dataset.recipeAction === "apply"
+              : candidate.getAttribute("aria-label") === `Edit ${recipeName}`,
           );
           return isMountedEnabledButton(button) ? button : null;
         };
         return {
           row: row?.isConnected ? row : null,
           apply: action("Apply"),
-          rename: action("Rename"),
-          delete: action("Delete"),
+          edit: action("Edit"),
         };
       };
       const restoredMounted = await waitForSmokeCondition(() => {
-        const { row, apply, rename } = getRecipeActions(smokeRecipeName);
-        return Boolean(row && apply && rename);
+        const { row, apply, edit } = getRecipeActions(smokeRecipeName);
+        return Boolean(row && apply && edit);
       });
       if (!restoredRecipe || !restoredMounted) {
         return { ok: false, message: "Workflow smoke did not restore the saved recipe after packaged startup." };
@@ -5763,56 +5723,68 @@ function App() {
       applyRecipeButton.click();
       const applyCommitted = await waitForSmokeCondition(() => {
         const status = document.querySelector<HTMLElement>('[data-smoke-id="user-recipe-status"]');
-        const rename = getRecipeActions(smokeRecipeName).rename;
+        const edit = getRecipeActions(smokeRecipeName).edit;
         return Boolean(
           status?.isConnected &&
           status.textContent?.startsWith(`Applied ${smokeRecipeName}.`) &&
-          rename,
+          edit,
         );
       });
-      const renameRecipeButton = getRecipeActions(smokeRecipeName).rename;
-      if (!applyCommitted || !renameRecipeButton) {
-        return { ok: false, message: "Workflow smoke did not commit Apply before mounting a fresh Rename action." };
+      const editRecipeButton = getRecipeActions(smokeRecipeName).edit;
+      if (!applyCommitted || !editRecipeButton) {
+        return { ok: false, message: "Workflow smoke did not commit Apply before mounting a fresh Edit action." };
       }
-      renameRecipeButton.click();
+      editRecipeButton.click();
 
-      const renameDialogMounted = await waitForSmokeCondition(() => {
+      const editDialogMounted = await waitForSmokeCondition(() => {
         const { dialog, input, confirm } = getRecipeNameDialogControls();
         return Boolean(
           dialog &&
           input &&
           document.activeElement === input &&
-          confirm?.textContent?.trim() === "Rename recipe",
+          confirm?.textContent?.trim() === "Save changes",
         );
       });
-      const renameInput = getRecipeNameDialogControls().input;
-      if (!renameDialogMounted || !renameInput) {
-        return { ok: false, message: "Workflow smoke could not find the mounted rename field." };
+      const editInput = getRecipeNameDialogControls().input;
+      if (!editDialogMounted || !editInput) {
+        return { ok: false, message: "Workflow smoke could not find the mounted edit field." };
       }
-      setMountedInputValue(renameInput, renamedSmokeRecipeName);
-      const renameReady = await waitForSmokeCondition(() => {
+      setMountedInputValue(editInput, renamedSmokeRecipeName);
+      const editReady = await waitForSmokeCondition(() => {
         const { input, confirm } = getRecipeNameDialogControls();
         return Boolean(
           input?.value === renamedSmokeRecipeName &&
           document.activeElement === input &&
-          confirm?.textContent?.trim() === "Rename recipe",
+          confirm?.textContent?.trim() === "Save changes",
         );
       });
-      const renameConfirm = getRecipeNameDialogControls().confirm;
-      if (!renameReady || !renameConfirm) {
-        return { ok: false, message: "Workflow smoke could not find the committed Rename recipe action." };
+      const editConfirm = getRecipeNameDialogControls().confirm;
+      if (!editReady || !editConfirm) {
+        return { ok: false, message: "Workflow smoke could not find the committed Save changes action." };
       }
-      renameConfirm.click();
+      editConfirm.click();
       const renamePassed = await waitForSmokeCondition(
         () => loadUserRecipeStore(localStorage).recipes.some((recipe) => recipe.name === renamedSmokeRecipeName),
       );
       if (!renamePassed) return { ok: false, message: "Workflow smoke did not persist the renamed recipe." };
 
-      const getDeleteRecipeButton = () => getRecipeActions(renamedSmokeRecipeName).delete;
-      const deleteMounted = await waitForSmokeCondition(() => getDeleteRecipeButton() !== null);
-      const deleteRecipeButton = getDeleteRecipeButton();
-      if (!deleteMounted || !deleteRecipeButton) {
-        return { ok: false, message: "Workflow smoke could not find the mounted Delete recipe action." };
+      const getEditRecipeButton = () => getRecipeActions(renamedSmokeRecipeName).edit;
+      const editMounted = await waitForSmokeCondition(() => getEditRecipeButton() !== null);
+      const renamedEditButton = getEditRecipeButton();
+      if (!editMounted || !renamedEditButton) {
+        return { ok: false, message: "Workflow smoke could not find the renamed recipe Edit action." };
+      }
+      renamedEditButton.click();
+      const deleteActionMounted = await waitForSmokeCondition(() => {
+        const dialog = document.querySelector<HTMLElement>('.vfl-recipe-modal[role="dialog"]');
+        return Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+          .some((button) => button.textContent?.trim() === "Delete recipe" && isMountedEnabledButton(button));
+      });
+      const editDialog = document.querySelector<HTMLElement>('.vfl-recipe-modal[role="dialog"]');
+      const deleteRecipeButton = Array.from(editDialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+        .find((button) => button.textContent?.trim() === "Delete recipe");
+      if (!deleteActionMounted || !isMountedEnabledButton(deleteRecipeButton)) {
+        return { ok: false, message: "Workflow smoke could not find Delete recipe inside the edit dialog." };
       }
       deleteRecipeButton.click();
       const getDeleteDialogControls = () => {
@@ -5852,7 +5824,7 @@ function App() {
           !loadUserRecipeStore(localStorage).recipes.some((recipe) => recipe.id === smokeRecipeId) &&
           document.activeElement === recipeSaveButtonRef.current,
       );
-      if (!deletePassed) return { ok: false, message: "Workflow smoke did not delete the recipe and restore focus to Save current settings." };
+      if (!deletePassed) return { ok: false, message: "Workflow smoke did not delete the recipe and restore focus to the create-recipe tile." };
 
       const sourceExtension = extname(smokeConfig.inputPath);
       const secondInputPath = `${dirname(smokeConfig.inputPath)}${stem(smokeConfig.inputPath)}-workflow-smoke.${sourceExtension}`;
@@ -5956,7 +5928,6 @@ function App() {
         audioCodec: "aac",
         passes: 1,
         attempts: 1,
-        audioRemovedForSizeTarget: false,
         subtitleBurnedIn: false,
         subtitleCueCount: null,
         commandPreview: "ffmpeg workflow smoke",
@@ -7238,14 +7209,24 @@ function App() {
         <UserRecipeDialog
           state={recipeDialog}
           nameDraft={recipeNameDraft}
-          currentSettingsSummary={currentRecipeSettingsSummary}
+          descriptionDraft={recipeDescriptionDraft}
+          resetToCurrentSettings={recipeResetToCurrentSettings}
           error={recipeDialogError}
           onNameDraftChange={(name) => {
             setRecipeNameDraft(name);
             setRecipeDialogError(null);
           }}
+          onDescriptionDraftChange={(description) => {
+            setRecipeDescriptionDraft(description);
+            setRecipeDialogError(null);
+          }}
+          onResetToCurrentSettingsChange={(enabled) => {
+            setRecipeResetToCurrentSettings(enabled);
+            setRecipeDialogError(null);
+          }}
           onConfirm={confirmRecipeDialog}
-          onCancel={closeRecipeDialog}
+          onRequestDelete={requestDeleteRecipe}
+          onCancel={cancelRecipeDialog}
         />
       ) : null}
       <header className="vfl-header">
@@ -7673,8 +7654,10 @@ function App() {
             </div>
             <div className="vfl-recipe-grid">
               {EXPORT_RECIPES.map((recipe) => {
-                const isActive = matchingFullBuiltInRecipe?.id === recipe.id ||
-                  (matchingFullBuiltInRecipe === null && matchingUserRecipe === null && matchingPartialBuiltInRecipe?.id === recipe.id);
+                const isActive = matchingUserRecipe === null && (
+                  matchingFullBuiltInRecipe?.id === recipe.id ||
+                  (matchingFullBuiltInRecipe === null && matchingPartialBuiltInRecipe?.id === recipe.id)
+                );
                 const isDisabled =
                   encodeBusy ||
                   (recipe.partial && format === "mp3") ||
@@ -7693,87 +7676,73 @@ function App() {
                   </button>
                 );
               })}
+              {userRecipeStore.recipes.map((recipe) => {
+                const isActive = matchingUserRecipe?.id === recipe.id;
+                const unavailable = encodeBusy || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
+                const recipeTitleId = `vfl-user-recipe-title-${recipe.id}`;
+                const recipeDescriptionId = `vfl-user-recipe-description-${recipe.id}`;
+                return (
+                  <div
+                    key={recipe.id}
+                    className={`vfl-user-recipe-tile ${isActive ? "active" : ""}`}
+                    data-user-recipe-id={recipe.id}
+                  >
+                    <button
+                      type="button"
+                      className={`vfl-recipe-option vfl-user-recipe-apply ${isActive ? "active" : ""}`}
+                      data-recipe-action="apply"
+                      aria-labelledby={recipeTitleId}
+                      aria-describedby={recipeDescriptionId}
+                      aria-pressed={isActive}
+                      onClick={() => applyUserRecipe(recipe)}
+                      disabled={unavailable}
+                    >
+                      <span id={recipeTitleId} className="vfl-recipe-option-title">{recipe.name}</span>
+                      <span id={recipeDescriptionId} className="vfl-recipe-option-copy">{recipe.description || "Saved settings"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="vfl-user-recipe-edit"
+                      aria-label={`Edit ${recipe.name}`}
+                      title={`Edit ${recipe.name}`}
+                      onClick={() => openEditRecipeDialog(recipe)}
+                      disabled={encodeBusy || userRecipeStore.readOnly}
+                    >
+                      <svg viewBox="0 0 16 16" aria-hidden="true">
+                        <path d="M11.9 1.7a1.4 1.4 0 0 1 2 2L6 11.6 2.7 12.3l.7-3.3 8.5-7.3Zm-7.7 7.8-.3 1.3 1.3-.3 6.4-6.4-1-1-6.4 6.4Z" />
+                      </svg>
+                    </button>
+                  </div>
+                );
+              })}
+              <button
+                ref={recipeSaveButtonRef}
+                type="button"
+                className="vfl-recipe-add"
+                data-smoke-id="save-current-recipe"
+                aria-label="Create recipe from current settings"
+                title="Create recipe from current settings"
+                onClick={openCreateRecipeDialog}
+                disabled={
+                  encodeBusy ||
+                  userRecipeStore.readOnly ||
+                  userRecipeStore.recipes.length >= 50
+                }
+              >
+                <span aria-hidden="true">+</span>
+              </button>
             </div>
-            <section className="vfl-user-recipes" aria-labelledby="vfl-user-recipes-title">
-              <div className="vfl-user-recipes-head">
-                <div>
-                  <div className="vfl-field-label" id="vfl-user-recipes-title">Your recipes</div>
-                  <div className="vfl-inline-hint">Saved only in this app on this device.</div>
-                </div>
-                <button
-                  ref={recipeSaveButtonRef}
-                  type="button"
-                  data-smoke-id="save-current-recipe"
-                  onClick={openSaveRecipeDialog}
-                  disabled={encodeBusy || userRecipeStore.readOnly}
-                >
-                  Save current settings
-                </button>
+            {recipeStatus ? (
+              <div
+                className={userRecipeStore.readOnly ? "vfl-error" : "vfl-inline-hint vfl-recipe-status"}
+                role={userRecipeStore.readOnly ? "alert" : "status"}
+                aria-live={userRecipeStore.readOnly ? "assertive" : "polite"}
+                aria-atomic="true"
+                data-smoke-id="user-recipe-status"
+              >
+                {recipeStatus}
               </div>
-              <div className="vfl-recipe-privacy vfl-recipe-privacy-compact">
-                Recipes save format, size, resize, audio, Strict Fit, uniqueness, and encoder settings. They never save media, output,
-                or external subtitle paths, title, trim, crop, transforms, color edits, HDR conversion choice, diagnostics, or queue and
-                job state. Metadata privacy stays separate.
-              </div>
-              {recipeStatus ? (
-                <div
-                  className={userRecipeStore.readOnly ? "vfl-error" : "vfl-inline-hint"}
-                  role={userRecipeStore.readOnly ? "alert" : "status"}
-                  aria-live={userRecipeStore.readOnly ? "assertive" : "polite"}
-                  aria-atomic="true"
-                  data-smoke-id="user-recipe-status"
-                >
-                  {recipeStatus}
-                </div>
-              ) : null}
-              {userRecipeStore.recipes.length ? (
-                <div className="vfl-user-recipe-list">
-                  {userRecipeStore.recipes.map((recipe) => {
-                    const isActive = matchingFullBuiltInRecipe === null && matchingUserRecipe?.id === recipe.id;
-                    const unavailable = encodeBusy || (recipe.settings.format === "mp3" && probe !== null && !probe.hasAudio);
-                    const resize = normalizeRecipeResizeSettings(recipe.settings);
-                    const recipeSummary = `${recipe.settings.format.toUpperCase()} • ${recipe.settings.sizeLimitMb || "no size cap"} • ${resize.mode === "source" ? "source size" : resize.mode === "maxEdge" ? `max ${resize.maxEdgePx}px` : `${resize.widthPx}x${resize.heightPx}`}`;
-                    return (
-                      <div key={recipe.id} className={`vfl-user-recipe ${isActive ? "active" : ""}`} data-user-recipe-id={recipe.id}>
-                        <div className="vfl-user-recipe-copy">
-                          <div className="vfl-recipe-option-title">{recipe.name}</div>
-                          <div className="vfl-recipe-option-copy">{recipeSummary}</div>
-                        </div>
-                        <div className="vfl-user-recipe-actions">
-                          <button
-                            type="button"
-                            aria-label={`Apply ${recipe.name}`}
-                            aria-pressed={isActive}
-                            onClick={() => applyUserRecipe(recipe)}
-                            disabled={unavailable}
-                          >
-                            Apply
-                          </button>
-                          <button
-                            type="button"
-                            aria-label={`Rename ${recipe.name}`}
-                            onClick={() => openRenameRecipeDialog(recipe)}
-                            disabled={encodeBusy || userRecipeStore.readOnly}
-                          >
-                            Rename
-                          </button>
-                          <button
-                            type="button"
-                            aria-label={`Delete ${recipe.name}`}
-                            onClick={() => openDeleteRecipeDialog(recipe)}
-                            disabled={encodeBusy || userRecipeStore.readOnly}
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="vfl-inline-hint">No user recipes saved yet.</div>
-              )}
-            </section>
+            ) : null}
           </RailCard>
 
           <RailCard
@@ -7851,44 +7820,16 @@ function App() {
                   })}
                 </div>
               </div>
-              <div className="vfl-field vfl-strict-fit-field">
-                <div className="vfl-field-label">Strict Fit</div>
-                <label className="vfl-check vfl-check-card">
-                  <input
-                    id="vfl-strict-fit"
-                    type="checkbox"
-                    checked={strictFit}
-                    onChange={(event) => {
-                      const enabled = event.currentTarget.checked;
-                      setStrictFit(enabled);
-                      if (!enabled) setStrictFitAllowAudioRemoval(false);
-                    }}
-                    disabled={encodeBusy || format === "mp3" || !sizeLimitEnabled}
-                  />
-                  <span>Try a bounded fallback plan when the requested plan misses</span>
-                </label>
-                <div className="vfl-inline-hint">{strictFitPolicySummary}</div>
-                <label className="vfl-check vfl-check-card vfl-nested-check">
-                  <input
-                    id="vfl-strict-fit-audio-removal"
-                    type="checkbox"
-                    checked={strictFitAllowAudioRemoval}
-                    onChange={(event) => setStrictFitAllowAudioRemoval(event.currentTarget.checked)}
-                    disabled={
-                      encodeBusy ||
-                      !strictFit ||
-                      !audioEnabled ||
-                      !probe?.hasAudio ||
-                      format === "mp3" ||
-                      !sizeLimitEnabled
-                    }
-                  />
-                  <span>Allow the final applicable plan to remove audio</span>
-                </label>
-                <div className="vfl-inline-hint">
-                  Off by default. Without this permission, every plan retains audio and the final audio fallback is 32 kbps.
-                </div>
-              </div>
+              <label className="vfl-check vfl-strict-fit-toggle">
+                <input
+                  id="vfl-strict-fit"
+                  type="checkbox"
+                  checked={strictFit}
+                  onChange={(event) => setStrictFit(event.currentTarget.checked)}
+                  disabled={encodeBusy || format === "mp3" || !sizeLimitEnabled}
+                />
+                <span>Strict Fit</span>
+              </label>
               <div className="vfl-field vfl-output-dimensions-field">
                 <div className="vfl-field-label">Output dimensions</div>
                 <div className="vfl-segmented" role="group" aria-label="Output dimensions">
@@ -8821,9 +8762,6 @@ function App() {
                               </div>
                             ) : null}
                           </div>
-                          {lastExport.diagnostics.audioRemovedForSizeTarget ? (
-                            <div className="vfl-export-result-note">Audio was removed by the explicitly permitted final Strict Fit plan.</div>
-                          ) : null}
                           {lastExport.diagnostics.copyFallbackReason ? (
                             <div className="vfl-export-result-note">
                               Copy fallback: {lastExport.diagnostics.copyFallbackReason}

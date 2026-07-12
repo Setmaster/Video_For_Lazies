@@ -21,7 +21,7 @@ The extracted-archive verification on both supported platforms checks:
 - byte identity of the canonical capability contract, then live encoder/filter inspection against the extracted FFmpeg
 - a real `libx264` encode followed by a duration probe through the extracted FFprobe
 - packaged media-depth behavior for selected streams, attached pictures, HDR/high-depth policy, SAR/rotation geometry, and reverse/loop memory bounds
-- exact-byte targets, opt-in Strict Fit, separate audio-removal permission, and one bounded external UTF-8 SRT with the fixed embedded subtitle font
+- exact-byte targets, opt-in audio-preserving Strict Fit, and one bounded external UTF-8 SRT with the fixed embedded subtitle font
 - frame-accurate trim, existing-destination no-clobber refusal, and metadata/privacy checks
 - recipe privacy, queue retry and snapshot restoration, multi-file routing, accessibility foundations, phase-aware progress, rotation/speed/frame-rate-cap behavior, Reset, Cancel, queued drops, and export-lifecycle behavior
 - normal MP4 and WebM exports, custom-size output, and a tight-target 1080p case

@@ -15,7 +15,6 @@ export const EXPORT_RECIPES = [
       },
       audioEnabled: true,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: 128,
@@ -42,7 +41,6 @@ export const EXPORT_RECIPES = [
       },
       audioEnabled: true,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: 96,
@@ -69,7 +67,6 @@ export const EXPORT_RECIPES = [
       },
       audioEnabled: true,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: null,
@@ -108,7 +105,6 @@ export const EXPORT_RECIPES = [
       },
       audioEnabled: true,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "h264",
         audioBitrateKbps: 192,
@@ -135,7 +131,6 @@ export const EXPORT_RECIPES = [
       },
       audioEnabled: true,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "vp9",
         audioBitrateKbps: null,
@@ -162,7 +157,6 @@ export const EXPORT_RECIPES = [
       },
       audioEnabled: true,
       strictFit: false,
-      strictFitAllowAudioRemoval: false,
       advanced: {
         videoCodec: "auto",
         audioBitrateKbps: 192,
@@ -216,11 +210,7 @@ function normalizeStrictFitSettings(settings) {
   const strictFit =
     settings?.format !== "mp3" && hasPositiveSizeTarget && settings?.strictFit === true;
 
-  return {
-    strictFit,
-    strictFitAllowAudioRemoval:
-      strictFit && Boolean(settings?.audioEnabled) && settings?.strictFitAllowAudioRemoval === true,
-  };
+  return { strictFit };
 }
 
 export function recipeMatchesSettings(recipe, settings) {
@@ -260,12 +250,6 @@ export function recipeMatchesSettings(recipe, settings) {
     ) {
       return false;
     }
-    if (
-      "strictFitAllowAudioRemoval" in partialSettings &&
-      currentStrictFit.strictFitAllowAudioRemoval !== Boolean(partialSettings.strictFitAllowAudioRemoval)
-    ) {
-      return false;
-    }
     return true;
   }
 
@@ -294,7 +278,6 @@ export function recipeMatchesSettings(recipe, settings) {
     Boolean(settings.normalizeAudio) === Boolean(recipeSettings.normalizeAudio) &&
     Boolean(settings.perturbFirstFrame) === Boolean(recipeSettings.perturbFirstFrame) &&
     currentStrictFit.strictFit === recipeStrictFit.strictFit &&
-    currentStrictFit.strictFitAllowAudioRemoval === recipeStrictFit.strictFitAllowAudioRemoval &&
     (currentAdvanced.videoCodec ?? "auto") === (recipeAdvanced.videoCodec ?? "auto") &&
     normalizeAdvancedNumber(currentAdvanced.audioBitrateKbps) === normalizeAdvancedNumber(recipeAdvanced.audioBitrateKbps) &&
     (currentAdvanced.videoQuality ?? "auto") === (recipeAdvanced.videoQuality ?? "auto") &&

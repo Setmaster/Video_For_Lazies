@@ -583,7 +583,7 @@ try {
       if (-not $sentKeyboardStages.ContainsKey($status.stage)) {
         switch ($status.stage) {
           "workflow-recipe-ready" {
-            Invoke-SmokeAutomationElement -Handle $process.MainWindowHandle -Name "Save current settings"
+            Invoke-SmokeAutomationElement -Handle $process.MainWindowHandle -Name "Create recipe from current settings"
             $sentKeyboardStages[$status.stage] = $true
           }
           "workflow-queue-ready" {
