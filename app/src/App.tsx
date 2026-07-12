@@ -968,7 +968,7 @@ function App() {
   }, [aboutOpen, elevatedUpdateRun, modalOpen]);
 
   useEffect(() => {
-    if (activeTrimTarget === "preview" || previewPlaying) {
+    if (activeTrimTargetRef.current === "preview" || previewPlayingRef.current) {
       previewSelectionTimeRef.current = previewTimeS;
     }
   }, [activeTrimTarget, previewPlaying, previewTimeS]);
@@ -1136,12 +1136,14 @@ function App() {
 
   useEffect(() => {
     setPreviewTimeS(0);
+    previewPlayingRef.current = false;
     setPreviewPlaying(false);
     setPreviewMediaReady(false);
     setLastExport(null);
     if (jobIdRef.current === null && pendingEncodeRef.current === null) {
       updateLatestAttempt(createIdleEncodeAttempt());
     }
+    activeTrimTargetRef.current = "preview";
     setActiveTrimTarget("preview");
     previewSelectionTimeRef.current = 0;
     smokeMetricsRef.current = null;
@@ -5368,10 +5370,12 @@ function App() {
 
   function pausePreviewPlayback() {
     cropperRef.current?.pause();
+    previewPlayingRef.current = false;
     setPreviewPlaying(false);
   }
 
   function syncPreviewToTime(nextTimeS: number, target: TrimFocusTarget, opts?: { pause?: boolean }) {
+    activeTrimTargetRef.current = target;
     setActiveTrimTarget(target);
     if (opts?.pause) {
       pausePreviewPlayback();
@@ -5473,16 +5477,18 @@ function App() {
   }
 
   function setTrimStartValue(nextTimeS: number) {
-    if (!probe || !trimTimeline) return;
-    const maxStart = Math.max(0, trimTimeline.end - trimTimeline.minGap);
+    const timeline = trimTimelineRef.current;
+    if (!probe || !timeline) return;
+    const maxStart = Math.max(0, timeline.end - timeline.minGap);
     const next = clamp(nextTimeS, 0, maxStart);
     setTrimStart(formatNumberInput(next));
     return next;
   }
 
   function setTrimEndValue(nextTimeS: number, opts?: { preferEmptyAtEnd?: boolean }) {
-    if (!probe || !trimTimeline) return;
-    const minEnd = Math.min(probe.durationS, trimTimeline.start + trimTimeline.minGap);
+    const timeline = trimTimelineRef.current;
+    if (!probe || !timeline) return;
+    const minEnd = Math.min(probe.durationS, timeline.start + timeline.minGap);
     const next = clamp(nextTimeS, minEnd, probe.durationS);
 
     if (opts?.preferEmptyAtEnd && next >= probe.durationS - 0.001) {
@@ -5516,8 +5522,9 @@ function App() {
   }
 
   function focusTrimTarget(target: Exclude<TrimFocusTarget, "preview">) {
-    if (!trimTimeline) return;
-    const nextTimeS = target === "start" ? trimTimeline.start : trimTimeline.end;
+    const timeline = trimTimelineRef.current;
+    if (!timeline) return;
+    const nextTimeS = target === "start" ? timeline.start : timeline.end;
     syncPreviewToTime(nextTimeS, target, { pause: true });
   }
 
@@ -6545,7 +6552,18 @@ function App() {
     setCropDetectHint(null);
     setTrimStart("0");
     setTrimEnd("");
-    await waitMs(160);
+    const trimResetCommitted = await waitForSmokeCondition(() => {
+      const timeline = trimTimelineRef.current;
+      return Boolean(
+        timeline &&
+        Math.abs(timeline.start) <= 0.001 &&
+        Math.abs(timeline.end - probe.durationS) <= 0.001 &&
+        !timeline.hasCustomEnd
+      );
+    });
+    if (!trimResetCommitted) {
+      return { ok: false, message: "Accessibility smoke trim reset did not reach the current timeline before interaction checks." };
+    }
     await reportSmokeStatus("accessibility-ready", {
       message: "Mounted accessibility checks passed for crop fields, trim sliders, live status, modal focus containment, background isolation, and focus restoration.",
     });
@@ -6565,19 +6583,47 @@ function App() {
     if (!accessibilityResult.ok) return accessibilityResult;
 
     syncPreviewToTime(0.5, "preview", { pause: true });
-    await waitMs(160);
+    const previewStartReady = await waitForSmokeCondition(() =>
+      activeTrimTargetRef.current === "preview" &&
+      Math.abs(previewTimeRef.current - 0.5) <= 0.06 &&
+      Math.abs(previewSelectionTimeRef.current - 0.5) <= 0.06,
+    );
+    if (!previewStartReady) {
+      return { ok: false, message: "Packaged app smoke preview selection did not reach 0.50s before the start nudge." };
+    }
     if (!runComposeShortcutAction({ kind: "nudge-timeline", deltaS: TRIM_FINE_NUDGE_S })) {
       return { ok: false, message: "Packaged app smoke could not nudge the free preview selection with the keyboard shortcut path." };
     }
-    await waitMs(160);
+    const previewStartNudged = await waitForSmokeCondition(() =>
+      activeTrimTargetRef.current === "preview" &&
+      Math.abs(previewTimeRef.current - 0.6) <= 0.06 &&
+      Math.abs(previewSelectionTimeRef.current - 0.6) <= 0.06,
+    );
+    if (!previewStartNudged) {
+      return { ok: false, message: "Packaged app smoke preview selection did not commit the 0.10s start nudge." };
+    }
 
     const rememberedStartS = previewSelectionTimeRef.current;
+    const endBeforeStartShortcut = trimTimelineRef.current?.end ?? probe.durationS;
     focusTrimTarget("end");
-    await waitMs(160);
+    const endFocusReady = await waitForSmokeCondition(() =>
+      activeTrimTargetRef.current === "end" &&
+      Math.abs(previewTimeRef.current - endBeforeStartShortcut) <= 0.06 &&
+      Math.abs(previewSelectionTimeRef.current - rememberedStartS) <= 0.001,
+    );
+    if (!endFocusReady) {
+      return { ok: false, message: "Packaged app smoke did not focus the current trim end while preserving the remembered start selection." };
+    }
     if (!runComposeShortcutAction({ kind: "apply-trim-start" })) {
       return { ok: false, message: "Packaged app smoke could not apply trim start through the keyboard shortcut path." };
     }
-    await waitMs(160);
+    const startShortcutCommitted = await waitForSmokeCondition(() => {
+      const timeline = trimTimelineRef.current;
+      return Boolean(timeline && Math.abs(timeline.start - rememberedStartS) <= 0.06);
+    });
+    if (!startShortcutCommitted) {
+      return { ok: false, message: "Packaged app smoke Set start action did not reach the current trim timeline." };
+    }
 
     const afterStartShortcut = trimTimelineRef.current;
     if (!afterStartShortcut || Math.abs(afterStartShortcut.start - rememberedStartS) > 0.06) {
@@ -6588,19 +6634,47 @@ function App() {
     }
 
     syncPreviewToTime(1.35, "preview", { pause: true });
-    await waitMs(160);
+    const previewEndReady = await waitForSmokeCondition(() =>
+      activeTrimTargetRef.current === "preview" &&
+      Math.abs(previewTimeRef.current - 1.35) <= 0.06 &&
+      Math.abs(previewSelectionTimeRef.current - 1.35) <= 0.06,
+    );
+    if (!previewEndReady) {
+      return { ok: false, message: "Packaged app smoke preview selection did not reach 1.35s before the end nudge." };
+    }
     if (!runComposeShortcutAction({ kind: "nudge-timeline", deltaS: TRIM_FINE_NUDGE_S })) {
       return { ok: false, message: "Packaged app smoke could not fine-nudge the preview selection for trim end." };
     }
-    await waitMs(160);
+    const previewEndNudged = await waitForSmokeCondition(() =>
+      activeTrimTargetRef.current === "preview" &&
+      Math.abs(previewTimeRef.current - 1.45) <= 0.06 &&
+      Math.abs(previewSelectionTimeRef.current - 1.45) <= 0.06,
+    );
+    if (!previewEndNudged) {
+      return { ok: false, message: "Packaged app smoke preview selection did not commit the 0.10s end nudge." };
+    }
 
     const rememberedEndS = previewSelectionTimeRef.current;
+    const startBeforeEndShortcut = trimTimelineRef.current?.start ?? rememberedStartS;
     focusTrimTarget("start");
-    await waitMs(160);
+    const startFocusReady = await waitForSmokeCondition(() =>
+      activeTrimTargetRef.current === "start" &&
+      Math.abs(previewTimeRef.current - startBeforeEndShortcut) <= 0.06 &&
+      Math.abs(previewSelectionTimeRef.current - rememberedEndS) <= 0.001,
+    );
+    if (!startFocusReady) {
+      return { ok: false, message: "Packaged app smoke did not focus the current trim start while preserving the remembered end selection." };
+    }
     if (!runComposeShortcutAction({ kind: "apply-trim-end" })) {
       return { ok: false, message: "Packaged app smoke could not apply trim end through the keyboard shortcut path." };
     }
-    await waitMs(160);
+    const endShortcutCommitted = await waitForSmokeCondition(() => {
+      const timeline = trimTimelineRef.current;
+      return Boolean(timeline && Math.abs(timeline.end - rememberedEndS) <= 0.06);
+    });
+    if (!endShortcutCommitted) {
+      return { ok: false, message: "Packaged app smoke Set end action did not reach the current trim timeline." };
+    }
 
     const afterEndShortcut = trimTimelineRef.current;
     if (!afterEndShortcut || Math.abs(afterEndShortcut.end - rememberedEndS) > 0.06) {
@@ -6611,15 +6685,26 @@ function App() {
     }
 
     focusTrimTarget("end");
-    await waitMs(160);
     const beforeSelectedEndNudge = trimTimelineRef.current?.end ?? rememberedEndS;
+    const selectedEndFocusReady = await waitForSmokeCondition(() =>
+      activeTrimTargetRef.current === "end" &&
+      Math.abs(previewTimeRef.current - beforeSelectedEndNudge) <= 0.06,
+    );
+    if (!selectedEndFocusReady) {
+      return { ok: false, message: "Packaged app smoke did not focus the current trim end before its selected-boundary nudge." };
+    }
     if (!runComposeShortcutAction({ kind: "nudge-timeline", deltaS: -TRIM_FINE_NUDGE_S })) {
       return { ok: false, message: "Packaged app smoke could not fine-nudge the selected trim boundary." };
     }
-    await waitMs(160);
-
-    const afterSelectedEndNudge = trimTimelineRef.current;
     const expectedEndAfterNudge = beforeSelectedEndNudge - TRIM_FINE_NUDGE_S;
+    const selectedEndNudgeCommitted = await waitForSmokeCondition(() => {
+      const timeline = trimTimelineRef.current;
+      return Boolean(timeline && Math.abs(timeline.end - expectedEndAfterNudge) <= 0.06);
+    });
+    if (!selectedEndNudgeCommitted) {
+      return { ok: false, message: "Packaged app smoke selected trim end nudge did not reach the current timeline." };
+    }
+    const afterSelectedEndNudge = trimTimelineRef.current;
     if (!afterSelectedEndNudge || Math.abs(afterSelectedEndNudge.end - expectedEndAfterNudge) > 0.06) {
       return {
         ok: false,
@@ -6677,7 +6762,9 @@ function App() {
     if (!previewReady || jobId !== null || pendingEncodeRef.current !== null) return;
     const nextPlaying = await cropperRef.current?.togglePlayback();
     if (typeof nextPlaying === "boolean") {
+      previewPlayingRef.current = nextPlaying;
       if (nextPlaying) {
+        activeTrimTargetRef.current = "preview";
         setActiveTrimTarget("preview");
       }
       setPreviewPlaying(nextPlaying);

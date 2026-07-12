@@ -39,11 +39,23 @@ test("set start and set end use the remembered preview selection instead of the 
   const raw = await fs.readFile(appPath, "utf8");
 
   assert.match(raw, /const previewSelectionTimeRef = useRef\(0\);/);
-  assert.match(raw, /if \(activeTrimTarget === "preview" \|\| previewPlaying\) \{\s*previewSelectionTimeRef\.current = previewTimeS;\s*\}/s);
+  assert.match(raw, /if \(activeTrimTargetRef\.current === "preview" \|\| previewPlayingRef\.current\) \{\s*previewSelectionTimeRef\.current = previewTimeS;\s*\}/s);
   assert.match(raw, /if \(target === "preview"\) \{\s*previewSelectionTimeRef\.current = safeTimeS;\s*\}/s);
   assert.match(raw, /function applyTrimStartFromCurrent\(\) \{\s*updateTrimTarget\("start", previewSelectionTimeRef\.current, \{ pause: true \}\);\s*\}/s);
   assert.match(raw, /function applyTrimEndFromCurrent\(\) \{\s*updateTrimTarget\("end", previewSelectionTimeRef\.current, \{ pause: true \}\);\s*\}/s);
-  assert.match(raw, /function focusTrimTarget\(target: Exclude<TrimFocusTarget, "preview">\) \{\s*if \(!trimTimeline\) return;\s*const nextTimeS = target === "start" \? trimTimeline\.start : trimTimeline\.end;\s*syncPreviewToTime\(nextTimeS, target, \{ pause: true \}\);\s*\}/s);
+  assert.match(raw, /function focusTrimTarget\(target: Exclude<TrimFocusTarget, "preview">\) \{\s*const timeline = trimTimelineRef\.current;\s*if \(!timeline\) return;\s*const nextTimeS = target === "start" \? timeline\.start : timeline\.end;\s*syncPreviewToTime\(nextTimeS, target, \{ pause: true \}\);\s*\}/s);
+});
+
+test("trim mutations read the current timeline after asynchronous interaction checks", async () => {
+  const appPath = path.resolve(__dirname, "../src/App.tsx");
+  const raw = await fs.readFile(appPath, "utf8");
+
+  assert.match(raw, /function setTrimStartValue\(nextTimeS: number\) \{\s*const timeline = trimTimelineRef\.current;\s*if \(!probe \|\| !timeline\) return;\s*const maxStart = Math\.max\(0, timeline\.end - timeline\.minGap\);/s);
+  assert.match(raw, /function setTrimEndValue\(nextTimeS: number, opts\?: \{ preferEmptyAtEnd\?: boolean \}\) \{\s*const timeline = trimTimelineRef\.current;\s*if \(!probe \|\| !timeline\) return;\s*const minEnd = Math\.min\(probe\.durationS, timeline\.start \+ timeline\.minGap\);/s);
+  assert.match(raw, /function syncPreviewToTime\(nextTimeS: number, target: TrimFocusTarget, opts\?: \{ pause\?: boolean \}\) \{\s*activeTrimTargetRef\.current = target;\s*setActiveTrimTarget\(target\);/s);
+  assert.match(raw, /const trimResetCommitted = await waitForSmokeCondition/);
+  assert.match(raw, /const startShortcutCommitted = await waitForSmokeCondition/);
+  assert.match(raw, /const endShortcutCommitted = await waitForSmokeCondition/);
 });
 
 test("trim UI exposes drag snap controls and compose keyboard shortcuts", async () => {
