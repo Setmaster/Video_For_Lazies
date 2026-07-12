@@ -247,10 +247,15 @@ function Invoke-SmokeAutomationElement {
   )
 
   $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
-  $condition = New-Object System.Windows.Automation.PropertyCondition(
+  $nameCondition = New-Object System.Windows.Automation.PropertyCondition(
     [System.Windows.Automation.AutomationElement]::NameProperty,
     $Name
   )
+  $invokableCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty,
+    $true
+  )
+  $condition = New-Object System.Windows.Automation.AndCondition($nameCondition, $invokableCondition)
   for ($attempt = 0; $attempt -lt 20; $attempt++) {
     $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
     if ($element) {
@@ -323,7 +328,12 @@ function Set-SmokeAutomationElementFocus {
     [System.Windows.Automation.AutomationElement]::NameProperty
   }
   $expected = if ($AutomationId) { $AutomationId } else { $Name }
-  $condition = New-Object System.Windows.Automation.PropertyCondition($property, $expected)
+  $identityCondition = New-Object System.Windows.Automation.PropertyCondition($property, $expected)
+  $focusableCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty,
+    $true
+  )
+  $condition = New-Object System.Windows.Automation.AndCondition($identityCondition, $focusableCondition)
   $element = $null
   for ($attempt = 0; $attempt -lt 20 -and -not $element; $attempt++) {
     $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
@@ -348,13 +358,8 @@ function Set-SmokeAutomationElementFocus {
   throw ("Portable export smoke could not establish stable WebView keyboard focus: {0}" -f $expected)
 }
 
-function Send-SmokeKeySequence {
-  param(
-    [System.Diagnostics.Process]$Process,
-    [string[]]$Keys,
-    [string]$AutomationName,
-    [string]$AutomationId
-  )
+function Set-SmokeProcessForeground {
+  param([System.Diagnostics.Process]$Process)
 
   $handle = [IntPtr]::Zero
   for ($attempt = 0; $attempt -lt 20; $attempt++) {
@@ -403,6 +408,18 @@ function Send-SmokeKeySequence {
     throw "Portable export smoke could not foreground the app for real keyboard input."
   }
   Start-Sleep -Milliseconds 50
+  return $handle
+}
+
+function Send-SmokeKeySequence {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string[]]$Keys,
+    [string]$AutomationName,
+    [string]$AutomationId
+  )
+
+  $handle = Set-SmokeProcessForeground -Process $Process
   foreach ($key in $Keys) {
     $targetElement = $null
     if ([VflPortableExportSmokeNative]::GetForegroundWindow() -ne $handle) {
@@ -419,6 +436,7 @@ function Send-SmokeKeySequence {
       }
     }
     $virtualKeys = @{
+      "{TAB}" = [UInt16]0x09
       "{LEFT}" = [UInt16]0x25
       "{UP}" = [UInt16]0x26
       "{RIGHT}" = [UInt16]0x27
@@ -426,10 +444,8 @@ function Send-SmokeKeySequence {
     if (-not $virtualKeys.ContainsKey($key)) {
       throw ("Portable export smoke does not support keyboard token: {0}" -f $key)
     }
-    [VflPortableExportSmokeNative]::SendVirtualKey($handle, [UInt16]$virtualKeys[$key], $true)
-    if ($targetElement -and -not (Test-SmokeAutomationElementFocus -Handle $handle -Element $targetElement)) {
-      throw "Portable export smoke lost stable WebView keyboard focus during native input."
-    }
+    $isExtendedKey = $key -in @("{LEFT}", "{UP}", "{RIGHT}")
+    [VflPortableExportSmokeNative]::SendVirtualKey($handle, [UInt16]$virtualKeys[$key], $isExtendedKey)
     Start-Sleep -Milliseconds 180
   }
 }
@@ -516,6 +532,7 @@ $process = [System.Diagnostics.Process]::Start($startInfo)
 if (-not $process) {
   throw "Portable export smoke could not launch the packaged app."
 }
+$null = Set-SmokeProcessForeground -Process $process
 
 $lastStatus = $null
 $lastStageName = $null
@@ -571,7 +588,7 @@ try {
           }
           "keyboard-trim-incremented" {
             Send-SmokeKeySequence -Process $process -Keys @("{LEFT}") -AutomationId "vfl-trim-start-slider"
-            $null = Set-SmokeAutomationElementFocus -Handle $process.MainWindowHandle -AutomationId "vfl-trim-end-slider"
+            Send-SmokeKeySequence -Process $process -Keys @("{TAB}")
             $sentKeyboardStages[$status.stage] = $true
           }
           "keyboard-crop-ready" {

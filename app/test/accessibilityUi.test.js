@@ -185,6 +185,7 @@ test("portable Windows smoke requires mounted accessibility evidence", async () 
   assert.match(app, /document\.hasFocus\(\) && document\.activeElement === target/);
   assert.match(app, /captureTrustedSmokeKey/);
   assert.match(app, /event\.isTrusted/);
+  assert.match(app, /captureTrustedSmokeKey\(startSlider, "Tab"\)/);
   assert.match(app, /Mounted accessibility checks passed/);
   assert.match(app, /getBoundingClientRect\(\)/);
   assert.match(app, /document\.activeElement !== aboutTrigger/);
@@ -196,7 +197,7 @@ test("portable Windows smoke requires mounted accessibility evidence", async () 
   assert.match(windows, /"workflow-ready"/);
   assert.match(windows, /SendInput\(uint inputCount/);
   assert.match(windows, /KEYEVENTF_EXTENDEDKEY/);
-  assert.match(windows, /SendVirtualKey\(\$handle, \[UInt16\]\$virtualKeys\[\$key\], \$true\)/);
+  assert.match(windows, /SendVirtualKey\(\$handle, \[UInt16\]\$virtualKeys\[\$key\], \$isExtendedKey\)/);
   assert.doesNotMatch(windows, /System\.Windows\.Forms\.SendKeys|keybd_event/);
   assert.match(windows, /"keyboard-trim-ready"/);
   assert.match(windows, /"keyboard-trim-incremented"/);

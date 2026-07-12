@@ -191,6 +191,8 @@ test("portable export smoke enforces ordered workflow and interaction stage hist
   assert.match(raw, /ForceForegroundWindow\(IntPtr hWnd\)/);
   assert.match(raw, /AttachThreadInput\(currentThread, targetThread, true\)/);
   assert.match(raw, /ForceForegroundWindow\(\$handle\)/);
+  assert.match(raw, /function Set-SmokeProcessForeground/);
+  assert.match(raw, /\$null = Set-SmokeProcessForeground -Process \$process/);
   assert.match(raw, /UIAutomationClient/);
   assert.match(raw, /Invoke-SmokeAutomationElement/);
   assert.match(raw, /Set-SmokeAutomationElementFocus/);
@@ -198,15 +200,16 @@ test("portable export smoke enforces ordered workflow and interaction stage hist
   assert.match(raw, /\$stableSamples -eq 3/);
   assert.match(raw, /Current\.HasKeyboardFocus/);
   assert.match(raw, /Automation\]::Compare\(\$Element, \$focused\)/);
+  assert.match(raw, /IsKeyboardFocusableProperty/);
   assert.match(raw, /InvokePattern/);
+  assert.match(raw, /IsInvokePatternAvailableProperty/);
   assert.match(raw, /-Name "Save current settings"/);
   assert.match(raw, /-Name "Run queue"/);
   assert.match(raw, /-AutomationId "vfl-trim-start-slider"/);
-  assert.match(raw, /-AutomationId "vfl-trim-end-slider"/);
   assert.match(raw, /-AutomationId "vfl-crop-x"/);
   assert.match(raw, /Invoke-SmokeAutomationElement -Handle \$process\.MainWindowHandle -Name "About & updates"/);
   assert.match(raw, /Invoke-SmokeAutomationElement -Handle \$process\.MainWindowHandle -Name "Close about dialog"/);
-  assert.match(raw, /Set-SmokeAutomationElementFocus -Handle \$process\.MainWindowHandle -AutomationId "vfl-trim-end-slider"/);
+  assert.match(raw, /Send-SmokeKeySequence -Process \$process -Keys @\("\{TAB\}"\)/);
   assert.match(raw, /GetForegroundWindow\(\) -ne \$handle[\s\S]*?ForceForegroundWindow\(\$handle\)[\s\S]*?could not restore foreground before real keyboard input/);
   assert.match(raw, /VFL_SMOKE_TRIM_START_S"\] = "0\.25"/);
   assert.match(raw, /struct MOUSEINPUT[\s\S]*?struct KEYBDINPUT[\s\S]*?struct HARDWAREINPUT[\s\S]*?struct INPUTUNION[\s\S]*?struct INPUT/);

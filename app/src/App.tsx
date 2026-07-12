@@ -6547,16 +6547,21 @@ function App() {
       return { ok: false, message: "Accessibility smoke did not receive one trusted real Right step on Trim start." };
     }
     const realTrimLeft = captureTrustedSmokeKey(startSlider, "ArrowLeft");
+    const realTrimTab = captureTrustedSmokeKey(startSlider, "Tab");
     await reportSmokeStatus("keyboard-trim-incremented", {
-      message: "Real packaged Right moved Trim start by exactly 0.1s; waiting for Left and accessible focus transfer.",
+      message: "Real packaged Right moved Trim start by exactly 0.1s; waiting for trusted real Left then Tab.",
     });
     const realTrimKeysPassed = await waitForSmokeCondition(() => {
       const currentStart = Number(document.getElementById("vfl-trim-start-slider")?.getAttribute("aria-valuenow"));
-      return realTrimLeft.received() && Math.abs(currentStart - beforeStart) <= 0.001 && document.activeElement?.id === "vfl-trim-end-slider";
+      return realTrimLeft.received() &&
+        realTrimTab.received() &&
+        Math.abs(currentStart - beforeStart) <= 0.001 &&
+        document.activeElement?.id === "vfl-trim-end-slider";
     });
     realTrimLeft.stop();
+    realTrimTab.stop();
     if (!realTrimKeysPassed) {
-      return { ok: false, message: "Accessibility smoke did not receive the trusted real Right, Left, and accessible trim focus sequence." };
+      return { ok: false, message: "Accessibility smoke did not receive the trusted real Right, Left, and Tab trim sequence." };
     }
     await reportSmokeStatus("keyboard-trim-complete", {
       message: "Real packaged trim keyboard sequence completed with the original value restored and focus on Trim end.",
