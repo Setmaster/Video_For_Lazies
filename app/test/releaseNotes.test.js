@@ -43,9 +43,14 @@ test("release notes renderer uses the defined template and curated notes", () =>
   assert.match(notes, /add release flow \(abcdef1\)/);
   assert.match(notes, /### Fixed/);
   assert.match(notes, /Video_For_Lazies-v0\.1\.1-linux-x64\.zip/);
-  assert.match(notes, /Windows portable zips are unsigned/);
+  assert.match(notes, /Windows portable executables are not Authenticode-signed/);
   assert.match(notes, /Windows x64 and Linux x64 portable releases bundle pinned GPL FFmpeg sidecars/);
+  assert.match(notes, /archive SHA256 and size, and the embedded payload manifest/);
+  assert.match(notes, /durable journal, and a verified backup/);
+  assert.match(notes, /Each extracted archive must exactly match its payload manifest/);
+  assert.match(notes, /Packaged smokes verify bundled FFmpeg capabilities/);
   assert.match(notes, /VFL_FFMPEG_PATH/);
+  assert.doesNotMatch(notes, /Repository visibility/);
 });
 
 test("release notes renderer describes the first release without a fake range", () => {

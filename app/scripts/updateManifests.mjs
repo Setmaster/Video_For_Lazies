@@ -29,6 +29,12 @@ export const UPDATE_MANIFEST_FILE_NAME = "vfl-update-manifest-v1.json";
 export const UPDATE_MANIFEST_SIGNATURE_FILE_NAME = `${UPDATE_MANIFEST_FILE_NAME}.sig`;
 export const PORTABLE_ROOT_DIR_NAME = "Video_For_Lazies";
 export const UPDATE_RELEASE_BASE_URL = "https://github.com/Setmaster/Video_For_Lazies/releases";
+export const UPDATE_NOTES_SUMMARY_MAX_CHARS = 240;
+
+const DEFAULT_UPDATE_NOTES_SUMMARY = "See the GitHub release notes for changes.";
+const VERSIONED_UPDATE_NOTES_SUMMARIES = Object.freeze({
+  "1.10.0": "Adds codec-aware exports, accessible crop and trim controls, in-memory queue tools and local recipes, Strict Fit, SRT subtitle burn-in, guarded Fast Trim, clearer phase progress, and journaled recovery for signed portable updates.",
+});
 
 const POSIX_SEP_PATTERN = /\\/g;
 const LOWER_HEX_SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -415,6 +421,15 @@ function sha256Bytes(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
+export function getUpdateNotesSummary(version) {
+  const normalizedVersion = normalizeVersionInput(version);
+  const summary = VERSIONED_UPDATE_NOTES_SUMMARIES[normalizedVersion] ?? DEFAULT_UPDATE_NOTES_SUMMARY;
+  if (summary.length > UPDATE_NOTES_SUMMARY_MAX_CHARS || /[\u0000-\u001f\u007f]/.test(summary)) {
+    throw new Error(`Update notes summary for ${normalizedVersion} must be bounded plain text.`);
+  }
+  return summary;
+}
+
 function platformFromUpdateTarget(target) {
   if (target === "linux-x64") return "linux";
   if (target === "windows-x64") return "win32";
@@ -553,7 +568,7 @@ export async function buildUpdateManifest({
     minUpdaterProtocol: 1,
     notes: {
       title: `Video For Lazies ${releaseTag}`,
-      summary: "See the GitHub release notes for changes.",
+      summary: getUpdateNotesSummary(normalizedVersion),
       url: `${UPDATE_RELEASE_BASE_URL}/tag/${releaseTag}`,
     },
     artifacts,

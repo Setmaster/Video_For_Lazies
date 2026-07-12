@@ -167,14 +167,17 @@ export function renderReleaseNotes({
 
   lines.push("## Runtime Notes", "");
   lines.push("- Windows x64 and Linux x64 portable releases bundle pinned GPL FFmpeg sidecars and include FFmpeg source plus build-provenance archives in the portable payload.");
-  lines.push("- Updater-capable releases verify a signed update manifest before downloading or applying future portable updates.");
-  lines.push("- Windows portable zips are unsigned and may trigger SmartScreen or antivirus reputation warnings. Verify the SHA256 checksum before running.");
+  lines.push("- Portable updates are accepted only after the app verifies the signed release manifest, archive SHA256 and size, and the embedded payload manifest.");
+  lines.push("- Updates use an app-managed staging directory, a durable journal, and a verified backup for automatic recovery or rollback after an interrupted replacement. If saved state cannot be trusted, the app preserves the staged files and backup for explicit recovery.");
+  lines.push("- Windows portable executables are not Authenticode-signed and may trigger SmartScreen or antivirus reputation warnings. Verify the matching entry in `SHA256SUMS.txt` before running.");
   lines.push("- `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH` remain available for custom runtime overrides on both platforms.");
-  lines.push("- Repository visibility is not changed by this release workflow.", "");
+  lines.push("");
 
   lines.push("## Verification", "");
-  lines.push("- GitHub Actions builds and verifies the portable zip artifacts before creating the release.");
-  lines.push("- The release includes a combined SHA256 checksum file for uploaded portable archives.", "");
+  lines.push("- GitHub Actions builds and verifies Windows x64 and Linux x64 portable archives before creating the release.");
+  lines.push("- Each extracted archive must exactly match its payload manifest, including the file set, SHA256, size, and Linux file modes where applicable.");
+  lines.push("- Packaged smokes verify bundled FFmpeg capabilities, encode/probe behavior, and app export workflows on both platforms; Windows also verifies the update-helper manifest and packaged startup.");
+  lines.push("- The release includes combined SHA256 checksums and a signed update manifest that binds each archive and payload-manifest digest.", "");
 
   return lines.join("\n");
 }

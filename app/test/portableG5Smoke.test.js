@@ -551,18 +551,14 @@ test("subtitle font preflight failures retain bounded path-free diagnostics", as
   }
 });
 
-test("G5 corpus is wired into extracted portable verification without changing version", async () => {
+test("G5 corpus is wired into extracted portable verification", async () => {
   const runnerPath = path.resolve(__dirname, "../scripts/run-portable-g5-smoke.mjs");
   const releasePath = path.resolve(__dirname, "../scripts/run-release-portable.mjs");
-  const packagePath = path.resolve(__dirname, "../package.json");
-  const [runner, release, packageRaw] = await Promise.all([
+  const [runner, release] = await Promise.all([
     fs.readFile(runnerPath, "utf8"),
     fs.readFile(releasePath, "utf8"),
-    fs.readFile(packagePath, "utf8"),
   ]);
-  const packageJson = JSON.parse(packageRaw);
 
-  assert.equal(packageJson.version, "1.9.1");
   assert.match(release, /import \{ runPortableG5Smoke \} from "\.\/run-portable-g5-smoke\.mjs"/);
   assert.match(release, /await runPortableG5Smoke\(\{ portableDir, platform \}\)/);
   assert.match(runner, /VFL_SMOKE_STRICT_FIT/);

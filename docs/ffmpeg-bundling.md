@@ -11,8 +11,22 @@ This app bundles FFmpeg for Windows x64 and Linux x64 release builds so end user
 - Platform bundles are staged by `app/scripts/sync-ffmpeg-sidecar.mjs`.
 - `npm run tauri build` and `npm run portable` trigger that staging automatically through Tauri's `beforeBuildCommand`.
 - The portable release format is a folder: `release/Video_For_Lazies/` plus `release/Video_For_Lazies/ffmpeg-sidecar/`.
-- The portable build also runs a Windows startup smoke (`app/scripts/windows-portable-smoke.ps1`) after packaging. It launches the portable exe, captures the app window, and fails the build if the rendered surface is overwhelmingly bright/white, which catches regressions like the accidental dev-surface/localhost build.
-- `npm run release:portable` packages a versioned zip such as `release/Video_For_Lazies-vX.Y.Z-win-x64.zip` or `release/Video_For_Lazies-vX.Y.Z-linux-x64.zip`, writes `release/SHA256SUMS.txt`, writes a payload manifest sidecar for the updater workflow, and verifies the extracted zip. Both platforms verify the bundled FFmpeg sidecar exposes `libx264` and can encode/probe a sample MP4. Windows additionally runs startup plus packaged interaction/export smoke, including a second tight-target 1080p MP4 smoke.
+- The portable folder includes the platform runtime, a byte-for-byte copy of the canonical `app/ffmpeg-capabilities.json` contract as `ffmpeg-sidecar/FFMPEG_CAPABILITIES.json`, the app and update helper, an owned-file payload manifest, and generated legal/source documents.
+- `npm run portable` performs the platform build. On Windows, it also runs the baseline startup gate: `app/scripts/windows-portable-smoke.ps1` launches the packaged executable, captures the app window, and rejects a missing or overwhelmingly bright/white surface. This catches regressions such as an accidental development/localhost build.
+- `npm run release:portable` packages a versioned zip such as `release/Video_For_Lazies-vX.Y.Z-win-x64.zip` or `release/Video_For_Lazies-vX.Y.Z-linux-x64.zip`, writes `release/SHA256SUMS.txt` and the payload-manifest sidecar, extracts the new zip, and verifies that extracted copy rather than trusting the build directory.
+
+The extracted-archive verification on both supported platforms checks:
+
+- exact payload ownership, hashes, sizes, and platform modes, including the app, update helper, legal/source files, sidecar runtime, and embedded payload manifest
+- byte identity of the canonical capability contract, then live encoder/filter inspection against the extracted FFmpeg
+- a real `libx264` encode followed by a duration probe through the extracted FFprobe
+- packaged media-depth behavior for selected streams, attached pictures, HDR/high-depth policy, SAR/rotation geometry, and reverse/loop memory bounds
+- exact-byte targets, opt-in Strict Fit, separate audio-removal permission, and one bounded external UTF-8 SRT with the fixed embedded subtitle font
+- Exact trim and explicitly accepted compatible copy-only Fast Trim, including packet/boundary and metadata checks
+- recipe privacy, queue retry and snapshot restoration, multi-file routing, accessibility foundations, phase-aware progress, rotation/speed/frame-rate-cap behavior, Reset, Cancel, queued drops, and export-lifecycle behavior
+- normal MP4 and WebM exports, custom-size output, and a tight-target 1080p case
+
+Linux additionally runs the full bundled codec-plan matrix. Windows additionally runs the native packaged-window startup and keyboard interaction paths. These checks prove the selected repository contract and tested fixtures; they are not a general claim that every possible FFmpeg input or filter combination works.
 
 ## Pinned Windows bundle
 
@@ -106,5 +120,6 @@ The project does not claim bit-for-bit reproducibility for the BtbN-hosted binar
 ## Codec behavior
 
 - The pinned GPL Windows and Linux bundles ship `libx264`, so bundled MP4 export uses H.264 by default.
-- If the active FFmpeg build does not expose `libx264` (for example via `VFL_FFMPEG_PATH`), MP4 export falls back to `mpeg4`.
+- In Auto mode, an active FFmpeg build without `libx264` (for example via `VFL_FFMPEG_PATH`) can fall back to `mpeg4` when that encoder is available. An explicit H.264 request or standard-SDR conversion fails closed instead.
 - WebM and MP3 continue to prefer the bundled `libvpx-vp9`, `libopus`, and `libmp3lame` encoders when available.
+- The release-required capability contract also covers the encoders and filters used by crop, scale, color conversion, SAR normalization, reverse/loop, audio normalization, PNG frame export, and fixed-style SRT burn-in. A custom FFmpeg override can disable an affected feature when that capability is missing; the app checks the active runtime and fails closed instead of assuming parity with the bundle.

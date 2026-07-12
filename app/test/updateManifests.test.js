@@ -9,11 +9,13 @@ import {
   APP_ID,
   PAYLOAD_MANIFEST_FILE_NAME,
   UPDATE_MANIFEST_SCHEMA,
+  UPDATE_NOTES_SUMMARY_MAX_CHARS,
   assertSafePortableRelativePath,
   buildUpdateManifest,
   copyPayloadManifestSidecar,
   generatePayloadManifest,
   getPayloadManifestSidecarPath,
+  getUpdateNotesSummary,
   validatePayloadManifest,
 } from "../scripts/updateManifests.mjs";
 import { createReleaseZipFixture } from "../test-support/releaseZipFixture.js";
@@ -182,6 +184,7 @@ test("update manifest is built from staged zips and payload sidecars", async () 
     assert.equal(manifest.schema, UPDATE_MANIFEST_SCHEMA);
     assert.equal(manifest.version, "1.2.3");
     assert.equal(manifest.releaseTag, "v1.2.3");
+    assert.equal(manifest.notes.summary, "See the GitHub release notes for changes.");
     assert.equal(manifest.artifacts["linux-x64"].payloadManifest.path, "Video_For_Lazies/VFL_PAYLOAD_MANIFEST.json");
     assert.equal(manifest.artifacts["windows-x64"].fileName, "Video_For_Lazies-v1.2.3-win-x64.zip");
     const linuxZipBytes = await fs.readFile(linuxZip);
@@ -191,6 +194,28 @@ test("update manifest is built from staged zips and payload sidecars", async () 
       manifest.artifacts["linux-x64"].payloadManifest.sha256,
       sha256(await fs.readFile(linuxSidecar)),
     );
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("v1.10.0 update manifest carries its bounded plain-text release summary", async () => {
+  const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-update-summary-test-"));
+  try {
+    const { releaseDir } = await writeUpdateReleasePair(tempRoot, { version: "1.10.0" });
+    const manifest = await buildUpdateManifest({
+      releaseAssetDir: releaseDir,
+      version: "1.10.0",
+      publishedAt: "2026-07-12T00:00:00.000Z",
+    });
+
+    assert.equal(
+      manifest.notes.summary,
+      "Adds codec-aware exports, accessible crop and trim controls, in-memory queue tools and local recipes, Strict Fit, SRT subtitle burn-in, guarded Fast Trim, clearer phase progress, and journaled recovery for signed portable updates.",
+    );
+    assert.ok(manifest.notes.summary.length <= UPDATE_NOTES_SUMMARY_MAX_CHARS);
+    assert.doesNotMatch(manifest.notes.summary, /[\u0000-\u001f\u007f]/);
+    assert.equal(getUpdateNotesSummary("1.10.1"), "See the GitHub release notes for changes.");
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }

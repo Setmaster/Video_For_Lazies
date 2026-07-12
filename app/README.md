@@ -1,28 +1,27 @@
 # Video For Lazies (Tauri)
 
-Rust + Tauri desktop app for exporting videos (optionally under a size limit), backed by `ffmpeg`.
+Rust and Tauri desktop app for focused local video exports through FFmpeg. The workbench accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports `mp4`, `webm`, or audio-only `mp3`.
 
 ## Requirements
 
-- Windows x64 and Linux x64 release builds bundle `ffmpeg` and `ffprobe` automatically.
-- Unsupported platforms and custom runtime builds can still use `ffmpeg` and `ffprobe` on `PATH`
-  - Or set `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH`
-- Node.js and Rust toolchain
+- Windows x64 and Linux x64 release builds stage pinned `ffmpeg` and `ffprobe` sidecars automatically.
+- Unsupported platforms and custom runtime builds can use `ffmpeg` and `ffprobe` on `PATH`, or set `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH`.
+- Local development requires Node.js and a Rust toolchain.
 
-## Run (dev)
+## Run (development)
 
 ```bash
 npm install
 npm run tauri dev
 ```
 
-## Build (bundle)
+## Build (Tauri)
 
 ```bash
 npm run tauri build
 ```
 
-On Windows and Linux x64, the Tauri build runs `npm run prepare:ffmpeg-sidecar` first to stage the pinned GPL FFmpeg bundle and its license/source metadata.
+On Windows and Linux x64, the Tauri build runs `npm run prepare:ffmpeg-sidecar` first. Staging verifies the pinned GPL FFmpeg archive and corresponding source/build-recipe archives before copying the runtime, capability contract, licenses, and source material.
 
 ## Portable Folder
 
@@ -30,12 +29,14 @@ On Windows and Linux x64, the Tauri build runs `npm run prepare:ffmpeg-sidecar` 
 npm run portable
 ```
 
-Writes a portable folder at `release/Video_For_Lazies/`.
-That folder contains the app executable and required legal/readme files.
-On Windows and Linux it also contains the bundled `ffmpeg-sidecar/`.
-On Windows, verification runs a startup smoke check against the packaged app window and fails the build if the portable release comes up on an obviously wrong surface.
-On Linux, verification runs the bundled FFmpeg and FFprobe through an encode/probe smoke.
-This path builds the portable release directly and does not require the WiX / NSIS installer steps.
+This writes `release/Video_For_Lazies/` with:
+
+- the app executable and `vfl-update-helper`
+- the platform `ffmpeg-sidecar/` and canonical capability contract
+- the DejaVu Sans subtitle font embedded in the app binary, with its license recorded in generated notices
+- the payload manifest, release-specific `SOURCE.md` and `THIRD_PARTY_NOTICES.md`, and copies of `README.md`, `FFMPEG_BUNDLING.md`, and `LICENSE.txt`
+
+The command builds directly with `tauri build --no-bundle`; it does not require WiX or NSIS. Windows also runs the packaged-window startup smoke and rejects a missing or obviously wrong app surface.
 
 ## Portable Release Archive
 
@@ -43,46 +44,94 @@ This path builds the portable release directly and does not require the WiX / NS
 npm run release:portable
 ```
 
-Builds `release/Video_For_Lazies/`, packages a versioned x64 zip such as `release/Video_For_Lazies-v0.1.0-win-x64.zip` or `release/Video_For_Lazies-v0.1.0-linux-x64.zip`, writes `release/SHA256SUMS.txt`, and verifies the extracted zip.
+This builds the portable folder, packages `release/Video_For_Lazies-vX.Y.Z-win-x64.zip` or `release/Video_For_Lazies-vX.Y.Z-linux-x64.zip`, writes the matching payload-manifest sidecar and `release/SHA256SUMS.txt`, extracts the zip, and verifies the extracted artifact rather than trusting the build folder.
 
-On both platforms, verification checks that the shipped sidecar exposes `libx264` and can encode/probe a sample MP4. On Windows, verification also runs startup smoke, the packaged interaction/export smoke, and a second tight-target 1080p MP4 smoke.
+Both platforms verify:
 
-The GitHub `Portable Release` workflow builds and verifies Linux and Windows x64 zips. Manual runs default to `build_only=true`, which retains private GitHub Actions artifacts for 30 days without creating a release. An intentional `build_only=false` run continues through release notes, updater-manifest signing, combined checksums, and draft or published GitHub Release creation as configured. Tag-triggered runs intentionally create a draft prerelease for asset review before explicit stable publication.
+- executable, legal/source, and exact payload-manifest ownership, hash, size, and mode contracts
+- the canonical FFmpeg capability contract and a real bundled `libx264` encode/probe
+- media-depth behavior for stream selection, HDR/high-depth policy, SAR/rotation geometry, and reverse/loop memory limits
+- exact-byte targets, opt-in Strict Fit, separate audio-removal consent, and one bounded external UTF-8 SRT
+- Exact trim plus explicitly accepted compatible copy-only Fast Trim
+- recipe privacy, queue retry and snapshot restoration, multi-file routing, reset/dialog accessibility, phase progress, rotation/speed/frame-rate-cap truth, active cancellation, queued drops, and export-lifecycle behavior
+- standard MP4, WebM, custom-size, and tight-target packaged exports
+
+Linux additionally runs the full bundled codec-plan matrix. Windows additionally runs the native startup smoke and packaged keyboard/window interaction path.
+
+The GitHub `Portable Release` workflow builds and verifies Linux and Windows x64 zips. Manual runs default to `build_only=true`, which uploads private GitHub Actions artifacts for 30 days and skips the release job. A deliberate `build_only=false` run continues through release notes (curated when supplied, otherwise generated from commits), combined checksums, signed updater-manifest creation, and a GitHub Release configured by the workflow inputs. Tag-triggered runs conservatively create a draft prerelease for asset review before explicit stable publication.
 
 ## Tests
 
 ```bash
 npm test
-cd src-tauri
-cargo test
+npx tsc --noEmit
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 ```
 
-## Notes
+Useful targeted package checks:
 
-- Size limit uses decimal MB (`1 MB = 1,000,000 bytes`).
-- Set size limit to `0` (or leave it empty) to disable size targeting.
-- The backend emits events:
-  - `encode-progress`
-  - `encode-finished`
+```bash
+npm run smoke:portable:export
+npm run smoke:portable:codecs
+npm run smoke:portable:g6
+npm run smoke:portable:g7
+```
 
-## Features (current)
+The targeted smoke commands expect an already assembled portable folder and are platform-gated. `npm run release:portable` is the complete archive-and-reextract gate.
 
-- Workbench layout: the video preview, scrubber, and trim controls are always visible on the left; all settings live in a fixed-width rail of collapsible cards on the right (Source & destination, Recipes, Export settings, Crop, Transform & color, Advanced, Current plan, Queue).
-- Drag and drop a video anywhere onto the window to set it as input.
-- Output path is auto-suggested in the same folder by incrementing a `-N` suffix, skips existing `-N` outputs and queued snapshots to avoid overwrites, and changing the export format updates the output extension.
-- Export format, normalize-speech, strip-metadata, and advanced overrides are remembered between launches (input/output paths are not persisted).
-- Quick size presets (4/10/25/50 MB), direct trim in/out handles under the preview, selected-boundary fine nudges plus compose shortcuts (`Space`, `Left` / `Right`, `Shift+Left` / `Shift+Right`, `[` and `]`), a `Current plan` card with plan status and last-export details, bottom-bar export/open actions plus queue position, and a `Save frame (PNG)` button beside the live preview controls.
-- Preview and shaping: trim, crop (drag-select with optional aspect lock, plus auto-detect), reverse, forward-then-reverse Loop, playback speed, rotate, and color adjustments (brightness, contrast, saturation).
-- Export settings: output format (`mp4`, `webm`, `mp3`), size limit (MB, optional), output dimensions (Original / Max edge / Custom with aspect lock), audio on/off, title metadata, and a strip-location-metadata privacy toggle (on by default).
-- Advanced: codec/quality/encode-speed/frame-rate-cap/audio overrides, speech normalization, and sample exports with a selectable 5/10/30 s window plus an extrapolated full-size estimate.
+## Implemented Product Contract
 
-## FFmpeg runtime notes
+### Workbench and editing
 
-- Runtime resolution order is env override -> bundled `ffmpeg-sidecar` -> `PATH`.
-- The bundled Windows and Linux packages use pinned GPL shared builds and include `libx264`, so bundled MP4 export uses H.264 by default.
-- If the active FFmpeg build does not expose `libx264`, MP4 export still falls back to `mpeg4`.
+- The preview, scrubber, trim sliders, and crop surface stay visible on the left. Source, recipes, export settings, crop, transform/color, advanced controls, current plan, and queue live in the collapsible right rail.
+- Trim sliders expose labelled keyboard semantics and 0.1-second or 1-second nudges. Exact trim is the default.
+- Fast Trim is a separate MP4/WebM copy-only mode. It requires an active trim, a backend-authoritative compatibility check, and explicit acceptance when the containing closed-GOP interval is wider than requested. It never silently re-encodes, falls back, or reuses stale consent.
+- Crop uses labelled source-pixel inputs plus pointer drawing. Quarter-turn rotation keeps preview geometry and crop coordinates aligned.
+- Speed is applied before the optional frame-rate cap, and the current plan reports the post-speed rate and whether the cap applies.
+- One UTF-8 SRT can be burned into MP4 or WebM using source timing, a fixed embedded DejaVu Sans style, and private temporary staging. It forces video re-encoding and rejects inline styling/position overrides.
+
+### Planning and publication
+
+- Probe selection is container and codec aware. Attached pictures are excluded from primary-video selection; compatible audio and video may be copied independently.
+- Exact target classification uses backend-reported integer bytes. With Strict Fit off, the requested dimensions and audio are preserved, and a measured overshoot is retained as an openable target-miss artifact.
+- Strict Fit is opt-in and globally bounded to four ordered plans. It stops at the first fit or retains the smallest miss. Audio removal is separately permitted and is off by default.
+- Every output uses a unique temporary path and exclusive no-clobber publication. Suggested paths and queue reservations also advance the `-N` suffix.
+- Progress is attempt/job bound, monotonic, and phase aware (`copying`, `encoding`, `finalizing`). The UI does not show 100 percent before the matching terminal event.
+
+### Media guardrails
+
+- HDR10 and high-bit-depth SDR require an explicit standard-SDR conversion and supported MP4/H.264 capability. The result is 8-bit BT.709 SDR; HDR preservation is not supported.
+- HLG, Dolby Vision, incomplete or contradictory HDR/high-depth metadata, unknown component depth, and arbitrary source rotations fail closed for video export. Audio-only MP3 may remain available.
+- Non-square source pixels are normalized to square-pixel output while preserving display shape unless custom dimensions explicitly take authority. Fast Trim blocks non-square-pixel sources.
+- Reverse and loop estimate decoded video/audio memory, warn above 512 MiB, and block above 2 GiB.
+
+### Queue, recipes, privacy, and recovery
+
+- The queue owns immutable snapshots, one active FFmpeg job, exact item/run identity, stale-event rejection, a 100-item bound, and up to 10 retained outcomes per item. Retry, duplicate, apply snapshot, stop-after-current, and clear-finished paths preserve focus and allocate fresh outputs.
+- A single supported drop while idle replaces the current source. Multi-file drops and drops during active work queue accepted files in order using a settings-only snapshot; unsupported, duplicate, and overflow counts stay visible.
+- Device-local schema-v2 recipes save only format, size, resize, audio, Strict Fit, frame uniqueness, and encoder settings. They exclude every source/output/subtitle path and clip-scoped edit, title, metadata privacy, diagnostics, queue state, and job state.
+- Metadata stripping is on by default. User-facing errors and retained smoke/diagnostic evidence redact process-unique and clip-private paths where those paths are not needed for the local workflow.
+- Reset All uses a confirmation dialog and clears settings, trim, crop, color, subtitle selection, and Fast Trim authority without clearing source, output, queue, or recipes. Cancel is a separate one-shot active-export action.
+- Signed portable updates show bounded progress, verify the selected payload, journal replacement state, preserve a verified backup, and attempt rollback/startup recovery after interruption. A manual portable download remains the fallback when recovery cannot complete.
+
+### Accessibility baseline
+
+- Crop fields have explicit labels and source-pixel values; trim handles expose slider roles, names, values, and keyboard behavior.
+- About, reset, recipe, and elevated-update dialogs contain focus, isolate the background, support appropriate Escape behavior, and restore focus to the trigger or safe queue control.
+- Probe, subtitle, crop, queue, progress, update, and failure states use mounted status/alert semantics where relevant.
+
+These are tested accessibility foundations, not a claim of WCAG conformance or complete coverage across screen readers, browsers, and operating systems.
+
+## FFmpeg Runtime Notes
+
+- Resolution order is environment override, bundled `ffmpeg-sidecar`, then `PATH`.
+- The bundled Windows and Linux packages use pinned GPL shared builds and include `libx264`, `libvpx-vp9`, `libopus`, `libmp3lame`, libass subtitle support, and the filters required by the shipped capability contract.
+- Bundled MP4 export uses H.264 by default. In Auto mode, a custom FFmpeg without `libx264` can fall back to `mpeg4` when that encoder is available; explicit H.264 and standard-SDR plans fail closed. Missing required filters or encoders block the affected feature.
 - Exact bundle/source provenance lives in [`../docs/ffmpeg-bundling.md`](../docs/ffmpeg-bundling.md).
 
 ## License
 
-Video For Lazies is licensed under GPL-3.0-or-later. The Windows and Linux portable builds bundle pinned GPL FFmpeg sidecars; see [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) and [`../docs/ffmpeg-bundling.md`](../docs/ffmpeg-bundling.md).
+Video For Lazies is licensed under GPL-3.0-or-later. Windows and Linux portable builds bundle pinned GPL FFmpeg sidecars; see [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md), [`../SOURCE.md`](../SOURCE.md), and [`../docs/ffmpeg-bundling.md`](../docs/ffmpeg-bundling.md).
