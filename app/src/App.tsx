@@ -71,6 +71,7 @@ import {
   settleEncodeFinished,
   type EncodeAttemptState,
 } from "./lib/encodeAttempt";
+import { installEncodeEventListeners } from "./lib/encodeEvents";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import {
   EXPORT_RECIPES,
@@ -153,6 +154,8 @@ const OUTPUT_DIMENSION_MAX_PX = 32768;
 const AUDIO_BITRATE_PRESETS_KBPS = [96, 128, 192, 256, 320] as const;
 const FRAME_RATE_CAP_PRESETS_FPS = [24, 30, 60] as const;
 const SIZE_TARGET_EXACTNESS_ERROR = "Size limit is too large to track exactly in bytes. Enter a smaller MB value.";
+const ENCODE_EVENT_SETUP_ERROR = "Export event handling could not start. Restart Video For Lazies, then try again. If the problem continues, reinstall the app and report the app version.";
+const ENCODE_EVENT_SETUP_SMOKE_ERROR = "Packaged app smoke export event setup failed (code: encode-event-listener-registration). Restart the app, then rerun the packaged smoke.";
 const VIDEO_CODEC_LABELS: Record<VideoCodecPreference, string> = {
   auto: "Auto",
   h264: "H.264",
@@ -708,6 +711,8 @@ function App() {
   const [frameSaving, setFrameSaving] = useState(false);
 
   const [jobId, setJobId] = useState<number | null>(null);
+  const [encodeEventsReady, setEncodeEventsReady] = useState(false);
+  const [encodeEventsError, setEncodeEventsError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState<string>("Pick a video to begin.");
   const [dragActive, setDragActive] = useState(false);
@@ -740,6 +745,8 @@ function App() {
   const modalOpen = elevatedUpdateRun || aboutOpen || recipeDialog !== null;
 
   const jobIdRef = useRef<number | null>(null);
+  const encodeEventsReadyRef = useRef(false);
+  const encodeEventsErrorRef = useRef<string | null>(null);
   const attemptIdRef = useRef(Math.floor(Date.now() * 1000));
   const latestAttemptRef = useRef<EncodeAttemptState>(latestAttempt);
   const inputPathRef = useRef("");
@@ -2745,7 +2752,13 @@ function App() {
                   : !fastTrimAccepted
                     ? "Accept the disclosed Fast Trim boundaries before exporting or adding this plan to the queue."
                     : null;
+  const encodeEventBlockingReason = encodeEventsError
+    ? encodeEventsError
+    : !encodeEventsReady
+      ? "Preparing export event handling."
+      : null;
   const exactExportPlanBlockingReason =
+    encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
     capabilityInspectionBlockingReason ??
     rotationBlockingReason ??
@@ -2761,6 +2774,7 @@ function App() {
     queueOutputBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting." : null);
   const exactSamplePlanBlockingReason =
+    encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
     capabilityInspectionBlockingReason ??
     rotationBlockingReason ??
@@ -2775,6 +2789,7 @@ function App() {
     exactSampleAutoVideoCodecBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting an exact sample." : null);
   const fastExportBasicBlockingReason =
+    encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
     (subtitleInspecting ? "Wait for external subtitle validation to finish." : null) ??
     queueOutputBlockingReason;
@@ -3362,6 +3377,12 @@ function App() {
     if (!smokeConfig) return;
     if (smokeStageRef.current === SMOKE_SUCCESS_STAGE || smokeStageRef.current === SMOKE_ERROR_STAGE) return;
 
+    if (encodeEventsError) {
+      void reportSmokeFailure(ENCODE_EVENT_SETUP_SMOKE_ERROR);
+      return;
+    }
+    if (!encodeEventsReady) return;
+
     if (probeError) {
       void reportSmokeFailure(`Packaged app smoke probe failed: ${probeError}`);
       return;
@@ -3653,22 +3674,31 @@ function App() {
     subtitleError,
     encodeCapabilities,
     encodeCapabilitiesError,
+    encodeEventsReady,
+    encodeEventsError,
   ]);
 
   useEffect(() => {
     if (!hasTauriRuntime()) return;
 
-    let unlistenProgress: (() => void) | null = null;
-    let unlistenFinished: (() => void) | null = null;
+    encodeEventsReadyRef.current = false;
+    encodeEventsErrorRef.current = null;
+    setEncodeEventsReady(false);
+    setEncodeEventsError(null);
 
-    (async () => {
-      unlistenProgress = await listen<EncodeProgressPayload>("encode-progress", (event) => {
+    const subscription = installEncodeEventListeners<EncodeFinishedPayload, EncodeProgressPayload>({
+      subscribeFinished: (handler) => listen<EncodeFinishedPayload>("encode-finished", (event) => {
+        handler(event.payload);
+      }),
+      subscribeProgress: (handler) => listen<EncodeProgressPayload>("encode-progress", (event) => {
+        handler(event.payload);
+      }),
+      onProgress: (payload) => {
         const pendingEncode = pendingEncodeRef.current;
-        if (!acceptsEncodeEvent(pendingEncode, event.payload)) return;
-        setProgress(Math.max(0, Math.min(1, event.payload.overallPct)));
-      });
-      unlistenFinished = await listen<EncodeFinishedPayload>("encode-finished", (event) => {
-        const p = event.payload;
+        if (!acceptsEncodeEvent(pendingEncode, payload)) return;
+        setProgress(Math.max(0, Math.min(1, payload.overallPct)));
+      },
+      onFinished: (p) => {
         const pendingEncode = pendingEncodeRef.current;
         if (!acceptsEncodeEvent(pendingEncode, p) || !pendingEncode) return;
 
@@ -3825,12 +3855,25 @@ function App() {
         if (shouldContinueQueue) {
           window.setTimeout(() => void startNextQueuedItem(), 0);
         }
-      });
-    })();
+      },
+      onReady: () => {
+        encodeEventsReadyRef.current = true;
+        encodeEventsErrorRef.current = null;
+        setEncodeEventsError(null);
+        setEncodeEventsReady(true);
+      },
+      onError: () => {
+        const message = ENCODE_EVENT_SETUP_ERROR;
+        encodeEventsReadyRef.current = false;
+        encodeEventsErrorRef.current = message;
+        setEncodeEventsReady(false);
+        setEncodeEventsError(message);
+      },
+    });
 
     return () => {
-      unlistenProgress?.();
-      unlistenFinished?.();
+      encodeEventsReadyRef.current = false;
+      subscription.dispose();
     };
   }, []);
 
@@ -4987,6 +5030,15 @@ function App() {
   }
 
   async function startNextQueuedItem() {
+    if (!encodeEventsReadyRef.current) {
+      dispatchExportQueue({ type: "stop-auto-run" });
+      setStatus(
+        encodeEventsErrorRef.current
+          ? encodeEventsErrorRef.current
+          : "Preparing export event handling. Try Run queue again in a moment.",
+      );
+      return;
+    }
     const current = exportQueueStateRef.current;
     if (
       !current.autoRun ||
@@ -5038,6 +5090,14 @@ function App() {
   }
 
   function runQueue() {
+    if (!encodeEventsReadyRef.current) {
+      setStatus(
+        encodeEventsErrorRef.current
+          ? encodeEventsErrorRef.current
+          : "Preparing export event handling. Try Run queue again in a moment.",
+      );
+      return;
+    }
     const state = exportQueueStateRef.current;
     if (
       jobIdRef.current !== null ||
@@ -5096,6 +5156,14 @@ function App() {
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
     reportAsSmokeResult?: boolean;
   }): Promise<StartEncodeResult> {
+    if (!encodeEventsReadyRef.current) {
+      return {
+        ok: false,
+        message: encodeEventsErrorRef.current
+          ? encodeEventsErrorRef.current
+          : "Preparing export event handling. Try again in a moment.",
+      };
+    }
     if (subtitleInspecting) {
       return { ok: false, message: "Wait for external subtitle validation to finish." };
     }
@@ -5655,6 +5723,20 @@ function App() {
       return Boolean(button?.isConnected && !button.disabled);
     }
 
+    function queueRuntimeSummary(itemId: number) {
+      const state = exportQueueStateRef.current;
+      const item = state.items.find((candidate) => candidate.id === itemId);
+      const pending = pendingEncodeRef.current;
+      return [
+        `item=${item?.status ?? "missing"}`,
+        `active=${state.active?.itemId === itemId ? "matching" : state.active ? "other" : "none"}`,
+        `autoRun=${state.autoRun ? "on" : "off"}`,
+        `pending=${pending ? (pending.jobId === null ? "starting" : "bound") : "none"}`,
+        `listeners=${encodeEventsReadyRef.current ? "ready" : "not-ready"}`,
+        `listenerError=${encodeEventsErrorRef.current ? "present" : "none"}`,
+      ].join(", ");
+    }
+
     function getRecipeNameDialogControls() {
       const dialog = document.querySelector<HTMLElement>('.vfl-recipe-modal[role="dialog"]');
       const input = document.getElementById("vfl-user-recipe-name");
@@ -6053,7 +6135,10 @@ function App() {
           return Boolean(item?.status === "failed" && item.lastOutcome?.diagnostics && !exportQueueStateRef.current.autoRun);
         }, 60_000);
         if (!realFailurePassed) {
-          return { ok: false, message: "Workflow smoke did not retain diagnostics from the real queued backend failure." };
+          return {
+            ok: false,
+            message: `Workflow smoke did not retain diagnostics from the real queued backend failure (${queueRuntimeSummary(failedItem.id)}).`,
+          };
         }
       } else {
         let failureState = dispatchExportQueue({ type: "start-auto-run" });
@@ -6153,8 +6238,8 @@ function App() {
           return {
             ok: false,
             message: expectQueueTargetMiss
-              ? "Workflow smoke did not retain the real queued target miss and its prior failure history."
-              : "Workflow smoke did not complete the real queued retry with retained failure history.",
+              ? `Workflow smoke did not retain the real queued target miss and its prior failure history (${queueRuntimeSummary(failedItem.id)}).`
+              : `Workflow smoke did not complete the real queued retry with retained failure history (${queueRuntimeSummary(failedItem.id)}).`,
           };
         }
         const recoveryEvidenceMounted = await waitForSmokeCondition(() => {
@@ -8578,7 +8663,16 @@ function App() {
               <button ref={queueFallbackButtonRef} type="button" onClick={() => void addFilesToQueue()} disabled={exportQueueRemainingCapacity(exportQueueState) === 0}>
                 Add files
               </button>
-              <button ref={queueRunButtonRef} data-smoke-id="run-export-queue" type="button" className="primary" onClick={runQueue} disabled={encodeBusy || queueRunning || queueCounts.queued === 0}>
+              <button
+                ref={queueRunButtonRef}
+                data-smoke-id="run-export-queue"
+                type="button"
+                className="primary"
+                onClick={runQueue}
+                disabled={!encodeEventsReady || encodeBusy || queueRunning || queueCounts.queued === 0}
+                title={encodeEventBlockingReason ?? undefined}
+                aria-describedby={encodeEventsError ? "vfl-encode-event-setup-error" : undefined}
+              >
                 Run queue
               </button>
               <button ref={queueStopButtonRef} type="button" onClick={stopQueueAfterCurrent} disabled={!queueRunning}>
@@ -8730,6 +8824,17 @@ function App() {
           <div className="vfl-footer-copy">
             <div className="vfl-footer-kicker">{footerKicker}</div>
             <div className="vfl-footer-status" role="status" aria-live="polite" aria-atomic="true">{displayedStatus}</div>
+            {encodeEventsError ? (
+              <div
+                id="vfl-encode-event-setup-error"
+                className="vfl-error"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              >
+                {encodeEventsError}
+              </div>
+            ) : null}
             <div className="vfl-footer-meta">{footerMetaText}</div>
           </div>
           <div className="vfl-footer-actions">

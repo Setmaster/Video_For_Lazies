@@ -194,6 +194,8 @@ test("packaged export proof exercises restart, real queue failure, retry, succes
   assert.match(app, /workflowQueueExport/);
   assert.match(app, /runQueue\(\)/);
   assert.match(app, /item\?\.status === "failed" && item\.lastOutcome\?\.diagnostics/);
+  assert.match(app, /function queueRuntimeSummary\(itemId: number\)/);
+  assert.match(app, /listeners=\$\{encodeEventsReadyRef\.current \? "ready" : "not-ready"\}/);
   assert.match(app, /item\?\.status === "done"/);
   assert.match(app, /item\.history\.some\(\(attempt\) => attempt\.kind === "failed" && attempt\.diagnostics\)/);
   assert.match(app, /reportAsSmokeResult: true/);

@@ -345,20 +345,36 @@ test("presentation gives failure and cancellation precedence over prior success 
 
 test("App routes both backend event types through attempt identity before effects", async () => {
   const app = await fs.readFile(path.resolve(__dirname, "../src/App.tsx"), "utf8");
-  const progressListener = app.slice(
-    app.indexOf('listen<EncodeProgressPayload>("encode-progress"'),
-    app.indexOf('listen<EncodeFinishedPayload>("encode-finished"'),
+  const listenerStart = app.indexOf("const subscription = installEncodeEventListeners");
+  const listenerEnd = app.indexOf("  }, []);", listenerStart);
+  const listenerInstall = app.slice(listenerStart, listenerEnd);
+  const finishedRegistration = listenerInstall.indexOf('listen<EncodeFinishedPayload>("encode-finished"');
+  const progressRegistration = listenerInstall.indexOf('listen<EncodeProgressPayload>("encode-progress"');
+  const progressListener = listenerInstall.slice(
+    listenerInstall.indexOf("onProgress:"),
+    listenerInstall.indexOf("onFinished:"),
   );
-  const finishedListener = app.slice(
-    app.indexOf('listen<EncodeFinishedPayload>("encode-finished"'),
-    app.indexOf("    })();", app.indexOf('listen<EncodeFinishedPayload>("encode-finished"')),
+  const finishedListener = listenerInstall.slice(
+    listenerInstall.indexOf("onFinished:"),
+    listenerInstall.indexOf("onReady:"),
   );
 
-  assert.match(progressListener, /if \(!acceptsEncodeEvent\(pendingEncode, event\.payload\)\) return;/);
+  assert.ok(listenerStart >= 0 && listenerEnd > listenerStart);
+  assert.ok(finishedRegistration >= 0 && progressRegistration > finishedRegistration);
+  assert.match(progressListener, /if \(!acceptsEncodeEvent\(pendingEncode, payload\)\) return;/);
   assert.match(finishedListener, /if \(!acceptsEncodeEvent\(pendingEncode, p\) \|\| !pendingEncode\) return;/);
+  assert.match(listenerInstall, /encodeEventsReadyRef\.current = true;/);
+  assert.match(listenerInstall, /encodeEventsErrorRef\.current = message;/);
+  assert.doesNotMatch(listenerInstall, /coerceErrorMessage\(error/);
+  assert.match(listenerInstall, /subscription\.dispose\(\)/);
   assert.match(app, /invoke<number>\("start_encode", \{ request, attemptId \}\)/);
   assert.match(app, /bindStartedEncode\(/);
   assert.match(app, /settleEncodeFinished\(/);
+  assert.match(app, /async function startEncode[\s\S]*?if \(!encodeEventsReadyRef\.current\)/);
+  assert.match(app, /function runQueue\(\) \{\s*if \(!encodeEventsReadyRef\.current\)/s);
+  assert.match(app, /if \(encodeEventsError\)[\s\S]*?if \(!encodeEventsReady\) return;/);
+  assert.match(app, /ENCODE_EVENT_SETUP_SMOKE_ERROR/);
+  assert.match(app, /id="vfl-encode-event-setup-error"[\s\S]*?role="alert"[\s\S]*?aria-live="assertive"/);
   assert.match(app, /const encodeBusy = attemptUi\.isActive \|\| queueRunning \|\| queuePreparationBusy \|\| queueSnapshotApplying \|\| subtitleInspecting;/);
   assert.match(app, /latestAttempt\.kind === "starting" \? \(/);
   assert.match(app, /disabled=\{!exportReady \|\| encodeBusy\}/);
