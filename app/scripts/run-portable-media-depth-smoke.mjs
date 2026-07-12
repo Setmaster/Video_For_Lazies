@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 
 import { ffmpegSidecarResourceTarget, getPortableOutputDir } from "./ffmpegBundle.mjs";
 import { getPortableExecutableName } from "./portableRelease.mjs";
+import { shutdownSmokeProcessAndLogs } from "./portable-smoke-support.mjs";
 
 const __filename = url.fileURLToPath(import.meta.url);
 const TRANSFORM_BUFFER_HARD_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
@@ -478,6 +479,8 @@ function buildMediaDepthSmokeEnvironment(testCase, {
   inputPath,
   outputPath,
   statusPath,
+  caseRoot = statusPath ? path.dirname(statusPath) : null,
+  platform = process.platform,
   baseEnv = process.env,
 } = {}) {
   if (!testCase || !mediaDepthSmokeCaseById.has(testCase.id)) {
@@ -492,7 +495,7 @@ function buildMediaDepthSmokeEnvironment(testCase, {
     }
   }
 
-  return {
+  const env = {
     ...baseEnv,
     VFL_SMOKE_INPUT: path.resolve(inputPath),
     VFL_SMOKE_OUTPUT: path.resolve(outputPath),
@@ -505,6 +508,10 @@ function buildMediaDepthSmokeEnvironment(testCase, {
     VFL_SMOKE_REVERSE: testCase.reverse ? "1" : "0",
     VFL_SMOKE_LOOP: testCase.loopVideo ? "1" : "0",
   };
+  if (platform === "win32") {
+    env.WEBVIEW2_USER_DATA_FOLDER = path.resolve(caseRoot, "webview2-user-data");
+  }
+  return env;
 }
 
 function parseRate(rawValue) {
@@ -741,46 +748,6 @@ async function readJsonFileOrNull(filePath) {
   } catch {
     return null;
   }
-}
-
-async function waitForChildExit(child, timeoutMs) {
-  if (child.exitCode !== null || child.signalCode !== null) return true;
-  return await new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      child.off("exit", onExit);
-      resolve(false);
-    }, timeoutMs);
-    const onExit = () => {
-      clearTimeout(timer);
-      resolve(true);
-    };
-    child.once("exit", onExit);
-  });
-}
-
-async function terminateSmokeChild(child, platform) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
-  const signal = (kind) => {
-    try {
-      if (platform === "linux" && child.pid) {
-        process.kill(-child.pid, kind);
-      } else {
-        child.kill(kind);
-      }
-      return true;
-    } catch {
-      try {
-        child.kill(kind);
-        return true;
-      } catch {
-        return false;
-      }
-    }
-  };
-  signal("SIGTERM");
-  if (await waitForChildExit(child, 2_500)) return;
-  signal("SIGKILL");
-  await waitForChildExit(child, 2_500);
 }
 
 async function runBounded(command, args, {
@@ -1108,7 +1075,12 @@ async function runPortableMediaDepthSmoke({
         inputPath,
         outputPath,
         statusPath,
+        caseRoot,
+        platform,
       });
+      if (platform === "win32") {
+        await fs.mkdir(smokeEnv.WEBVIEW2_USER_DATA_FOLDER, { recursive: true });
+      }
       const launch = buildPortableMediaDepthLaunch(appPath, { platform, env: smokeEnv });
       let child = null;
       try {
@@ -1148,7 +1120,7 @@ async function runPortableMediaDepthSmoke({
         }
         console.log(`Portable media-depth smoke passed: ${testCase.id}`);
       } finally {
-        await terminateSmokeChild(child, platform);
+        await shutdownSmokeProcessAndLogs(child, platform, []);
       }
     }
     console.log(`Portable media-depth smoke passed ${selectedCases.length} cases on ${platform}.`);
@@ -1160,7 +1132,12 @@ async function runPortableMediaDepthSmoke({
     throw error;
   } finally {
     if (!failed || !keepFailureArtifacts) {
-      await fs.rm(smokeRoot, { recursive: true, force: true });
+      await fs.rm(smokeRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 200,
+      });
     }
   }
 }

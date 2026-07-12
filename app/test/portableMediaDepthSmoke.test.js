@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -146,7 +147,9 @@ test("packaged smoke environment exposes strict color and Reverse hooks", () => 
     inputPath: "/tmp/input clip.mkv",
     outputPath: "/tmp/output clip.mp4",
     statusPath: "/tmp/status file.json",
-    baseEnv: { KEEP_ME: "yes" },
+    caseRoot: "/tmp/media-depth-case",
+    platform: "win32",
+    baseEnv: { KEEP_ME: "yes", WEBVIEW2_USER_DATA_FOLDER: "/tmp/shared-webview-profile" },
   });
   assert.equal(env.KEEP_ME, "yes");
   assert.equal(env.VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS, "1");
@@ -154,6 +157,8 @@ test("packaged smoke environment exposes strict color and Reverse hooks", () => 
   assert.equal(env.VFL_SMOKE_REVERSE, "1");
   assert.equal(env.VFL_SMOKE_LOOP, "1");
   assert.equal(env.VFL_SMOKE_FORMAT, "mp4");
+  assert.equal(env.WEBVIEW2_USER_DATA_FOLDER, path.resolve("/tmp/media-depth-case/webview2-user-data"));
+  assert.notEqual(env.WEBVIEW2_USER_DATA_FOLDER, "/tmp/shared-webview-profile");
 
   const convertedCase = mediaDepthSmokeCases.find((candidate) => candidate.id === "hdr10-to-standard-sdr");
   const convertedEnv = buildMediaDepthSmokeEnvironment(convertedCase, {
@@ -200,6 +205,18 @@ test("packaged smoke environment exposes strict color and Reverse hooks", () => 
     }),
     /canonical test case|unsupported/i,
   );
+});
+
+test("media-depth smoke isolates WebView2 and uses full-tree shutdown with bounded cleanup", async () => {
+  const source = await fs.readFile(
+    new URL("../scripts/run-portable-media-depth-smoke.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /from "\.\/portable-smoke-support\.mjs"/);
+  assert.match(source, /shutdownSmokeProcessAndLogs\(child, platform, \[\]\)/);
+  assert.match(source, /WEBVIEW2_USER_DATA_FOLDER = path\.resolve\(caseRoot, "webview2-user-data"\)/);
+  assert.match(source, /maxRetries: 5/);
+  assert.match(source, /retryDelay: 200/);
 });
 
 test("portable media-depth paths and launch commands model exact Windows and Linux payloads", () => {
