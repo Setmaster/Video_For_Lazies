@@ -178,6 +178,10 @@ if (-not $ScreenshotPath) {
   $ScreenshotPath = New-SmokeScreenshotPath
 }
 $ScreenshotPath = [System.IO.Path]::GetFullPath($ScreenshotPath)
+$webViewDataRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("vfl-portable-startup-webview-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $webViewDataRoot -Force | Out-Null
+$hadWebViewDataRoot = Test-Path Env:WEBVIEW2_USER_DATA_FOLDER
+$previousWebViewDataRoot = $env:WEBVIEW2_USER_DATA_FOLDER
 
 $process = $null
 $finalShot = $null
@@ -185,7 +189,16 @@ $lastStats = $null
 $passed = $false
 
 try {
-  $process = Start-Process -FilePath $exePath -WorkingDirectory $portableRoot -PassThru
+  try {
+    $env:WEBVIEW2_USER_DATA_FOLDER = $webViewDataRoot
+    $process = Start-Process -FilePath $exePath -WorkingDirectory $portableRoot -PassThru
+  } finally {
+    if ($hadWebViewDataRoot) {
+      $env:WEBVIEW2_USER_DATA_FOLDER = $previousWebViewDataRoot
+    } else {
+      Remove-Item Env:WEBVIEW2_USER_DATA_FOLDER -ErrorAction SilentlyContinue
+    }
+  }
   $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
 
   do {
@@ -242,6 +255,25 @@ try {
   }
 } finally {
   if ($process -and -not $process.HasExited) {
-    Stop-Process -Id $process.Id -Force
+    & taskkill.exe /PID $process.Id /T /F | Out-Null
+    if (-not $process.WaitForExit(5000)) {
+      Stop-Process -Id $process.Id -Force
+      if (-not $process.WaitForExit(5000)) {
+        throw "Portable smoke app process tree did not terminate."
+      }
+    }
+  }
+  if (Test-Path -LiteralPath $webViewDataRoot) {
+    for ($cleanupAttempt = 1; $cleanupAttempt -le 6; $cleanupAttempt++) {
+      try {
+        Remove-Item -LiteralPath $webViewDataRoot -Recurse -Force
+        break
+      } catch {
+        if ($cleanupAttempt -eq 6) {
+          throw
+        }
+        Start-Sleep -Milliseconds 250
+      }
+    }
   }
 }

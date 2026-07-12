@@ -143,6 +143,11 @@ test("portable build uses tauri build instead of raw cargo build", async () => {
   assert.equal(releaseScript, "node scripts/run-release-portable.mjs");
   assert.match(smokePowerShellRaw, /\[int\]\$StartupTimeoutSeconds = 30/);
   assert.match(smokePowerShellRaw, /\[int\]\$MaxAttempts = 8/);
+  assert.match(smokePowerShellRaw, /vfl-portable-startup-webview-/);
+  assert.match(smokePowerShellRaw, /WEBVIEW2_USER_DATA_FOLDER = \$webViewDataRoot/);
+  assert.match(smokePowerShellRaw, /taskkill\.exe \/PID \$process\.Id \/T \/F/);
+  assert.match(smokePowerShellRaw, /\$cleanupAttempt -le 6/);
+  assert.match(smokePowerShellRaw, /Start-Sleep -Milliseconds 250/);
   assert.match(makePortableRaw, /cleanupPaths:\s*listPortableLegacyPaths\(\)/);
   assert.match(makePortableRaw, /generatePortableDocs/);
   assert.doesNotMatch(portableScript, /\bcargo build\b/);
