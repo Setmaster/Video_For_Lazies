@@ -18,14 +18,14 @@ function between(source, startMarker, endMarker) {
   return source.slice(start, end);
 }
 
-test("successful recipe notices hold for 1.6 seconds before fading", async () => {
+test("successful recipe notices hold for 3 seconds before fading", async () => {
   const [app, css] = await Promise.all([
     read("../src/App.tsx"),
     read("../src/App.css"),
   ]);
 
-  assert.match(app, /const RECIPE_NOTIFICATION_FADE_START_MS = 1600;/);
-  assert.match(app, /const RECIPE_NOTIFICATION_CLEAR_MS = 1800;/);
+  assert.match(app, /const RECIPE_NOTIFICATION_FADE_START_MS = 3000;/);
+  assert.match(app, /const RECIPE_NOTIFICATION_CLEAR_MS = 3200;/);
 
   const transientHelper = between(
     app,
