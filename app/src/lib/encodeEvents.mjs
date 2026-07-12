@@ -12,6 +12,17 @@ function safeUnlisten(unlisten) {
   }
 }
 
+export const ENCODE_EVENT_REGISTRATION_TIMEOUT_MS = 10_000;
+
+const defaultScheduler = Object.freeze({
+  setTimeout(callback, delayMs) {
+    return globalThis.setTimeout(callback, delayMs);
+  },
+  clearTimeout(handle) {
+    globalThis.clearTimeout(handle);
+  },
+});
+
 export function installEncodeEventListeners({
   subscribeFinished,
   subscribeProgress,
@@ -19,10 +30,37 @@ export function installEncodeEventListeners({
   onProgress,
   onReady,
   onError,
+  registrationTimeoutMs = ENCODE_EVENT_REGISTRATION_TIMEOUT_MS,
+  scheduler = defaultScheduler,
 }) {
-  let disposed = false;
+  let state = "installing";
   let unlistenFinished = null;
   let unlistenProgress = null;
+  let deadlineActive = false;
+  let deadlineHandle = null;
+  let readySettled = false;
+  let resolveReady;
+
+  const ready = new Promise((resolve) => {
+    resolveReady = resolve;
+  });
+
+  const settleReady = (value) => {
+    if (readySettled) return;
+    readySettled = true;
+    resolveReady(value);
+  };
+
+  const clearDeadline = () => {
+    if (!deadlineActive) return;
+    deadlineActive = false;
+    try {
+      scheduler.clearTimeout(deadlineHandle);
+    } catch {
+      // Registration state must remain deterministic if scheduler cleanup fails.
+    }
+    deadlineHandle = null;
+  };
 
   const cleanup = () => {
     const finished = unlistenFinished;
@@ -33,36 +71,66 @@ export function installEncodeEventListeners({
     safeUnlisten(finished);
   };
 
-  const ready = (async () => {
+  const failRegistration = (error) => {
+    if (state !== "installing") return;
+    state = "failed";
+    clearDeadline();
+    cleanup();
+    settleReady(false);
+    try {
+      onError(error);
+    } catch {
+      // Readiness has already failed closed; callback errors cannot reopen it.
+    }
+  };
+
+  const requestedTimeoutMs = Number(registrationTimeoutMs);
+  const timeoutMs = Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+    ? requestedTimeoutMs
+    : ENCODE_EVENT_REGISTRATION_TIMEOUT_MS;
+
+  try {
+    deadlineHandle = scheduler.setTimeout(() => {
+      failRegistration(new Error("Export event listeners did not become ready in time."));
+    }, timeoutMs);
+    deadlineActive = true;
+  } catch (error) {
+    failRegistration(error);
+  }
+
+  if (state === "installing") void (async () => {
     try {
       const finished = await subscribeFinished(onFinished);
-      if (disposed) {
+      if (state !== "installing") {
         safeUnlisten(finished);
-        return false;
+        return;
       }
       unlistenFinished = finished;
 
       const progress = await subscribeProgress(onProgress);
-      if (disposed) {
+      if (state !== "installing") {
         safeUnlisten(progress);
-        cleanup();
-        return false;
+        return;
       }
       unlistenProgress = progress;
       onReady();
-      return true;
+      if (state !== "installing") return;
+      state = "ready";
+      clearDeadline();
+      settleReady(true);
     } catch (error) {
-      cleanup();
-      if (!disposed) onError(error);
-      return false;
+      failRegistration(error);
     }
   })();
 
   return {
     ready,
     dispose() {
-      disposed = true;
+      if (state === "disposed") return;
+      state = "disposed";
+      clearDeadline();
       cleanup();
+      settleReady(false);
     },
   };
 }

@@ -4,10 +4,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { repoRoot } from "./ffmpegBundle.mjs";
-import { writeUpdateManifest } from "./updateManifests.mjs";
+import { selectUpdateReleasePair, writeUpdateManifest } from "./updateManifests.mjs";
 
-const REQUIRED_ZIP_SUFFIXES = ["linux-x64.zip", "win-x64.zip"];
-const RELEASE_ZIP_PATTERN = /^Video_For_Lazies-v(.+)-(linux|win)-x64\.zip$/;
+const REQUIRED_UPDATE_TARGETS = ["linux-x64", "windows-x64"];
 
 function parseArgs(argv) {
   const options = {};
@@ -27,13 +26,15 @@ function parseArgs(argv) {
   return options;
 }
 
-async function walkFiles(root) {
+async function walkFiles(root, excludedDir) {
   const entries = await fs.readdir(root, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
     const entryPath = path.resolve(root, entry.name);
     if (entry.isDirectory()) {
-      files.push(...await walkFiles(entryPath));
+      if (entryPath !== excludedDir) {
+        files.push(...await walkFiles(entryPath, excludedDir));
+      }
     } else if (entry.isFile()) {
       files.push(entryPath);
     }
@@ -47,71 +48,87 @@ async function sha256File(filePath) {
   return hash.digest("hex");
 }
 
-export async function prepareReleaseAssets({ inputDir, outputDir } = {}) {
+function pathContains(parentPath, candidatePath) {
+  const relative = path.relative(parentPath, candidatePath);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function resolveThroughExistingAncestor(candidatePath) {
+  let currentPath = path.resolve(candidatePath);
+  const missingSegments = [];
+  while (true) {
+    try {
+      const realPath = await fs.realpath(currentPath);
+      return path.resolve(realPath, ...missingSegments.reverse());
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parentPath = path.dirname(currentPath);
+      if (parentPath === currentPath) throw error;
+      missingSegments.push(path.basename(currentPath));
+      currentPath = parentPath;
+    }
+  }
+}
+
+async function assertSafeReleaseDirectories(inputDir, outputDir) {
+  const [canonicalInputDir, canonicalOutputDir] = await Promise.all([
+    resolveThroughExistingAncestor(inputDir),
+    resolveThroughExistingAncestor(outputDir),
+  ]);
+  if (pathContains(canonicalOutputDir, canonicalInputDir)) {
+    throw new Error("Release asset output directory must not contain the input directory.");
+  }
+  return { canonicalInputDir, canonicalOutputDir };
+}
+
+export async function prepareReleaseAssets({ inputDir, outputDir, version } = {}) {
   const resolvedInputDir = path.resolve(repoRoot, inputDir ?? "release");
   const resolvedOutputDir = path.resolve(repoRoot, outputDir ?? "release/release-assets");
-  const files = await walkFiles(resolvedInputDir);
-  const zipFiles = files
-    .filter((filePath) => /Video_For_Lazies-v.+-(linux|win)-x64\.zip$/.test(path.basename(filePath)))
-    .sort((left, right) => path.basename(left).localeCompare(path.basename(right)));
-
-  const zipNames = zipFiles.map((filePath) => path.basename(filePath));
-  const missingSuffixes = REQUIRED_ZIP_SUFFIXES.filter(
-    (suffix) => !zipNames.some((zipName) => zipName.endsWith(`-${suffix}`)),
+  const initialDirectories = await assertSafeReleaseDirectories(
+    resolvedInputDir,
+    resolvedOutputDir,
   );
+  const files = await walkFiles(resolvedInputDir, resolvedOutputDir);
+  const releasePair = selectUpdateReleasePair({ filePaths: files, version });
 
-  if (!zipFiles.length) {
-    throw new Error(`No release zip files found under ${resolvedInputDir}.`);
-  }
-  if (missingSuffixes.length) {
-    throw new Error(`Missing required release zip files for: ${missingSuffixes.join(", ")}.`);
+  const finalDirectories = await assertSafeReleaseDirectories(
+    resolvedInputDir,
+    resolvedOutputDir,
+  );
+  if (
+    finalDirectories.canonicalInputDir !== initialDirectories.canonicalInputDir
+    || finalDirectories.canonicalOutputDir !== initialDirectories.canonicalOutputDir
+  ) {
+    throw new Error("Release asset input or output directory changed during validation.");
   }
 
   await fs.rm(resolvedOutputDir, { recursive: true, force: true });
   await fs.mkdir(resolvedOutputDir, { recursive: true });
 
   const copiedFiles = [];
-  for (const zipFile of zipFiles) {
+  const copiedPayloadSidecars = [];
+  for (const target of REQUIRED_UPDATE_TARGETS) {
+    const { zipPath: zipFile, payloadSidecarPath } = releasePair.artifacts[target];
     const outputPath = path.resolve(resolvedOutputDir, path.basename(zipFile));
     await fs.copyFile(zipFile, outputPath);
     copiedFiles.push(outputPath);
+    const copiedPayloadPath = path.resolve(resolvedOutputDir, path.basename(payloadSidecarPath));
+    await fs.copyFile(payloadSidecarPath, copiedPayloadPath);
+    copiedPayloadSidecars.push(copiedPayloadPath);
   }
 
-  const payloadManifestFiles = files
-    .filter((filePath) => /Video_For_Lazies-v.+-(linux|win)-x64\.payload-manifest\.json$/.test(path.basename(filePath)))
-    .sort((left, right) => path.basename(left).localeCompare(path.basename(right)));
-
-  for (const payloadManifestFile of payloadManifestFiles) {
-    await fs.copyFile(payloadManifestFile, path.resolve(resolvedOutputDir, path.basename(payloadManifestFile)));
-  }
-
-  const releaseVersions = new Set(
-    zipNames.map((zipName) => {
-      const match = zipName.match(RELEASE_ZIP_PATTERN);
-      return match?.[1] ?? null;
-    }),
-  );
-  releaseVersions.delete(null);
-  if (releaseVersions.size !== 1) {
-    throw new Error(`Release zips must all use the same version: ${zipNames.join(", ")}`);
-  }
-  const [releaseVersion] = releaseVersions;
-
+  const { outputPath: updateManifestPath } = await writeUpdateManifest({
+    releaseAssetDir: resolvedOutputDir,
+    version: releasePair.version,
+  });
   const checksumLines = [];
   for (const filePath of copiedFiles) {
     checksumLines.push(`${await sha256File(filePath)}  ${path.basename(filePath)}`);
   }
-
   const checksumPath = path.resolve(resolvedOutputDir, "SHA256SUMS.txt");
   await fs.writeFile(checksumPath, `${checksumLines.join("\n")}\n`);
-  const { outputPath: updateManifestPath } = await writeUpdateManifest({
-    releaseAssetDir: resolvedOutputDir,
-    version: releaseVersion,
-  });
 
-  await Promise.all(payloadManifestFiles.map((payloadManifestFile) =>
-    fs.rm(path.resolve(resolvedOutputDir, path.basename(payloadManifestFile)), { force: true })
-  ));
+  await Promise.all(copiedPayloadSidecars.map((payloadSidecar) => fs.rm(payloadSidecar)));
 
   return { outputDir: resolvedOutputDir, files: [...copiedFiles, checksumPath, updateManifestPath] };
 }
@@ -121,6 +138,7 @@ async function main() {
   const result = await prepareReleaseAssets({
     inputDir: options.input,
     outputDir: options.output,
+    version: options.version,
   });
 
   console.log(`Release assets staged in ${result.outputDir}`);

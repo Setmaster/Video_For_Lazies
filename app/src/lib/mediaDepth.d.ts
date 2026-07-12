@@ -42,6 +42,18 @@ export function encodedOutputDimensions(
   requiresEncode: boolean,
 ): { width: number; height: number };
 export function timelineSpeedChanges(value: number | string): boolean;
+export type EffectiveFrameRatePlan = {
+  postSpeedFps: number | null;
+  capFps: number | null;
+  capApplies: boolean;
+  outputFps: number | null;
+};
+export function effectiveFrameRatePlan(options?: {
+  format?: string | null;
+  sourceFrameRate?: number | null;
+  speed?: number;
+  frameRateCapFps?: number | null;
+}): EffectiveFrameRatePlan;
 export function minimumVideoBitrateKbps(options: {
   codec: string;
   width: number;

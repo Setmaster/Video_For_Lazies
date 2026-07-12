@@ -2413,6 +2413,7 @@ export {
   resolveG6SmokeCases,
   runPortableG6FastTrimSmoke,
   safeInteger,
+  shutdownSmokeProcessAndLogs,
   splitRawRgbFrames,
   usToSecondsString,
   verifyPortablePreflight,

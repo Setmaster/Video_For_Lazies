@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { installEncodeEventListeners } from "../src/lib/encodeEvents.mjs";
+import {
+  ENCODE_EVENT_REGISTRATION_TIMEOUT_MS,
+  installEncodeEventListeners,
+} from "../src/lib/encodeEvents.mjs";
 import { createExportQueueState, reduceExportQueue } from "../src/lib/exportQueue.mjs";
 
 function deferred() {
@@ -12,6 +15,35 @@ function deferred() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function manualScheduler() {
+  let nextId = 1;
+  const tasks = new Map();
+  const delays = [];
+  return {
+    scheduler: {
+      setTimeout(callback, delayMs) {
+        const id = nextId;
+        nextId += 1;
+        tasks.set(id, callback);
+        delays.push(delayMs);
+        return id;
+      },
+      clearTimeout(id) {
+        tasks.delete(id);
+      },
+    },
+    delays,
+    fire() {
+      const pending = [...tasks.entries()];
+      tasks.clear();
+      for (const [, callback] of pending) callback();
+    },
+    pendingCount() {
+      return tasks.size;
+    },
+  };
 }
 
 test("terminal encode listener is ready before progress and before exports may start", async () => {
@@ -281,4 +313,184 @@ test("asynchronous listener teardown rejection is consumed", async () => {
   listeners.dispose();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(rejectedTeardownCalls, 1);
+});
+
+test("one bounded deadline covers both encode listener registrations", async () => {
+  const clock = manualScheduler();
+  const progressRegistration = deferred();
+  let terminalUnlistens = 0;
+  let reportedError = null;
+
+  const listeners = installEncodeEventListeners({
+    async subscribeFinished() {
+      return () => {
+        terminalUnlistens += 1;
+      };
+    },
+    subscribeProgress() {
+      return progressRegistration.promise;
+    },
+    onFinished() {},
+    onProgress() {},
+    onReady() {
+      assert.fail("timed-out listeners must not become ready");
+    },
+    onError(error) {
+      reportedError = error;
+    },
+    registrationTimeoutMs: 250,
+    scheduler: clock.scheduler,
+  });
+
+  await Promise.resolve();
+  assert.deepEqual(clock.delays, [250]);
+  clock.fire();
+
+  assert.equal(await listeners.ready, false);
+  assert.equal(terminalUnlistens, 1);
+  assert.match(reportedError?.message ?? "", /did not become ready in time/);
+});
+
+test("a terminal listener that resolves after the deadline is removed exactly once", async () => {
+  const clock = manualScheduler();
+  const finishedRegistration = deferred();
+  let terminalUnlistens = 0;
+  let progressSubscriptions = 0;
+
+  const listeners = installEncodeEventListeners({
+    subscribeFinished() {
+      return finishedRegistration.promise;
+    },
+    async subscribeProgress() {
+      progressSubscriptions += 1;
+      return () => {};
+    },
+    onFinished() {},
+    onProgress() {},
+    onReady() {
+      assert.fail("timed-out listeners must not become ready");
+    },
+    onError() {},
+    scheduler: clock.scheduler,
+  });
+
+  assert.deepEqual(clock.delays, [ENCODE_EVENT_REGISTRATION_TIMEOUT_MS]);
+  clock.fire();
+  assert.equal(await listeners.ready, false);
+
+  finishedRegistration.resolve(() => {
+    terminalUnlistens += 1;
+  });
+  await Promise.resolve();
+  assert.equal(terminalUnlistens, 1);
+  assert.equal(progressSubscriptions, 0);
+
+  listeners.dispose();
+  assert.equal(terminalUnlistens, 1);
+});
+
+test("a progress listener that resolves after the deadline is removed exactly once", async () => {
+  const clock = manualScheduler();
+  const progressRegistration = deferred();
+  let terminalUnlistens = 0;
+  let progressUnlistens = 0;
+
+  const listeners = installEncodeEventListeners({
+    async subscribeFinished() {
+      return () => {
+        terminalUnlistens += 1;
+      };
+    },
+    subscribeProgress() {
+      return progressRegistration.promise;
+    },
+    onFinished() {},
+    onProgress() {},
+    onReady() {
+      assert.fail("timed-out listeners must not become ready");
+    },
+    onError() {},
+    scheduler: clock.scheduler,
+  });
+
+  await Promise.resolve();
+  clock.fire();
+  assert.equal(await listeners.ready, false);
+  assert.equal(terminalUnlistens, 1);
+
+  progressRegistration.resolve(() => {
+    progressUnlistens += 1;
+  });
+  await Promise.resolve();
+  assert.equal(progressUnlistens, 1);
+
+  listeners.dispose();
+  assert.equal(terminalUnlistens, 1);
+  assert.equal(progressUnlistens, 1);
+});
+
+test("a listener rejection after the deadline is consumed without duplicate failure", async () => {
+  const clock = manualScheduler();
+  const progressRegistration = deferred();
+  let reportedErrors = 0;
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    const listeners = installEncodeEventListeners({
+      async subscribeFinished() {
+        return () => {};
+      },
+      subscribeProgress() {
+        return progressRegistration.promise;
+      },
+      onFinished() {},
+      onProgress() {},
+      onReady() {
+        assert.fail("timed-out listeners must not become ready");
+      },
+      onError() {
+        reportedErrors += 1;
+      },
+      scheduler: clock.scheduler,
+    });
+
+    await Promise.resolve();
+    clock.fire();
+    assert.equal(await listeners.ready, false);
+
+    progressRegistration.reject(new Error("late progress registration failure"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reportedErrors, 1);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("successful registration clears its pending deadline", async () => {
+  const clock = manualScheduler();
+  let errors = 0;
+  const listeners = installEncodeEventListeners({
+    async subscribeFinished() {
+      return () => {};
+    },
+    async subscribeProgress() {
+      return () => {};
+    },
+    onFinished() {},
+    onProgress() {},
+    onReady() {},
+    onError() {
+      errors += 1;
+    },
+    scheduler: clock.scheduler,
+  });
+
+  assert.equal(await listeners.ready, true);
+  assert.equal(clock.pendingCount(), 0);
+  clock.fire();
+  assert.equal(errors, 0);
+  listeners.dispose();
 });

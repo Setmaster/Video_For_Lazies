@@ -371,13 +371,39 @@ test("App routes both backend event types through attempt identity before effect
   assert.match(app, /bindStartedEncode\(/);
   assert.match(app, /settleEncodeFinished\(/);
   assert.match(app, /async function startEncode[\s\S]*?if \(!encodeEventsReadyRef\.current\)/);
-  assert.match(app, /function runQueue\(\) \{\s*if \(!encodeEventsReadyRef\.current\)/s);
+  assert.match(app, /function runQueue\(\) \{[\s\S]*?if \(!encodeEventsReadyRef\.current\)/s);
+  assert.match(app, /function runQueue\(\) \{\s*if \(updateBusyRef\.current\)/s);
   assert.match(app, /if \(encodeEventsError\)[\s\S]*?if \(!encodeEventsReady\) return;/);
   assert.match(app, /ENCODE_EVENT_SETUP_SMOKE_ERROR/);
   assert.match(app, /id="vfl-encode-event-setup-error"[\s\S]*?role="alert"[\s\S]*?aria-live="assertive"/);
-  assert.match(app, /const encodeBusy = attemptUi\.isActive \|\| queueRunning \|\| queuePreparationBusy \|\| queueSnapshotApplying \|\| subtitleInspecting;/);
-  assert.match(app, /latestAttempt\.kind === "starting" \? \(/);
+  assert.match(app, /const encodeBusy =[\s\S]*?attemptUi\.isActive[\s\S]*?subtitleInspecting \|\|[\s\S]*?updateBusy;/);
+  assert.match(app, /data-smoke-id="export"/);
+  assert.match(app, /data-smoke-id="cancel-export"/);
+  assert.match(app, /latestAttempt\.kind === "cancelling" \? "Cancelling…" : "Exporting…"/);
   assert.match(app, /disabled=\{!exportReady \|\| encodeBusy\}/);
+
+  const footerStart = app.indexOf("<footer");
+  const footerEnd = app.indexOf("</footer>", footerStart);
+  const footer = app.slice(footerStart, footerEnd);
+  const cancelButton = footer.indexOf('data-smoke-id="cancel-export"');
+  const exportButton = footer.indexOf('data-smoke-id="export"');
+  assert.ok(footerStart >= 0 && footerEnd > footerStart, "footer must remain mounted");
+  assert.ok(cancelButton >= 0 && exportButton > cancelButton, "Cancel must be inserted before Export so Export keeps the stable right-edge position");
+  assert.match(footer, /key="cancel-export"[\s\S]*?data-smoke-id="cancel-export"/);
+  assert.match(footer, /key="export"[\s\S]*?data-smoke-id="export"/);
+
+  const cancelStart = app.indexOf("async function cancelEncode()");
+  const cancelEnd = app.indexOf("async function openFolderFor", cancelStart);
+  const cancelEncode = app.slice(cancelStart, cancelEnd);
+  const cancellingGuard = cancelEncode.indexOf('latestAttemptRef.current.kind === "cancelling"');
+  const requestGuard = cancelEncode.indexOf("pendingEncode.cancelRequested");
+  const requestLatch = cancelEncode.indexOf("pendingEncode.cancelRequested = true");
+  const backendCancel = cancelEncode.indexOf('invoke("cancel_encode"');
+  assert.ok(cancelStart >= 0 && cancelEnd > cancelStart, "cancel handler must be extractable");
+  assert.ok(cancellingGuard >= 0, "repeat cancellation must stop at the attempt-state guard");
+  assert.ok(requestGuard >= 0 && requestLatch > requestGuard, "cancel must use a synchronous per-job latch");
+  assert.ok(backendCancel > requestLatch, "the idempotence latch must be set before awaiting the backend");
+
   assert.match(app, /Previous successful export/);
   assert.match(app, /openFolderFor\(lastExport\.outputPath\)/);
   assert.match(app, /latestAttempt\.outputPath \|\| outputPath \|\| inputPath/);

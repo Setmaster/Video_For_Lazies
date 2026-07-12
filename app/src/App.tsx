@@ -1,5 +1,5 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -13,6 +13,9 @@ import { UserRecipeDialog, type UserRecipeDialogState } from "./components/UserR
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
 import type {
   AppSmokeConfig,
+  AppSmokeG7Evidence,
+  AppSmokeMountedProgressSample,
+  AppSmokeProgressSample,
   AppSmokeStatus,
   AudioChannelPreference,
   ColorPolicy,
@@ -34,6 +37,9 @@ import type {
   TrimResult,
   UpdateApplyResponse,
   UpdateCheckResponse,
+  UpdateProgressEvent,
+  UpdatePublicError,
+  UpdateStartupResponse,
   VideoCodecPreference,
   VideoQualityPreference,
   VideoProbe,
@@ -59,7 +65,8 @@ import {
 } from "./lib/exportQueue";
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
 import { basename, dirname, ensureUniqueOutputPath, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
-import { getActiveProgressUi } from "./lib/progress";
+import { createEncodeProgressState, getActiveProgressUi, reduceEncodeProgress } from "./lib/progress";
+import { formatClock } from "./lib/timeFormat";
 import {
   acceptsEncodeEvent,
   beginEncodeAttempt,
@@ -72,6 +79,7 @@ import {
   type EncodeAttemptState,
 } from "./lib/encodeAttempt";
 import { installEncodeEventListeners } from "./lib/encodeEvents";
+import { createUpdateProgressState, getUpdateProgressUi, reduceUpdateProgress } from "./lib/updateState";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import {
   EXPORT_RECIPES,
@@ -101,6 +109,7 @@ import {
   classifyColorSource,
   codecOutputDimensionBlockingReason,
   encodedOutputDimensions,
+  effectiveFrameRatePlan,
   estimateTransformMemory,
   fitMaxEdgeDisplayDimensions,
   fitMaxEdgeDimensions,
@@ -156,6 +165,7 @@ const FRAME_RATE_CAP_PRESETS_FPS = [24, 30, 60] as const;
 const SIZE_TARGET_EXACTNESS_ERROR = "Size limit is too large to track exactly in bytes. Enter a smaller MB value.";
 const ENCODE_EVENT_SETUP_ERROR = "Export event handling could not start. Restart Video For Lazies, then try again. If the problem continues, reinstall the app and report the app version.";
 const ENCODE_EVENT_SETUP_SMOKE_ERROR = "Packaged app smoke export event setup failed (code: encode-event-listener-registration). Restart the app, then rerun the packaged smoke.";
+const CROP_DETECTION_PUBLIC_ERROR = "Crop detection could not analyze the selected video.";
 const VIDEO_CODEC_LABELS: Record<VideoCodecPreference, string> = {
   auto: "Auto",
   h264: "H.264",
@@ -207,6 +217,7 @@ const SMOKE_STAGE_ORDER = [
   "workflow-queue-ready",
   "workflow-queue-complete",
   "workflow-ready",
+  "g7-ui-ready",
   "preview-ready",
   "keyboard-trim-ready",
   "keyboard-trim-incremented",
@@ -224,6 +235,9 @@ const SMOKE_STAGE_ORDER = [
   "fast-trim-source-mutation-ready",
   "fast-trim-source-mutation-complete",
   "encoding",
+  "g7-controls-ready",
+  "g7-drop-queued",
+  "g7-cancel-requested",
 ] as const;
 const APP_VERSION = "1.9.1";
 const APP_LINKS = {
@@ -301,6 +315,37 @@ type SmokeInteractionResult =
       expectedDurationS: number;
     };
 
+type SmokeG7Operation = NonNullable<AppSmokeConfig["g7Operation"]>;
+
+function createSmokeG7Evidence(operation: SmokeG7Operation): AppSmokeG7Evidence {
+  return {
+    operation,
+    resetDialogRole: null,
+    resetCancelFocused: false,
+    resetCancelPreservedSettings: false,
+    resetCancelRestoredFocus: false,
+    resetConfirmed: false,
+    resetConfirmRestoredFocus: false,
+    previewRotationDeg: null,
+    previewTransform: null,
+    postSpeedFrameRateFps: null,
+    frameRateCapFps: null,
+    frameRateCapApplies: null,
+    frameRateMountedCopyVerified: false,
+    exportControlStable: false,
+    exportControlInitiallyFocused: false,
+    exportControlPreservedIdentity: false,
+    exportControlPreservedGeometry: false,
+    cancelControlSeparate: false,
+    cancelInvokeCount: 0,
+    dropActionKind: null,
+    dropPreservedInput: null,
+    queuedDropCount: null,
+    progressHistory: [],
+    mountedProgressHistory: [],
+  };
+}
+
 type TargetCorrectiveContext = {
   sourcePathIdentity: string | null;
   format: OutputFormat;
@@ -338,21 +383,6 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
-function formatClock(totalSeconds: number) {
-  if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "0:00";
-
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  const secondsText = seconds.toFixed(2).padStart(5, "0");
-
-  if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, "0")}:${secondsText}`;
-  }
-
-  return `${minutes}:${secondsText}`;
-}
-
 function rangeFillStyle(value: number, min: number, max: number): CSSProperties {
   if (!Number.isFinite(value) || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) return {};
   const fill = clamp(((value - min) / (max - min)) * 100, 0, 100);
@@ -380,6 +410,36 @@ function hasTauriRuntime() {
 
 function coerceErrorMessage(error: unknown, fallback: string) {
   return typeof error === "string" ? error : error instanceof Error ? error.message : fallback;
+}
+
+function pathFreeSmokeMessage(error: unknown, config: AppSmokeConfig, fallback: string) {
+  let message = coerceErrorMessage(error, fallback).trim() || fallback;
+  const tokens = [config.inputPath, config.outputPath, config.subtitlePath, config.g7DropPath]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .flatMap((value) => {
+      const slashValue = value.split("\\").join("/");
+      const backslashValue = value.split("/").join("\\");
+      const name = slashValue.split("/").pop() ?? "";
+      return [value, slashValue, backslashValue, name];
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length);
+  for (const token of new Set(tokens)) {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    message = message.replace(new RegExp(escaped, "gi"), "the selected file");
+  }
+  return message.trim() || fallback;
+}
+
+function coerceUpdatePublicError(error: unknown, fallback: string): UpdatePublicError {
+  const candidate = error && typeof error === "object" ? error as Partial<UpdatePublicError> : null;
+  return {
+    code: typeof candidate?.code === "string" ? candidate.code : "update-failed",
+    phase: candidate?.phase ?? "failed",
+    retryable: candidate?.retryable !== false,
+    action: typeof candidate?.action === "string" ? candidate.action : "retryOrDownloadPortable",
+    message: typeof candidate?.message === "string" && candidate.message ? candidate.message : fallback,
+  };
 }
 
 function waitMs(ms: number) {
@@ -713,7 +773,7 @@ function App() {
   const [jobId, setJobId] = useState<number | null>(null);
   const [encodeEventsReady, setEncodeEventsReady] = useState(false);
   const [encodeEventsError, setEncodeEventsError] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
+  const [encodeProgress, setEncodeProgress] = useState(() => createEncodeProgressState());
   const [status, setStatus] = useState<string>("Pick a video to begin.");
   const [dragActive, setDragActive] = useState(false);
   const [settingsReady, setSettingsReady] = useState(false);
@@ -733,18 +793,27 @@ function App() {
   const [recipeNameDraft, setRecipeNameDraft] = useState("");
   const [recipeDialogError, setRecipeDialogError] = useState<string | null>(null);
   const [recipeStatus, setRecipeStatus] = useState<string | null>(null);
+  const [resetConfirmationOpen, setResetConfirmationOpen] = useState(false);
   const [updateNotice, setUpdateNotice] = useState<UpdateCheckResponse | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [updateProgress, setUpdateProgress] = useState(() => createUpdateProgressState());
+  const [updatePublicError, setUpdatePublicError] = useState<UpdatePublicError | null>(null);
+  const [updateStartupNotice, setUpdateStartupNotice] = useState<{
+    kind: "status" | "error";
+    message: string;
+  } | null>(null);
   const [manualUpdateBusy, setManualUpdateBusy] = useState(false);
   const [manualUpdateStatus, setManualUpdateStatus] = useState<string | null>(null);
   // True when this instance was relaunched elevated to finish installing an
   // update; the app applies it immediately and restarts on its own.
   const [elevatedUpdateRun, setElevatedUpdateRun] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const modalOpen = elevatedUpdateRun || aboutOpen || recipeDialog !== null;
+  const modalOpen = elevatedUpdateRun || aboutOpen || recipeDialog !== null || resetConfirmationOpen;
 
   const jobIdRef = useRef<number | null>(null);
+  const updateBusyRef = useRef(false);
+  const updatePhaseRef = useRef<UpdateProgressEvent["phase"] | null>(null);
   const encodeEventsReadyRef = useRef(false);
   const encodeEventsErrorRef = useRef<string | null>(null);
   const attemptIdRef = useRef(Math.floor(Date.now() * 1000));
@@ -755,6 +824,7 @@ function App() {
   const formatRef = useRef<OutputFormat>(format);
   const outputAutoRef = useRef<boolean>(outputAuto);
   const cropperRef = useRef<VideoCropperHandle | null>(null);
+  const cropDetectionRevisionRef = useRef(0);
   const trimTimelineTrackRef = useRef<HTMLDivElement | null>(null);
   const trimDragCleanupRef = useRef<(() => void) | null>(null);
   const exportQueueStateRef = useRef<ExportQueueState>(exportQueueState);
@@ -798,6 +868,15 @@ function App() {
   const smokeFastTrimResetDoneRef = useRef(false);
   const smokeSourceMutationRunningRef = useRef(false);
   const smokeSourceMutationDoneRef = useRef(false);
+  const smokeG7UiRunningRef = useRef(false);
+  const smokeG7UiDoneRef = useRef(false);
+  const smokeG7ActiveChecksRunningRef = useRef(false);
+  const smokeG7ActiveChecksDoneRef = useRef(false);
+  const smokeG7EvidenceRef = useRef<AppSmokeG7Evidence | null>(null);
+  const smokeG7ExportButtonRef = useRef<HTMLButtonElement | null>(null);
+  const smokeG7ExportRectRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null);
+  const smokeG7BeforeCancelInvokeRef = useRef<(() => Promise<void>) | null>(null);
+  const smokeG7CancelStagePromiseRef = useRef<Promise<void> | null>(null);
   const previewTimeRef = useRef(0);
   const previewSelectionTimeRef = useRef(0);
   const previewPlayingRef = useRef(false);
@@ -892,6 +971,20 @@ function App() {
     if (!smokeConfigRef.current) return;
     if (smokeStageRef.current === SMOKE_SUCCESS_STAGE || smokeStageRef.current === SMOKE_ERROR_STAGE) return;
 
+    // G7's retained status is itself privacy evidence. The runner already
+    // owns the expected output path, so never copy that private control value
+    // into a G7 status file.
+    const smokeOutputPath = smokeConfigRef.current.g7Operation
+      ? null
+      : extra.outputPath ?? null;
+    const smokeMessage = smokeConfigRef.current.g7Operation && extra.message
+      ? pathFreeSmokeMessage(
+          extra.message,
+          smokeConfigRef.current,
+          "Packaged G7 smoke operation failed.",
+        )
+      : extra.message ?? null;
+
     const currentRank = smokeStageRank(smokeStageRef.current);
     const nextRank = smokeStageRank(stage);
     if (stage !== SMOKE_SUCCESS_STAGE && stage !== SMOKE_ERROR_STAGE && nextRank >= 0 && currentRank >= nextRank) return;
@@ -906,8 +999,8 @@ function App() {
           status: {
             stage,
             ok: extra.ok ?? null,
-            message: extra.message ?? null,
-            outputPath: extra.outputPath ?? null,
+            message: smokeMessage,
+            outputPath: smokeOutputPath,
             outputSizeBytes: extra.outputSizeBytes ?? null,
             trimStartS: extra.trimStartS ?? null,
             trimEndS: extra.trimEndS ?? null,
@@ -918,6 +1011,7 @@ function App() {
             fastTrimInspection: extra.fastTrimInspection ?? null,
             trimResult: extra.trimResult ?? null,
             queueOutcomeKind: extra.queueOutcomeKind ?? null,
+            g7Evidence: extra.g7Evidence ?? null,
           },
         });
       } catch (error) {
@@ -936,9 +1030,45 @@ function App() {
     await reportSmokeStatus(SMOKE_ERROR_STAGE, { ...extra, ok: false, message });
   }
 
+  function updateSmokeG7Evidence(patch: Partial<AppSmokeG7Evidence>) {
+    const current = smokeG7EvidenceRef.current;
+    if (!current) return;
+    smokeG7EvidenceRef.current = { ...current, ...patch };
+  }
+
+  function appendSmokeG7Progress(payload: EncodeProgressPayload) {
+    const current = smokeG7EvidenceRef.current;
+    if (!current || smokeAttemptIdRef.current !== payload.attemptId) return;
+    const sample: AppSmokeProgressSample = {
+      attemptId: payload.attemptId,
+      jobId: payload.jobId,
+      phase: payload.phase,
+      stepIndex: payload.stepIndex,
+      stepCount: payload.stepCount,
+      pass: payload.pass,
+      totalPasses: payload.totalPasses,
+      passPct: payload.passPct,
+      overallPct: payload.overallPct,
+    };
+    if (current.progressHistory.length >= 512) {
+      void reportSmokeFailure("Packaged G7 progress telemetry exceeded its bounded 512-sample history.", {
+        g7Evidence: current,
+      });
+      return;
+    }
+    smokeG7EvidenceRef.current = {
+      ...current,
+      progressHistory: [...current.progressHistory, sample],
+    };
+  }
+
   useEffect(() => {
     jobIdRef.current = jobId;
   }, [jobId]);
+
+  useEffect(() => {
+    updateBusyRef.current = updateBusy;
+  }, [updateBusy]);
 
   useEffect(() => {
     formatRef.current = format;
@@ -987,9 +1117,29 @@ function App() {
 
     void (async () => {
       try {
-        await invoke("finalize_update_startup");
+        const startup = await invoke<UpdateStartupResponse>("finalize_update_startup", {
+          onEvent: createUpdateProgressChannel(),
+        });
+        if (startup.status === "recoveryRequired") {
+          if (!stop) setUpdateStartupNotice({ kind: "error", message: startup.message });
+          return;
+        }
+        if (startup.status === "recovering" || startup.status === "elevatingRecovery") {
+          if (!stop) {
+            updateBusyRef.current = true;
+            setUpdateBusy(true);
+            setUpdateStatus(startup.message);
+            setUpdateStartupNotice({ kind: "status", message: startup.message });
+          }
+          return;
+        }
+        if (!stop && (startup.status === "completed" || startup.status === "recovered")) {
+          setUpdateStartupNotice({ kind: "status", message: startup.message });
+        }
       } catch (error) {
-        console.warn("Failed to finalize pending update state:", error);
+        const publicError = coerceUpdatePublicError(error, "The updater could not verify its saved state. Restart the app before trying another update.");
+        if (!stop) setUpdateStartupNotice({ kind: "error", message: publicError.message });
+        return;
       }
 
       try {
@@ -1005,7 +1155,10 @@ function App() {
       }
 
       try {
-        const result = await invoke<UpdateCheckResponse>("check_for_update", { force: false });
+        const result = await invoke<UpdateCheckResponse>("check_for_update", {
+          force: false,
+          onEvent: createUpdateProgressChannel(),
+        });
         if (!stop && result.status === "available") {
           setUpdateNotice(result);
           setUpdateStatus(null);
@@ -1101,7 +1254,8 @@ function App() {
           const queuedCount = summarizeExportQueue(exportQueueStateRef.current).queued;
           const encoding = jobIdRef.current !== null || pendingEncodeRef.current !== null;
           const preparing = queuePreparationCountRef.current > 0;
-          if (!encoding && queuedCount === 0 && !preparing) return;
+          const updating = updateBusyRef.current;
+          if (!encoding && queuedCount === 0 && !preparing && !updating) return;
 
           const unfinished = [
             encoding ? "an export is still running" : null,
@@ -1109,6 +1263,7 @@ function App() {
               ? `${queuedCount} queued export${queuedCount === 1 ? " has" : "s have"} not started`
               : null,
             preparing ? "selected queue files are still being prepared" : null,
+            updating ? "an update is still being prepared" : null,
           ].filter((part): part is string => Boolean(part));
           const summary = `${unfinished.join(", and ")}.`;
           const ok = await confirmDialog(`${summary} Close anyway?`, {
@@ -1241,6 +1396,17 @@ function App() {
         smokeFastTrimResetDoneRef.current = false;
         smokeSourceMutationRunningRef.current = false;
         smokeSourceMutationDoneRef.current = false;
+        smokeG7UiRunningRef.current = false;
+        smokeG7UiDoneRef.current = false;
+        smokeG7ActiveChecksRunningRef.current = false;
+        smokeG7ActiveChecksDoneRef.current = false;
+        smokeG7EvidenceRef.current = config.g7Operation
+          ? createSmokeG7Evidence(config.g7Operation)
+          : null;
+        smokeG7ExportButtonRef.current = null;
+        smokeG7ExportRectRef.current = null;
+        smokeG7BeforeCancelInvokeRef.current = null;
+        smokeG7CancelStagePromiseRef.current = null;
         smokeConfigRef.current = config;
         setSmokeConfig(config);
         await reportSmokeStatus("detected", { message: "Packaged app smoke mode detected." });
@@ -1281,7 +1447,8 @@ function App() {
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
       exportQueueStateRef.current.autoRun ||
-      queueSnapshotApplyingRef.current
+      queueSnapshotApplyingRef.current ||
+      updateBusyRef.current
     ) return;
     supersedeQueueSnapshotApply();
     setOutputAuto(true);
@@ -1299,14 +1466,21 @@ function App() {
     setStatus("Probing…");
   }
 
-  function resetAllSettings() {
+  function performResetAllSettings() {
     if (
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
       exportQueueStateRef.current.autoRun ||
-      queueSnapshotApplyingRef.current
-    ) return;
+      queueSnapshotApplyingRef.current ||
+      updateBusyRef.current
+    ) {
+      setResetConfirmationOpen(false);
+      return;
+    }
+    setResetConfirmationOpen(false);
     supersedeQueueSnapshotApply();
+    cropDetectionRevisionRef.current += 1;
+    setCropDetecting(false);
     setFormat(DEFAULT_OUTPUT_FORMAT);
     setTitle("");
     setSizeLimitMb(DEFAULT_SIZE_LIMIT_MB);
@@ -1595,6 +1769,17 @@ function App() {
     smokeFastTrimResetDoneRef.current = false;
     smokeSourceMutationRunningRef.current = false;
     smokeSourceMutationDoneRef.current = false;
+    smokeG7UiRunningRef.current = false;
+    smokeG7UiDoneRef.current = false;
+    smokeG7ActiveChecksRunningRef.current = false;
+    smokeG7ActiveChecksDoneRef.current = false;
+    smokeG7EvidenceRef.current = smokeConfig.g7Operation
+      ? createSmokeG7Evidence(smokeConfig.g7Operation)
+      : null;
+    smokeG7ExportButtonRef.current = null;
+    smokeG7ExportRectRef.current = null;
+    smokeG7BeforeCancelInvokeRef.current = null;
+    smokeG7CancelStagePromiseRef.current = null;
 
     handleDroppedPaths([smokeConfig.inputPath]);
     setOutputAuto(false);
@@ -1669,7 +1854,7 @@ function App() {
     setSaturation("1");
     setStatus("Smoke: preparing packaged interaction check…");
     void reportSmokeStatus("input-applied", {
-      message: `Smoke input staged through the shared drop path: ${smokeConfig.inputPath}`,
+      message: "Smoke input staged through the shared drop path.",
       outputPath: smokeConfig.outputPath,
     });
   }, [smokeConfig]);
@@ -1980,12 +2165,13 @@ function App() {
   const advancedFrameRateCapRequest = advancedFrameRateCapValid ? advancedFrameRateCapValue : null;
   const advancedAudioApplies = !sizeLimitEnabled && advancedAudioBitrateRequest !== null;
   const sourceFrameRate = probe?.frameRate ?? null;
-  const frameRateCapApplies =
-    format !== "mp3" &&
-    advancedFrameRateCapRequest !== null &&
-    (sourceFrameRate === null ||
-      sourceFrameRate * (Number.isFinite(Number(speed)) && Number(speed) > 0 ? Number(speed) : 1) >
-        advancedFrameRateCapRequest + 0.01);
+  const frameRatePlan = effectiveFrameRatePlan({
+    format,
+    sourceFrameRate,
+    speed: Number(speed),
+    frameRateCapFps: advancedFrameRateCapRequest,
+  });
+  const frameRateCapApplies = frameRatePlan.capApplies;
   const audioOverrideCanApply =
     format === "mp3" ? Boolean(probe?.hasAudio) : audioEnabled && Boolean(probe?.hasAudio);
   const advancedAudioChannelsApplies = advancedAudioChannels !== "auto" && audioOverrideCanApply;
@@ -2062,9 +2248,11 @@ function App() {
       ? "No video frame rate"
       : advancedFrameRateCapRequest === null
         ? "Source frame rate"
-        : sourceFrameRate !== null && sourceFrameRate <= advancedFrameRateCapRequest + 0.01
-          ? `Cap ${advancedFrameRateCapRequest} fps, source is already lower`
-          : `Cap at ${advancedFrameRateCapRequest} fps`;
+        : frameRatePlan.postSpeedFps === null
+          ? `Cap at ${advancedFrameRateCapRequest} fps, source rate unavailable`
+          : frameRatePlan.capApplies
+            ? `Cap at ${advancedFrameRateCapRequest} fps from ${frameRatePlan.postSpeedFps.toFixed(1)} fps after speed`
+            : `Cap ${advancedFrameRateCapRequest} fps, effective rate is already ${frameRatePlan.postSpeedFps.toFixed(1)} fps`;
   const advancedAudioChannelsSummary =
     advancedAudioChannels === "auto"
       ? "Auto audio channels"
@@ -2921,23 +3109,33 @@ function App() {
     lastExport.correctiveContext.format === format &&
     lastExport.targetResult.targetBytes === currentExactTargetBytes,
   );
-  const progressUi = getActiveProgressUi(progress, jobId !== null);
+  const progressUi = getActiveProgressUi(encodeProgress, jobId !== null);
+  const updateProgressUi = getUpdateProgressUi(updateProgress);
   const attemptUi = deriveEncodeAttemptPresentation(latestAttempt);
-  const encodeBusy = attemptUi.isActive || queueRunning || queuePreparationBusy || queueSnapshotApplying || subtitleInspecting;
+  const encodeBusy =
+    attemptUi.isActive ||
+    queueRunning ||
+    queuePreparationBusy ||
+    queueSnapshotApplying ||
+    subtitleInspecting ||
+    cropDetecting ||
+    frameSaving ||
+    updateBusy;
   const lastExportIsCurrentOutcome =
     latestAttempt.kind === "succeeded" || latestAttempt.kind === "target-missed";
   const latestAttemptOutputPath =
     "outputPath" in latestAttempt ? latestAttempt.outputPath ?? null : null;
-  const displayedStatus =
-    latestAttempt.kind === "running" && jobId !== null && progressUi.isFinalizing
+  const displayedStatus = latestAttempt.kind === "running" && jobId !== null
+    ? progressUi.phase === "finalizing"
       ? "Finalizing output..."
-      : status;
+      : progressUi.phase === "copying"
+        ? "Copying media..."
+        : "Encoding..."
+    : status;
 
   const footerKicker =
     latestAttempt.kind === "running"
-      ? progressUi.isFinalizing
-        ? "Finalizing output"
-        : "Encoding now"
+      ? progressUi.label
       : attemptUi.kicker
         ? attemptUi.kicker
         : inputPath
@@ -3093,8 +3291,14 @@ function App() {
       warnings.push("The MPEG-4 fallback codec has no meaningful speed preset; this setting may not change that encoder.");
     }
 
-    if (advancedFrameRateCapRequest !== null && sourceFrameRate !== null && sourceFrameRate <= advancedFrameRateCapRequest + 0.01) {
-      warnings.push(`Frame-rate cap is set to ${advancedFrameRateCapRequest} fps, but the source is already about ${sourceFrameRate.toFixed(1)} fps.`);
+    if (
+      advancedFrameRateCapRequest !== null &&
+      frameRatePlan.postSpeedFps !== null &&
+      !frameRatePlan.capApplies
+    ) {
+      warnings.push(
+        `Frame-rate cap is set to ${advancedFrameRateCapRequest} fps, but the post-speed rate is already about ${frameRatePlan.postSpeedFps.toFixed(1)} fps.`,
+      );
     }
 
     if (advancedAudioChannels !== "auto" && !audioOverrideCanApply) {
@@ -3115,6 +3319,7 @@ function App() {
     advancedEncodeSpeed,
     advancedFrameRateCapRequest,
     sourceFrameRate,
+    frameRatePlan,
     advancedAudioChannels,
     audioOverrideCanApply,
     colorSource,
@@ -3134,6 +3339,12 @@ function App() {
   ]);
 
   const handleDroppedPaths = useEffectEvent(async (paths: string[]) => {
+    if (updateBusyRef.current) {
+      setDragActive(false);
+      const message = "Finish the current update before adding media files.";
+      setStatus(message);
+      return { kind: "status" as const, message, clearDragActive: true };
+    }
     const action = resolveDroppedVideoAction({
       paths,
       currentFormat: formatRef.current,
@@ -3489,13 +3700,36 @@ function App() {
       return;
     }
 
+    if (smokeConfig.g7Operation && !smokeG7UiDoneRef.current) {
+      if (smokeG7UiRunningRef.current) return;
+      smokeG7UiRunningRef.current = true;
+      void (async () => {
+        try {
+          const result = await runSmokeG7UiChecks();
+          if (!result.ok) {
+            await reportSmokeFailure(result.message, {
+              g7Evidence: smokeG7EvidenceRef.current,
+            });
+            return;
+          }
+          smokeG7UiDoneRef.current = true;
+          setStatus("Smoke: G7 operational UI checks passed.");
+        } finally {
+          smokeG7UiRunningRef.current = false;
+        }
+      })();
+      return;
+    }
+
     if (smokeConfig.skipPreviewInteractions) {
       if (!smokeInteractionDoneRef.current) {
         const trimStartS = Math.max(0, smokeConfig.trimStartS);
         const trimEndS = Math.max(trimStartS, Math.min(probe.durationS, smokeConfig.trimEndS ?? probe.durationS));
+        const smokeSpeed = Number(speed);
+        const effectiveSmokeSpeed = Number.isFinite(smokeSpeed) && smokeSpeed > 0 ? smokeSpeed : 1;
         const expectedDurationS = smokeConfig.fastTrim
           ? fastTrimEffectiveDurationS(fastTrimStateRef.current.inspection) ?? Math.max(0, trimEndS - trimStartS)
-          : Math.max(0, trimEndS - trimStartS) *
+          : (Math.max(0, trimEndS - trimStartS) / effectiveSmokeSpeed) *
             (smokeConfig.loopVideo && smokeConfig.format !== "mp3" ? 2 : 1);
         smokeMetricsRef.current = {
           trimStartS,
@@ -3666,6 +3900,7 @@ function App() {
     jobId,
     trimTimeline,
     trimMode,
+    speed,
     fastTrimState,
     status,
     subtitlePath,
@@ -3677,6 +3912,136 @@ function App() {
     encodeEventsReady,
     encodeEventsError,
   ]);
+
+  useEffect(() => {
+    if (!smokeConfig?.g7Operation || jobId === null) return;
+    if (
+      encodeProgress.attemptId === null ||
+      encodeProgress.jobId !== jobId ||
+      smokeAttemptIdRef.current !== encodeProgress.attemptId
+    ) return;
+
+    const current = smokeG7EvidenceRef.current;
+    if (!current) return;
+    const progressElement = document.querySelector<HTMLElement>(
+      '[data-smoke-id="encode-progress"][role="progressbar"]',
+    );
+    if (!progressElement) {
+      void reportSmokeFailure("Packaged G7 could not find the mounted encode progressbar.", {
+        g7Evidence: current,
+      });
+      return;
+    }
+
+    const numberAttribute = (name: string) => {
+      const raw = progressElement.getAttribute(name);
+      if (raw === null || !/^-?\d+$/.test(raw)) return null;
+      const value = Number(raw);
+      return Number.isSafeInteger(value) ? value : null;
+    };
+    const metaValues = progressElement.querySelectorAll<HTMLElement>(".vfl-progress-meta > span");
+    const phaseLabel = metaValues.item(0)?.textContent?.trim() ?? "";
+    const percentText = metaValues.item(1)?.textContent?.trim() ?? "";
+    const percentMatch = /^(\d+)%$/.exec(percentText);
+    const fillElement = progressElement.querySelector<HTMLElement>(".vfl-progress-fill");
+    const valueNow = numberAttribute("aria-valuenow");
+    const sample: AppSmokeMountedProgressSample = {
+      attemptId: encodeProgress.attemptId,
+      jobId: encodeProgress.jobId,
+      phase: progressUi.phase,
+      sourceOverallPct: encodeProgress.overallPct,
+      isFinalizing: Boolean(fillElement?.classList.contains("is-finalizing")),
+      role: progressElement.getAttribute("role"),
+      ariaLabel: progressElement.getAttribute("aria-label"),
+      valueMin: numberAttribute("aria-valuemin"),
+      valueMax: numberAttribute("aria-valuemax"),
+      valueNow,
+      valueText: progressElement.getAttribute("aria-valuetext"),
+      phaseLabel,
+      visiblePercent: percentMatch ? Number(percentMatch[1]) : null,
+      fillWidth: fillElement?.style.width ?? "",
+    };
+    const expectedFillWidth = `${progressUi.percent}%`;
+    if (
+      sample.role !== "progressbar" ||
+      sample.ariaLabel !== "Encoding progress" ||
+      sample.valueMin !== 0 ||
+      sample.valueMax !== 100 ||
+      sample.valueNow !== progressUi.percent ||
+      sample.valueNow > 99 ||
+      sample.valueText !== progressUi.valueText ||
+      sample.phaseLabel !== progressUi.label ||
+      sample.visiblePercent !== progressUi.percent ||
+      sample.fillWidth !== expectedFillWidth ||
+      sample.isFinalizing !== progressUi.isFinalizing ||
+      progressElement.getAttribute("aria-hidden") !== null
+    ) {
+      void reportSmokeFailure("Packaged G7 mounted progressbar accessibility or visible-value contract failed.", {
+        g7Evidence: current,
+      });
+      return;
+    }
+
+    const previous = current.mountedProgressHistory[current.mountedProgressHistory.length - 1];
+    if (
+      previous?.valueNow !== null &&
+      previous?.valueNow !== undefined &&
+      valueNow !== null &&
+      valueNow < previous.valueNow
+    ) {
+      void reportSmokeFailure("Packaged G7 mounted progressbar visibly regressed.", {
+        g7Evidence: current,
+      });
+      return;
+    }
+    if (previous && JSON.stringify(previous) === JSON.stringify(sample)) return;
+    if (current.mountedProgressHistory.length >= 512) {
+      void reportSmokeFailure("Packaged G7 mounted progress evidence exceeded its bounded 512-sample history.", {
+        g7Evidence: current,
+      });
+      return;
+    }
+    smokeG7EvidenceRef.current = {
+      ...current,
+      mountedProgressHistory: [...current.mountedProgressHistory, sample],
+    };
+  }, [
+    smokeConfig?.g7Operation,
+    jobId,
+    encodeProgress.attemptId,
+    encodeProgress.jobId,
+    encodeProgress.overallPct,
+    progressUi.phase,
+    progressUi.isFinalizing,
+    progressUi.label,
+    progressUi.percent,
+    progressUi.valueText,
+  ]);
+
+  useEffect(() => {
+    if (
+      !smokeConfig?.g7Operation ||
+      jobId === null ||
+      smokeG7ActiveChecksDoneRef.current ||
+      smokeG7ActiveChecksRunningRef.current
+    ) return;
+
+    smokeG7ActiveChecksRunningRef.current = true;
+    void (async () => {
+      try {
+        const result = await runSmokeG7ActiveEncodeChecks();
+        if (!result.ok) {
+          await reportSmokeFailure(result.message, {
+            g7Evidence: smokeG7EvidenceRef.current,
+          });
+          return;
+        }
+        smokeG7ActiveChecksDoneRef.current = true;
+      } finally {
+        smokeG7ActiveChecksRunningRef.current = false;
+      }
+    })();
+  }, [smokeConfig, jobId]);
 
   useEffect(() => {
     if (!hasTauriRuntime()) return;
@@ -3696,7 +4061,8 @@ function App() {
       onProgress: (payload) => {
         const pendingEncode = pendingEncodeRef.current;
         if (!acceptsEncodeEvent(pendingEncode, payload)) return;
-        setProgress(Math.max(0, Math.min(1, payload.overallPct)));
+        appendSmokeG7Progress(payload);
+        setEncodeProgress((current) => reduceEncodeProgress(current, payload));
       },
       onFinished: (p) => {
         const pendingEncode = pendingEncodeRef.current;
@@ -3717,17 +4083,72 @@ function App() {
         pendingEncodeRef.current = settlement.pending;
         setJobId(null);
         jobIdRef.current = null;
-        setProgress(0);
+        setEncodeProgress(createEncodeProgressState());
 
         if (smokeAttemptIdRef.current === p.attemptId) {
           smokeAttemptIdRef.current = null;
-          if (!p.ok) {
+          const g7Operation = smokeConfigRef.current?.g7Operation ?? null;
+          const g7Evidence = smokeG7EvidenceRef.current;
+          const expectedMountedActivePhase =
+            g7Operation === "copy-progress" ? "copying" : "encoding";
+          const mountedProgressReady =
+            !g7Operation ||
+            (
+              g7Evidence?.mountedProgressHistory.some(
+                (sample) => sample.phase === expectedMountedActivePhase,
+              ) === true &&
+              (
+                g7Operation === "cancel-drop" ||
+                g7Evidence.mountedProgressHistory.some(
+                  (sample) => sample.phase === "finalizing",
+                )
+              )
+            );
+          const expectedG7Cancellation =
+            g7Operation === "cancel-drop" && settlement.state.kind === "cancelled";
+          if (!mountedProgressReady) {
+            void reportSmokeFailure(
+              "Packaged G7 export settled before its mounted progressbar evidence completed.",
+              { g7Evidence },
+            );
+          } else if (expectedG7Cancellation) {
+            if (
+              !smokeG7ActiveChecksDoneRef.current ||
+              !g7Evidence?.dropPreservedInput ||
+              g7Evidence.cancelInvokeCount !== 1
+            ) {
+              void reportSmokeFailure(
+                "Packaged G7 cancellation settled before its drop and idempotence evidence completed.",
+                { g7Evidence },
+              );
+            } else {
+              void reportSmokeStatus(SMOKE_SUCCESS_STAGE, {
+                ok: true,
+                message: "The expected packaged export cancellation completed safely.",
+                outputPath: null,
+                outputSizeBytes: null,
+                diagnostics: p.diagnostics ?? null,
+                trimResult: p.trimResult ?? null,
+                g7Evidence,
+              });
+            }
+          } else if (!p.ok) {
             void reportSmokeFailure(
               `Packaged app smoke encode failed: ${p.message || "Encode failed."}`,
               {
                 diagnostics: p.diagnostics ?? null,
                 trimResult: p.trimResult ?? null,
+                g7Evidence,
               },
+            );
+          } else if (
+            g7Operation &&
+            g7Operation !== "copy-progress" &&
+            !smokeG7ActiveChecksDoneRef.current
+          ) {
+            void reportSmokeFailure(
+              "Packaged G7 export completed before its mounted active-control evidence finished.",
+              { g7Evidence },
             );
           } else {
             const smokeMetrics = smokeMetricsRef.current;
@@ -3743,6 +4164,7 @@ function App() {
               diagnostics: p.diagnostics ?? null,
               trimResult: p.trimResult ?? null,
               queueOutcomeKind: p.targetResult?.status === "missed" ? "target-missed" : "done",
+              g7Evidence,
             });
           }
         }
@@ -4721,6 +5143,19 @@ function App() {
         throw new Error("Fast Trim reset smoke could not find the enabled mounted Reset all settings action.");
       }
       resetAllButton.click();
+      const confirmationFocused = await waitForSmokeCondition(() => {
+        const cancel = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-cancel"]');
+        const confirm = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-confirm"]');
+        return Boolean(cancel && confirm && document.activeElement === cancel);
+      });
+      if (!confirmationFocused) {
+        throw new Error("Reset all settings confirmation did not open with focus on the safe Cancel action.");
+      }
+      const confirmResetButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-confirm"]');
+      if (!confirmResetButton || confirmResetButton.disabled) {
+        throw new Error("Fast Trim reset smoke could not confirm Reset all settings.");
+      }
+      confirmResetButton.click();
       if (!(await waitForSmokeCondition(resetStateIsClear))) {
         throw new Error("Mounted Reset all settings did not select Exact, clear Fast consent, and reset both trim inputs.");
       }
@@ -4937,6 +5372,10 @@ function App() {
   }
 
   async function addCurrentPlanToQueue() {
+    if (updateBusyRef.current) {
+      setStatus("Finish the current update before changing the export queue.");
+      return;
+    }
     if (!exportReady) return;
     let capturedRequest: EncodeRequest;
     try {
@@ -4973,6 +5412,10 @@ function App() {
   }
 
   async function addFilesToQueue() {
+    if (updateBusyRef.current) {
+      setStatus("Finish the current update before changing the export queue.");
+      return;
+    }
     try {
       const selected = await openDialog({
         multiple: true,
@@ -5045,7 +5488,8 @@ function App() {
       current.active !== null ||
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
-      queuePreparationCountRef.current > 0
+      queuePreparationCountRef.current > 0 ||
+      updateBusyRef.current
     ) return;
 
     const claimed = dispatchExportQueue({ type: "claim-next" });
@@ -5090,6 +5534,10 @@ function App() {
   }
 
   function runQueue() {
+    if (updateBusyRef.current) {
+      setStatus("Finish the current update before running the export queue.");
+      return;
+    }
     if (!encodeEventsReadyRef.current) {
       setStatus(
         encodeEventsErrorRef.current
@@ -5119,13 +5567,17 @@ function App() {
   async function autoDetectCrop() {
     if (!inputPath || !probe) return;
     const requestedPath = inputPath;
+    const requestRevision = ++cropDetectionRevisionRef.current;
     setCropDetectHint(null);
     setCropDetecting(true);
     try {
       const crop = await invoke<Crop | null>("detect_crop", { path: inputPath });
       // A slow detection must not apply the old video's crop to a newly
-      // loaded input.
-      if (inputPathRef.current !== requestedPath) return;
+      // loaded input or overwrite a confirmed settings reset.
+      if (
+        cropDetectionRevisionRef.current !== requestRevision ||
+        inputPathRef.current !== requestedPath
+      ) return;
       if (!crop) {
         setCropDetectHint("No crop detected.");
         return;
@@ -5138,12 +5590,16 @@ function App() {
       });
       setCropEnabled(true);
       setCropDetectHint(`Detected ${crop.width}x${crop.height} @ ${crop.x},${crop.y}.`);
-    } catch (e) {
-      if (inputPathRef.current !== requestedPath) return;
-      const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "Crop detection failed.";
-      setCropDetectHint(msg);
+    } catch {
+      if (
+        cropDetectionRevisionRef.current !== requestRevision ||
+        inputPathRef.current !== requestedPath
+      ) return;
+      setCropDetectHint(CROP_DETECTION_PUBLIC_ERROR);
     } finally {
-      setCropDetecting(false);
+      if (cropDetectionRevisionRef.current === requestRevision) {
+        setCropDetecting(false);
+      }
     }
   }
 
@@ -5156,6 +5612,9 @@ function App() {
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
     reportAsSmokeResult?: boolean;
   }): Promise<StartEncodeResult> {
+    if (updateBusyRef.current) {
+      return { ok: false, message: "Finish the current update before starting an export." };
+    }
     if (!encodeEventsReadyRef.current) {
       return {
         ok: false,
@@ -5219,7 +5678,7 @@ function App() {
         smokeAttemptIdRef.current = attemptId;
       }
       setStatus(options?.startingStatus ?? "Starting…");
-      setProgress(0);
+      setEncodeProgress(createEncodeProgressState());
       const id = await invoke<number>("start_encode", { request, attemptId });
       const binding = bindStartedEncode(
         pendingEncodeRef.current,
@@ -5268,6 +5727,7 @@ function App() {
       !probe ||
       jobId !== null ||
       pendingEncodeRef.current !== null
+      || updateBusyRef.current
     ) return;
 
     try {
@@ -5316,17 +5776,18 @@ function App() {
   }
 
   async function cancelEncode() {
-    if (jobId === null) return;
+    if (jobId === null || latestAttemptRef.current.kind === "cancelling") return;
     const pendingEncode = pendingEncodeRef.current;
     if (pendingEncode?.jobId === jobId) {
-      pendingEncode.cancelRequested = true;
-      updateLatestAttempt(
-        requestEncodeCancellation(
-          latestAttemptRef.current,
-          pendingEncode.attemptId,
-          jobId,
-        ),
+      if (pendingEncode.cancelRequested) return;
+      const cancellingAttempt = requestEncodeCancellation(
+        latestAttemptRef.current,
+        pendingEncode.attemptId,
+        jobId,
       );
+      if (cancellingAttempt === latestAttemptRef.current) return;
+      pendingEncode.cancelRequested = true;
+      updateLatestAttempt(cancellingAttempt);
     }
     if (exportQueueStateRef.current.active !== null) {
       recordQueueStopIntent();
@@ -5335,6 +5796,14 @@ function App() {
       setStatus("Canceling…");
     }
     try {
+      if (smokeG7EvidenceRef.current?.operation === "cancel-drop") {
+        updateSmokeG7Evidence({
+          cancelInvokeCount: smokeG7EvidenceRef.current.cancelInvokeCount + 1,
+        });
+        const beforeBackendInvoke = smokeG7BeforeCancelInvokeRef.current;
+        smokeG7BeforeCancelInvokeRef.current = null;
+        if (beforeBackendInvoke) await beforeBackendInvoke();
+      }
       await invoke("cancel_encode", { jobId });
     } catch {
       // ignore
@@ -6308,6 +6777,317 @@ function App() {
     }
   }
 
+  async function runSmokeG7UiChecks(): Promise<SmokeWorkflowResult> {
+    const config = smokeConfigRef.current;
+    const operation = config?.g7Operation;
+    if (!config || !operation || !probe) {
+      return { ok: false, message: "Packaged G7 UI checks ran without their source probe and operation." };
+    }
+
+    setOpenCards((cards) => ({ ...cards, transform: true, advanced: true }));
+    setSpeed("1.25");
+    setRotateDeg(180);
+    setAdvancedFrameRateCapFps("24");
+
+    const seededSettingsMounted = await waitForSmokeCondition(() => {
+      const speedInput = document.getElementById("vfl-speed") as HTMLInputElement | null;
+      const rotateInput = document.getElementById("vfl-rotate") as HTMLSelectElement | null;
+      const capInput = document.getElementById("vfl-frame-rate-cap") as HTMLSelectElement | null;
+      return speedInput?.value === "1.25" && rotateInput?.value === "180" && capInput?.value === "24";
+    });
+    if (!seededSettingsMounted) {
+      return { ok: false, message: "Packaged G7 reset check could not mount its non-default settings." };
+    }
+
+    const resetButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-settings"]');
+    if (!resetButton || resetButton.disabled) {
+      return { ok: false, message: "Packaged G7 reset check could not find the enabled mounted Reset all settings action." };
+    }
+
+    resetButton.focus();
+    resetButton.click();
+    const cancelFocused = await waitForSmokeCondition(() => {
+      const dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+      const cancel = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-cancel"]');
+      return Boolean(dialog && cancel && document.activeElement === cancel);
+    });
+    const firstDialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+    if (!cancelFocused || !firstDialog) {
+      return { ok: false, message: "Packaged G7 reset confirmation did not open as an alert dialog with safe Cancel focus." };
+    }
+    updateSmokeG7Evidence({
+      resetDialogRole: firstDialog.getAttribute("role"),
+      resetCancelFocused: true,
+    });
+
+    const cancelReset = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-cancel"]');
+    cancelReset?.click();
+    const cancelPreserved = await waitForSmokeCondition(() => {
+      const speedInput = document.getElementById("vfl-speed") as HTMLInputElement | null;
+      const rotateInput = document.getElementById("vfl-rotate") as HTMLSelectElement | null;
+      const capInput = document.getElementById("vfl-frame-rate-cap") as HTMLSelectElement | null;
+      return (
+        !document.querySelector('[role="alertdialog"]') &&
+        document.activeElement === resetButton &&
+        speedInput?.value === "1.25" &&
+        rotateInput?.value === "180" &&
+        capInput?.value === "24"
+      );
+    });
+    if (!cancelPreserved) {
+      return { ok: false, message: "Packaged G7 reset Cancel did not preserve settings and restore trigger focus." };
+    }
+    updateSmokeG7Evidence({
+      resetCancelPreservedSettings: true,
+      resetCancelRestoredFocus: true,
+    });
+
+    resetButton.click();
+    const secondDialogReady = await waitForSmokeCondition(() => {
+      const cancel = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-cancel"]');
+      const confirm = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-confirm"]');
+      return Boolean(cancel && confirm && document.activeElement === cancel && !confirm.disabled);
+    });
+    if (!secondDialogReady) {
+      return { ok: false, message: "Packaged G7 reset confirmation could not be reopened for the destructive action." };
+    }
+    document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-confirm"]')?.click();
+    const resetConfirmed = await waitForSmokeCondition(() => {
+      const speedInput = document.getElementById("vfl-speed") as HTMLInputElement | null;
+      const rotateInput = document.getElementById("vfl-rotate") as HTMLSelectElement | null;
+      const capInput = document.getElementById("vfl-frame-rate-cap") as HTMLSelectElement | null;
+      return (
+        !document.querySelector('[role="alertdialog"]') &&
+        document.activeElement === resetButton &&
+        speedInput?.value === "1.0" &&
+        rotateInput?.value === "0" &&
+        capInput?.value === "auto"
+      );
+    });
+    if (!resetConfirmed) {
+      return { ok: false, message: "Packaged G7 confirmed reset did not restore defaults and trigger focus." };
+    }
+    updateSmokeG7Evidence({
+      resetConfirmed: true,
+      resetConfirmRestoredFocus: true,
+    });
+
+    const speedValue = operation === "rotate-speed-cap" ? "2" : operation === "cancel-drop" ? "0.5" : "1.0";
+    const rotationValue = operation === "copy-progress" ? 0 : 90;
+    const capValue = operation === "copy-progress" ? "auto" : "24";
+    setSpeed(speedValue);
+    setRotateDeg(rotationValue);
+    setAdvancedFrameRateCapFps(capValue);
+    setAdvancedEncodeSpeed(operation === "cancel-drop" ? "smaller" : "auto");
+    setCropEnabled(false);
+    setCropRect({ x: 0, y: 0, w: 1, h: 1 });
+
+    const desiredSettingsMounted = await waitForSmokeCondition(() => {
+      const speedInput = document.getElementById("vfl-speed") as HTMLInputElement | null;
+      const rotateInput = document.getElementById("vfl-rotate") as HTMLSelectElement | null;
+      const capInput = document.getElementById("vfl-frame-rate-cap") as HTMLSelectElement | null;
+      return speedInput?.value === speedValue && rotateInput?.value === String(rotationValue) && capInput?.value === capValue;
+    });
+    if (!desiredSettingsMounted) {
+      return { ok: false, message: "Packaged G7 operation settings did not reach their mounted controls." };
+    }
+
+    let previewTransform: string | null = null;
+    if (rotationValue !== 0) {
+      const rotatedPreviewReady = await waitForSmokeCondition(() => {
+        const surface = document.querySelector<HTMLElement>(".vfl-video-surface");
+        previewTransform = surface?.style.transform ?? null;
+        return Boolean(previewTransform?.includes(`rotate(${rotationValue}deg)`));
+      });
+      if (!rotatedPreviewReady) {
+        return { ok: false, message: "Packaged G7 preview did not render the selected manual quarter-turn." };
+      }
+    }
+
+    const speedNumber = Number(speedValue);
+    const postSpeedFrameRateFps = probe.frameRate == null ? null : probe.frameRate * speedNumber;
+    const frameRateCapFps = capValue === "auto" ? null : Number(capValue);
+    const frameRateCapApplies = postSpeedFrameRateFps === null || frameRateCapFps === null
+      ? null
+      : postSpeedFrameRateFps > frameRateCapFps + 0.01;
+    if (frameRateCapFps !== null && frameRateCapApplies !== true) {
+      return { ok: false, message: "Packaged G7 speed-aware frame cap did not apply to the post-speed source rate." };
+    }
+    let frameRateMountedCopyVerified = frameRateCapFps === null;
+    if (frameRateCapFps !== null && postSpeedFrameRateFps !== null) {
+      frameRateMountedCopyVerified = await waitForSmokeCondition(() => {
+        const capInput = document.getElementById("vfl-frame-rate-cap");
+        const hint = capInput?.closest(".vfl-field")?.querySelector<HTMLElement>(".vfl-inline-hint");
+        const copy = hint?.textContent ?? "";
+        return (
+          copy.includes(`${postSpeedFrameRateFps.toFixed(1)} fps`) &&
+          copy.includes(`${frameRateCapFps} fps`)
+        );
+      });
+      if (!frameRateMountedCopyVerified) {
+        return { ok: false, message: "Packaged G7 mounted frame-rate guidance did not name the post-speed rate and selected cap." };
+      }
+    }
+
+    const exportButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="export"]');
+    if (!exportButton || exportButton.disabled || exportButton.textContent?.trim() !== "Export") {
+      return { ok: false, message: "Packaged G7 checks could not find the ready mounted Export control." };
+    }
+    exportButton.focus();
+    if (document.activeElement !== exportButton) {
+      return { ok: false, message: "Packaged G7 ready Export control did not take focus before activation." };
+    }
+    smokeG7ExportButtonRef.current = exportButton;
+    const exportRect = exportButton.getBoundingClientRect();
+    smokeG7ExportRectRef.current = {
+      x: exportRect.x,
+      y: exportRect.y,
+      width: exportRect.width,
+      height: exportRect.height,
+    };
+    updateSmokeG7Evidence({
+      previewRotationDeg: rotationValue,
+      previewTransform,
+      postSpeedFrameRateFps,
+      frameRateCapFps,
+      frameRateCapApplies,
+      frameRateMountedCopyVerified,
+      exportControlStable: true,
+      exportControlInitiallyFocused: true,
+    });
+    await reportSmokeStatus("g7-ui-ready", {
+      message: "Mounted G7 reset, preview rotation, speed-aware frame cap, and stable Export preflight checks passed.",
+      g7Evidence: smokeG7EvidenceRef.current,
+    });
+    return { ok: true, message: "Mounted G7 operational UI checks passed." };
+  }
+
+  async function runSmokeG7ActiveEncodeChecks(): Promise<SmokeWorkflowResult> {
+    const config = smokeConfigRef.current;
+    const evidence = smokeG7EvidenceRef.current;
+    if (!config?.g7Operation || !evidence || jobIdRef.current === null) {
+      return { ok: false, message: "Packaged G7 active-export checks ran without an active operation." };
+    }
+
+    const activeControlsMounted = await waitForSmokeCondition(() => {
+      const exportButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="export"]');
+      const cancelButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="cancel-export"]');
+      return Boolean(
+        exportButton &&
+        exportButton === smokeG7ExportButtonRef.current &&
+        exportButton.disabled &&
+        exportButton.textContent?.trim() === "Exporting…" &&
+        cancelButton &&
+        cancelButton !== exportButton &&
+        !cancelButton.disabled
+      );
+    });
+    if (!activeControlsMounted) {
+      return { ok: false, message: "Packaged G7 Export did not retain identity beside a separate active Cancel control." };
+    }
+    const before = smokeG7ExportRectRef.current;
+    const activeExport = document.querySelector<HTMLButtonElement>('[data-smoke-id="export"]');
+    const after = activeExport?.getBoundingClientRect();
+    const geometryStable = Boolean(
+      before &&
+      after &&
+      Math.abs(before.x - after.x) <= 1 &&
+      Math.abs(before.y - after.y) <= 1 &&
+      Math.abs(before.width - after.width) <= 1 &&
+      Math.abs(before.height - after.height) <= 1
+    );
+    if (!geometryStable && before && after) {
+      return {
+        ok: false,
+        message: `Packaged G7 Export moved from ${before.x.toFixed(1)},${before.y.toFixed(1)} ${before.width.toFixed(1)}x${before.height.toFixed(1)} to ${after.x.toFixed(1)},${after.y.toFixed(1)} ${after.width.toFixed(1)}x${after.height.toFixed(1)} CSS pixels.`,
+      };
+    }
+    if (!geometryStable) {
+      return { ok: false, message: "Packaged G7 Export geometry was unavailable across the active-state transition." };
+    }
+    updateSmokeG7Evidence({
+      exportControlPreservedIdentity: true,
+      exportControlPreservedGeometry: true,
+      cancelControlSeparate: true,
+    });
+    await reportSmokeStatus("g7-controls-ready", {
+      message: "The mounted Export control retained identity and became disabled beside a separate enabled Cancel action.",
+      g7Evidence: smokeG7EvidenceRef.current,
+    });
+
+    if (config.g7Operation !== "cancel-drop") {
+      smokeG7ActiveChecksDoneRef.current = true;
+      return { ok: true, message: "Mounted active-export controls passed." };
+    }
+    if (!config.g7DropPath) {
+      return { ok: false, message: "Packaged G7 cancel-drop operation has no configured drop input." };
+    }
+
+    const sourceBeforeDrop = inputPathRef.current;
+    const queueCountBeforeDrop = exportQueueStateRef.current.items.length;
+    const action = await handleDroppedPaths([config.g7DropPath]);
+    const droppedInputQueued = await waitForSmokeCondition(() =>
+      exportQueueStateRef.current.items.length === queueCountBeforeDrop + 1 &&
+      exportQueueStateRef.current.items.some(
+        (item) => queuePathIdentity(item.inputPath) === queuePathIdentity(config.g7DropPath ?? ""),
+      ),
+    );
+    const dropPreservedInput = queuePathIdentity(inputPathRef.current) === queuePathIdentity(sourceBeforeDrop);
+    if (action.kind !== "queueInputs" || !droppedInputQueued || !dropPreservedInput) {
+      return { ok: false, message: "Packaged G7 active-export drop did not queue the file while preserving the current source." };
+    }
+    updateSmokeG7Evidence({
+      dropActionKind: action.kind,
+      dropPreservedInput: true,
+      queuedDropCount: exportQueueStateRef.current.items.length - queueCountBeforeDrop,
+    });
+    await reportSmokeStatus("g7-drop-queued", {
+      message: "A drop during export was queued with a clear status and did not replace the active source.",
+      g7Evidence: smokeG7EvidenceRef.current,
+    });
+
+    const backendEncodeStarted = await waitForSmokeCondition(
+      () => smokeG7EvidenceRef.current?.progressHistory.some((sample) => sample.phase === "encoding") === true,
+      15_000,
+    );
+    if (!backendEncodeStarted) {
+      return { ok: false, message: "Packaged G7 cancellation never observed a real backend encode progress event." };
+    }
+
+    const cancelButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="cancel-export"]');
+    if (!cancelButton || cancelButton.disabled) {
+      return { ok: false, message: "Packaged G7 cancel-drop operation lost its mounted Cancel action." };
+    }
+    smokeG7BeforeCancelInvokeRef.current = () => {
+      const stagePromise = reportSmokeStatus("g7-cancel-requested", {
+        message: "Mounted cancellation was requested once; a repeated handler call was ignored.",
+        g7Evidence: smokeG7EvidenceRef.current,
+      });
+      smokeG7CancelStagePromiseRef.current = stagePromise;
+      return stagePromise;
+    };
+    cancelButton.click();
+    const repeatedCancellation = cancelEncode();
+    const cancelStagePromise = smokeG7CancelStagePromiseRef.current;
+    if (
+      latestAttemptRef.current.kind !== "cancelling" ||
+      smokeG7EvidenceRef.current?.cancelInvokeCount !== 1 ||
+      !cancelStagePromise
+    ) {
+      return { ok: false, message: "Packaged G7 Cancel did not synchronously latch one idempotent backend request." };
+    }
+    await repeatedCancellation;
+    await cancelStagePromise;
+    const cancellationRendered = await waitForSmokeCondition(() =>
+      document.querySelector<HTMLButtonElement>('[data-smoke-id="cancel-export"]')?.disabled === true,
+    );
+    if (!cancellationRendered || smokeG7EvidenceRef.current?.cancelInvokeCount !== 1) {
+      return { ok: false, message: "Packaged G7 repeated cancellation reached the backend more than once." };
+    }
+    smokeG7ActiveChecksDoneRef.current = true;
+    return { ok: true, message: "Mounted active-export drop and idempotent cancellation checks passed." };
+  }
+
   async function runSmokeAccessibilityChecks(): Promise<SmokeAccessibilityResult> {
     if (!probe || !previewReady || !previewMediaReady) {
       return { ok: false, message: "Accessibility smoke ran before the preview was ready." };
@@ -6864,6 +7644,18 @@ function App() {
     clearFastTrimState();
   }
 
+  function createUpdateProgressChannel(onPhaseMessage?: (message: string) => void) {
+    setUpdateProgress(createUpdateProgressState());
+    updatePhaseRef.current = null;
+    return new Channel<UpdateProgressEvent>((event) => {
+      setUpdateProgress((current) => reduceUpdateProgress(current, event));
+      if (updatePhaseRef.current !== event.phase) {
+        updatePhaseRef.current = event.phase;
+        onPhaseMessage?.(event.message);
+      }
+    });
+  }
+
   async function dismissUpdate(choice: "remindLater" | "skip7days" | "dismiss") {
     if (!updateNotice?.latestVersion) {
       setUpdateNotice(null);
@@ -6875,11 +7667,12 @@ function App() {
         choice,
         version: updateNotice.latestVersion,
       });
-    } catch (error) {
-      console.warn("Failed to store update prompt choice:", error);
-    } finally {
       setUpdateNotice(null);
       setUpdateStatus(null);
+    } catch (error) {
+      setUpdateStatus(
+        coerceUpdatePublicError(error, "The update preference could not be saved. Try again.").message,
+      );
     }
   }
 
@@ -6889,7 +7682,10 @@ function App() {
     setManualUpdateBusy(true);
     setManualUpdateStatus("Checking for updates...");
     try {
-      const result = await invoke<UpdateCheckResponse>("check_for_update", { force: true });
+      const result = await invoke<UpdateCheckResponse>("check_for_update", {
+        force: true,
+        onEvent: createUpdateProgressChannel(setManualUpdateStatus),
+      });
       if (result.status === "available") {
         setUpdateNotice(result);
         setUpdateStatus(null);
@@ -6900,21 +7696,41 @@ function App() {
         setManualUpdateStatus(result.reason ?? "Video For Lazies is up to date.");
       }
     } catch (error) {
-      setManualUpdateStatus(coerceErrorMessage(error, "Update check failed."));
+      setManualUpdateStatus(
+        coerceUpdatePublicError(error, "Video For Lazies could not check for updates. Check your connection and try again.").message,
+      );
     } finally {
       setManualUpdateBusy(false);
     }
   }
 
   async function applyUpdate() {
-    if (updateBusy) return;
+    if (
+      updateBusyRef.current ||
+      jobIdRef.current !== null ||
+      pendingEncodeRef.current !== null ||
+      exportQueueStateRef.current.autoRun ||
+      queuePreparationCountRef.current > 0 ||
+      cropDetecting ||
+      frameSaving
+    ) return;
+    updateBusyRef.current = true;
     setUpdateBusy(true);
+    setUpdatePublicError(null);
     setUpdateStatus("Preparing update...");
     try {
-      const result = await invoke<UpdateApplyResponse>("prepare_and_apply_update");
+      const result = await invoke<UpdateApplyResponse>("prepare_and_apply_update", {
+        onEvent: createUpdateProgressChannel(setUpdateStatus),
+      });
       setUpdateStatus(result.message);
     } catch (error) {
-      setUpdateStatus(coerceErrorMessage(error, "Update failed."));
+      const publicError = coerceUpdatePublicError(
+        error,
+        "The update could not be prepared safely. Your current app was not changed. Try again, or download the portable release manually.",
+      );
+      setUpdatePublicError(publicError);
+      setUpdateStatus(publicError.message);
+      updateBusyRef.current = false;
       setUpdateBusy(false);
     }
   }
@@ -6947,7 +7763,11 @@ function App() {
       {dragActive && !modalOpen ? (
         <div className="vfl-drop-overlay" aria-hidden="true">
           <div className="vfl-drop-overlay-card">
-            {encodeBusy ? "Drop files to add them after the current export" : "Drop one file to open, or several to queue"}
+            {updateBusy
+              ? "Finish the current update before adding files"
+              : encodeBusy
+                ? "Drop files to add them after the current export"
+                : "Drop one file to open, or several to queue"}
           </div>
         </div>
       ) : null}
@@ -6966,6 +7786,22 @@ function App() {
               ? updateStatus ?? "Installing the update with administrator permission. The app restarts automatically."
               : updateStatus ?? "Installing the update with administrator permission."}
           </div>
+          {updateBusy ? (
+            <div
+              className="vfl-progress"
+              role="progressbar"
+              aria-label="Elevated update progress"
+              aria-valuemin={updateProgressUi.determinate ? 0 : undefined}
+              aria-valuemax={updateProgressUi.determinate ? 100 : undefined}
+              aria-valuenow={updateProgressUi.percent ?? undefined}
+              aria-valuetext={updateProgressUi.valueText}
+            >
+              <div className="vfl-progress-meta">
+                <span>{updateProgressUi.label}</span>
+                {updateProgressUi.percent !== null ? <span>{updateProgressUi.percent}%</span> : null}
+              </div>
+            </div>
+          ) : null}
           {!updateBusy ? (
             <div className="vfl-actions">
               <button onClick={() => void applyUpdate()}>Try again</button>
@@ -7027,6 +7863,38 @@ function App() {
               </button>
             </div>
         </ModalDialog>
+      ) : resetConfirmationOpen ? (
+        <ModalDialog
+          role="alertdialog"
+          className="vfl-reset-confirmation"
+          labelledBy="vfl-reset-confirmation-title"
+          describedBy="vfl-reset-confirmation-description"
+          initialFocus="first"
+          onRequestClose={() => setResetConfirmationOpen(false)}
+          closeOnBackdrop
+        >
+          <div className="vfl-about-title" id="vfl-reset-confirmation-title">Reset all settings?</div>
+          <p className="vfl-muted" id="vfl-reset-confirmation-description">
+            This clears the current export settings, trim, crop, color edits, subtitle selection, and Fast Trim consent. It does not remove the source, output file, queue, or saved recipes.
+          </p>
+          <div className="vfl-actions">
+            <button
+              type="button"
+              data-smoke-id="reset-all-cancel"
+              onClick={() => setResetConfirmationOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="danger"
+              data-smoke-id="reset-all-confirm"
+              onClick={performResetAllSettings}
+            >
+              Reset settings
+            </button>
+          </div>
+        </ModalDialog>
       ) : recipeDialog ? (
         <UserRecipeDialog
           state={recipeDialog}
@@ -7042,20 +7910,76 @@ function App() {
         />
       ) : null}
       <header className="vfl-header">
+        {updateStartupNotice ? (
+          <div className={`vfl-update-banner ${updateStartupNotice.kind === "error" ? "is-error" : ""}`}>
+            <div className="vfl-update-copy">
+              <div className="vfl-update-kicker">Update recovery</div>
+              <div
+                className="vfl-update-summary"
+                role={updateStartupNotice.kind === "error" ? "alert" : "status"}
+                aria-live={updateStartupNotice.kind === "error" ? "assertive" : "polite"}
+                aria-atomic="true"
+              >
+                {updateStartupNotice.message}
+              </div>
+            </div>
+            <div className="vfl-update-actions">
+              <button type="button" onClick={() => void openExternalUrl(APP_LINKS.releases)}>
+                Open portable releases
+              </button>
+              {updateStartupNotice.kind === "status" ? (
+                <button type="button" onClick={() => setUpdateStartupNotice(null)}>Dismiss</button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         {updateNotice ? (
-          <div className="vfl-update-banner" role="status" aria-live="polite" aria-atomic="true" aria-busy={updateBusy}>
+          <div className="vfl-update-banner" aria-busy={updateBusy}>
             <div className="vfl-update-copy">
               <div className="vfl-update-kicker">Update available</div>
               <div className="vfl-update-title">
                 Video For Lazies {updateNotice.latestVersion}
                 {updateNotice.artifact?.sizeBytes ? ` (${(updateNotice.artifact.sizeBytes / (1024 * 1024)).toFixed(1)} MB)` : ""}
               </div>
-              <div className="vfl-update-summary">{updateStatus ?? updateNotice.notes?.summary ?? "A new portable release is ready."}</div>
+              <div
+                className="vfl-update-summary"
+                role={updatePublicError ? "alert" : "status"}
+                aria-live={updatePublicError ? "assertive" : "polite"}
+                aria-atomic="true"
+              >
+                {updateStatus ?? updateNotice.notes?.summary ?? "A new portable release is ready."}
+              </div>
+              {updateBusy ? (
+                <div
+                  className="vfl-progress"
+                  role="progressbar"
+                  aria-label="Update progress"
+                  aria-valuemin={updateProgressUi.determinate ? 0 : undefined}
+                  aria-valuemax={updateProgressUi.determinate ? 100 : undefined}
+                  aria-valuenow={updateProgressUi.percent ?? undefined}
+                  aria-valuetext={updateProgressUi.valueText}
+                >
+                  <div className="vfl-progress-meta">
+                    <span>{updateProgressUi.label}</span>
+                    {updateProgressUi.percent !== null ? <span>{updateProgressUi.percent}%</span> : null}
+                  </div>
+                  {updateProgressUi.percent !== null ? (
+                    <div className="vfl-progress-bar">
+                      <div className="vfl-progress-fill" style={{ width: `${updateProgressUi.percent}%` }} />
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
             <div className="vfl-update-actions">
               <button className="primary" onClick={() => void applyUpdate()} disabled={updateBusy || encodeBusy}>
-                {updateBusy ? "Updating..." : "Update now"}
+                {updateBusy ? "Updating..." : updatePublicError ? "Retry update" : "Update now"}
               </button>
+              {updatePublicError ? (
+                <button type="button" onClick={() => void openExternalUrl(APP_LINKS.releases)} disabled={updateBusy}>
+                  Download portable release
+                </button>
+              ) : null}
               <button onClick={() => void dismissUpdate("remindLater")} disabled={updateBusy}>
                 Remind me later
               </button>
@@ -7117,6 +8041,7 @@ function App() {
                           onChange={setCropRect}
                           aspect={aspect}
                           frameAspectRatio={probe.width / probe.height}
+                          rotationDeg={rotateDeg}
                           cropEnabled={cropEnabled}
                           disabled={encodeBusy}
                           colorFilter={previewColorFilter}
@@ -8205,7 +9130,9 @@ function App() {
                             : advancedFrameRateCapRequest === null
                               ? "Auto keeps the source frame rate."
                               : frameRateCapApplies
-                                ? `Frames above ${advancedFrameRateCapRequest} fps will be reduced.`
+                                ? frameRatePlan.postSpeedFps !== null
+                                  ? `Effective post-speed rate is about ${frameRatePlan.postSpeedFps.toFixed(1)} fps; frames above ${advancedFrameRateCapRequest} fps will be reduced.`
+                                  : `Frames above ${advancedFrameRateCapRequest} fps will be reduced.`
                                 : "Source is already at or below the cap."}
                         </div>
                       </div>
@@ -8628,7 +9555,11 @@ function App() {
                   ) : null}
                   <div className="vfl-plan-actions">
                     <div className="vfl-actions vfl-actions-secondary">
-                      <button data-smoke-id="reset-all-settings" onClick={resetAllSettings} disabled={encodeBusy}>
+                      <button
+                        data-smoke-id="reset-all-settings"
+                        onClick={() => setResetConfirmationOpen(true)}
+                        disabled={encodeBusy || updateBusy}
+                      >
                         Reset all settings
                       </button>
                     </div>
@@ -8839,26 +9770,41 @@ function App() {
           </div>
           <div className="vfl-footer-actions">
             {lastExport ? (
-              <button onClick={() => void openOutputFile(lastExport.outputPath)} disabled={encodeBusy}>
+              <button key="open-export" onClick={() => void openOutputFile(lastExport.outputPath)} disabled={encodeBusy}>
                 {lastExportIsCurrentOutcome ? "Open file" : "Open previous file"}
               </button>
             ) : null}
-            <button onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || encodeBusy}>
+            <button key="open-output-folder" onClick={openOutputFolder} disabled={(!outputPath && !inputPath) || encodeBusy}>
               Open folder
             </button>
-            {latestAttempt.kind === "starting" ? (
-              <button className="primary vfl-export-button" disabled>
-                Starting…
+            {jobId !== null ? (
+              <button
+                key="cancel-export"
+                className="danger vfl-cancel-export-button"
+                data-smoke-id="cancel-export"
+                onClick={() => void cancelEncode()}
+                disabled={latestAttempt.kind === "cancelling"}
+              >
+                {latestAttempt.kind === "cancelling"
+                  ? "Cancellation requested"
+                  : exportQueueState.active !== null
+                    ? "Cancel current and stop queue"
+                    : "Cancel export"}
               </button>
-            ) : jobId !== null ? (
-              <button className="danger vfl-export-button" onClick={cancelEncode}>
-                Cancel
-              </button>
-            ) : (
-              <button className="primary vfl-export-button" onClick={() => void startEncode()} disabled={!exportReady || encodeBusy}>
-                Export
-              </button>
-            )}
+            ) : null}
+            <button
+              key="export"
+              className="primary vfl-export-button"
+              data-smoke-id="export"
+              onClick={() => void startEncode()}
+              disabled={!exportReady || encodeBusy}
+            >
+              {latestAttempt.kind === "starting"
+                ? "Starting…"
+                : jobId !== null
+                  ? latestAttempt.kind === "cancelling" ? "Cancelling…" : "Exporting…"
+                  : "Export"}
+            </button>
           </div>
         </div>
         {activeQueuePosition && exportQueue.length ? (
@@ -8866,27 +9812,28 @@ function App() {
             Queue: item {activeQueuePosition} of {exportQueue.length}
           </div>
         ) : null}
-        {jobId !== null ? (
-          <div
-            className="vfl-progress"
-            role="progressbar"
-            aria-label="Encoding progress"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={progressUi.percent}
-          >
-            <div className="vfl-progress-meta">
-              <span>{progressUi.label}</span>
-              <span>{progressUi.percent}%</span>
-            </div>
-            <div className="vfl-progress-bar">
-              <div
-                className={`vfl-progress-fill ${progressUi.isFinalizing ? "is-finalizing" : ""}`}
-                style={{ width: `${progressUi.percent}%` }}
-              />
-            </div>
+        <div
+          data-smoke-id="encode-progress"
+          className={`vfl-progress ${jobId === null ? "is-placeholder" : ""}`}
+          role={jobId !== null ? "progressbar" : undefined}
+          aria-label={jobId !== null ? "Encoding progress" : undefined}
+          aria-valuemin={jobId !== null ? 0 : undefined}
+          aria-valuemax={jobId !== null ? 100 : undefined}
+          aria-valuenow={jobId !== null ? progressUi.percent : undefined}
+          aria-valuetext={jobId !== null ? progressUi.valueText : undefined}
+          aria-hidden={jobId === null ? "true" : undefined}
+        >
+          <div className="vfl-progress-meta">
+            <span>{progressUi.label}</span>
+            <span>{progressUi.percent}%</span>
           </div>
-        ) : null}
+          <div className="vfl-progress-bar">
+            <div
+              className={`vfl-progress-fill ${progressUi.isFinalizing ? "is-finalizing" : ""}`}
+              style={{ width: `${progressUi.percent}%` }}
+            />
+          </div>
+        </div>
       </footer>
     </div>
   );

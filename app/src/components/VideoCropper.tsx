@@ -1,5 +1,12 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import { pixelAspectToNormalizedRatio } from "../lib/accessibility";
+import {
+  displayPointToSourcePoint,
+  normalizeQuarterTurn,
+  quarterTurnSwapsAxes,
+  rotatedAspectRatio,
+  sourceRectToDisplayRect,
+} from "../lib/previewGeometry";
 
 export type NormalizedRect = { x: number; y: number; w: number; h: number };
 export type VideoCropperHandle = {
@@ -209,6 +216,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   onChange: (r: NormalizedRect) => void;
   aspect: AspectMode;
   frameAspectRatio?: number;
+  rotationDeg?: number;
   cropEnabled: boolean;
   disabled?: boolean;
   colorFilter?: string | null;
@@ -221,6 +229,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   onChange,
   aspect,
   frameAspectRatio,
+  rotationDeg = 0,
   cropEnabled,
   disabled,
   colorFilter,
@@ -235,6 +244,8 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   const [cursor, setCursor] = useState("default");
 
   const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const normalizedRotation = normalizeQuarterTurn(rotationDeg);
+  const rotationSwapsAxes = quarterTurnSwapsAxes(normalizedRotation);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -248,26 +259,59 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   }, []);
 
   const content = useMemo(
-    () => getContentRectPx(containerSize.w, containerSize.h, videoSize.w, videoSize.h),
-    [containerSize, videoSize],
+    () => getContentRectPx(
+      containerSize.w,
+      containerSize.h,
+      rotationSwapsAxes ? videoSize.h : videoSize.w,
+      rotationSwapsAxes ? videoSize.w : videoSize.h,
+    ),
+    [containerSize, rotationSwapsAxes, videoSize],
   );
 
   const normalizedAspectRatio = useMemo(
     () =>
       aspect.locked && aspect.ratio
-        ? pixelAspectToNormalizedRatio(aspect.ratio, content.width, content.height)
+        ? pixelAspectToNormalizedRatio(aspect.ratio, videoSize.w, videoSize.h)
         : null,
-    [aspect.locked, aspect.ratio, content.height, content.width],
+    [aspect.locked, aspect.ratio, videoSize.h, videoSize.w],
   );
 
   const rectPx = useMemo(() => {
+    const displayRect = sourceRectToDisplayRect(rect, normalizedRotation);
     return {
-      left: content.x + rect.x * content.width,
-      top: content.y + rect.y * content.height,
-      width: rect.w * content.width,
-      height: rect.h * content.height,
+      left: content.x + displayRect.x * content.width,
+      top: content.y + displayRect.y * content.height,
+      width: displayRect.w * content.width,
+      height: displayRect.h * content.height,
     };
-  }, [content, rect]);
+  }, [content, normalizedRotation, rect]);
+
+  const videoSurfaceStyle = useMemo(() => ({
+    left: content.x + content.width / 2,
+    top: content.y + content.height / 2,
+    width: rotationSwapsAxes ? content.height : content.width,
+    height: rotationSwapsAxes ? content.width : content.height,
+    transform: `translate(-50%, -50%) rotate(${normalizedRotation}deg)`,
+  }), [content, normalizedRotation, rotationSwapsAxes]);
+
+  function pointerToSource(clientX: number, clientY: number, container: DOMRect) {
+    return displayPointToSourcePoint(
+      toNorm(clientX, clientY, container, content),
+      normalizedRotation,
+    );
+  }
+
+  function pointerThresholds() {
+    return rotationSwapsAxes
+      ? {
+          x: 12 / Math.max(1, content.height),
+          y: 12 / Math.max(1, content.width),
+        }
+      : {
+          x: 12 / Math.max(1, content.width),
+          y: 12 / Math.max(1, content.height),
+        };
+  }
 
   function setRect(next: NormalizedRect) {
     onChange(fitToBounds(minSizedRect(next, 0.03)));
@@ -276,11 +320,13 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   const cropInteractive = cropEnabled && !disabled;
 
   function cursorForCorner(corner: "nw" | "ne" | "sw" | "se") {
-    return corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize";
+    const sourceNwSe = corner === "nw" || corner === "se";
+    return sourceNwSe !== rotationSwapsAxes ? "nwse-resize" : "nesw-resize";
   }
 
   function cursorForEdge(edge: "n" | "s" | "e" | "w") {
-    return edge === "n" || edge === "s" ? "ns-resize" : "ew-resize";
+    const sourceVertical = edge === "n" || edge === "s";
+    return sourceVertical !== rotationSwapsAxes ? "ns-resize" : "ew-resize";
   }
 
   function onPointerDown(e: PointerEvent<HTMLDivElement>) {
@@ -288,10 +334,11 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     const containerEl = containerRef.current;
     if (!containerEl) return;
     const container = containerEl.getBoundingClientRect();
-    const p = toNorm(e.clientX, e.clientY, container, content);
+    const p = pointerToSource(e.clientX, e.clientY, container);
 
-    const thresholdX = 12 / Math.max(1, content.width);
-    const thresholdY = 12 / Math.max(1, content.height);
+    const thresholds = pointerThresholds();
+    const thresholdX = thresholds.x;
+    const thresholdY = thresholds.y;
     const corner = cornerFromPoint(p.x, p.y, rect, thresholdX, thresholdY);
 
     if (corner) {
@@ -332,11 +379,12 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     const containerEl = containerRef.current;
     if (!containerEl) return;
     const container = containerEl.getBoundingClientRect();
-    const p = toNorm(e.clientX, e.clientY, container, content);
+    const p = pointerToSource(e.clientX, e.clientY, container);
 
     if (mode.kind === "none") {
-      const thresholdX = 12 / Math.max(1, content.width);
-      const thresholdY = 12 / Math.max(1, content.height);
+      const thresholds = pointerThresholds();
+      const thresholdX = thresholds.x;
+      const thresholdY = thresholds.y;
       const corner = cornerFromPoint(p.x, p.y, rect, thresholdX, thresholdY);
       if (corner) {
         setCursor(cursorForCorner(corner));
@@ -586,8 +634,11 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     } as const;
   };
 
-  const safeFrameAspectRatio =
+  const sourceFrameAspectRatio =
     Number.isFinite(frameAspectRatio) && frameAspectRatio && frameAspectRatio > 0 ? frameAspectRatio : undefined;
+  const safeFrameAspectRatio = sourceFrameAspectRatio
+    ? rotatedAspectRatio(sourceFrameAspectRatio, 1, normalizedRotation) ?? sourceFrameAspectRatio
+    : undefined;
 
   return (
     <div
@@ -602,15 +653,17 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
       }
     >
       <div className="vfl-cropper-stage" ref={containerRef}>
-        <video
-          className="vfl-video"
-          ref={videoRef}
-          src={src}
-          aria-label="Video preview"
-          style={colorFilter ? { filter: colorFilter } : undefined}
-          preload="auto"
-          playsInline
-        />
+        <div className="vfl-video-surface" style={videoSurfaceStyle}>
+          <video
+            className="vfl-video"
+            ref={videoRef}
+            src={src}
+            aria-label={`Video preview, rotated ${normalizedRotation} degrees`}
+            style={colorFilter ? { filter: colorFilter } : undefined}
+            preload="auto"
+            playsInline
+          />
+        </div>
         {cropEnabled ? (
           <div
             className="vfl-overlay"

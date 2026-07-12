@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,15 @@ const CROP_DETECT_TIMEOUT: Duration = Duration::from_secs(60);
 const FRAME_EXTRACT_TIMEOUT: Duration = Duration::from_secs(45);
 const ENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const ENCODE_INITIAL_BUFFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+// Pinned FFmpeg n8.1.2 emits progress=end only after av_write_trailer and file
+// close. Local characterization put 91.5 MB +faststart copy/reencode tails at
+// 3.6-16.1 ms, but portable folders can live on much slower disks. Once media
+// time reaches the final 0.5%, use a distinct generous bound instead of the
+// ordinary 120-second progress-idle limit.
+const ENCODE_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const FINALIZATION_TAIL_PERMILLE: u64 = 995;
+const FINALIZATION_TAIL_MAX_US: u64 = 5_000_000;
+const FINALIZATION_ESTIMATED_WALL_MAX: Duration = Duration::from_secs(5);
 const SIZE_COPY_MONITOR_HEADROOM_BYTES: u64 = 1024 * 1024;
 const FFMPEG_SIDECAR_DIR: &str = "ffmpeg-sidecar";
 const EXTERNAL_SUBTITLE_FILE_NAME: &str = "vfl_external.srt";
@@ -469,10 +478,21 @@ pub struct EncodeRequest {
 pub struct EncodeProgressPayload {
     pub attempt_id: u64,
     pub job_id: u64,
+    pub phase: EncodeProgressPhase,
+    pub step_index: u8,
+    pub step_count: u8,
     pub pass: u8,
     pub total_passes: u8,
     pub pass_pct: f64,
     pub overall_pct: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EncodeProgressPhase {
+    Copying,
+    Encoding,
+    Finalizing,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1275,7 +1295,16 @@ struct ReverseBufferEstimate {
 struct FfmpegRunLimits {
     initial_progress_timeout: Duration,
     idle_timeout: Duration,
+    finalization_timeout: Duration,
     output_size_limit: Option<(PathBuf, u64)>,
+    output_activity_path: Option<PathBuf>,
+}
+
+impl FfmpegRunLimits {
+    fn with_output_activity(mut self, output_path: &Path) -> Self {
+        self.output_activity_path = Some(output_path.to_path_buf());
+        self
+    }
 }
 
 fn ffmpeg_run_limits(reverse: bool) -> FfmpegRunLimits {
@@ -1286,12 +1315,166 @@ fn ffmpeg_run_limits(reverse: bool) -> FfmpegRunLimits {
             ENCODE_IDLE_TIMEOUT
         },
         idle_timeout: ENCODE_IDLE_TIMEOUT,
+        finalization_timeout: ENCODE_FINALIZATION_TIMEOUT,
         output_size_limit: None,
+        output_activity_path: None,
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncodeProgressStep {
+    phase: EncodeProgressPhase,
+    step_index: u8,
+    step_count: u8,
+    pass: u8,
+    total_passes: u8,
+}
+
+impl EncodeProgressStep {
+    fn new(
+        phase: EncodeProgressPhase,
+        step_index: u8,
+        step_count: u8,
+        pass: u8,
+        total_passes: u8,
+    ) -> Self {
+        debug_assert!(step_index > 0 && step_index <= step_count);
+        debug_assert!(pass > 0 && pass <= total_passes);
+        Self {
+            phase,
+            step_index: step_index.max(1),
+            step_count: step_count.max(1),
+            pass: pass.max(1),
+            total_passes: total_passes.max(1),
+        }
+    }
+
+    fn single(phase: EncodeProgressPhase) -> Self {
+        Self::new(phase, 1, 1, 1, 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum FfmpegWatchdogPhase {
+    WaitingForInitial = 0,
+    Running = 1,
+    Finalizing = 2,
+}
+
+impl FfmpegWatchdogPhase {
+    fn from_atomic(value: u8) -> Self {
+        match value {
+            1 => Self::Running,
+            2 => Self::Finalizing,
+            _ => Self::WaitingForInitial,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfmpegWatchdogDecision {
+    Continue,
+    EnterFinalization,
+    InitialTimeout,
+    IdleTimeout,
+    FinalizationTimeout,
+}
+
+fn promote_watchdog_timeout_for_file_activity(
+    decision: FfmpegWatchdogDecision,
+    file_activity_seen: bool,
+) -> FfmpegWatchdogDecision {
+    if file_activity_seen
+        && matches!(
+            decision,
+            FfmpegWatchdogDecision::InitialTimeout | FfmpegWatchdogDecision::IdleTimeout
+        )
+    {
+        FfmpegWatchdogDecision::EnterFinalization
+    } else {
+        decision
+    }
+}
+
+fn ffmpeg_watchdog_decision(
+    phase: FfmpegWatchdogPhase,
+    process_elapsed: Duration,
+    output_idle: Duration,
+    finalizing_elapsed: Option<Duration>,
+    limits: &FfmpegRunLimits,
+) -> FfmpegWatchdogDecision {
+    match phase {
+        FfmpegWatchdogPhase::WaitingForInitial => {
+            if process_elapsed >= limits.initial_progress_timeout {
+                FfmpegWatchdogDecision::InitialTimeout
+            } else {
+                FfmpegWatchdogDecision::Continue
+            }
+        }
+        FfmpegWatchdogPhase::Running => {
+            if output_idle >= limits.idle_timeout {
+                FfmpegWatchdogDecision::IdleTimeout
+            } else {
+                FfmpegWatchdogDecision::Continue
+            }
+        }
+        FfmpegWatchdogPhase::Finalizing => {
+            if finalizing_elapsed.is_some_and(|elapsed| elapsed >= limits.finalization_timeout) {
+                FfmpegWatchdogDecision::FinalizationTimeout
+            } else {
+                FfmpegWatchdogDecision::Continue
+            }
+        }
+    }
+}
+
+fn output_time_is_finalizing(
+    out_time_us: u64,
+    duration_us: u64,
+    process_elapsed: Duration,
+) -> bool {
+    if duration_us == 0 {
+        return false;
+    }
+    let threshold_tail = out_time_us.saturating_mul(1_000)
+        >= duration_us.saturating_mul(FINALIZATION_TAIL_PERMILLE)
+        && duration_us.saturating_sub(out_time_us) <= FINALIZATION_TAIL_MAX_US;
+    if threshold_tail || out_time_us >= duration_us {
+        return true;
+    }
+    if out_time_us == 0 || process_elapsed.is_zero() {
+        return false;
+    }
+
+    // FFmpeg emits periodic progress before writing the trailer, then emits
+    // progress=end only after the trailer and file close. A fast operation can
+    // skip the fixed five-media-second tail entirely. Use its conservative
+    // cumulative media rate to recognize only operations whose remaining
+    // media work is estimated to fit inside the same five-second wall window.
+    // Strictly advancing samples continue to reset the finalization watchdog.
+    let remaining_media_us = duration_us.saturating_sub(out_time_us) as u128;
+    remaining_media_us.saturating_mul(process_elapsed.as_micros())
+        <= (out_time_us as u128).saturating_mul(FINALIZATION_ESTIMATED_WALL_MAX.as_micros())
+}
+
+fn output_file_fingerprint(path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| {
+            modified
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+        })
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Some((metadata.len(), modified_ns))
+}
+
 fn size_copy_run_limits(target_bytes: u64, output_path: &Path) -> FfmpegRunLimits {
-    let mut limits = ffmpeg_run_limits(false);
+    let mut limits = ffmpeg_run_limits(false).with_output_activity(output_path);
     limits.output_size_limit = Some((
         output_path.to_path_buf(),
         target_bytes.saturating_add(SIZE_COPY_MONITOR_HEADROOM_BYTES),
@@ -6212,7 +6395,13 @@ fn parse_cropdetect_from_stderr(stderr: &str, probe: &VideoProbe) -> Option<Crop
     })
 }
 
+const CROP_DETECTION_PUBLIC_ERROR: &str = "Crop detection could not analyze the selected video.";
+
 pub fn detect_crop(path: String) -> Result<Option<Crop>, String> {
+    detect_crop_inner(path).map_err(|_| CROP_DETECTION_PUBLIC_ERROR.to_string())
+}
+
+fn detect_crop_inner(path: String) -> Result<Option<Crop>, String> {
     let input_path = PathBuf::from(path.trim());
     if !input_path.exists() {
         return Err(format!("File not found: {}", input_path.display()));
@@ -6720,49 +6909,148 @@ fn parse_out_time_us(line: &str) -> Option<u64> {
     }
 }
 
+fn encode_progress_fractions(
+    progress: EncodeProgressStep,
+    out_time_us: u64,
+    duration_us: u64,
+) -> Option<(f64, f64)> {
+    if duration_us == 0 {
+        return None;
+    }
+    let pass_pct = (out_time_us as f64 / duration_us as f64).clamp(0.0, 1.0);
+    let overall_pct = (((progress.step_index.saturating_sub(1)) as f64) + pass_pct)
+        / (progress.step_count as f64);
+    Some((pass_pct, overall_pct))
+}
+
 fn emit_progress(
-    window: &Window,
+    window: Option<&Window>,
     attempt_id: u64,
     job_id: u64,
-    pass: u8,
-    total_passes: u8,
+    progress: EncodeProgressStep,
+    phase: EncodeProgressPhase,
     out_time_us: u64,
     duration_us: u64,
 ) {
-    if duration_us == 0 {
-        return;
+    if let Some(payload) = encode_progress_payload(
+        attempt_id,
+        job_id,
+        progress,
+        phase,
+        out_time_us,
+        duration_us,
+    ) {
+        emit_progress_payload(window, payload);
     }
-    let pass_pct = (out_time_us as f64 / duration_us as f64).clamp(0.0, 1.0);
-    let overall_pct = if total_passes <= 1 {
-        pass_pct
-    } else {
-        (((pass.saturating_sub(1)) as f64) + pass_pct) / (total_passes as f64)
-    };
+}
 
+fn emit_progress_payload(window: Option<&Window>, payload: EncodeProgressPayload) {
+    if let Some(window) = window {
+        let _ = window.emit("encode-progress", payload);
+    }
+}
+
+fn encode_progress_payload(
+    attempt_id: u64,
+    job_id: u64,
+    progress: EncodeProgressStep,
+    phase: EncodeProgressPhase,
+    out_time_us: u64,
+    duration_us: u64,
+) -> Option<EncodeProgressPayload> {
+    let (pass_pct, overall_pct) = encode_progress_fractions(progress, out_time_us, duration_us)?;
+    Some(EncodeProgressPayload {
+        attempt_id,
+        job_id,
+        phase,
+        step_index: progress.step_index,
+        step_count: progress.step_count,
+        pass: progress.pass,
+        total_passes: progress.total_passes,
+        pass_pct,
+        overall_pct,
+    })
+}
+
+fn invocation_tail_payload(
+    attempt_id: u64,
+    job_id: u64,
+    progress: EncodeProgressStep,
+    duration_us: u64,
+    user_finalization_is_terminal: bool,
+) -> Option<EncodeProgressPayload> {
+    encode_progress_payload(
+        attempt_id,
+        job_id,
+        progress,
+        if user_finalization_is_terminal {
+            EncodeProgressPhase::Finalizing
+        } else {
+            progress.phase
+        },
+        duration_us,
+        duration_us,
+    )
+}
+
+fn should_emit_periodic_active_progress(
+    finalizing_now: bool,
+    tail_already_emitted: bool,
+    since_last_emit: Duration,
+) -> bool {
+    !finalizing_now && !tail_already_emitted && since_last_emit >= PROGRESS_EMIT_EVERY
+}
+
+fn operation_finalization_payload(attempt_id: u64, job_id: u64) -> EncodeProgressPayload {
+    EncodeProgressPayload {
+        attempt_id,
+        job_id,
+        phase: EncodeProgressPhase::Finalizing,
+        step_index: 1,
+        step_count: 1,
+        pass: 1,
+        total_passes: 1,
+        pass_pct: 1.0,
+        overall_pct: 1.0,
+    }
+}
+
+fn emit_operation_finalization(window: &Window, attempt_id: u64, job_id: u64) {
     let _ = window.emit(
         "encode-progress",
-        EncodeProgressPayload {
-            attempt_id,
-            job_id,
-            pass,
-            total_passes,
-            pass_pct,
-            overall_pct,
-        },
+        operation_finalization_payload(attempt_id, job_id),
     );
+}
+
+fn publish_child_with_cancel_latch<T>(
+    child_slot: &Mutex<Option<T>>,
+    child: T,
+    cancel: &AtomicBool,
+    cancel_child: impl FnOnce(&mut T),
+) -> Result<(), String> {
+    let mut guard = child_slot
+        .lock()
+        .map_err(|_| "Internal error (child lock poisoned).".to_string())?;
+    *guard = Some(child);
+    if cancel.load(Ordering::Relaxed)
+        && let Some(child) = guard.as_mut()
+    {
+        cancel_child(child);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_with_progress(
-    window: &Window,
+    window: Option<&Window>,
     attempt_id: u64,
     job_id: u64,
     ffmpeg_bin: &str,
     args: &[String],
     working_dir: Option<&Path>,
-    pass: u8,
-    total_passes: u8,
+    progress: EncodeProgressStep,
     duration_us: u64,
+    user_finalization_is_terminal: bool,
     limits: FfmpegRunLimits,
     cancel: &AtomicBool,
     child_slot: &Arc<Mutex<Option<Child>>>,
@@ -6793,12 +7081,9 @@ fn run_ffmpeg_with_progress(
         .take()
         .ok_or_else(|| "Failed to capture ffmpeg error output.".to_string())?;
 
-    {
-        let mut guard = child_slot
-            .lock()
-            .map_err(|_| "Internal error (child lock poisoned).".to_string())?;
-        *guard = Some(child);
-    }
+    publish_child_with_cancel_latch(child_slot, child, cancel, |child| {
+        let _ = child.kill();
+    })?;
 
     let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_tail_thread = stderr_tail.clone();
@@ -6823,17 +7108,22 @@ fn run_ffmpeg_with_progress(
 
     let process_done = Arc::new(AtomicBool::new(false));
     let watchdog_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let saw_progress_output = Arc::new(AtomicBool::new(false));
-    let last_output_at = Arc::new(Mutex::new(Instant::now()));
+    let watchdog_phase = Arc::new(AtomicU8::new(FfmpegWatchdogPhase::WaitingForInitial as u8));
+    let last_media_advance_at = Arc::new(Mutex::new(Instant::now()));
+    let finalization_started_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let process_started_at = Instant::now();
     let watchdog_child_slot = child_slot.clone();
     let watchdog_done = process_done.clone();
     let watchdog_error_thread = watchdog_error.clone();
-    let watchdog_saw_progress = saw_progress_output.clone();
-    let watchdog_last_output = last_output_at.clone();
+    let watchdog_phase_thread = watchdog_phase.clone();
+    let watchdog_last_media_advance = last_media_advance_at.clone();
+    let watchdog_finalization_started = finalization_started_at.clone();
     let watchdog_thread = std::thread::spawn(move || {
+        let mut output_fingerprint = None;
+        let mut last_file_activity_at: Option<Instant> = None;
         while !watchdog_done.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(50));
+            let now = Instant::now();
             let output_size_error = limits.output_size_limit.as_ref().and_then(
                 |(output_path, max_bytes)| {
                     fs::metadata(output_path)
@@ -6848,25 +7138,65 @@ fn run_ffmpeg_with_progress(
                         })
                 },
             );
-            let timeout_error = if watchdog_saw_progress.load(Ordering::Relaxed) {
-                let idle_for = watchdog_last_output
-                    .lock()
-                    .ok()
-                    .map(|last_output| last_output.elapsed())
-                    .unwrap_or_default();
-                (idle_for >= limits.idle_timeout).then(|| {
-                    format!(
-                        "ffmpeg made no progress for {} seconds and was stopped.",
-                        limits.idle_timeout.as_secs()
-                    )
-                })
-            } else {
-                (process_started_at.elapsed() >= limits.initial_progress_timeout).then(|| {
-                    format!(
-                        "ffmpeg produced no initial progress for {} seconds and was stopped.",
-                        limits.initial_progress_timeout.as_secs()
-                    )
-                })
+            let phase =
+                FfmpegWatchdogPhase::from_atomic(watchdog_phase_thread.load(Ordering::Relaxed));
+            if let Some(output_path) = limits.output_activity_path.as_deref()
+                && let Some(next_fingerprint) = output_file_fingerprint(output_path)
+            {
+                let changed = output_fingerprint
+                    .is_some_and(|previous| previous != next_fingerprint)
+                    || output_fingerprint.is_none() && next_fingerprint.0 > 0;
+                output_fingerprint = Some(next_fingerprint);
+                if changed {
+                    last_file_activity_at = Some(now);
+                    if phase == FfmpegWatchdogPhase::Finalizing
+                        && let Ok(mut started) = watchdog_finalization_started.lock()
+                    {
+                        *started = Some(now);
+                    }
+                }
+            }
+            let idle_for = watchdog_last_media_advance
+                .lock()
+                .ok()
+                .map(|last_advance| last_advance.elapsed())
+                .unwrap_or_default();
+            let finalizing_for = watchdog_finalization_started
+                .lock()
+                .ok()
+                .and_then(|started| started.map(|started| started.elapsed()));
+            let decision = promote_watchdog_timeout_for_file_activity(
+                ffmpeg_watchdog_decision(
+                    phase,
+                    process_started_at.elapsed(),
+                    idle_for,
+                    finalizing_for,
+                    &limits,
+                ),
+                last_file_activity_at.is_some(),
+            );
+            let timeout_error = match decision {
+                FfmpegWatchdogDecision::Continue => None,
+                FfmpegWatchdogDecision::EnterFinalization => {
+                    watchdog_phase_thread
+                        .store(FfmpegWatchdogPhase::Finalizing as u8, Ordering::Relaxed);
+                    if let Ok(mut started) = watchdog_finalization_started.lock() {
+                        *started = last_file_activity_at.or(Some(now));
+                    }
+                    None
+                }
+                FfmpegWatchdogDecision::InitialTimeout => Some(format!(
+                    "ffmpeg produced no initial progress for {} seconds and was stopped.",
+                    limits.initial_progress_timeout.as_secs()
+                )),
+                FfmpegWatchdogDecision::IdleTimeout => Some(format!(
+                    "ffmpeg made no progress for {} seconds and was stopped.",
+                    limits.idle_timeout.as_secs()
+                )),
+                FfmpegWatchdogDecision::FinalizationTimeout => Some(format!(
+                    "ffmpeg did not finish finalizing within {} seconds and was stopped.",
+                    limits.finalization_timeout.as_secs()
+                )),
             };
             if let Some(error) = output_size_error.or(timeout_error) {
                 if let Ok(mut slot) = watchdog_error_thread.lock() {
@@ -6882,7 +7212,20 @@ fn run_ffmpeg_with_progress(
         }
     });
 
-    let mut last_emit = Instant::now() - PROGRESS_EMIT_EVERY;
+    // Always expose the active phase, even when a small stream-copy operation
+    // reaches its first timestamp only after entering the final media tail.
+    emit_progress(
+        window,
+        attempt_id,
+        job_id,
+        progress,
+        progress.phase,
+        0,
+        duration_us,
+    );
+    let mut last_emit = Instant::now();
+    let mut finalizing_emitted = false;
+    let mut last_out_time_us: Option<u64> = None;
     let reader = BufReader::new(stdout);
     let mut read_error: Option<String> = None;
 
@@ -6908,30 +7251,101 @@ fn run_ffmpeg_with_progress(
                 break;
             }
         };
-        if let Ok(mut last_output) = last_output_at.lock() {
-            *last_output = Instant::now();
-        }
-        saw_progress_output.store(true, Ordering::Relaxed);
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        let now = Instant::now();
 
         if let Some(out_time_us) = parse_out_time_us(line) {
-            let now = Instant::now();
-            if now.duration_since(last_emit) >= PROGRESS_EMIT_EVERY {
+            let media_advanced = last_out_time_us
+                .map(|last| out_time_us > last)
+                .unwrap_or(out_time_us > 0);
+            if media_advanced {
+                last_out_time_us = Some(out_time_us);
+                if let Ok(mut last_advance) = last_media_advance_at.lock() {
+                    *last_advance = now;
+                }
+                let _ = watchdog_phase.compare_exchange(
+                    FfmpegWatchdogPhase::WaitingForInitial as u8,
+                    FfmpegWatchdogPhase::Running as u8,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            } else if last_out_time_us.is_none() {
+                last_out_time_us = Some(out_time_us);
+            }
+            let finalizing = output_time_is_finalizing(
+                out_time_us,
+                duration_us,
+                now.duration_since(process_started_at),
+            );
+            if finalizing {
+                let entered_finalization = watchdog_phase
+                    .swap(FfmpegWatchdogPhase::Finalizing as u8, Ordering::Relaxed)
+                    != FfmpegWatchdogPhase::Finalizing as u8;
+                if (entered_finalization || media_advanced)
+                    && let Ok(mut started) = finalization_started_at.lock()
+                {
+                    *started = Some(now);
+                }
+            } else if media_advanced
+                && FfmpegWatchdogPhase::from_atomic(watchdog_phase.load(Ordering::Relaxed))
+                    == FfmpegWatchdogPhase::Finalizing
+                && let Ok(mut started) = finalization_started_at.lock()
+            {
+                *started = Some(now);
+            }
+            if finalizing && !finalizing_emitted {
+                finalizing_emitted = true;
+                last_emit = now;
+                if let Some(payload) = invocation_tail_payload(
+                    attempt_id,
+                    job_id,
+                    progress,
+                    duration_us,
+                    user_finalization_is_terminal,
+                ) {
+                    emit_progress_payload(window, payload);
+                }
+            } else if should_emit_periodic_active_progress(
+                finalizing,
+                finalizing_emitted,
+                now.duration_since(last_emit),
+            ) {
                 last_emit = now;
                 emit_progress(
                     window,
                     attempt_id,
                     job_id,
-                    pass,
-                    total_passes,
+                    progress,
+                    progress.phase,
                     out_time_us,
                     duration_us,
                 );
             }
             continue;
+        }
+
+        if line == "progress=end" {
+            if watchdog_phase.swap(FfmpegWatchdogPhase::Finalizing as u8, Ordering::Relaxed)
+                != FfmpegWatchdogPhase::Finalizing as u8
+                && let Ok(mut started) = finalization_started_at.lock()
+            {
+                *started = Some(now);
+            }
+            if !finalizing_emitted {
+                finalizing_emitted = true;
+                if let Some(payload) = invocation_tail_payload(
+                    attempt_id,
+                    job_id,
+                    progress,
+                    duration_us,
+                    user_finalization_is_terminal,
+                ) {
+                    emit_progress_payload(window, payload);
+                }
+            }
         }
     }
 
@@ -6978,15 +7392,17 @@ fn run_ffmpeg_with_progress(
         ));
     }
 
-    emit_progress(
-        window,
-        attempt_id,
-        job_id,
-        pass,
-        total_passes,
-        duration_us,
-        duration_us,
-    );
+    if !finalizing_emitted
+        && let Some(payload) = invocation_tail_payload(
+            attempt_id,
+            job_id,
+            progress,
+            duration_us,
+            user_finalization_is_terminal,
+        )
+    {
+        emit_progress_payload(window, payload);
+    }
     Ok(())
 }
 
@@ -7629,16 +8045,16 @@ fn run_fast_trim_job(
         ffmpeg_command_preview(&args, &[(input_str, "<input>"), (&temp_str, "<output>")]);
 
     run_ffmpeg_with_progress(
-        window,
+        Some(window),
         attempt_id,
         job_id,
         ffmpeg_bin,
         &args,
         None,
-        1,
-        1,
+        EncodeProgressStep::single(EncodeProgressPhase::Copying),
         duration_us,
-        ffmpeg_run_limits(false),
+        true,
+        ffmpeg_run_limits(false).with_output_activity(&temp_path),
         cancel.as_ref(),
         child_slot,
     )
@@ -7716,6 +8132,7 @@ fn run_fast_trim_job(
         trim_ffmpeg_invocations: Some(1),
         command_preview,
     };
+    emit_operation_finalization(window, attempt_id, job_id);
     publish_output_file(temp_path, output_path)?;
     Ok(EncodeFinishedPayload {
         attempt_id,
@@ -7915,16 +8332,16 @@ pub fn run_encode_job(
             ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
         run_ffmpeg_with_progress(
-            window,
+            Some(window),
             attempt_id,
             job_id,
             &ffmpeg_bin,
             &args,
             subtitle_working_dir,
-            1,
-            1,
+            EncodeProgressStep::single(EncodeProgressPhase::Encoding),
             duration_us,
-            ffmpeg_run_limits(request.reverse),
+            true,
+            ffmpeg_run_limits(request.reverse).with_output_activity(&temp_path),
             cancel.as_ref(),
             child_slot,
         )?;
@@ -7960,6 +8377,7 @@ pub fn run_encode_job(
         if cancel.load(Ordering::Relaxed) {
             return Err("Canceled.".to_string());
         }
+        emit_operation_finalization(window, attempt_id, job_id);
         publish_output_file(temp_path, &output_path)?;
 
         return Ok(EncodeFinishedPayload {
@@ -8035,6 +8453,19 @@ pub fn run_encode_job(
     let mut size_copy_fallback_reason: Option<String> = None;
     let mut fit_plan_history: Vec<FitPlanResult> = Vec::new();
     let mut best_output: Option<SizeCandidateOutput> = None;
+    let size_copy_progress_steps = if request.strict_fit {
+        0
+    } else {
+        command_plan.size_copy_candidates.len() as u8
+    };
+    let size_reencode_progress_steps = if request.strict_fit {
+        (STRICT_FIT_MAX_PLANS * 2) as u8
+    } else {
+        6
+    };
+    let size_progress_step_count = size_copy_progress_steps
+        .saturating_add(size_reencode_progress_steps)
+        .max(1);
     if !request.strict_fit {
         for (candidate_index, candidate) in command_plan.size_copy_candidates.iter().enumerate() {
             let mut args = build_copy_candidate_args(&input_str, &request, candidate);
@@ -8046,15 +8477,21 @@ pub fn run_encode_job(
                 ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
 
             match run_ffmpeg_with_progress(
-                window,
+                Some(window),
                 attempt_id,
                 job_id,
                 &ffmpeg_bin,
                 &args,
                 subtitle_working_dir,
-                1,
-                1,
+                EncodeProgressStep::new(
+                    EncodeProgressPhase::Copying,
+                    (candidate_index + 1) as u8,
+                    size_progress_step_count,
+                    1,
+                    1,
+                ),
                 duration_us,
+                false,
                 size_copy_run_limits(target_bytes, temp_path.as_ref()),
                 cancel.as_ref(),
                 child_slot,
@@ -8099,6 +8536,7 @@ pub fn run_encode_job(
                             selected_plan_number: plan_number,
                             plans: fit_plan_history.clone(),
                         };
+                        emit_operation_finalization(window, attempt_id, job_id);
                         publish_output_file(temp_path, &output_path)?;
                         return Ok(EncodeFinishedPayload {
                             attempt_id,
@@ -8228,6 +8666,9 @@ pub fn run_encode_job(
         let mut executed_plan = command_plan.clone();
         let mut copy_fallback_reason: Option<String> = None;
         let mut execution_attempts = 0u32;
+        let initial_contains_copy = executed_plan.video_action == StreamAction::Copy
+            || executed_plan.audio_action == StreamAction::Copy;
+        let progress_step_count = if initial_contains_copy { 2 } else { 1 };
 
         loop {
             execution_attempts += 1;
@@ -8245,18 +8686,31 @@ pub fn run_encode_job(
             let temp_str = temp_path.to_string_lossy().to_string();
             let command_preview =
                 ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
+            let progress_phase = if executed_plan.video_action == StreamAction::Encode
+                || executed_plan.audio_action == StreamAction::Encode
+            {
+                EncodeProgressPhase::Encoding
+            } else {
+                EncodeProgressPhase::Copying
+            };
 
             match run_ffmpeg_with_progress(
-                window,
+                Some(window),
                 attempt_id,
                 job_id,
                 &ffmpeg_bin,
                 &args,
                 subtitle_working_dir,
-                1,
-                1,
+                EncodeProgressStep::new(
+                    progress_phase,
+                    execution_attempts as u8,
+                    progress_step_count,
+                    1,
+                    1,
+                ),
                 duration_us,
-                ffmpeg_run_limits(request.reverse),
+                !initial_contains_copy || execution_attempts >= 2,
+                ffmpeg_run_limits(request.reverse).with_output_activity(&temp_path),
                 cancel.as_ref(),
                 child_slot,
             ) {
@@ -8267,6 +8721,7 @@ pub fn run_encode_job(
                     if cancel.load(Ordering::Relaxed) {
                         return Err("Canceled.".to_string());
                     }
+                    emit_operation_finalization(window, attempt_id, job_id);
                     publish_output_file(temp_path, &output_path)?;
                     let selected_audio_bitrate_kbps =
                         (executed_plan.audio_action == StreamAction::Encode).then(|| {
@@ -8416,11 +8871,13 @@ pub fn run_encode_job(
         let passlog_prefix = temp_dir.path().join("ffmpeg2pass");
         let passlog_str = passlog_prefix.to_string_lossy().to_string();
         let plan_number = fit_plan_history.len() as u32 + 1;
-        let (progress_pass_1, progress_pass_2, progress_total) = if request.strict_fit {
+        let (progress_step_1, progress_step_2) = if request.strict_fit {
             let first = ((plan_number - 1) * 2 + 1) as u8;
-            (first, first + 1, (STRICT_FIT_MAX_PLANS * 2) as u8)
+            (first, first + 1)
         } else {
-            (1, 2, 2)
+            let first =
+                size_copy_progress_steps.saturating_add(((reencode_attempt - 1) * 2 + 1) as u8);
+            (first, first + 1)
         };
 
         let mut pass1 = vec![
@@ -8461,15 +8918,21 @@ pub fn run_encode_job(
         pass1.push(null_sink().to_string());
 
         if let Err(error) = run_ffmpeg_with_progress(
-            window,
+            Some(window),
             attempt_id,
             job_id,
             &ffmpeg_bin,
             &pass1,
             subtitle_working_dir,
-            progress_pass_1,
-            progress_total,
+            EncodeProgressStep::new(
+                EncodeProgressPhase::Encoding,
+                progress_step_1,
+                size_progress_step_count,
+                1,
+                2,
+            ),
             duration_us,
+            false,
             ffmpeg_run_limits(active_request.reverse),
             cancel.as_ref(),
             child_slot,
@@ -8575,16 +9038,22 @@ pub fn run_encode_job(
         );
 
         if let Err(error) = run_ffmpeg_with_progress(
-            window,
+            Some(window),
             attempt_id,
             job_id,
             &ffmpeg_bin,
             &pass2,
             subtitle_working_dir,
-            progress_pass_2,
-            progress_total,
+            EncodeProgressStep::new(
+                EncodeProgressPhase::Encoding,
+                progress_step_2,
+                size_progress_step_count,
+                2,
+                2,
+            ),
             duration_us,
-            ffmpeg_run_limits(active_request.reverse),
+            false,
+            ffmpeg_run_limits(active_request.reverse).with_output_activity(&temp_output),
             cancel.as_ref(),
             child_slot,
         ) {
@@ -8868,6 +9337,7 @@ pub fn run_encode_job(
         command_preview: selected.command_preview,
     };
     let output_size_bytes = selected.actual_size_bytes;
+    emit_operation_finalization(window, attempt_id, job_id);
     publish_output_file(selected.temp_output, &output_path)?;
     Ok(EncodeFinishedPayload {
         attempt_id,
@@ -12264,6 +12734,24 @@ Encoders:
         assert!(parse_cropdetect_from_stderr(stderr, &probe).is_none());
     }
 
+    #[test]
+    fn crop_detection_public_error_never_exposes_the_selected_path() {
+        let private_path = std::env::temp_dir().join(format!(
+            "vfl-private-crop-source-{}-{}.mp4",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let private_path_text = private_path.to_string_lossy().to_string();
+        let error = detect_crop(private_path_text.clone()).unwrap_err();
+
+        assert_eq!(error, CROP_DETECTION_PUBLIC_ERROR);
+        assert!(!error.contains(&private_path_text));
+        assert!(!error.contains("vfl-private-crop-source"));
+    }
+
     fn hdr10_probe() -> VideoProbe {
         VideoProbe {
             pixel_format: Some("yuv420p10le".to_string()),
@@ -12830,6 +13318,7 @@ IO... xv36le                  3             36      12-12-12\n",
         let ordinary = ffmpeg_run_limits(false);
         assert_eq!(ordinary.initial_progress_timeout, ENCODE_IDLE_TIMEOUT);
         assert_eq!(ordinary.idle_timeout, ENCODE_IDLE_TIMEOUT);
+        assert_eq!(ordinary.finalization_timeout, ENCODE_FINALIZATION_TIMEOUT);
         let reverse = ffmpeg_run_limits(true);
         assert_eq!(
             reverse.initial_progress_timeout,
@@ -12846,6 +13335,328 @@ IO... xv36le                  3             36      12-12-12\n",
                 1_000_000 + SIZE_COPY_MONITOR_HEADROOM_BYTES
             ))
         );
+    }
+
+    #[test]
+    fn watchdog_phase_uses_distinct_initial_running_and_finalization_bounds() {
+        let limits = ffmpeg_run_limits(false);
+        assert_eq!(
+            ffmpeg_watchdog_decision(
+                FfmpegWatchdogPhase::WaitingForInitial,
+                ENCODE_IDLE_TIMEOUT - Duration::from_millis(1),
+                Duration::ZERO,
+                None,
+                &limits,
+            ),
+            FfmpegWatchdogDecision::Continue
+        );
+        assert_eq!(
+            ffmpeg_watchdog_decision(
+                FfmpegWatchdogPhase::WaitingForInitial,
+                ENCODE_IDLE_TIMEOUT,
+                Duration::ZERO,
+                None,
+                &limits,
+            ),
+            FfmpegWatchdogDecision::InitialTimeout
+        );
+        assert_eq!(
+            ffmpeg_watchdog_decision(
+                FfmpegWatchdogPhase::Running,
+                ENCODE_IDLE_TIMEOUT * 5,
+                ENCODE_IDLE_TIMEOUT,
+                None,
+                &limits,
+            ),
+            FfmpegWatchdogDecision::IdleTimeout
+        );
+        assert_eq!(
+            ffmpeg_watchdog_decision(
+                FfmpegWatchdogPhase::Finalizing,
+                ENCODE_FINALIZATION_TIMEOUT * 2,
+                ENCODE_IDLE_TIMEOUT * 2,
+                Some(ENCODE_FINALIZATION_TIMEOUT - Duration::from_millis(1)),
+                &limits,
+            ),
+            FfmpegWatchdogDecision::Continue
+        );
+        assert_eq!(
+            ffmpeg_watchdog_decision(
+                FfmpegWatchdogPhase::Finalizing,
+                ENCODE_FINALIZATION_TIMEOUT,
+                ENCODE_IDLE_TIMEOUT * 2,
+                Some(ENCODE_FINALIZATION_TIMEOUT),
+                &limits,
+            ),
+            FfmpegWatchdogDecision::FinalizationTimeout
+        );
+        assert_eq!(
+            promote_watchdog_timeout_for_file_activity(
+                FfmpegWatchdogDecision::InitialTimeout,
+                true,
+            ),
+            FfmpegWatchdogDecision::EnterFinalization
+        );
+        assert_eq!(
+            promote_watchdog_timeout_for_file_activity(
+                FfmpegWatchdogDecision::InitialTimeout,
+                false,
+            ),
+            FfmpegWatchdogDecision::InitialTimeout
+        );
+        assert_eq!(
+            promote_watchdog_timeout_for_file_activity(
+                FfmpegWatchdogDecision::FinalizationTimeout,
+                true,
+            ),
+            FfmpegWatchdogDecision::FinalizationTimeout
+        );
+    }
+
+    #[test]
+    fn media_tail_enters_finalization_before_progress_end() {
+        let slow = Duration::from_secs(1_000);
+        assert!(!output_time_is_finalizing(994_999, 1_000_000, slow));
+        assert!(output_time_is_finalizing(995_000, 1_000_000, slow));
+        assert!(output_time_is_finalizing(1_000_000, 1_000_000, slow));
+        assert!(!output_time_is_finalizing(
+            35_820_000_000,
+            36_000_000_000,
+            slow
+        ));
+        assert!(output_time_is_finalizing(
+            35_995_000_000,
+            36_000_000_000,
+            slow
+        ));
+        assert!(!output_time_is_finalizing(1_000_000, 0, slow));
+    }
+
+    #[test]
+    fn fast_media_rate_recognizes_a_skipped_fixed_tail_sample() {
+        let first_is_finalizing =
+            output_time_is_finalizing(50_000_000, 60_000_000, Duration::from_millis(100));
+        let later_sample_is_finalizing =
+            output_time_is_finalizing(51_000_000, 60_000_000, Duration::from_secs(60));
+        assert!(first_is_finalizing);
+        assert!(!later_sample_is_finalizing);
+        assert!(!should_emit_periodic_active_progress(
+            later_sample_is_finalizing,
+            first_is_finalizing,
+            PROGRESS_EMIT_EVERY,
+        ));
+    }
+
+    #[cfg(unix)]
+    fn run_fake_ffmpeg(
+        script: &str,
+        extra_args: &[String],
+        limits: FfmpegRunLimits,
+    ) -> Result<(), String> {
+        let mut args = vec!["-c".to_string(), script.to_string()];
+        args.extend(extra_args.iter().cloned());
+        let cancel = AtomicBool::new(false);
+        let child_slot = Arc::new(Mutex::new(None));
+        run_ffmpeg_with_progress(
+            None,
+            91,
+            17,
+            "sh",
+            &args,
+            None,
+            EncodeProgressStep::single(EncodeProgressPhase::Encoding),
+            60_000_000,
+            false,
+            limits,
+            &cancel,
+            &child_slot,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ffmpeg_skipped_tail_gets_finalization_silence_not_running_idle_timeout() {
+        let limits = FfmpegRunLimits {
+            initial_progress_timeout: Duration::from_millis(80),
+            idle_timeout: Duration::from_millis(80),
+            finalization_timeout: Duration::from_millis(600),
+            output_size_limit: None,
+            output_activity_path: None,
+        };
+        run_fake_ffmpeg(
+            "printf 'out_time_us=50000000\\n'; exec sleep 0.25",
+            &[],
+            limits,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ffmpeg_zero_sample_output_activity_promotes_to_bounded_finalization() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_path = temp.path().join("output.mp4");
+        let limits = FfmpegRunLimits {
+            initial_progress_timeout: Duration::from_millis(80),
+            idle_timeout: Duration::from_millis(80),
+            finalization_timeout: Duration::from_millis(600),
+            output_size_limit: None,
+            output_activity_path: Some(output_path.clone()),
+        };
+        run_fake_ffmpeg(
+            "printf payload > \"$1\"; exec sleep 0.25",
+            &[
+                "vfl-fake".to_string(),
+                output_path.to_string_lossy().to_string(),
+            ],
+            limits,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ffmpeg_true_finalization_hang_is_killed_at_the_separate_bound() {
+        let limits = FfmpegRunLimits {
+            initial_progress_timeout: Duration::from_millis(80),
+            idle_timeout: Duration::from_millis(80),
+            finalization_timeout: Duration::from_millis(180),
+            output_size_limit: None,
+            output_activity_path: None,
+        };
+        let error = run_fake_ffmpeg(
+            "i=0; while [ \"$i\" -lt 40 ]; do printf 'out_time_us=50000000\\n'; i=$((i + 1)); sleep 0.05; done; exec sleep 5",
+            &[],
+            limits,
+        )
+        .unwrap_err();
+        assert!(error.contains("finish finalizing within"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ffmpeg_advancing_finalization_samples_reset_the_silence_bound() {
+        let limits = FfmpegRunLimits {
+            initial_progress_timeout: Duration::from_millis(80),
+            idle_timeout: Duration::from_millis(80),
+            finalization_timeout: Duration::from_millis(180),
+            output_size_limit: None,
+            output_activity_path: None,
+        };
+        run_fake_ffmpeg(
+            "printf 'out_time_us=50000000\\n'; sleep 0.12; printf 'out_time_us=51000000\\n'; exec sleep 0.12",
+            &[],
+            limits,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn invocation_schedule_is_monotonic_across_copy_fallback_and_correction() {
+        let duration_us = 10_000_000;
+        let steps = [
+            EncodeProgressStep::new(EncodeProgressPhase::Copying, 1, 8, 1, 1),
+            EncodeProgressStep::new(EncodeProgressPhase::Copying, 2, 8, 1, 1),
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 3, 8, 1, 2),
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 4, 8, 2, 2),
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 5, 8, 1, 2),
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 6, 8, 2, 2),
+        ];
+        let mut previous = 0.0;
+        for step in steps {
+            let (_, start) = encode_progress_fractions(step, 0, duration_us).unwrap();
+            let (_, end) = encode_progress_fractions(step, duration_us, duration_us).unwrap();
+            assert!(
+                start >= previous,
+                "step start {start} regressed below {previous}"
+            );
+            assert!(end >= start);
+            previous = end;
+        }
+        assert_eq!(previous, 0.75);
+
+        let terminal = operation_finalization_payload(91, 17);
+        assert_eq!(terminal.attempt_id, 91);
+        assert_eq!(terminal.job_id, 17);
+        assert_eq!(terminal.phase, EncodeProgressPhase::Finalizing);
+        assert_eq!(terminal.step_index, terminal.step_count);
+        assert_eq!(terminal.pass_pct, 1.0);
+        assert_eq!(terminal.overall_pct, 1.0);
+    }
+
+    #[test]
+    fn copy_fallback_tail_does_not_claim_output_finalization_before_fallback() {
+        let duration_us = 10_000_000;
+        let copy = EncodeProgressStep::new(EncodeProgressPhase::Copying, 1, 2, 1, 1);
+        let fallback = EncodeProgressStep::new(EncodeProgressPhase::Encoding, 2, 2, 1, 1);
+        let events = [
+            invocation_tail_payload(91, 17, copy, duration_us, false).unwrap(),
+            encode_progress_payload(91, 17, fallback, fallback.phase, 0, duration_us).unwrap(),
+            invocation_tail_payload(91, 17, fallback, duration_us, true).unwrap(),
+            operation_finalization_payload(91, 17),
+        ];
+
+        assert_eq!(
+            events.iter().map(|event| event.phase).collect::<Vec<_>>(),
+            vec![
+                EncodeProgressPhase::Copying,
+                EncodeProgressPhase::Encoding,
+                EncodeProgressPhase::Finalizing,
+                EncodeProgressPhase::Finalizing,
+            ]
+        );
+        for pair in events.windows(2) {
+            assert!(pair[1].overall_pct >= pair[0].overall_pct);
+        }
+    }
+
+    #[test]
+    fn two_pass_candidate_tails_remain_encoding_until_a_candidate_is_selected() {
+        let duration_us = 10_000_000;
+        let steps = [
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 1, 4, 1, 2),
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 2, 4, 2, 2),
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 3, 4, 1, 2),
+            EncodeProgressStep::new(EncodeProgressPhase::Encoding, 4, 4, 2, 2),
+        ];
+        let mut events = Vec::new();
+        for step in steps {
+            events.push(invocation_tail_payload(91, 17, step, duration_us, false).unwrap());
+        }
+        events.push(operation_finalization_payload(91, 17));
+
+        assert!(
+            events[..events.len() - 1]
+                .iter()
+                .all(|event| event.phase == EncodeProgressPhase::Encoding)
+        );
+        assert_eq!(
+            events.last().unwrap().phase,
+            EncodeProgressPhase::Finalizing
+        );
+        for pair in events.windows(2) {
+            assert!(pair[1].overall_pct >= pair[0].overall_pct);
+        }
+    }
+
+    #[test]
+    fn child_publication_honors_a_cancel_latched_before_the_slot_is_filled() {
+        #[derive(Debug)]
+        struct FakeChild {
+            killed: bool,
+        }
+
+        let child_slot = Mutex::new(None);
+        let cancel = AtomicBool::new(true);
+        publish_child_with_cancel_latch(
+            &child_slot,
+            FakeChild { killed: false },
+            &cancel,
+            |child| child.killed = true,
+        )
+        .unwrap();
+
+        assert!(child_slot.lock().unwrap().as_ref().unwrap().killed);
     }
 
     #[test]

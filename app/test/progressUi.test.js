@@ -8,7 +8,9 @@ import {
   ACTIVE_PROGRESS_DISPLAY_CAP,
   FINALIZING_PROGRESS_THRESHOLD,
   clampProgress,
+  createEncodeProgressState,
   getActiveProgressUi,
+  reduceEncodeProgress,
 } from "../src/lib/progress.mjs";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
@@ -38,6 +40,38 @@ test("progress inputs clamp to the supported display range", () => {
   assert.equal(clampProgress(-0.25), 0);
   assert.equal(clampProgress(1.25), 1);
   assert.equal(clampProgress(Number.NaN), 0);
+});
+
+test("progress reducer stays monotonic across copying, fallback encoding, and finalization", () => {
+  let state = createEncodeProgressState();
+  state = reduceEncodeProgress(state, {
+    attemptId: 10, jobId: 20, phase: "copying", stepIndex: 1, stepCount: 4,
+    pass: 1, totalPasses: 1, passPct: 1, overallPct: 0.25,
+  });
+  state = reduceEncodeProgress(state, {
+    attemptId: 10, jobId: 20, phase: "encoding", stepIndex: 2, stepCount: 4,
+    pass: 1, totalPasses: 2, passPct: 0.1, overallPct: 0.2,
+  });
+  assert.equal(state.overallPct, 0.25);
+  assert.equal(state.phase, "encoding");
+
+  state = reduceEncodeProgress(state, {
+    attemptId: 10, jobId: 20, phase: "finalizing", stepIndex: 2, stepCount: 4,
+    pass: 1, totalPasses: 2, passPct: 1, overallPct: 0.5,
+  });
+  const ui = getActiveProgressUi(state, true);
+  assert.equal(ui.isFinalizing, true);
+  assert.equal(ui.label, "Finalizing output");
+  assert.match(ui.valueText, /step 2 of 4, 50 percent/);
+});
+
+test("progress reducer rejects stale attempt and mismatched job events", () => {
+  const current = reduceEncodeProgress(createEncodeProgressState(), {
+    attemptId: 10, jobId: 20, phase: "encoding", stepIndex: 1, stepCount: 2,
+    pass: 1, totalPasses: 1, passPct: 0.5, overallPct: 0.25,
+  });
+  assert.equal(reduceEncodeProgress(current, { ...current, attemptId: 9, overallPct: 1 }), current);
+  assert.equal(reduceEncodeProgress(current, { ...current, jobId: 21, overallPct: 1 }), current);
 });
 
 test("finalizing progress is visually distinct without a looping animation", async () => {

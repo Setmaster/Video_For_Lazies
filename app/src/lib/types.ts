@@ -254,6 +254,9 @@ export interface EncodeFeatureCapability {
 export interface EncodeProgressPayload {
   attemptId: number;
   jobId: number;
+  phase: "copying" | "encoding" | "finalizing";
+  stepIndex: number;
+  stepCount: number;
   pass: number;
   totalPasses: number;
   passPct: number;
@@ -370,6 +373,66 @@ export interface AppSmokeConfig {
   strictFitAllowAudioRemoval?: boolean | null;
   // Launch-only input. It is never copied into AppSmokeStatus.
   subtitlePath?: string | null;
+  g7Operation?: "copy-progress" | "rotate-speed-cap" | "cancel-drop" | null;
+  // Launch-only input used to exercise the active-export drop path. It is
+  // never copied into AppSmokeStatus.
+  g7DropPath?: string | null;
+}
+
+export interface AppSmokeProgressSample {
+  attemptId: number;
+  jobId: number;
+  phase: EncodeProgressPayload["phase"];
+  stepIndex: number;
+  stepCount: number;
+  pass: number;
+  totalPasses: number;
+  passPct: number;
+  overallPct: number;
+}
+
+export interface AppSmokeMountedProgressSample {
+  attemptId: number;
+  jobId: number;
+  phase: EncodeProgressPayload["phase"];
+  sourceOverallPct: number;
+  isFinalizing: boolean;
+  role: string | null;
+  ariaLabel: string | null;
+  valueMin: number | null;
+  valueMax: number | null;
+  valueNow: number | null;
+  valueText: string | null;
+  phaseLabel: string;
+  visiblePercent: number | null;
+  fillWidth: string;
+}
+
+export interface AppSmokeG7Evidence {
+  operation: NonNullable<AppSmokeConfig["g7Operation"]>;
+  resetDialogRole: string | null;
+  resetCancelFocused: boolean;
+  resetCancelPreservedSettings: boolean;
+  resetCancelRestoredFocus: boolean;
+  resetConfirmed: boolean;
+  resetConfirmRestoredFocus: boolean;
+  previewRotationDeg: number | null;
+  previewTransform: string | null;
+  postSpeedFrameRateFps: number | null;
+  frameRateCapFps: number | null;
+  frameRateCapApplies: boolean | null;
+  frameRateMountedCopyVerified: boolean;
+  exportControlStable: boolean;
+  exportControlInitiallyFocused: boolean;
+  exportControlPreservedIdentity: boolean;
+  exportControlPreservedGeometry: boolean;
+  cancelControlSeparate: boolean;
+  cancelInvokeCount: number;
+  dropActionKind: string | null;
+  dropPreservedInput: boolean | null;
+  queuedDropCount: number | null;
+  progressHistory: AppSmokeProgressSample[];
+  mountedProgressHistory: AppSmokeMountedProgressSample[];
 }
 
 export interface AppSmokeStatus {
@@ -387,6 +450,7 @@ export interface AppSmokeStatus {
   fastTrimInspection?: FastTrimInspection | null;
   trimResult?: TrimResult | null;
   queueOutcomeKind?: "done" | "target-missed" | null;
+  g7Evidence?: AppSmokeG7Evidence | null;
 }
 
 export interface UpdateNotes {
@@ -415,7 +479,51 @@ export interface UpdateCheckResponse {
 }
 
 export interface UpdateApplyResponse {
-  status: "restarting";
+  status: "restarting" | "elevating";
   version: string;
+  message: string;
+}
+
+export type UpdatePhase =
+  | "checking"
+  | "downloading"
+  | "verifyingArchive"
+  | "extracting"
+  | "verifyingPayload"
+  | "staging"
+  | "launchingHelper"
+  | "waitingForExit"
+  | "backingUp"
+  | "replacing"
+  | "rollingBack"
+  | "restarting"
+  | "recovering"
+  | "completed"
+  | "failed";
+
+export interface UpdateProgressEvent {
+  operationId: string;
+  phase: UpdatePhase;
+  completedBytes?: number | null;
+  totalBytes?: number | null;
+  message: string;
+}
+
+export interface UpdatePublicError {
+  code: string;
+  phase: UpdatePhase;
+  retryable: boolean;
+  action: string;
+  message: string;
+}
+
+export interface UpdateStartupResponse {
+  status:
+    | "none"
+    | "completed"
+    | "recovered"
+    | "recovering"
+    | "elevatingRecovery"
+    | "recoveryRequired";
   message: string;
 }

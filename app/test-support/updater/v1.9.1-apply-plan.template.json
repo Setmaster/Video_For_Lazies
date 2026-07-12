@@ -1,0 +1,14 @@
+{
+  "schema": "com.setmaster.video-for-lazies.apply-plan.v1",
+  "updateId": "__UPDATE_ID__",
+  "fromVersion": "1.9.1",
+  "toVersion": "1.10.0",
+  "target": "linux-x64",
+  "installDir": "__INSTALL_DIR__",
+  "stageDir": "__STAGE_DIR__",
+  "backupDir": "__BACKUP_DIR__",
+  "parentPid": 0,
+  "executableName": "video_for_lazies",
+  "helperName": "vfl-update-helper",
+  "relaunchViaShell": false
+}

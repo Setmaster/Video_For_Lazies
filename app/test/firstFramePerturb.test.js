@@ -38,7 +38,7 @@ test("frontend plumbs perturbFirstFrame through requests, recipes, and reset", a
   assert.match(app, /if \(partialSettings\.perturbFirstFrame !== undefined\) setPerturbFirstFrame\(partialSettings\.perturbFirstFrame\);/);
   assert.match(app, /setPerturbFirstFrame\(Boolean\(recipeSettings\.perturbFirstFrame\)\);/);
   // Reset returns it to off, and it participates in recipe matching.
-  assert.match(app, /resetAllSettings[\s\S]*setPerturbFirstFrame\(false\);/);
+  assert.match(app, /performResetAllSettings[\s\S]*setPerturbFirstFrame\(false\);/);
   // A user-facing control exists.
   assert.match(app, /Make each export unique/);
 });

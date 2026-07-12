@@ -24,6 +24,78 @@ struct JobManager {
     current: Mutex<Option<JobHandle>>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum AppSmokeG7Operation {
+    CopyProgress,
+    RotateSpeedCap,
+    CancelDrop,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppSmokeProgressSample {
+    attempt_id: u64,
+    job_id: u64,
+    phase: String,
+    step_index: u8,
+    step_count: u8,
+    pass: u8,
+    total_passes: u8,
+    pass_pct: f64,
+    overall_pct: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppSmokeMountedProgressSample {
+    attempt_id: u64,
+    job_id: u64,
+    phase: String,
+    source_overall_pct: f64,
+    is_finalizing: bool,
+    role: Option<String>,
+    aria_label: Option<String>,
+    value_min: Option<u16>,
+    value_max: Option<u16>,
+    value_now: Option<u16>,
+    value_text: Option<String>,
+    phase_label: String,
+    visible_percent: Option<u16>,
+    fill_width: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppSmokeG7Evidence {
+    operation: AppSmokeG7Operation,
+    reset_dialog_role: Option<String>,
+    reset_cancel_focused: bool,
+    reset_cancel_preserved_settings: bool,
+    reset_cancel_restored_focus: bool,
+    reset_confirmed: bool,
+    reset_confirm_restored_focus: bool,
+    preview_rotation_deg: Option<u16>,
+    preview_transform: Option<String>,
+    post_speed_frame_rate_fps: Option<f64>,
+    frame_rate_cap_fps: Option<f64>,
+    frame_rate_cap_applies: Option<bool>,
+    frame_rate_mounted_copy_verified: bool,
+    export_control_stable: bool,
+    export_control_initially_focused: bool,
+    export_control_preserved_identity: bool,
+    export_control_preserved_geometry: bool,
+    cancel_control_separate: bool,
+    cancel_invoke_count: u32,
+    drop_action_kind: Option<String>,
+    drop_preserved_input: Option<bool>,
+    queued_drop_count: Option<u32>,
+    #[serde(default)]
+    progress_history: Vec<AppSmokeProgressSample>,
+    #[serde(default)]
+    mounted_progress_history: Vec<AppSmokeMountedProgressSample>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSmokeConfig {
@@ -53,6 +125,8 @@ struct AppSmokeConfig {
     color_policy: video::ColorPolicy,
     reverse: bool,
     loop_video: bool,
+    g7_operation: Option<AppSmokeG7Operation>,
+    g7_drop_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -73,6 +147,7 @@ struct AppSmokeStatus {
     expected_duration_s: Option<f64>,
     #[serde(default)]
     stage_history: Vec<String>,
+    g7_evidence: Option<AppSmokeG7Evidence>,
 }
 
 impl JobManager {
@@ -160,6 +235,19 @@ fn parse_smoke_color_policy(raw: &str) -> Result<video::ColorPolicy, String> {
         "" | "auto" => Ok(video::ColorPolicy::Auto),
         "standardsdr" | "standard-sdr" | "standard_sdr" => Ok(video::ColorPolicy::StandardSdr),
         _ => Err("VFL_SMOKE_COLOR_POLICY must be one of: auto, standardSdr.".to_string()),
+    }
+}
+
+fn parse_smoke_g7_operation(raw: &str) -> Result<Option<AppSmokeG7Operation>, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "copy-progress" => Ok(Some(AppSmokeG7Operation::CopyProgress)),
+        "rotate-speed-cap" => Ok(Some(AppSmokeG7Operation::RotateSpeedCap)),
+        "cancel-drop" => Ok(Some(AppSmokeG7Operation::CancelDrop)),
+        _ => Err(
+            "VFL_SMOKE_G7_OPERATION must be one of: copy-progress, rotate-speed-cap, cancel-drop."
+                .to_string(),
+        ),
     }
 }
 
@@ -292,6 +380,16 @@ fn parse_smoke_config_from_env(
     )?;
     let reverse = parse_smoke_bool(env, "VFL_SMOKE_REVERSE")?;
     let loop_video = parse_smoke_bool(env, "VFL_SMOKE_LOOP")?;
+    let g7_operation = parse_smoke_g7_operation(
+        env.get("VFL_SMOKE_G7_OPERATION")
+            .map(String::as_str)
+            .unwrap_or(""),
+    )?;
+    let g7_drop_path = env
+        .get("VFL_SMOKE_G7_DROP_PATH")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     if size_limit_mb < 0.0 {
         return Err("VFL_SMOKE_SIZE_LIMIT_MB must be >= 0.".to_string());
@@ -341,6 +439,16 @@ fn parse_smoke_config_from_env(
                 .to_string(),
         );
     }
+    if matches!(g7_operation, Some(AppSmokeG7Operation::CancelDrop)) && g7_drop_path.is_none() {
+        return Err(
+            "VFL_SMOKE_G7_DROP_PATH is required for the cancel-drop G7 operation.".to_string(),
+        );
+    }
+    if !matches!(g7_operation, Some(AppSmokeG7Operation::CancelDrop)) && g7_drop_path.is_some() {
+        return Err(
+            "VFL_SMOKE_G7_DROP_PATH is only valid for the cancel-drop G7 operation.".to_string(),
+        );
+    }
 
     Ok(Some(AppSmokeConfig {
         input_path: input_path.to_string(),
@@ -369,6 +477,8 @@ fn parse_smoke_config_from_env(
         color_policy,
         reverse,
         loop_video,
+        g7_operation,
+        g7_drop_path,
     }))
 }
 
@@ -468,6 +578,9 @@ fn merge_smoke_optional_fields(existing: Option<&AppSmokeStatus>, next: &mut App
     }
     if next.expected_duration_s.is_none() {
         next.expected_duration_s = existing.expected_duration_s;
+    }
+    if next.g7_evidence.is_none() {
+        next.g7_evidence = existing.g7_evidence.clone();
     }
 }
 
@@ -602,9 +715,35 @@ fn start_encode(
 
     let app_handle = window.app_handle().clone();
     let failure_request = request.clone();
+    let g7_smoke_operation = read_smoke_config()
+        .ok()
+        .flatten()
+        .and_then(|config| config.g7_operation);
+    let settle_g7_active_controls = matches!(
+        g7_smoke_operation,
+        Some(AppSmokeG7Operation::RotateSpeedCap | AppSmokeG7Operation::CancelDrop)
+    );
 
     std::thread::spawn(move || {
+        if settle_g7_active_controls {
+            // Packaged smoke only: give React one bounded frame window to
+            // expose the running Export/Cancel contract before a fast local
+            // encode can finish. The cancel case still waits for a real
+            // backend progress event before activating Cancel.
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        } else if g7_smoke_operation.is_some() {
+            // Packaged copy smoke still needs the job identity mounted before
+            // its first real progress event can be observed in the DOM.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         let result = video::run_encode_job(&window, attempt_id, job_id, &cancel, &child, request);
+
+        if g7_smoke_operation.is_some() {
+            // Packaged smoke only: keep the terminal progress or cancelling
+            // state observable for a bounded committed render before the
+            // finished event removes the active controls.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
 
         let manager: State<'_, JobManager> = app_handle.state();
         manager.clear_if_matches(job_id, attempt_id);
@@ -666,9 +805,13 @@ pub fn run() {
     if std::env::args().any(|arg| arg == updater::ELEVATED_UPDATE_ARG) {
         updater::set_elevated_update_run(true);
     }
+    if std::env::args().any(|arg| arg == updater::ELEVATED_RECOVERY_ARG) {
+        updater::set_elevated_recovery_run(true);
+    }
 
     tauri::Builder::default()
         .manage(JobManager::new())
+        .manage(updater::UpdaterCoordinator::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         // Destroyed (not CloseRequested) so the frontend close-confirm can still
@@ -706,8 +849,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSmokeConfig, AppSmokeStatus, JobHandle, JobManager, is_supported_preview_path,
-        merge_smoke_optional_fields, merge_smoke_stage_history, parse_smoke_config_from_env,
+        AppSmokeConfig, AppSmokeG7Operation, AppSmokeStatus, JobHandle, JobManager,
+        is_supported_preview_path, merge_smoke_optional_fields, merge_smoke_stage_history,
+        parse_smoke_config_from_env,
     };
     use crate::video::{
         ColorPolicy, FastTrimInspection, FastTrimInspectionStatus, OutputFormat, ResizeMode,
@@ -805,6 +949,8 @@ mod tests {
                 color_policy: ColorPolicy::Auto,
                 reverse: false,
                 loop_video: false,
+                g7_operation: None,
+                g7_drop_path: None,
             })
         );
     }
@@ -869,6 +1015,8 @@ mod tests {
                 color_policy: ColorPolicy::StandardSdr,
                 reverse: true,
                 loop_video: true,
+                g7_operation: None,
+                g7_drop_path: None,
             })
         );
     }
@@ -892,6 +1040,70 @@ mod tests {
         assert!(serialized.get("audio_enabled").is_none());
         assert!(serialized.get("strip_metadata").is_none());
         assert!(serialized.get("source_mutation").is_none());
+    }
+
+    #[test]
+    fn parse_smoke_config_reads_and_serializes_g7_operation() {
+        let status_path = temp_smoke_status_path("g7-operation");
+        let env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_G7_OPERATION", "cancel-drop"),
+            ("VFL_SMOKE_G7_DROP_PATH", r"C:\tmp\queued.mp4"),
+        ]);
+
+        let config = parse_smoke_config_from_env(&env).unwrap().unwrap();
+        assert_eq!(config.g7_operation, Some(AppSmokeG7Operation::CancelDrop));
+        assert_eq!(config.g7_drop_path.as_deref(), Some(r"C:\tmp\queued.mp4"));
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["g7Operation"], "cancel-drop");
+        assert_eq!(serialized["g7DropPath"], r"C:\tmp\queued.mp4");
+        assert!(serialized.get("g7_operation").is_none());
+    }
+
+    #[test]
+    fn parse_smoke_config_rejects_invalid_g7_operation_and_drop_pairing() {
+        let status_path = temp_smoke_status_path("g7-invalid");
+        let base = [
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", status_path.as_str()),
+        ];
+
+        let mut unknown = smoke_env(&base);
+        unknown.insert("VFL_SMOKE_G7_OPERATION".to_string(), "surprise".to_string());
+        assert!(
+            parse_smoke_config_from_env(&unknown)
+                .unwrap_err()
+                .contains("VFL_SMOKE_G7_OPERATION")
+        );
+
+        let mut missing_drop = smoke_env(&base);
+        missing_drop.insert(
+            "VFL_SMOKE_G7_OPERATION".to_string(),
+            "cancel-drop".to_string(),
+        );
+        assert!(
+            parse_smoke_config_from_env(&missing_drop)
+                .unwrap_err()
+                .contains("VFL_SMOKE_G7_DROP_PATH")
+        );
+
+        let mut stray_drop = smoke_env(&base);
+        stray_drop.insert(
+            "VFL_SMOKE_G7_OPERATION".to_string(),
+            "copy-progress".to_string(),
+        );
+        stray_drop.insert(
+            "VFL_SMOKE_G7_DROP_PATH".to_string(),
+            r"C:\tmp\queued.mp4".to_string(),
+        );
+        assert!(
+            parse_smoke_config_from_env(&stray_drop)
+                .unwrap_err()
+                .contains("only valid")
+        );
     }
 
     #[test]
@@ -1136,6 +1348,7 @@ mod tests {
                 "probe-ready".to_string(),
                 "preview-ready".to_string(),
             ],
+            g7_evidence: None,
         };
 
         assert_eq!(
@@ -1167,6 +1380,7 @@ mod tests {
             trim_end_s: None,
             expected_duration_s: None,
             stage_history: Vec::new(),
+            g7_evidence: None,
         };
 
         assert_eq!(
@@ -1192,6 +1406,7 @@ mod tests {
             trim_end_s: None,
             expected_duration_s: None,
             stage_history: vec!["detected".to_string(), "input-applied".to_string()],
+            g7_evidence: None,
         };
 
         assert_eq!(
@@ -1246,6 +1461,7 @@ mod tests {
             trim_end_s: Some(1.35),
             expected_duration_s: Some(0.75),
             stage_history: vec!["interaction-ready".to_string()],
+            g7_evidence: None,
         };
         let mut next = AppSmokeStatus {
             stage: "success".to_string(),
@@ -1262,6 +1478,7 @@ mod tests {
             trim_end_s: None,
             expected_duration_s: None,
             stage_history: vec!["success".to_string()],
+            g7_evidence: None,
         };
 
         merge_smoke_optional_fields(Some(&existing), &mut next);

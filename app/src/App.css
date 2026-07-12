@@ -823,6 +823,11 @@ button:focus-visible {
   height: 100%;
 }
 
+.vfl-video-surface {
+  position: absolute;
+  transform-origin: center;
+}
+
 .vfl-video {
   width: 100%;
   height: 100%;
@@ -1847,7 +1852,9 @@ input[type="range"]:focus-visible {
 }
 
 .vfl-export-button {
-  min-width: 96px;
+  box-sizing: border-box;
+  width: 112px;
+  min-width: 112px;
 }
 
 .vfl-footer-queue {
@@ -1860,6 +1867,11 @@ input[type="range"]:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.vfl-progress.is-placeholder {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .vfl-progress-meta {
@@ -1956,8 +1968,30 @@ input[type="range"]:focus-visible {
   scrollbar-color: var(--scrollbar) transparent;
 }
 
+.vfl-reset-confirmation {
+  width: min(520px, 100%);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: var(--shadow-lg);
+}
+
+.vfl-reset-confirmation p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.vfl-reset-confirmation .vfl-actions {
+  justify-content: flex-end;
+}
+
 .vfl-about-modal:focus-visible,
-.vfl-elevated-update-card:focus {
+.vfl-elevated-update-card:focus,
+.vfl-reset-confirmation:focus-visible {
   outline: 2px solid rgba(var(--accent), 0.7);
   outline-offset: 3px;
 }

@@ -14,6 +14,11 @@ import {
   sha256File,
 } from "./portableRelease.mjs";
 import { normalizeVersionInput } from "./versioning.mjs";
+import {
+  MAX_UPDATE_ARCHIVE_BYTES,
+  MAX_UPDATE_ZIP_ENTRIES,
+  readVerifiedZipEntriesFromBuffer,
+} from "./zipEntries.mjs";
 
 export const APP_ID = "com.setmaster.video-for-lazies";
 export const UPDATE_CHANNEL = "stable";
@@ -29,6 +34,7 @@ const POSIX_SEP_PATTERN = /\\/g;
 const LOWER_HEX_SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const RELEASE_ZIP_PATTERN = /^Video_For_Lazies-v(.+)-(linux|win)-x64\.zip$/;
 const PAYLOAD_SIDECAR_PATTERN = /^Video_For_Lazies-v(.+)-(linux|win)-x64\.payload-manifest\.json$/;
+const REQUIRED_UPDATE_TARGETS = ["linux-x64", "windows-x64"];
 
 export function getUpdateTargetLabel({ platform = process.platform, arch = process.arch } = {}) {
   const portableTarget = getPortableTargetLabel({ platform, arch });
@@ -79,13 +85,22 @@ export function assertSafePortableRelativePath(relativePath) {
   if (relativePath.startsWith("/") || relativePath.startsWith("\\")) {
     throw new Error(`Portable payload path must be relative: ${relativePath}`);
   }
-  if (/^[A-Za-z]:/.test(relativePath) || relativePath.startsWith("//") || relativePath.startsWith("\\\\")) {
+  if (/^[A-Za-z]:/.test(relativePath)) {
     throw new Error(`Portable payload path must not include a drive or UNC prefix: ${relativePath}`);
   }
+  if (relativePath.includes("\\")) {
+    throw new Error(`Portable payload path must not contain backslashes: ${relativePath}`);
+  }
+  if (relativePath.startsWith("~") || relativePath.includes(":")) {
+    throw new Error(`Portable payload path contains an updater-reserved character: ${relativePath}`);
+  }
 
-  const normalized = path.posix.normalize(relativePath.replace(POSIX_SEP_PATTERN, "/"));
+  const normalized = path.posix.normalize(relativePath);
   if (normalized === "." || normalized.startsWith("../") || normalized === "..") {
     throw new Error(`Portable payload path escapes the portable root: ${relativePath}`);
+  }
+  if (normalized.split("/", 1)[0].toLowerCase() === ".vfl-updates") {
+    throw new Error(`Portable payload path enters the updater state directory: ${relativePath}`);
   }
   return normalized;
 }
@@ -208,34 +223,27 @@ export async function readPayloadManifest(portableDir) {
   return JSON.parse(await fs.readFile(getPayloadManifestPath(portableDir), "utf8"));
 }
 
-export async function validatePayloadManifest({
-  portableDir,
-  version,
-  platform = process.platform,
-  arch = process.arch,
-} = {}) {
-  const target = getUpdateTargetLabel({ platform, arch });
-  const manifest = await readPayloadManifest(portableDir);
+function validatePayloadManifestContract(manifest, { version, target, platform }) {
   assertManifestHeader(manifest, { schema: PAYLOAD_MANIFEST_SCHEMA, version, target });
-
   if (manifest.rootDir !== PORTABLE_ROOT_DIR_NAME) {
     throw new Error(`Unexpected portable root in payload manifest: ${manifest.rootDir}`);
   }
   if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
     throw new Error("Payload manifest must list at least one file.");
   }
+  if (manifest.files.length >= MAX_UPDATE_ZIP_ENTRIES) {
+    throw new Error("Payload manifest file count is outside the supported update range.");
+  }
 
-  const seenPaths = new Set();
+  const entries = new Map();
   for (const entry of manifest.files) {
     const safePath = assertSafePortableRelativePath(entry.path);
     if (safePath !== entry.path) {
       throw new Error(`Payload manifest path is not normalized: ${entry.path}`);
     }
-    if (seenPaths.has(safePath)) {
+    if (entries.has(safePath)) {
       throw new Error(`Duplicate payload manifest path: ${safePath}`);
     }
-    seenPaths.add(safePath);
-
     if (entry.kind !== "file") {
       throw new Error(`Unsupported payload entry kind for ${safePath}: ${entry.kind}`);
     }
@@ -249,7 +257,27 @@ export async function validatePayloadManifest({
     if (platform !== "linux" && entry.mode !== null) {
       throw new Error(`Payload mode for ${safePath} must be null on non-Linux targets.`);
     }
+    entries.set(safePath, entry);
+  }
 
+  for (const requiredFile of expectedRequiredFiles({ platform })) {
+    if (!entries.has(requiredFile)) {
+      throw new Error(`Payload manifest is missing required file: ${requiredFile}`);
+    }
+  }
+  return entries;
+}
+
+export async function validatePayloadManifest({
+  portableDir,
+  version,
+  platform = process.platform,
+  arch = process.arch,
+} = {}) {
+  const target = getUpdateTargetLabel({ platform, arch });
+  const manifest = await readPayloadManifest(portableDir);
+  const manifestEntries = validatePayloadManifestContract(manifest, { version, target, platform });
+  for (const [safePath, entry] of manifestEntries) {
     const absolutePath = path.resolve(portableDir, safePath);
     const stat = await fs.lstat(absolutePath);
     if (stat.isSymbolicLink() || !stat.isFile()) {
@@ -267,15 +295,9 @@ export async function validatePayloadManifest({
   }
 
   const actualFiles = (await walkPortableFiles(portableDir)).map((file) => file.relativePath).sort();
-  const manifestFiles = [...seenPaths].sort();
+  const manifestFiles = [...manifestEntries.keys()].sort();
   if (JSON.stringify(actualFiles) !== JSON.stringify(manifestFiles)) {
     throw new Error("Payload manifest does not exactly match the portable file list.");
-  }
-
-  for (const requiredFile of expectedRequiredFiles({ platform })) {
-    if (!seenPaths.has(requiredFile)) {
-      throw new Error(`Payload manifest is missing required file: ${requiredFile}`);
-    }
   }
 
   return manifest;
@@ -318,6 +340,163 @@ function parseReleaseFile(fileName, pattern) {
   };
 }
 
+export function selectUpdateReleasePair({ filePaths, version } = {}) {
+  if (!Array.isArray(filePaths)) {
+    throw new Error("filePaths must be an array.");
+  }
+
+  const candidates = new Map(REQUIRED_UPDATE_TARGETS.map((target) => [target, {
+    zips: [],
+    payloadSidecars: [],
+  }]));
+  for (const filePath of filePaths) {
+    const fileName = path.basename(filePath);
+    const zipInfo = parseReleaseFile(fileName, RELEASE_ZIP_PATTERN);
+    if (zipInfo) {
+      candidates.get(zipInfo.updateTarget).zips.push({ filePath, ...zipInfo });
+      continue;
+    }
+
+    const payloadInfo = parseReleaseFile(fileName, PAYLOAD_SIDECAR_PATTERN);
+    if (payloadInfo) {
+      candidates.get(payloadInfo.updateTarget).payloadSidecars.push({ filePath, ...payloadInfo });
+    }
+  }
+
+  for (const target of REQUIRED_UPDATE_TARGETS) {
+    const targetCandidates = candidates.get(target);
+    if (targetCandidates.zips.length === 0) {
+      throw new Error(`Missing release zip for updater target: ${target}`);
+    }
+    if (targetCandidates.zips.length !== 1) {
+      throw new Error(
+        `Duplicate release zip candidates for updater target ${target}: ${targetCandidates.zips.map(({ filePath }) => filePath).join(", ")}`,
+      );
+    }
+    if (targetCandidates.payloadSidecars.length === 0) {
+      throw new Error(`Missing payload manifest sidecar for updater target: ${target}`);
+    }
+    if (targetCandidates.payloadSidecars.length !== 1) {
+      throw new Error(
+        `Duplicate payload manifest sidecar candidates for updater target ${target}: ${targetCandidates.payloadSidecars.map(({ filePath }) => filePath).join(", ")}`,
+      );
+    }
+  }
+
+  const selected = Object.fromEntries(REQUIRED_UPDATE_TARGETS.map((target) => {
+    const targetCandidates = candidates.get(target);
+    return [target, {
+      zipPath: targetCandidates.zips[0].filePath,
+      zipVersion: normalizeVersionInput(targetCandidates.zips[0].version),
+      payloadSidecarPath: targetCandidates.payloadSidecars[0].filePath,
+      payloadSidecarVersion: normalizeVersionInput(targetCandidates.payloadSidecars[0].version),
+    }];
+  }));
+  const pairVersions = new Set(Object.values(selected).flatMap((artifact) => [
+    artifact.zipVersion,
+    artifact.payloadSidecarVersion,
+  ]));
+  if (pairVersions.size !== 1) {
+    throw new Error(
+      `Release zip and payload sidecar candidates must form one version pair: ${[...pairVersions].sort().join(", ")}`,
+    );
+  }
+
+  const [pairVersion] = pairVersions;
+  if (version !== undefined && pairVersion !== normalizeVersionInput(version)) {
+    throw new Error(
+      `Release artifact pair version ${pairVersion} does not match requested version ${normalizeVersionInput(version)}.`,
+    );
+  }
+  return { version: pairVersion, artifacts: selected };
+}
+
+function sha256Bytes(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+function platformFromUpdateTarget(target) {
+  if (target === "linux-x64") return "linux";
+  if (target === "windows-x64") return "win32";
+  throw new Error(`Unsupported update target: ${target}`);
+}
+
+function validateReleaseZipPayload({ zipBytes, payloadBytes, version, target, archiveLabel }) {
+  const platform = platformFromUpdateTarget(target);
+  const archiveEntries = readVerifiedZipEntriesFromBuffer(zipBytes, { archiveLabel });
+  const rootPrefix = `${PORTABLE_ROOT_DIR_NAME}/`;
+  const archivedFiles = new Map();
+
+  for (const archiveEntry of archiveEntries) {
+    if (archiveEntry.name === rootPrefix && archiveEntry.isDirectory) continue;
+    if (!archiveEntry.name.startsWith(rootPrefix)) {
+      throw new Error(`${archiveLabel} contains an entry outside ${PORTABLE_ROOT_DIR_NAME}.`);
+    }
+    const relativePath = archiveEntry.name.slice(rootPrefix.length);
+    if (archiveEntry.isDirectory) {
+      const directoryPath = relativePath.replace(/\/$/, "");
+      if (directoryPath !== "") {
+        const safeDirectoryPath = assertSafePortableRelativePath(directoryPath);
+        if (safeDirectoryPath !== directoryPath) {
+          throw new Error(
+            `${archiveLabel} contains a non-normalized payload directory: ${directoryPath}`,
+          );
+        }
+      }
+      continue;
+    }
+    const safePath = assertSafePortableRelativePath(relativePath);
+    if (safePath !== relativePath) {
+      throw new Error(`${archiveLabel} contains a non-normalized payload path: ${relativePath}`);
+    }
+    if (archivedFiles.has(safePath)) {
+      throw new Error(`${archiveLabel} contains duplicate payload paths: ${safePath}`);
+    }
+    archivedFiles.set(safePath, archiveEntry);
+  }
+
+  const embeddedManifestEntry = archivedFiles.get(PAYLOAD_MANIFEST_FILE_NAME);
+  if (!embeddedManifestEntry) {
+    throw new Error(`${archiveLabel} is missing ${PAYLOAD_MANIFEST_FILE_NAME}.`);
+  }
+  if (!embeddedManifestEntry.bytes.equals(payloadBytes)) {
+    throw new Error(
+      `Payload manifest sidecar does not byte-for-byte match the manifest embedded in ${archiveLabel}.`,
+    );
+  }
+
+  let payloadManifest;
+  try {
+    payloadManifest = JSON.parse(payloadBytes.toString("utf8"));
+  } catch (error) {
+    throw new Error(`Payload manifest for ${archiveLabel} is invalid JSON: ${error.message}`);
+  }
+  const manifestEntries = validatePayloadManifestContract(payloadManifest, { version, target, platform });
+  const actualPayloadPaths = [...archivedFiles.keys()]
+    .filter((entryPath) => entryPath !== PAYLOAD_MANIFEST_FILE_NAME)
+    .sort();
+  const manifestPayloadPaths = [...manifestEntries.keys()].sort();
+  if (JSON.stringify(actualPayloadPaths) !== JSON.stringify(manifestPayloadPaths)) {
+    throw new Error(`${archiveLabel} payload does not exactly match its manifest file list.`);
+  }
+
+  for (const [relativePath, manifestEntry] of manifestEntries) {
+    const archiveEntry = archivedFiles.get(relativePath);
+    if (archiveEntry.bytes.length !== manifestEntry.sizeBytes) {
+      throw new Error(`${archiveLabel} payload size mismatch for ${relativePath}.`);
+    }
+    if (sha256Bytes(archiveEntry.bytes) !== manifestEntry.sha256) {
+      throw new Error(`${archiveLabel} payload hash mismatch for ${relativePath}.`);
+    }
+    if (platform === "linux") {
+      if (archiveEntry.unixMode === null || (archiveEntry.unixMode & 0o777) !== manifestEntry.mode) {
+        throw new Error(`${archiveLabel} payload mode mismatch for ${relativePath}.`);
+      }
+    }
+  }
+  return payloadManifest;
+}
+
 export async function buildUpdateManifest({
   releaseAssetDir,
   version,
@@ -329,58 +508,36 @@ export async function buildUpdateManifest({
 
   const normalizedVersion = normalizeVersionInput(version);
   const files = await walkFiles(releaseAssetDir);
-  const zipFiles = new Map();
-  const payloadSidecars = new Map();
-
-  for (const filePath of files) {
-    const fileName = path.basename(filePath);
-    const zipInfo = parseReleaseFile(fileName, RELEASE_ZIP_PATTERN);
-    if (zipInfo) {
-      if (normalizeVersionInput(zipInfo.version) !== normalizedVersion) {
-        throw new Error(`Release zip version does not match requested version: ${fileName}`);
-      }
-      zipFiles.set(zipInfo.updateTarget, filePath);
-      continue;
-    }
-
-    const payloadInfo = parseReleaseFile(fileName, PAYLOAD_SIDECAR_PATTERN);
-    if (payloadInfo) {
-      if (normalizeVersionInput(payloadInfo.version) !== normalizedVersion) {
-        throw new Error(`Payload sidecar version does not match requested version: ${fileName}`);
-      }
-      payloadSidecars.set(payloadInfo.updateTarget, filePath);
-    }
-  }
-
-  const requiredTargets = ["linux-x64", "windows-x64"];
-  for (const target of requiredTargets) {
-    if (!zipFiles.has(target)) {
-      throw new Error(`Missing release zip for updater target: ${target}`);
-    }
-    if (!payloadSidecars.has(target)) {
-      throw new Error(`Missing payload manifest sidecar for updater target: ${target}`);
-    }
-  }
+  const releasePair = selectUpdateReleasePair({ filePaths: files, version: normalizedVersion });
 
   const releaseTag = `v${normalizedVersion}`;
   const artifacts = {};
-  for (const target of requiredTargets) {
-    const zipPath = zipFiles.get(target);
-    const payloadPath = payloadSidecars.get(target);
+  for (const target of REQUIRED_UPDATE_TARGETS) {
+    const { zipPath, payloadSidecarPath: payloadPath } = releasePair.artifacts[target];
     const zipName = path.basename(zipPath);
     const zipStat = await fs.stat(zipPath);
-    const payloadManifest = JSON.parse(await fs.readFile(payloadPath, "utf8"));
-    assertManifestHeader(payloadManifest, { schema: PAYLOAD_MANIFEST_SCHEMA, version: normalizedVersion, target });
+    if (!zipStat.isFile() || zipStat.size === 0 || zipStat.size > MAX_UPDATE_ARCHIVE_BYTES) {
+      throw new Error(`${zipName} size is outside the supported update range.`);
+    }
+    const zipBytes = await fs.readFile(zipPath);
+    const payloadBytes = await fs.readFile(payloadPath);
+    const payloadManifest = validateReleaseZipPayload({
+      zipBytes,
+      payloadBytes,
+      version: normalizedVersion,
+      target,
+      archiveLabel: zipName,
+    });
 
     artifacts[target] = {
       fileName: zipName,
       url: `${UPDATE_RELEASE_BASE_URL}/download/${releaseTag}/${zipName}`,
-      sha256: await sha256File(zipPath),
-      sizeBytes: zipStat.size,
+      sha256: sha256Bytes(zipBytes),
+      sizeBytes: zipBytes.length,
       rootDir: PORTABLE_ROOT_DIR_NAME,
       payloadManifest: {
         path: `${PORTABLE_ROOT_DIR_NAME}/${PAYLOAD_MANIFEST_FILE_NAME}`,
-        sha256: await sha256File(payloadPath),
+        sha256: sha256Bytes(payloadBytes),
       },
     };
   }

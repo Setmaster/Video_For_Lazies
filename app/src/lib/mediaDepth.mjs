@@ -139,16 +139,38 @@ export function timelineSpeedChanges(value) {
   return Number.isFinite(speed) && Math.abs(speed - 1) > 1e-9;
 }
 
-export function minimumVideoBitrateKbps({ codec, width, height, sourceFrameRate = null, speed = 1, frameRateCapFps = null }) {
-  if (codec !== "mpeg4") return 50;
+export function effectiveFrameRatePlan({
+  format = "mp4",
+  sourceFrameRate = null,
+  speed = 1,
+  frameRateCapFps = null,
+} = {}) {
+  if (String(format).toLowerCase() === "mp3") {
+    return {
+      postSpeedFps: null,
+      capFps: null,
+      capApplies: false,
+      outputFps: null,
+    };
+  }
+
   const sourceFps = finitePositive(sourceFrameRate);
   const safeSpeed = finitePositive(speed) ?? 1;
-  const cap = finitePositive(frameRateCapFps);
-  const effectiveSourceFps = sourceFps === null ? null : sourceFps * safeSpeed;
-  const plannedFps = cap !== null && (effectiveSourceFps === null || effectiveSourceFps > cap + 0.01)
-    ? cap
-    : effectiveSourceFps ?? 30;
-  const fps = clamp(plannedFps, 1, 120);
+  const postSpeedFps = sourceFps === null ? null : finitePositive(sourceFps * safeSpeed);
+  const capFps = finitePositive(frameRateCapFps);
+  const capApplies = capFps !== null && (postSpeedFps === null || postSpeedFps > capFps + 0.01);
+  return {
+    postSpeedFps,
+    capFps,
+    capApplies,
+    outputFps: capApplies ? capFps : postSpeedFps,
+  };
+}
+
+export function minimumVideoBitrateKbps({ codec, width, height, sourceFrameRate = null, speed = 1, frameRateCapFps = null }) {
+  if (codec !== "mpeg4") return 50;
+  const frameRatePlan = effectiveFrameRatePlan({ sourceFrameRate, speed, frameRateCapFps });
+  const fps = clamp(frameRatePlan.outputFps ?? 30, 1, 120);
   const safeWidth = finitePositive(width);
   const safeHeight = finitePositive(height);
   if (safeWidth === null || safeHeight === null) return Number.POSITIVE_INFINITY;
@@ -252,9 +274,9 @@ export function estimateTransformMemory({
   const end = clamp(Number.isFinite(parsedEnd) ? parsedEnd : sourceDuration, start, sourceDuration);
   const retainedDuration = Math.max(0, end - start);
   const reverseFrames = Math.ceil(retainedDuration * fps);
-  const cap = finitePositive(frameRateCapFps);
-  const loopFrames = cap !== null && fps * safeSpeed > cap + 0.01
-    ? Math.ceil((retainedDuration / safeSpeed) * cap)
+  const frameRatePlan = effectiveFrameRatePlan({ sourceFrameRate: fps, speed: safeSpeed, frameRateCapFps });
+  const loopFrames = frameRatePlan.capApplies
+    ? Math.ceil((retainedDuration / safeSpeed) * frameRatePlan.capFps)
     : reverseFrames;
   const frameBytes = safeWidth * safeHeight * bytesPerPixel + TRANSFORM_VIDEO_FRAME_OVERHEAD_BYTES;
   const videoBytes = videoEnabled

@@ -40,7 +40,7 @@ test("App uses one reducer-backed queue identity and closes queue continuation r
   assert.match(app, /const queuePreparationCountRef = useRef\(0\)/);
   assert.match(app, /queuePreparationCountRef\.current \+= 1/);
   assert.match(app, /queuePreparationCountRef\.current === 0[\s\S]*?startNextQueuedItem/);
-  assert.match(app, /const encodeBusy = attemptUi\.isActive \|\| queueRunning \|\| queuePreparationBusy \|\| queueSnapshotApplying/);
+  assert.match(app, /const encodeBusy =[\s\S]*?attemptUi\.isActive[\s\S]*?queueSnapshotApplying[\s\S]*?updateBusy;/);
 });
 
 test("drop, output claims, retry, snapshot, and diagnostics are wired through production paths", async () => {

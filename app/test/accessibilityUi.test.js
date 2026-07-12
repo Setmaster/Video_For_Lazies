@@ -134,16 +134,51 @@ test("crop, trim, modal, and live-status accessibility contracts are wired", asy
   assert.match(modal, /returnFocus\?\.isConnected/);
   assert.match(app, /role="alertdialog"/);
   assert.match(app, /closeOnBackdrop/);
-  assert.match(app, /const modalOpen = elevatedUpdateRun \|\| aboutOpen \|\| recipeDialog !== null;/);
+  assert.match(css, /\.vfl-reset-confirmation \{[^}]*background: var\(--panel\);[^}]*box-shadow: var\(--shadow-lg\);/s);
+  assert.match(app, /const modalOpen = elevatedUpdateRun \|\| aboutOpen \|\| recipeDialog !== null \|\| resetConfirmationOpen;/);
   assert.match(app, /!modalOpenRef\.current/);
 
   assert.match(app, /id="vfl-crop-detect-status"/);
   assert.match(app, /aria-live="polite"/);
   assert.match(app, /aria-atomic="true"/);
   assert.match(app, /"accessibility-ready"/);
-  assert.match(cropper, /const thresholdX = 12 \/ Math\.max\(1, content\.width\);/);
-  assert.match(cropper, /const thresholdY = 12 \/ Math\.max\(1, content\.height\);/);
-  assert.match(cropper, /pixelAspectToNormalizedRatio\(aspect\.ratio, content\.width, content\.height\)/);
+  assert.match(cropper, /function pointerThresholds\(\)/);
+  assert.match(cropper, /displayPointToSourcePoint/);
+  assert.match(cropper, /sourceRectToDisplayRect/);
+  assert.match(cropper, /pixelAspectToNormalizedRatio\(aspect\.ratio, videoSize\.w, videoSize\.h\)/);
+  assert.match(app, /data-smoke-id="reset-all-cancel"/);
+  assert.match(app, /data-smoke-id="reset-all-confirm"/);
+
+  const resetDialogClass = app.indexOf('className="vfl-reset-confirmation"');
+  const resetDialogStart = app.lastIndexOf("<ModalDialog", resetDialogClass);
+  const resetDialogEnd = app.indexOf("</ModalDialog>", resetDialogStart);
+  const resetDialog = app.slice(resetDialogStart, resetDialogEnd);
+  const resetCancel = resetDialog.indexOf('data-smoke-id="reset-all-cancel"');
+  const resetConfirm = resetDialog.indexOf('data-smoke-id="reset-all-confirm"');
+  assert.ok(resetDialogStart >= 0 && resetDialogEnd > resetDialogStart, "reset confirmation must be a modal alertdialog");
+  assert.match(resetDialog, /initialFocus="first"/);
+  assert.match(resetDialog, /onRequestClose=\{\(\) => setResetConfirmationOpen\(false\)\}/);
+  assert.ok(resetCancel >= 0 && resetConfirm > resetCancel, "safe Cancel must receive first focus before destructive confirmation");
+  assert.match(resetDialog, /data-smoke-id="reset-all-cancel"[\s\S]*?onClick=\{\(\) => setResetConfirmationOpen\(false\)\}/);
+  assert.match(resetDialog, /data-smoke-id="reset-all-confirm"[\s\S]*?onClick=\{performResetAllSettings\}/);
+
+  const resetStart = app.indexOf("function performResetAllSettings()");
+  const resetEnd = app.indexOf("function applyFullRecipeSettings", resetStart);
+  const resetSettings = app.slice(resetStart, resetEnd);
+  assert.match(resetSettings, /cropDetectionRevisionRef\.current \+= 1;/);
+  assert.match(resetSettings, /setCropDetecting\(false\);/);
+
+  const detectStart = app.indexOf("async function autoDetectCrop()");
+  const detectEnd = app.indexOf("async function startEncode", detectStart);
+  const autoDetect = app.slice(detectStart, detectEnd);
+  assert.match(autoDetect, /const requestRevision = \+\+cropDetectionRevisionRef\.current;/);
+  assert.match(autoDetect, /cropDetectionRevisionRef\.current !== requestRevision/);
+  assert.match(autoDetect, /inputPathRef\.current !== requestedPath/);
+  assert.match(autoDetect, /catch \{[\s\S]*?setCropDetectHint\(CROP_DETECTION_PUBLIC_ERROR\);/);
+  assert.doesNotMatch(autoDetect, /e instanceof Error|setCropDetectHint\(msg\)/);
+  assert.match(autoDetect, /finally \{\s*if \(cropDetectionRevisionRef\.current === requestRevision\) \{\s*setCropDetecting\(false\);/s);
+
+  assert.match(app, /Reset all settings confirmation did not open with focus on the safe Cancel action\./);
 });
 
 test("portable Windows smoke requires mounted accessibility evidence", async () => {

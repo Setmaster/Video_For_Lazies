@@ -107,34 +107,19 @@ async function sha256File(filePath) {
   return hash.digest("hex");
 }
 
-async function downloadFile(url, destinationPath) {
-  let response;
-  try {
-    response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  } catch {
-    await downloadFileWithCurl(url, destinationPath);
-    return;
-  }
+async function downloadFileWithFetch(url, tempPath, timeoutMs) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok || !response.body) {
     await response.body?.cancel();
-    await downloadFileWithCurl(url, destinationPath);
-    return;
+    throw new Error(`HTTP ${response.status || "response body unavailable"}`);
   }
-
-  await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
-
-  const tempPath = `${destinationPath}.partial`;
   const fileStream = fs.createWriteStream(tempPath);
   await pipeline(Readable.fromWeb(response.body), fileStream);
-  await fsp.rename(tempPath, destinationPath);
 }
 
-async function downloadFileWithCurl(url, destinationPath) {
-  await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
-  const tempPath = `${destinationPath}.partial`;
-  await fsp.rm(tempPath, { force: true });
-
+async function downloadFileWithCurl(url, tempPath, timeoutMs) {
   await new Promise((resolve, reject) => {
+    const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
     const child = spawn(
       "curl",
       [
@@ -147,7 +132,7 @@ async function downloadFileWithCurl(url, destinationPath) {
         "--connect-timeout",
         "30",
         "--max-time",
-        String(DOWNLOAD_TIMEOUT_MS / 1000),
+        String(timeoutSeconds),
         "--user-agent",
         "Video-For-Lazies-release-builder",
         "--output",
@@ -156,10 +141,64 @@ async function downloadFileWithCurl(url, destinationPath) {
       ],
       { stdio: "inherit" },
     );
-    waitForSuccessfulClose(child, `curl download ${url}`, DOWNLOAD_TIMEOUT_MS).then(resolve, reject);
+    waitForSuccessfulClose(child, `curl download ${url}`, timeoutMs).then(resolve, reject);
   });
+}
 
-  await fsp.rename(tempPath, destinationPath);
+function uniquePartialPath(destinationPath, attemptIndex) {
+  return `${destinationPath}.partial-${process.pid}-${Date.now()}-${attemptIndex}-${crypto.randomBytes(4).toString("hex")}`;
+}
+
+export async function downloadVerifiedFile({
+  destinationPath,
+  url,
+  expectedSha256,
+  timeoutMs = DOWNLOAD_TIMEOUT_MS,
+  now = () => Date.now(),
+  attempts = [
+    { label: "fetch", run: downloadFileWithFetch },
+    { label: "curl", run: downloadFileWithCurl },
+  ],
+  partialPathForAttempt = uniquePartialPath,
+} = {}) {
+  const startedAt = now();
+  const failures = [];
+  const requireDeadlineRemaining = (stage) => {
+    const elapsedMs = Math.max(0, now() - startedAt);
+    if (timeoutMs - elapsedMs <= 0) {
+      throw new Error(`shared deadline expired ${stage}`);
+    }
+  };
+  await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
+
+  for (let index = 0; index < attempts.length; index += 1) {
+    const attempt = attempts[index];
+    const elapsedMs = Math.max(0, now() - startedAt);
+    const remainingMs = Math.floor(timeoutMs - elapsedMs);
+    if (remainingMs <= 0) {
+      failures.push("shared deadline expired");
+      break;
+    }
+
+    const tempPath = partialPathForAttempt(destinationPath, index);
+    await fsp.rm(tempPath, { force: true });
+    try {
+      await attempt.run(url, tempPath, remainingMs);
+      requireDeadlineRemaining("after transport");
+      const actualSha = await sha256File(tempPath);
+      requireDeadlineRemaining("during verification");
+      if (actualSha !== expectedSha256) {
+        throw new Error("checksum mismatch");
+      }
+      await fsp.rename(tempPath, destinationPath);
+      return;
+    } catch (error) {
+      failures.push(`${attempt.label}: ${error instanceof Error ? error.message : "failed"}`);
+      await fsp.rm(tempPath, { force: true });
+    }
+  }
+
+  throw new Error(`Could not download a verified ${path.basename(destinationPath)} (${failures.join("; ")}).`);
 }
 
 async function ensureDownloadedFile(filePath, url, expectedSha256) {
@@ -171,12 +210,11 @@ async function ensureDownloadedFile(filePath, url, expectedSha256) {
     await fsp.rm(filePath, { force: true });
   }
 
-  await downloadFile(url, filePath);
-  const actualSha = await sha256File(filePath);
-  if (actualSha !== expectedSha256) {
-    await fsp.rm(filePath, { force: true });
-    throw new Error(`Checksum mismatch for ${path.basename(filePath)} (expected ${expectedSha256}, got ${actualSha})`);
-  }
+  await downloadVerifiedFile({
+    destinationPath: filePath,
+    url,
+    expectedSha256,
+  });
 }
 
 function escapePowerShellLiteral(value) {

@@ -62,6 +62,10 @@ test("media-depth policy is wired through requests, resets, capability gating, a
   assert.match(app, /setReverse\(smokeConfig\.reverse \?\? false\)/);
   assert.match(app, /Transform memory/);
   assert.match(app, /Source media facts/);
+  assert.match(
+    app,
+    /const advancedFrameRateSummary =[\s\S]*?frameRatePlan\.capApplies[\s\S]*?frameRatePlan\.postSpeedFps\.toFixed\(1\)[\s\S]*?fps after speed/,
+  );
   assert.match(css, /\.vfl-memory-status\.blocked/);
   assert.match(css, /\.vfl-color-policy/);
 });
