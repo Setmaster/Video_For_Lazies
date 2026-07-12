@@ -6,6 +6,19 @@ import url from "node:url";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
+test("trim has one exact frontend path with no alternate mode or consent state", async () => {
+  const [app, types] = await Promise.all([
+    fs.readFile(path.resolve(__dirname, "../src/App.tsx"), "utf8"),
+    fs.readFile(path.resolve(__dirname, "../src/lib/types.ts"), "utf8"),
+  ]);
+
+  assert.match(types, /export interface Trim \{\s*startS: number;\s*endS\?: number \| null;\s*\}/s);
+  assert.doesNotMatch(types, /FastTrim|TrimMode|fastCopy|fastCopyConsent/);
+  assert.match(app, /const trim = startS > 0 \|\| endS !== null\s*\? \{ startS, endS \}\s*: null;/s);
+  assert.match(app, /const trimForcesReencode = trimIsActive;/);
+  assert.doesNotMatch(app, /FastTrim|fastTrim|Fast Trim|fastCopy|inspect_fast_trim|TrimModeControls/);
+});
+
 test("trim UI keeps preview synced to the selected start or end handle", async () => {
   const appPath = path.resolve(__dirname, "../src/App.tsx");
   const handlePath = path.resolve(__dirname, "../src/components/TrimSliderHandle.tsx");

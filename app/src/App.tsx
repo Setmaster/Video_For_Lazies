@@ -7,7 +7,6 @@ import { confirm as confirmDialog, open as openDialog, save as saveDialog } from
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
-import { TrimModeControls } from "./components/TrimModeControls";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
 import { UserRecipeDialog, type UserRecipeDialogState } from "./components/UserRecipeDialog";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
@@ -27,14 +26,11 @@ import type {
   EncodeProgressPayload,
   EncodeRequest,
   ExportDiagnostics,
-  FastTrimInspection,
   OutputFormat,
   ResizeMode,
   StreamAction,
   SubtitleInspection,
   TargetResult,
-  TrimMode,
-  TrimResult,
   UpdateApplyResponse,
   UpdateCheckResponse,
   UpdateProgressEvent,
@@ -128,26 +124,6 @@ import {
   targetResultFormatData,
   type StrictFitCorrectiveAction,
 } from "./lib/strictFit";
-import {
-  acceptFastTrimBounds,
-  beginFastTrimCheck,
-  createFastTrimState,
-  failFastTrimCheck,
-  fastTrimConsentForRequest,
-  fastTrimConsentsMatch,
-  fastTrimDurationFromRequest,
-  fastTrimEffectiveDurationS,
-  fastTrimModeLabel,
-  fastTrimRequestFingerprint,
-  fastTrimStateForPresentation,
-  fastTrimStateIsAccepted,
-  invalidateFastTrimState,
-  pathFreeFastTrimMessage,
-  settleFastTrimCheck,
-  summarizeFastTrimInspection,
-  summarizeTrimResult,
-  type FastTrimUiState,
-} from "./lib/fastTrim";
 import "./App.css";
 
 const SETTINGS_KEY = "vfl:settings:v1";
@@ -209,9 +185,6 @@ const SMOKE_STAGE_ORDER = [
   "detected",
   "input-applied",
   "probe-ready",
-  "fast-trim-ready",
-  "fast-trim-reset-trim-complete",
-  "fast-trim-reset-all-complete",
   "workflow-recipe-ready",
   "workflow-recipe-saved",
   "workflow-queue-ready",
@@ -222,9 +195,6 @@ const SMOKE_STAGE_ORDER = [
   "keyboard-trim-ready",
   "keyboard-trim-incremented",
   "keyboard-trim-complete",
-  "keyboard-fast-trim-ready",
-  "keyboard-fast-trim-accept-ready",
-  "keyboard-fast-trim-complete",
   "keyboard-crop-ready",
   "keyboard-crop-complete",
   "keyboard-modal-ready",
@@ -232,8 +202,6 @@ const SMOKE_STAGE_ORDER = [
   "keyboard-complete",
   "accessibility-ready",
   "interaction-ready",
-  "fast-trim-source-mutation-ready",
-  "fast-trim-source-mutation-complete",
   "encoding",
   "g7-controls-ready",
   "g7-drop-queued",
@@ -365,7 +333,6 @@ type LastExportResult = {
   format: OutputFormat;
   message: string | null;
   diagnostics: ExportDiagnostics | null;
-  trimResult: TrimResult | null;
   targetResult: TargetResult | null;
   correctiveContext: TargetCorrectiveContext;
   completedAtMs: number;
@@ -615,30 +582,8 @@ function QueueDiagnosticsDetails({
       {diagnostics.failureReason ? (
         <div className="vfl-export-result-note">Failure: {diagnostics.failureReason}</div>
       ) : null}
-      {diagnostics.trimMode ? (
-        <div className="vfl-export-result-note">
-          Trim: {fastTrimModeLabel(diagnostics.trimMode)}
-          {diagnostics.trimEffectiveStartUs != null && diagnostics.trimEffectiveEndUs != null
-            ? `, expected ${formatClock(diagnostics.trimEffectiveStartUs / 1_000_000)} to ${formatClock(diagnostics.trimEffectiveEndUs / 1_000_000)}`
-            : ""}
-        </div>
-      ) : null}
       <pre className="vfl-command-preview">{diagnostics.commandPreview}</pre>
     </details>
-  );
-}
-
-function TrimResultDetails({ result }: { result: TrimResult }) {
-  return (
-    <section className="vfl-trim-result" aria-label="Trim result">
-      <strong>{fastTrimModeLabel(result.mode)}</strong>
-      <div>{summarizeTrimResult(result)}</div>
-      {result.mode === "fastCopy" ? (
-        <div>
-          Video {formatStreamAction(result.videoAction)}, audio {formatStreamAction(result.audioAction)}, {result.videoPacketCount} video packets, {result.ffmpegInvocations} FFmpeg invocation.
-        </div>
-      ) : null}
-    </section>
   );
 }
 
@@ -748,8 +693,6 @@ function App() {
   const [trimStart, setTrimStart] = useState("0");
   const [trimEnd, setTrimEnd] = useState("");
   const [trimDragSnapS, setTrimDragSnapS] = useState("0");
-  const [trimMode, setTrimMode] = useState<TrimMode>("exact");
-  const [fastTrimState, setFastTrimState] = useState<FastTrimUiState>(() => createFastTrimState());
   const [reverse, setReverse] = useState(false);
   const [loopVideo, setLoopVideo] = useState(false);
   const [speed, setSpeed] = useState("1.0");
@@ -846,10 +789,6 @@ function App() {
   const queueRegionRef = useRef<HTMLDivElement | null>(null);
   const subtitleBrowseButtonRef = useRef<HTMLButtonElement | null>(null);
   const subtitleInspectionTokenRef = useRef(0);
-  const fastTrimRequestIdRef = useRef(0);
-  const fastTrimFingerprintRef = useRef<string | null>(null);
-  const fastTrimModeRef = useRef<TrimMode>("exact");
-  const fastTrimStateRef = useRef<FastTrimUiState>(fastTrimState);
   const modalOpenRef = useRef(false);
   const smokeConfigRef = useRef<AppSmokeConfig | null>(null);
   const smokeStageRef = useRef<string | null>(null);
@@ -863,11 +802,6 @@ function App() {
   const smokeInteractionDoneRef = useRef(false);
   const smokeWorkflowRunningRef = useRef(false);
   const smokeWorkflowDoneRef = useRef(false);
-  const smokeFastTrimRunningRef = useRef(false);
-  const smokeFastTrimDoneRef = useRef(false);
-  const smokeFastTrimResetDoneRef = useRef(false);
-  const smokeSourceMutationRunningRef = useRef(false);
-  const smokeSourceMutationDoneRef = useRef(false);
   const smokeG7UiRunningRef = useRef(false);
   const smokeG7UiDoneRef = useRef(false);
   const smokeG7ActiveChecksRunningRef = useRef(false);
@@ -1008,8 +942,6 @@ function App() {
             stageHistory: smokeStageHistoryRef.current,
             targetResult: extra.targetResult ?? null,
             diagnostics: extra.diagnostics ?? null,
-            fastTrimInspection: extra.fastTrimInspection ?? null,
-            trimResult: extra.trimResult ?? null,
             queueOutcomeKind: extra.queueOutcomeKind ?? null,
             g7Evidence: extra.g7Evidence ?? null,
           },
@@ -1073,14 +1005,6 @@ function App() {
   useEffect(() => {
     formatRef.current = format;
   }, [format]);
-
-  useEffect(() => {
-    fastTrimModeRef.current = trimMode;
-  }, [trimMode]);
-
-  useEffect(() => {
-    fastTrimStateRef.current = fastTrimState;
-  }, [fastTrimState]);
 
   useEffect(() => {
     outputAutoRef.current = outputAuto;
@@ -1391,11 +1315,6 @@ function App() {
         smokeAttemptIdRef.current = null;
         smokeWorkflowRunningRef.current = false;
         smokeWorkflowDoneRef.current = false;
-        smokeFastTrimRunningRef.current = false;
-        smokeFastTrimDoneRef.current = false;
-        smokeFastTrimResetDoneRef.current = false;
-        smokeSourceMutationRunningRef.current = false;
-        smokeSourceMutationDoneRef.current = false;
         smokeG7UiRunningRef.current = false;
         smokeG7UiDoneRef.current = false;
         smokeG7ActiveChecksRunningRef.current = false;
@@ -1456,9 +1375,6 @@ function App() {
     setColorPolicy("auto");
     if (queuePathIdentity(path) !== queuePathIdentity(inputPathRef.current)) {
       clearExternalSubtitle("External subtitles cleared for the new source.");
-      fastTrimModeRef.current = "exact";
-      setTrimMode("exact");
-      clearFastTrimState();
     }
 
     if (nextFormat !== formatRef.current) setFormat(nextFormat);
@@ -1510,9 +1426,6 @@ function App() {
     setTrimStart("0");
     setTrimEnd("");
     setTrimDragSnapS("0");
-    fastTrimModeRef.current = "exact";
-    setTrimMode("exact");
-    clearFastTrimState();
     setReverse(false);
     setLoopVideo(false);
     setSpeed("1.0");
@@ -1535,7 +1448,6 @@ function App() {
     options: { resetOutput: boolean },
   ) {
     if (queueSnapshotApplyingRef.current) return;
-    invalidateCurrentFastTrim("Recipe settings changed. Re-check Fast Trim for this clip.");
     preservePendingSnapshotCropWithoutAnnouncement();
     const recipeAdvanced = recipeSettings.advanced;
     const recipeResize = normalizeRecipeResizeSettings(recipeSettings);
@@ -1581,7 +1493,6 @@ function App() {
         setStatus(`${recipe.label} is available only for MP4 or WebM video exports.`);
         return;
       }
-      invalidateCurrentFastTrim("Recipe settings changed. Re-check Fast Trim for this clip.");
       preservePendingSnapshotCropWithoutAnnouncement();
       // Partial recipes change only the settings they list and leave the rest
       // of the current configuration (including the output path) untouched.
@@ -1764,11 +1675,6 @@ function App() {
     smokeMetricsRef.current = null;
     smokeInteractionRunningRef.current = false;
     smokeInteractionDoneRef.current = false;
-    smokeFastTrimRunningRef.current = false;
-    smokeFastTrimDoneRef.current = false;
-    smokeFastTrimResetDoneRef.current = false;
-    smokeSourceMutationRunningRef.current = false;
-    smokeSourceMutationDoneRef.current = false;
     smokeG7UiRunningRef.current = false;
     smokeG7UiDoneRef.current = false;
     smokeG7ActiveChecksRunningRef.current = false;
@@ -1836,10 +1742,6 @@ function App() {
     setTrimStart(formatNumberInput(smokeConfig.trimStartS));
     setTrimEnd(smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined ? "" : formatNumberInput(smokeConfig.trimEndS));
     setTrimDragSnapS("0");
-    const smokeTrimMode: TrimMode = smokeConfig.fastTrim ? "fastCopy" : "exact";
-    fastTrimModeRef.current = smokeTrimMode;
-    setTrimMode(smokeTrimMode);
-    clearFastTrimState();
     setReverse(smokeConfig.reverse ?? false);
     setLoopVideo(smokeConfig.loopVideo ?? false);
     setSpeed("1.0");
@@ -1985,7 +1887,7 @@ function App() {
         probe.frameRate * speedNum > planningFrameRateCap + 0.01);
     const videoEncodeAlreadyDefinite =
       !sourceVideoCopyCompatibleForPlanning ||
-      (trimMode === "exact" && trimRequestIsActive({ startS: startRaw, endS: endRaw, durationS: probe.durationS })) ||
+      trimRequestIsActive({ startS: startRaw, endS: endRaw, durationS: probe.durationS }) ||
       planningCropIsActive ||
       reverse ||
       loopVideo ||
@@ -2034,7 +1936,6 @@ function App() {
     speed,
     trimStart,
     trimEnd,
-    trimMode,
     format,
     loopVideo,
     squarePixelVideoDimensions,
@@ -2274,7 +2175,7 @@ function App() {
     endS: trimEndValue,
     durationS: probe?.durationS ?? null,
   });
-  const trimForcesReencode = trimIsActive && trimMode === "exact";
+  const trimForcesReencode = trimIsActive;
   const cropFilterPlanned = Boolean(
     cropEnabled && cropPixelRect && probe && !isFullFramePixelCrop(cropPixelRect, probe.width, probe.height),
   );
@@ -2558,8 +2459,7 @@ function App() {
     );
     return { ...plannedSummary, w: dimensions.width, h: dimensions.height };
   }, [plannedSummary, format, currentPlanRequiresVideoEncoder]);
-  // Sample export always replaces the current trim with an Exact trim, even
-  // while the workbench is displaying an accepted Fast Trim plan.
+  // Sample export always replaces the current trim with a short exact trim.
   const exactSampleRequiresVideoEncoder = format !== "mp3";
   const exactSamplePlannedEncodeSummary = useMemo(() => {
     if (!plannedSummary || format === "mp3" || plannedSummary.w === null || plannedSummary.h === null) {
@@ -2846,40 +2746,7 @@ function App() {
     outputPath && exportQueueClaimsOutputPath(exportQueueState, outputPath)
       ? "That output path is already reserved by an item in the export queue. Choose another destination or remove the queued item."
       : null;
-  const fastTrimCurrentFingerprint = (() => {
-    if (trimMode !== "fastCopy" || !trimIsActive) return null;
-    try {
-      return fastTrimRequestFingerprint(buildRequest());
-    } catch {
-      return null;
-    }
-  })();
-  useEffect(() => {
-    fastTrimFingerprintRef.current = fastTrimCurrentFingerprint;
-    if (trimMode !== "fastCopy") return;
-    const current = fastTrimStateRef.current;
-    if (
-      current.fingerprint &&
-      current.phase !== "idle" &&
-      current.phase !== "stale" &&
-      current.fingerprint !== fastTrimCurrentFingerprint
-    ) {
-      fastTrimRequestIdRef.current += 1;
-      const nextState = invalidateFastTrimState(current);
-      fastTrimStateRef.current = nextState;
-      setFastTrimState(nextState);
-    }
-  }, [fastTrimCurrentFingerprint, trimMode]);
-  const fastTrimPresentationState = fastTrimStateForPresentation(
-    fastTrimState,
-    fastTrimCurrentFingerprint,
-  );
-  const fastTrimAccepted = trimMode === "fastCopy" &&
-    fastTrimStateIsAccepted(fastTrimState, fastTrimCurrentFingerprint);
-  const fastTrimPlannedDurationS = trimMode === "fastCopy" && fastTrimPresentationState.phase === "ready"
-    ? fastTrimEffectiveDurationS(fastTrimPresentationState.inspection)
-    : null;
-  const currentPlannedDurationS = fastTrimPlannedDurationS ?? plannedEncodeSummary?.durationS ?? null;
+  const currentPlannedDurationS = plannedEncodeSummary?.durationS ?? null;
   const planSummaryText = useMemo(() => {
     if (!plannedEncodeSummary) return null;
     const shape =
@@ -2889,27 +2756,11 @@ function App() {
     const bitrate = plannedEncodeSummary.totalKbps !== null ? `~${plannedEncodeSummary.totalKbps} kbps` : "no size limit";
     return `${shape} • ${formatClock(currentPlannedDurationS ?? plannedEncodeSummary.durationS)} • ${bitrate}`;
   }, [plannedEncodeSummary, currentPlannedDurationS]);
-  const trimMethodSummary = !trimIsActive
+  const trimAccuracySummary = !trimIsActive
     ? "No active trim"
-    : trimMode === "exact"
-      ? "Exact trim (decoded frame/sample boundaries)"
-      : fastTrimPresentationState.phase === "ready"
-        ? summarizeFastTrimInspection(fastTrimPresentationState.inspection)
-        : fastTrimPresentationState.phase === "blocked"
-          ? "Fast trim, no re-encode is selected but blocked"
-          : fastTrimPresentationState.phase === "checking"
-            ? "Fast trim, no re-encode is being checked"
-            : "Fast trim, no re-encode requires a current check";
+    : "Frame/sample accurate boundaries";
   const encodeModeSummary =
-    trimMode === "fastCopy" && trimIsActive
-      ? fastTrimPresentationState.phase === "ready"
-        ? "Fast Trim copy-only plan, checked by the backend"
-        : fastTrimPresentationState.phase === "blocked"
-          ? "Fast Trim copy-only plan, blocked by the backend check"
-          : fastTrimPresentationState.phase === "checking"
-            ? "Fast Trim copy-only plan, authoritative check in progress"
-            : "Fast Trim copy-only plan, requires an authoritative check"
-      : format === "mp3"
+    format === "mp3"
         ? "Audio-only re-encode"
         : externalSubtitleActive
           ? "Force re-encode to burn external subtitles"
@@ -2921,25 +2772,6 @@ function App() {
                 ? "Re-encode for edits"
                 : "Auto stream copy when safe";
   const advancedPlanSummary = `${encodeModeSummary} • ${advancedCodecSummary}`;
-  const fastTrimBlockingReason = trimMode !== "fastCopy"
-    ? null
-    : !trimIsActive
-      ? "Fast Trim requires an active trim range."
-      : !fastTrimCurrentFingerprint
-        ? "Complete the current source, output, and trim settings before checking Fast Trim."
-        : fastTrimPresentationState.phase === "checking"
-          ? "Wait for Fast Trim inspection to finish."
-          : fastTrimPresentationState.phase === "blocked"
-            ? fastTrimPresentationState.inspection?.reasons[0]?.message ?? "Fast Trim is blocked by the current plan."
-            : fastTrimPresentationState.phase === "stale"
-              ? fastTrimPresentationState.error ?? "Settings changed. Check Fast Trim again."
-              : fastTrimPresentationState.phase === "error"
-                ? fastTrimPresentationState.error ?? "Fast Trim inspection failed."
-                : fastTrimPresentationState.phase !== "ready"
-                  ? "Check Fast Trim before exporting or adding this plan to the queue."
-                  : !fastTrimAccepted
-                    ? "Accept the disclosed Fast Trim boundaries before exporting or adding this plan to the queue."
-                    : null;
   const encodeEventBlockingReason = encodeEventsError
     ? encodeEventsError
     : !encodeEventsReady
@@ -2976,14 +2808,7 @@ function App() {
     externalSubtitleBlockingReason ??
     exactSampleAutoVideoCodecBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting an exact sample." : null);
-  const fastExportBasicBlockingReason =
-    encodeEventBlockingReason ??
-    sizeTargetExactnessBlockingReason ??
-    (subtitleInspecting ? "Wait for external subtitle validation to finish." : null) ??
-    queueOutputBlockingReason;
-  const exportBlockingReason = trimMode === "fastCopy"
-    ? fastExportBasicBlockingReason ?? fastTrimBlockingReason
-    : exactExportPlanBlockingReason;
+  const exportBlockingReason = exactExportPlanBlockingReason;
   const colorHandlingSummary = format === "mp3"
     ? "Video color is not included in MP3 output"
     : colorSource.kind === "standard"
@@ -3016,7 +2841,7 @@ function App() {
     const chips: string[] = [];
 
     if (trimIsActive) {
-      chips.push(trimMode === "fastCopy" ? "Fast trim, no re-encode" : "Exact trim");
+      chips.push("Trim");
     }
 
     if (cropFilterPlanned) chips.push("Crop");
@@ -3055,7 +2880,6 @@ function App() {
     return chips;
   }, [
     trimIsActive,
-    trimMode,
     cropFilterPlanned,
     speed,
     rotateDeg,
@@ -3227,13 +3051,6 @@ function App() {
       warnings.push("MP3 export needs an input with an audio stream.");
     }
 
-    if (trimMode === "fastCopy" && trimIsActive) {
-      warnings.push("Fast Trim keeps a containing closed-GOP interval and may retain material before and after the requested boundaries. It never falls back to re-encoding.");
-      if (fastTrimPresentationState.phase === "blocked") {
-        warnings.push(...(fastTrimPresentationState.inspection?.reasons.map((reason) => reason.message) ?? []));
-      }
-    }
-
     if (externalSubtitleActive) {
       warnings.push(
         format === "mp3"
@@ -3275,7 +3092,7 @@ function App() {
       warnings.push(transformMemoryEstimate.reason ?? "Reverse/Loop exceeds the decoded-memory safety limit.");
     }
 
-    if (trimMode !== "fastCopy" && capabilityInspectionBlockingReason && encodeCapabilitiesError) {
+    if (capabilityInspectionBlockingReason && encodeCapabilitiesError) {
       warnings.push(capabilityInspectionBlockingReason);
     }
 
@@ -3333,9 +3150,7 @@ function App() {
     strictFit,
     strictFitPolicySummary,
     externalSubtitleActive,
-    trimMode,
     trimIsActive,
-    fastTrimPresentationState,
   ]);
 
   const handleDroppedPaths = useEffectEvent(async (paths: string[]) => {
@@ -3627,61 +3442,6 @@ function App() {
       message: `Source probed: ${probe.width}x${probe.height}, ${formatClock(probe.durationS)}`,
     });
 
-    if (smokeConfig.fastTrim && !smokeFastTrimDoneRef.current) {
-      if (trimMode !== "fastCopy" || smokeFastTrimRunningRef.current) return;
-      smokeFastTrimRunningRef.current = true;
-      void (async () => {
-        try {
-          const inspection = await checkFastTrim({ acceptAdjusted: true });
-          if (!inspection) {
-            await reportSmokeFailure(
-              `Packaged Fast Trim inspection failed: ${fastTrimStateRef.current.error ?? "no inspection result was returned."}`,
-            );
-            return;
-          }
-          if (inspection.status === "blocked") {
-            const reasons = inspection.reasons.map((reason) => `${reason.code}: ${reason.message}`).join("; ");
-            await reportSmokeFailure(
-              `Packaged Fast Trim was blocked: ${reasons || "no reason was returned."}`,
-              { fastTrimInspection: inspection },
-            );
-            return;
-          }
-          const fingerprint = fastTrimRequestFingerprint(buildRequest());
-          if (!fastTrimStateIsAccepted(fastTrimStateRef.current, fingerprint)) {
-            await reportSmokeFailure("Packaged Fast Trim did not retain its checked consent and required boundary acceptance.");
-            return;
-          }
-          const effectiveDurationS = fastTrimEffectiveDurationS(inspection);
-          if (smokeInteractionDoneRef.current && smokeMetricsRef.current && effectiveDurationS !== null) {
-            smokeMetricsRef.current = {
-              ...smokeMetricsRef.current,
-              expectedDurationS: effectiveDurationS,
-            };
-          }
-          await reportSmokeStatus("fast-trim-ready", {
-            message: inspection.requiresAcceptance
-              ? "Fast Trim expected boundaries were inspected and accepted for packaged automation."
-              : "Fast Trim requested boundaries were already aligned and inspected for packaged automation.",
-            fastTrimInspection: inspection,
-          });
-          if (!smokeFastTrimResetDoneRef.current) {
-            const resetResult = await runSmokeFastTrimResetChecks(inspection);
-            if (!resetResult.ok) {
-              await reportSmokeFailure(resetResult.message);
-              return;
-            }
-            smokeFastTrimResetDoneRef.current = true;
-          }
-          smokeFastTrimDoneRef.current = true;
-          setStatus("Smoke: Fast Trim inspection is ready.");
-        } finally {
-          smokeFastTrimRunningRef.current = false;
-        }
-      })();
-      return;
-    }
-
     if (!smokeWorkflowDoneRef.current) {
       if (smokeWorkflowRunningRef.current) return;
       smokeWorkflowRunningRef.current = true;
@@ -3693,7 +3453,6 @@ function App() {
           return;
         }
         smokeWorkflowDoneRef.current = true;
-        if (smokeConfig.fastTrim) smokeFastTrimDoneRef.current = false;
         await reportSmokeStatus("workflow-ready", { message: result.message });
         setStatus("Smoke: queue and recipe workflow checks passed.");
       })();
@@ -3727,10 +3486,8 @@ function App() {
         const trimEndS = Math.max(trimStartS, Math.min(probe.durationS, smokeConfig.trimEndS ?? probe.durationS));
         const smokeSpeed = Number(speed);
         const effectiveSmokeSpeed = Number.isFinite(smokeSpeed) && smokeSpeed > 0 ? smokeSpeed : 1;
-        const expectedDurationS = smokeConfig.fastTrim
-          ? fastTrimEffectiveDurationS(fastTrimStateRef.current.inspection) ?? Math.max(0, trimEndS - trimStartS)
-          : (Math.max(0, trimEndS - trimStartS) / effectiveSmokeSpeed) *
-            (smokeConfig.loopVideo && smokeConfig.format !== "mp3" ? 2 : 1);
+        const expectedDurationS = (Math.max(0, trimEndS - trimStartS) / effectiveSmokeSpeed) *
+          (smokeConfig.loopVideo && smokeConfig.format !== "mp3" ? 2 : 1);
         smokeMetricsRef.current = {
           trimStartS,
           trimEndS,
@@ -3766,21 +3523,9 @@ function App() {
           }
 
           smokeInteractionDoneRef.current = true;
-          const reportedTrimStartS = smokeConfig.fastTrim ? Math.max(0, smokeConfig.trimStartS) : result.trimStartS;
-          const reportedTrimEndS = smokeConfig.fastTrim
-            ? Math.max(reportedTrimStartS, Math.min(probe.durationS, smokeConfig.trimEndS ?? probe.durationS))
-            : result.trimEndS;
-          const reportedExpectedDurationS = smokeConfig.fastTrim
-            ? fastTrimEffectiveDurationS(fastTrimStateRef.current.inspection) ?? Math.max(0, reportedTrimEndS - reportedTrimStartS)
-            : result.expectedDurationS;
-          if (smokeConfig.fastTrim) {
-            setTrimStart(formatNumberInput(reportedTrimStartS));
-            setTrimEnd(formatNumberInput(reportedTrimEndS));
-            setCropEnabled(false);
-            setCropRect({ x: 0, y: 0, w: 1, h: 1 });
-            invalidateCurrentFastTrim("Smoke restored the configured Fast Trim boundaries; checking again.");
-            smokeFastTrimDoneRef.current = false;
-          }
+          const reportedTrimStartS = result.trimStartS;
+          const reportedTrimEndS = result.trimEndS;
+          const reportedExpectedDurationS = result.expectedDurationS;
           smokeMetricsRef.current = {
             trimStartS: reportedTrimStartS,
             trimEndS: reportedTrimEndS,
@@ -3799,74 +3544,6 @@ function App() {
     }
 
     if (!smokeInteractionDoneRef.current) return;
-
-    if (smokeConfig.sourceMutation && !smokeSourceMutationDoneRef.current) {
-      if (smokeSourceMutationRunningRef.current) return;
-      smokeSourceMutationRunningRef.current = true;
-      void (async () => {
-        try {
-          const acceptedRequest = buildRequest();
-          const acceptedConsent = acceptedRequest.trim?.mode === "fastCopy"
-            ? acceptedRequest.trim.fastCopyConsent
-            : null;
-          if (!acceptedConsent || !fastTrimStateIsAccepted(
-            fastTrimStateRef.current,
-            fastTrimRequestFingerprint(acceptedRequest),
-          )) {
-            await reportSmokeFailure("Packaged source-mutation smoke reached its gate without current accepted Fast Trim consent.");
-            return;
-          }
-          await reportSmokeStatus("fast-trim-source-mutation-ready", {
-            message: "Fast Trim consent is attached. Waiting for the packaged harness to mutate the source before execution.",
-          });
-
-          const inspectionRequest = cloneEncodeRequest(acceptedRequest);
-          if (!inspectionRequest.trim) {
-            await reportSmokeFailure("Packaged source-mutation smoke lost its Fast Trim request.");
-            return;
-          }
-          inspectionRequest.trim.fastCopyConsent = null;
-          const deadline = Date.now() + 30_000;
-          let mutatedInspection: FastTrimInspection | null = null;
-          while (Date.now() < deadline) {
-            let candidate: FastTrimInspection;
-            try {
-              candidate = await invoke<FastTrimInspection>("inspect_fast_trim", { request: inspectionRequest });
-            } catch (error) {
-              await reportSmokeFailure(
-                `Packaged source-mutation reinspection failed: ${pathFreeFastTrimMessage(error, [inputPath, outputPath, subtitlePath])}`,
-              );
-              return;
-            }
-            if (candidate.status === "blocked") {
-              const reason = candidate.reasons[0]?.message ?? "the mutated source was no longer Fast-compatible";
-              await reportSmokeFailure(`Packaged source-mutation reinspection was blocked: ${reason}.`);
-              return;
-            }
-            if (
-              candidate.consent?.confirmationToken &&
-              candidate.consent.confirmationToken !== acceptedConsent.confirmationToken
-            ) {
-              mutatedInspection = candidate;
-              break;
-            }
-            await waitMs(100);
-          }
-          if (!mutatedInspection) {
-            await reportSmokeFailure("Packaged source-mutation smoke timed out waiting for changed backend source identity.");
-            return;
-          }
-          await reportSmokeStatus("fast-trim-source-mutation-complete", {
-            message: "Backend reinspection observed changed source identity while the UI retained the original accepted consent.",
-          });
-          smokeSourceMutationDoneRef.current = true;
-          setStatus("Smoke: source mutation detected; starting with the intentionally stale consent.");
-        } finally {
-          smokeSourceMutationRunningRef.current = false;
-        }
-      })();
-      return;
-    }
 
     if (jobId !== null || smokeStartRef.current) return;
 
@@ -3899,9 +3576,7 @@ function App() {
     previewError,
     jobId,
     trimTimeline,
-    trimMode,
     speed,
-    fastTrimState,
     status,
     subtitlePath,
     subtitleInspection,
@@ -4128,7 +3803,6 @@ function App() {
                 outputPath: null,
                 outputSizeBytes: null,
                 diagnostics: p.diagnostics ?? null,
-                trimResult: p.trimResult ?? null,
                 g7Evidence,
               });
             }
@@ -4137,7 +3811,6 @@ function App() {
               `Packaged app smoke encode failed: ${p.message || "Encode failed."}`,
               {
                 diagnostics: p.diagnostics ?? null,
-                trimResult: p.trimResult ?? null,
                 g7Evidence,
               },
             );
@@ -4162,7 +3835,6 @@ function App() {
               expectedDurationS: smokeMetrics?.expectedDurationS ?? completedContext.durationS,
               targetResult: p.targetResult ?? null,
               diagnostics: p.diagnostics ?? null,
-              trimResult: p.trimResult ?? null,
               queueOutcomeKind: p.targetResult?.status === "missed" ? "target-missed" : "done",
               g7Evidence,
             });
@@ -4184,7 +3856,6 @@ function App() {
                 outputPath: p.outputPath ?? completedContext.outputPath,
                 outputSizeBytes: p.outputSizeBytes ?? null,
                 diagnostics: p.diagnostics ?? null,
-                trimResult: p.trimResult ?? null,
                 completedAtMs,
               },
             });
@@ -4236,7 +3907,6 @@ function App() {
           format: completedContext.format,
           message: p.message ?? null,
           diagnostics: p.diagnostics ?? null,
-          trimResult: p.trimResult ?? null,
           targetResult: p.targetResult ?? null,
           correctiveContext: {
             ...completedContext.correctiveContext,
@@ -4265,7 +3935,6 @@ function App() {
               outputSizeBytes: p.outputSizeBytes ?? null,
               targetResult: p.targetResult ?? null,
               diagnostics: p.diagnostics ?? null,
-              trimResult: p.trimResult ?? null,
               completedAtMs,
             },
           });
@@ -4646,7 +4315,7 @@ function App() {
     const endS = endRaw === null || endRaw >= probe.durationS ? null : endRaw;
     if (endS !== null && endS <= startS) throw new Error("Trim end (s) must be greater than trim start.");
     const trim = startS > 0 || endS !== null
-      ? { startS, endS, mode: trimMode, fastCopyConsent: null }
+      ? { startS, endS }
       : null;
 
     const cropPx = cropEnabled ? cropRectToPixels(cropRect, probe.width, probe.height) : null;
@@ -4683,121 +4352,7 @@ function App() {
         requestStrictFit && audioEnabled && probe.hasAudio && strictFitAllowAudioRemoval,
       subtitlePath: subtitlePath || null,
     };
-    if (request.trim?.mode === "fastCopy") {
-      const fingerprint = fastTrimRequestFingerprint(request);
-      request.trim.fastCopyConsent = fastTrimConsentForRequest(fastTrimState, fingerprint);
-    }
     return request;
-  }
-
-  function clearFastTrimState() {
-    fastTrimRequestIdRef.current += 1;
-    fastTrimFingerprintRef.current = null;
-    fastTrimStateRef.current = createFastTrimState();
-    setFastTrimState(fastTrimStateRef.current);
-  }
-
-  function invalidateCurrentFastTrim(message = "Settings changed. Check Fast Trim again.") {
-    if (fastTrimModeRef.current !== "fastCopy") return;
-    fastTrimRequestIdRef.current += 1;
-    fastTrimFingerprintRef.current = null;
-    const nextState = invalidateFastTrimState(fastTrimStateRef.current, message);
-    fastTrimStateRef.current = nextState;
-    setFastTrimState(nextState);
-  }
-
-  function selectTrimMode(nextMode: TrimMode) {
-    if (nextMode === trimMode) return;
-    fastTrimRequestIdRef.current += 1;
-    fastTrimFingerprintRef.current = null;
-    fastTrimModeRef.current = nextMode;
-    setTrimMode(nextMode);
-    const nextState = createFastTrimState();
-    fastTrimStateRef.current = nextState;
-    setFastTrimState(nextState);
-  }
-
-  async function checkFastTrim(options: { acceptAdjusted?: boolean; request?: EncodeRequest } = {}): Promise<FastTrimInspection | null> {
-    let request: EncodeRequest;
-    try {
-      request = options.request ? cloneEncodeRequest(options.request) : buildRequest();
-    } catch (error) {
-      const message = pathFreeFastTrimMessage(error, [inputPath, outputPath, subtitlePath]);
-      const nextState = invalidateFastTrimState(fastTrimStateRef.current, message);
-      fastTrimStateRef.current = nextState;
-      setFastTrimState(nextState);
-      return null;
-    }
-    if (!request.trim || fastTrimModeRef.current !== "fastCopy") {
-      const nextState = invalidateFastTrimState(
-        fastTrimStateRef.current,
-        "Set a trim range and select Fast trim, no re-encode before checking.",
-      );
-      fastTrimStateRef.current = nextState;
-      setFastTrimState(nextState);
-      return null;
-    }
-
-    const inspectionRequest = cloneEncodeRequest(request);
-    inspectionRequest.trim = {
-      startS: request.trim.startS,
-      endS: request.trim.endS ?? null,
-      mode: "fastCopy",
-      fastCopyConsent: null,
-    };
-    const fingerprint = fastTrimRequestFingerprint(inspectionRequest);
-    if (!fingerprint) return null;
-    const requestId = fastTrimRequestIdRef.current + 1;
-    fastTrimRequestIdRef.current = requestId;
-    fastTrimFingerprintRef.current = fingerprint;
-    const checkingState = beginFastTrimCheck(fastTrimStateRef.current, fingerprint, requestId);
-    fastTrimStateRef.current = checkingState;
-    setFastTrimState(checkingState);
-
-    try {
-      const inspection = await invoke<FastTrimInspection>("inspect_fast_trim", { request: inspectionRequest });
-      if (
-        fastTrimRequestIdRef.current !== requestId ||
-        fastTrimModeRef.current !== "fastCopy" ||
-        fastTrimFingerprintRef.current !== fingerprint
-      ) return null;
-      let nextState = settleFastTrimCheck(fastTrimStateRef.current, fingerprint, requestId, inspection);
-      if (options.acceptAdjusted && inspection.status === "ready") {
-        nextState = acceptFastTrimBounds(nextState, true);
-      }
-      fastTrimStateRef.current = nextState;
-      setFastTrimState(nextState);
-      return inspection;
-    } catch (error) {
-      if (fastTrimRequestIdRef.current !== requestId) return null;
-      const message = pathFreeFastTrimMessage(error, [inputPath, outputPath, subtitlePath]);
-      const nextState = failFastTrimCheck(fastTrimStateRef.current, fingerprint, requestId, message);
-      fastTrimStateRef.current = nextState;
-      setFastTrimState(nextState);
-      return null;
-    }
-  }
-
-  function restoreFastTrimInspection(
-    request: EncodeRequest,
-    inspection: FastTrimInspection,
-    acceptSnapshotConsent: boolean,
-  ) {
-    const fingerprint = fastTrimRequestFingerprint(request);
-    if (!fingerprint) {
-      clearFastTrimState();
-      return;
-    }
-    const requestId = fastTrimRequestIdRef.current + 1;
-    fastTrimRequestIdRef.current = requestId;
-    fastTrimFingerprintRef.current = fingerprint;
-    let nextState = beginFastTrimCheck(createFastTrimState(), fingerprint, requestId);
-    nextState = settleFastTrimCheck(nextState, fingerprint, requestId, inspection);
-    if (acceptSnapshotConsent && inspection.status === "ready") {
-      nextState = acceptFastTrimBounds(nextState, true);
-    }
-    fastTrimStateRef.current = nextState;
-    setFastTrimState(nextState);
   }
 
   function claimedOutputPathsForPreparation(): string[] {
@@ -4939,8 +4494,6 @@ function App() {
     sourceProbe: VideoProbe,
     nextOutputPath: string,
     inspectedSubtitle: SubtitleInspection | null,
-    inspectedFastTrim: FastTrimInspection | null,
-    acceptSnapshotFastTrimConsent: boolean,
   ) {
     const resize = request.resize ?? {
       mode: request.maxEdgePx ? "maxEdge" as const : "source" as const,
@@ -4992,14 +4545,6 @@ function App() {
     setTrimStart(request.trim?.startS ? String(request.trim.startS) : "0");
     setTrimEnd(request.trim?.endS == null ? "" : String(request.trim.endS));
     setTrimDragSnapS("0");
-    const requestTrimMode = request.trim?.mode ?? "exact";
-    fastTrimModeRef.current = requestTrimMode;
-    setTrimMode(requestTrimMode);
-    if (requestTrimMode === "fastCopy" && inspectedFastTrim) {
-      restoreFastTrimInspection(request, inspectedFastTrim, acceptSnapshotFastTrimConsent);
-    } else {
-      clearFastTrimState();
-    }
     setReverse(request.reverse);
     setLoopVideo(request.format === "mp3" ? false : request.loopVideo);
     setSpeed(String(request.speed));
@@ -5027,169 +4572,6 @@ function App() {
     // newly applied source is probing.
     setOutputAuto(false);
     setOutputPath(nextOutputPath);
-  }
-
-  async function runSmokeFastTrimResetChecks(
-    configuredInspection: FastTrimInspection,
-  ): Promise<SmokeAccessibilityResult> {
-    if (!smokeConfig || !probe || configuredInspection.status !== "ready" || !configuredInspection.consent) {
-      return { ok: false, message: "Fast Trim reset smoke started without a ready configured plan." };
-    }
-
-    const configuredRequest = buildRequest();
-    if (!configuredRequest.trim) {
-      return { ok: false, message: "Fast Trim reset smoke lost the configured trim request." };
-    }
-    configuredRequest.trim = {
-      ...configuredRequest.trim,
-      mode: "fastCopy",
-      fastCopyConsent: configuredInspection.consent,
-    };
-    let restorableInspection = configuredInspection;
-    let result: SmokeAccessibilityResult = {
-      ok: true,
-      message: "Mounted Reset Trim and Reset All actions returned Fast Trim to Exact and cleared consent.",
-    };
-
-    const resetStateIsClear = () => {
-      const exactRadio = document.querySelector<HTMLInputElement>('[data-smoke-id="trim-mode-exact"]');
-      const startInput = document.getElementById("vfl-trim-start");
-      const endInput = document.getElementById("vfl-trim-end");
-      const state = fastTrimStateRef.current;
-      return Boolean(
-        exactRadio?.checked &&
-        fastTrimModeRef.current === "exact" &&
-        state.phase === "idle" &&
-        state.fingerprint === null &&
-        state.inspection === null &&
-        state.acceptedConfirmationToken === null &&
-        startInput instanceof HTMLInputElement &&
-        startInput.value === "0" &&
-        endInput instanceof HTMLInputElement &&
-        endInput.value === "",
-      );
-    };
-    const setMountedInputValue = (input: HTMLInputElement, value: string) => {
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-      if (!setter) throw new Error("Fast Trim reset smoke could not access the mounted input value setter.");
-      setter.call(input, value);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    };
-
-    try {
-      setOpenCards((cards) => ({ ...cards, crop: true, plan: true }));
-      const resetActionsMounted = await waitForSmokeCondition(() => Boolean(
-        document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-trim"]') &&
-        document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-settings"]'),
-      ));
-      if (!resetActionsMounted) {
-        throw new Error("Fast Trim reset smoke could not mount both reset actions.");
-      }
-      const resetTrimButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-trim"]');
-      if (!resetTrimButton || resetTrimButton.disabled) {
-        throw new Error("Fast Trim reset smoke could not find the enabled mounted Reset trim action.");
-      }
-      resetTrimButton.click();
-      if (!(await waitForSmokeCondition(resetStateIsClear))) {
-        throw new Error("Mounted Reset trim did not select Exact, clear Fast consent, and reset both trim inputs.");
-      }
-      await reportSmokeStatus("fast-trim-reset-trim-complete", {
-        message: "Mounted Reset trim selected Exact, cleared Fast inspection/consent, and reset both trim inputs.",
-      });
-
-      const startInput = document.getElementById("vfl-trim-start");
-      const endInput = document.getElementById("vfl-trim-end");
-      if (!(startInput instanceof HTMLInputElement) || !(endInput instanceof HTMLInputElement)) {
-        throw new Error("Fast Trim reset smoke could not remount both trim inputs.");
-      }
-      setMountedInputValue(startInput, formatNumberInput(smokeConfig.trimStartS));
-      setMountedInputValue(
-        endInput,
-        smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined
-          ? ""
-          : formatNumberInput(smokeConfig.trimEndS),
-      );
-      const fastRadio = document.querySelector<HTMLInputElement>('[data-smoke-id="trim-mode-fast"]');
-      if (!fastRadio || fastRadio.disabled) {
-        throw new Error("Fast Trim reset smoke could not find the enabled mounted Fast Trim radio.");
-      }
-      fastRadio.click();
-      if (!(await waitForSmokeCondition(() => {
-        const currentFastRadio = document.querySelector<HTMLInputElement>('[data-smoke-id="trim-mode-fast"]');
-        return Boolean(currentFastRadio?.checked && fastTrimModeRef.current === "fastCopy");
-      }))) {
-        throw new Error("Fast Trim reset smoke could not restore Fast Trim through its mounted radio.");
-      }
-
-      const reinspectionRequest = cloneEncodeRequest(configuredRequest);
-      if (!reinspectionRequest.trim) throw new Error("Fast Trim reset smoke lost its reinspection trim.");
-      reinspectionRequest.trim.fastCopyConsent = null;
-      const reinspection = await checkFastTrim({ acceptAdjusted: true, request: reinspectionRequest });
-      const reinspectionFingerprint = fastTrimRequestFingerprint(reinspectionRequest);
-      if (
-        !reinspection ||
-        reinspection.status !== "ready" ||
-        !reinspection.consent ||
-        !fastTrimStateIsAccepted(fastTrimStateRef.current, reinspectionFingerprint)
-      ) {
-        throw new Error("Fast Trim reset smoke could not re-check and accept the configured plan between resets.");
-      }
-      restorableInspection = reinspection;
-      configuredRequest.trim.fastCopyConsent = reinspection.consent;
-
-      const resetAllButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-settings"]');
-      if (!resetAllButton || resetAllButton.disabled) {
-        throw new Error("Fast Trim reset smoke could not find the enabled mounted Reset all settings action.");
-      }
-      resetAllButton.click();
-      const confirmationFocused = await waitForSmokeCondition(() => {
-        const cancel = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-cancel"]');
-        const confirm = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-confirm"]');
-        return Boolean(cancel && confirm && document.activeElement === cancel);
-      });
-      if (!confirmationFocused) {
-        throw new Error("Reset all settings confirmation did not open with focus on the safe Cancel action.");
-      }
-      const confirmResetButton = document.querySelector<HTMLButtonElement>('[data-smoke-id="reset-all-confirm"]');
-      if (!confirmResetButton || confirmResetButton.disabled) {
-        throw new Error("Fast Trim reset smoke could not confirm Reset all settings.");
-      }
-      confirmResetButton.click();
-      if (!(await waitForSmokeCondition(resetStateIsClear))) {
-        throw new Error("Mounted Reset all settings did not select Exact, clear Fast consent, and reset both trim inputs.");
-      }
-      await reportSmokeStatus("fast-trim-reset-all-complete", {
-        message: "Mounted Reset all settings selected Exact, cleared Fast inspection/consent, and reset both trim inputs.",
-      });
-    } catch (error) {
-      result = {
-        ok: false,
-        message: coerceErrorMessage(error, "Mounted Fast Trim reset checks failed."),
-      };
-    } finally {
-      applyQueueRequestToWorkbench(
-        configuredRequest,
-        probe,
-        smokeConfig.outputPath,
-        subtitleInspection,
-        restorableInspection,
-        true,
-      );
-      const configuredFingerprint = fastTrimRequestFingerprint(configuredRequest);
-      const restored = await waitForSmokeCondition(() => {
-        const fastRadio = document.querySelector<HTMLInputElement>('[data-smoke-id="trim-mode-fast"]');
-        return Boolean(
-          fastRadio?.checked &&
-          fastTrimModeRef.current === "fastCopy" &&
-          fastTrimStateIsAccepted(fastTrimStateRef.current, configuredFingerprint),
-        );
-      });
-      if (!restored && result.ok) {
-        result = { ok: false, message: "Fast Trim reset smoke could not restore the configured accepted plan." };
-      }
-    }
-    return result;
   }
 
   async function retryQueueItem(itemId: number) {
@@ -5269,15 +4651,11 @@ function App() {
     setQueueSnapshotApplying(true);
     window.setTimeout(focusQueueAfterMutation, 0);
     let snapshotSubtitlePath: string | null = null;
-    let snapshotFastTrimPaths: string[] = [];
     try {
       await serializeQueuePreparation(async () => {
         const item = exportQueueStateRef.current.items.find((candidate) => candidate.id === itemId);
         if (!item || item.status === "running") return;
         snapshotSubtitlePath = item.request.subtitlePath ?? null;
-        snapshotFastTrimPaths = item.request.trim?.mode === "fastCopy"
-          ? [item.request.inputPath, item.request.outputPath]
-          : [];
         if (item.format === "mp3" && item.request.subtitlePath) {
           throw new Error("That queue snapshot combines MP3 with external subtitles. Choose MP4 or WebM first.");
         }
@@ -5285,18 +4663,11 @@ function App() {
           throw new Error(subtitlePickerBlockingReason ?? "External subtitles are unavailable in the active FFmpeg build.");
         }
         const requestFingerprint = JSON.stringify(item.request);
-        const inspectionRequest = cloneEncodeRequest(item.request);
-        if (inspectionRequest.trim?.mode === "fastCopy") {
-          inspectionRequest.trim.fastCopyConsent = null;
-        }
-        const [sourceProbe, nextOutputPath, inspectedSubtitle, inspectedFastTrim] = await Promise.all([
+        const [sourceProbe, nextOutputPath, inspectedSubtitle] = await Promise.all([
           invoke<VideoProbe>("probe_video", { path: item.inputPath }),
           suggestedOutputForInput(item.inputPath, item.format, claimedOutputPathsForPreparation()),
           item.request.subtitlePath
             ? invoke<SubtitleInspection>("inspect_srt", { path: item.request.subtitlePath })
-            : Promise.resolve(null),
-          item.request.trim?.mode === "fastCopy"
-            ? invoke<FastTrimInspection>("inspect_fast_trim", { request: inspectionRequest })
             : Promise.resolve(null),
         ]);
         if (queueSnapshotApplyTokenRef.current !== token) return;
@@ -5313,19 +4684,8 @@ function App() {
         if (!currentItem || currentItem.status === "running" || JSON.stringify(currentItem.request) !== requestFingerprint) return;
 
         const request = { ...cloneEncodeRequest(item.request), outputPath: nextOutputPath };
-        const snapshotFastConsentMatches = Boolean(
-          request.trim?.mode === "fastCopy" &&
-          inspectedFastTrim?.status === "ready" &&
-          fastTrimConsentsMatch(request.trim.fastCopyConsent, inspectedFastTrim.consent),
-        );
-        const acceptAppliedFastTrimConsent = snapshotFastConsentMatches || smokeConfigRef.current?.fastTrim === true;
-        const appliedSnapshotStatus = request.trim?.mode !== "fastCopy"
-          ? `Applied the full queue snapshot for ${basename(item.inputPath)} with a fresh output path.`
-          : inspectedFastTrim?.status === "blocked"
-            ? "Applied the full queue snapshot. Fast Trim is still selected but is blocked; review its reasons."
-            : inspectedFastTrim?.requiresAcceptance && !acceptAppliedFastTrimConsent
-              ? "Applied the full queue snapshot. Fast Trim boundaries changed; review and accept the current interval."
-              : `Applied the full queue snapshot and re-checked Fast Trim for ${basename(item.inputPath)} with a fresh output path.`;
+        const appliedSnapshotStatus =
+          `Applied the full queue snapshot for ${basename(item.inputPath)} with a fresh output path.`;
         const inputChanged = inputPathRef.current !== item.inputPath;
         pendingQueueSnapshotRef.current = inputChanged
           ? {
@@ -5340,8 +4700,6 @@ function App() {
           sourceProbe,
           nextOutputPath,
           inspectedSubtitle,
-          inspectedFastTrim,
-          acceptAppliedFastTrimConsent,
         );
         if (inputChanged) setInputPath(item.inputPath);
         setProbe(sourceProbe);
@@ -5353,9 +4711,7 @@ function App() {
         pendingQueueSnapshotRef.current = null;
         const message = snapshotSubtitlePath
           ? safeSubtitleError(error, snapshotSubtitlePath)
-          : snapshotFastTrimPaths.length
-            ? pathFreeFastTrimMessage(error, snapshotFastTrimPaths)
-            : coerceErrorMessage(error, "Could not apply the queue snapshot.");
+          : coerceErrorMessage(error, "Could not apply the queue snapshot.");
         if (snapshotSubtitlePath) {
           setOpenCards((cards) => ({ ...cards, output: true }));
           setSubtitleError(message);
@@ -5384,7 +4740,7 @@ function App() {
       setStatus(coerceErrorMessage(error, "Failed to capture the current export plan."));
       return;
     }
-    const capturedDurationS = fastTrimDurationFromRequest(capturedRequest) ?? currentPlannedDurationS;
+    const capturedDurationS = currentPlannedDurationS;
     await serializeQueuePreparation(async () => {
       try {
         if (exportQueueRemainingCapacity(exportQueueStateRef.current) === 0) {
@@ -5656,7 +5012,7 @@ function App() {
         jobId: null,
         cancelRequested: false,
         outputPath: request.outputPath,
-        durationS: options?.durationS ?? fastTrimDurationFromRequest(request) ?? currentPlannedDurationS,
+        durationS: options?.durationS ?? currentPlannedDurationS,
         format: request.format,
         queueItemId: options?.queueItemId ?? null,
         queueRunId: options?.queueRunId ?? null,
@@ -5761,7 +5117,7 @@ function App() {
       }
 
       request.outputPath = selected;
-      request.trim = { startS: sampleStart, endS: sampleEnd, mode: "exact", fastCopyConsent: null };
+      request.trim = { startS: sampleStart, endS: sampleEnd };
 
       setSampleEstimate(null);
       await startEncode({
@@ -6364,12 +5720,6 @@ function App() {
         '"cueCount"',
         '"title"',
         '"trim"',
-        '"fastCopyConsent"',
-        '"confirmationToken"',
-        '"requestedStartUs"',
-        '"effectiveStartUs"',
-        '"videoPacketCount"',
-        '"trimResult"',
         '"crop"',
         '"colorPolicy"',
         '"stripMetadata"',
@@ -7158,79 +6508,6 @@ function App() {
       message: "Real packaged trim keyboard sequence completed with the original value restored and focus on Trim end.",
     });
 
-    if (smokeConfig?.fastTrim) {
-      selectTrimMode("exact");
-      const exactMounted = await waitForSmokeCondition(() => {
-        const exact = document.querySelector<HTMLInputElement>('[data-smoke-id="trim-mode-exact"]');
-        return Boolean(exact?.checked);
-      });
-      const exactRadio = document.querySelector<HTMLInputElement>('[data-smoke-id="trim-mode-exact"]');
-      if (!exactMounted || !exactRadio || exactRadio.type !== "radio") {
-        return { ok: false, message: "Accessibility smoke could not mount the native Exact Trim radio." };
-      }
-      exactRadio.focus();
-      await reportSmokeStatus("keyboard-fast-trim-ready", {
-        message: "Waiting for real packaged keyboard input: Right on the Exact Trim radio to select Fast Trim.",
-      });
-      const realFastSelectionPassed = await waitForSmokeCondition(() => {
-        const fast = document.querySelector<HTMLInputElement>('[data-smoke-id="trim-mode-fast"]');
-        return Boolean(fast?.checked && fastTrimModeRef.current === "fastCopy");
-      });
-      if (!realFastSelectionPassed) {
-        return { ok: false, message: "Accessibility smoke did not receive the real Right key that selects Fast Trim." };
-      }
-
-      const proofRequest = buildRequest();
-      const currentTimeline = trimTimelineRef.current;
-      if (!currentTimeline) {
-        return { ok: false, message: "Accessibility smoke lost the current trim interval before Fast Trim inspection." };
-      }
-      proofRequest.trim = {
-        startS: currentTimeline.start,
-        endS: currentTimeline.hasCustomEnd ? currentTimeline.end : null,
-        mode: "fastCopy",
-        fastCopyConsent: null,
-      };
-      const inspection = await checkFastTrim({ request: proofRequest });
-      if (!inspection || inspection.status !== "ready") {
-        return {
-          ok: false,
-          message: inspection?.reasons[0]?.message ?? fastTrimStateRef.current.error ?? "Accessibility smoke could not check Fast Trim.",
-        };
-      }
-
-      if (inspection.requiresAcceptance) {
-        const acceptMounted = await waitForSmokeCondition(
-          () => document.querySelector<HTMLInputElement>('[data-smoke-id="fast-trim-accept"]') !== null,
-        );
-        const accept = document.querySelector<HTMLInputElement>('[data-smoke-id="fast-trim-accept"]');
-        if (!acceptMounted || !accept || accept.type !== "checkbox") {
-          return { ok: false, message: "Accessibility smoke could not mount the adjusted-boundary Fast Trim checkbox." };
-        }
-        accept.focus();
-        await reportSmokeStatus("keyboard-fast-trim-accept-ready", {
-          message: "Waiting for real packaged keyboard input: Space on the concrete Fast Trim boundary acknowledgment.",
-        });
-        const realAcceptancePassed = await waitForSmokeCondition(() => {
-          const currentAccept = document.querySelector<HTMLInputElement>('[data-smoke-id="fast-trim-accept"]');
-          return Boolean(
-            currentAccept?.checked &&
-            fastTrimStateIsAccepted(fastTrimStateRef.current, fastTrimStateRef.current.fingerprint),
-          );
-        });
-        if (!realAcceptancePassed) {
-          return { ok: false, message: "Accessibility smoke did not receive the real Space key that accepts Fast Trim boundaries." };
-        }
-      }
-
-      await reportSmokeStatus("keyboard-fast-trim-complete", {
-        message: inspection.requiresAcceptance
-          ? "Real packaged Fast Trim radio selection and concrete boundary acknowledgment passed."
-          : "Real packaged Fast Trim radio selection passed; the checked boundaries required no second acknowledgment.",
-        fastTrimInspection: inspection,
-      });
-    }
-
     startSlider.focus();
     const startMaximum = Number(startSlider.getAttribute("aria-valuemax"));
     const arrowEvent = dispatchKey(startSlider, "ArrowRight");
@@ -7639,9 +6916,6 @@ function App() {
   function resetTrim() {
     setTrimStart("0");
     setTrimEnd("");
-    fastTrimModeRef.current = "exact";
-    setTrimMode("exact");
-    clearFastTrimState();
   }
 
   function createUpdateProgressChannel(onPhaseMessage?: (message: string) => void) {
@@ -7875,7 +7149,7 @@ function App() {
         >
           <div className="vfl-about-title" id="vfl-reset-confirmation-title">Reset all settings?</div>
           <p className="vfl-muted" id="vfl-reset-confirmation-description">
-            This clears the current export settings, trim, crop, color edits, subtitle selection, and Fast Trim consent. It does not remove the source, output file, queue, or saved recipes.
+            This clears the current export settings, trim, crop, color edits, and subtitle selection. It does not remove the source, output file, queue, or saved recipes.
           </p>
           <div className="vfl-actions">
             <button
@@ -8220,20 +7494,6 @@ function App() {
                               Reset trim
                             </button>
                           </div>
-                          <TrimModeControls
-                            mode={trimMode}
-                            trimActive={trimIsActive}
-                            disabled={encodeBusy}
-                            state={fastTrimPresentationState}
-                            accepted={fastTrimAccepted}
-                            onModeChange={selectTrimMode}
-                            onCheck={() => void checkFastTrim()}
-                            onAcceptedChange={(accepted) => {
-                              const nextState = acceptFastTrimBounds(fastTrimStateRef.current, accepted);
-                              fastTrimStateRef.current = nextState;
-                              setFastTrimState(nextState);
-                            }}
-                          />
                           <div className="vfl-kbd-hint">{trimShortcutHint}</div>
                         </div>
                       ) : null}
@@ -8387,8 +7647,8 @@ function App() {
               </div>
               <div className="vfl-recipe-privacy vfl-recipe-privacy-compact">
                 Recipes save format, size, resize, audio, Strict Fit, uniqueness, and encoder settings. They never save media, output,
-                or external subtitle paths, title, trim, trim method, Fast Trim boundaries or consent, crop, transforms, color edits,
-                HDR conversion choice, diagnostics, or queue and job state. Metadata privacy stays separate.
+                or external subtitle paths, title, trim, crop, transforms, color edits, HDR conversion choice, diagnostics, or queue and
+                job state. Metadata privacy stays separate.
               </div>
               {recipeStatus ? (
                 <div
@@ -9210,7 +8470,7 @@ function App() {
                           ? `Sample ${formatByteSize(sampleEstimate.sampleBytes)}${
                               sampleEstimate.estimateBytes ? ` -> full export ~ ${formatByteSize(sampleEstimate.estimateBytes)}` : ""
                             }`
-                          : "Encodes a short slice around the preview position. Samples always use Exact trim, even when the full export uses Fast Trim."}
+                          : "Encodes a short slice around the preview position with exact trim boundaries."}
                       </div>
                     </div>
 
@@ -9345,8 +8605,8 @@ function App() {
                       <div className="vfl-summary-value">{planSummaryText ?? "Pick a valid input and settings to calculate the plan."}</div>
                     </div>
                     <div className="vfl-summary-row">
-                      <div className="vfl-summary-label">Trim method</div>
-                      <div className="vfl-summary-value">{trimMethodSummary}</div>
+                      <div className="vfl-summary-label">Trim</div>
+                      <div className="vfl-summary-value">{trimAccuracySummary}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Recipe</div>
@@ -9413,7 +8673,6 @@ function App() {
                       {lastExport.message ? <div className="vfl-export-result-note">{lastExport.message}</div> : null}
                       <div className="vfl-export-result-path">{lastExport.outputPath}</div>
                       {lastExport.targetResult ? <TargetResultDetails targetResult={lastExport.targetResult} /> : null}
-                      {lastExport.trimResult ? <TrimResultDetails result={lastExport.trimResult} /> : null}
                       {lastExport.diagnostics ? (
                         <details className="vfl-export-diagnostics">
                           <summary>Export details</summary>
@@ -9493,20 +8752,6 @@ function App() {
                                 <span>External subtitles</span>
                                 <strong>
                                   Burned in{lastExport.diagnostics.subtitleCueCount ? `, ${lastExport.diagnostics.subtitleCueCount} cues` : ""}
-                                </strong>
-                              </div>
-                            ) : null}
-                            {lastExport.diagnostics.trimMode ? (
-                              <div>
-                                <span>Trim method</span>
-                                <strong>{fastTrimModeLabel(lastExport.diagnostics.trimMode)}</strong>
-                              </div>
-                            ) : null}
-                            {lastExport.diagnostics.trimEffectiveStartUs != null && lastExport.diagnostics.trimEffectiveEndUs != null ? (
-                              <div>
-                                <span>Expected source interval</span>
-                                <strong>
-                                  {formatClock(lastExport.diagnostics.trimEffectiveStartUs / 1_000_000)} to {formatClock(lastExport.diagnostics.trimEffectiveEndUs / 1_000_000)}
                                 </strong>
                               </div>
                             ) : null}
@@ -9631,12 +8876,8 @@ function App() {
                     (outcome?.kind === "target-missed" ? outcome.outputPath : null);
                   const attemptedOutputPath = outcome && !outcomeHasArtifact ? outcome.outputPath : null;
                   const outcomeIsFailure = outcome?.kind === "failed" || outcome?.kind === "cancelled";
-                  const queuedTrimMode = item.request.trim?.mode ?? "exact";
-                  const queuedFastConsent = queuedTrimMode === "fastCopy" ? item.request.trim?.fastCopyConsent : null;
                   const queuedTrimSummary = item.request.trim
-                    ? queuedFastConsent
-                      ? `${fastTrimModeLabel(queuedTrimMode)} • expected ${formatClock(queuedFastConsent.effectiveStartUs / 1_000_000)} to ${formatClock(queuedFastConsent.effectiveEndUs / 1_000_000)}`
-                      : `${fastTrimModeLabel(queuedTrimMode)} • requested ${formatClock(item.request.trim.startS)} to ${item.request.trim.endS == null ? "end" : formatClock(item.request.trim.endS)}`
+                    ? `Trim • requested ${formatClock(item.request.trim.startS)} to ${item.request.trim.endS == null ? "end" : formatClock(item.request.trim.endS)}`
                     : "No trim";
                   return (
                   <div
@@ -9652,7 +8893,7 @@ function App() {
                         {item.format.toUpperCase()} {"->"} {basename(item.outputPath)}
                         {outcome?.outputSizeBytes ? ` • ${formatByteSize(outcome.outputSizeBytes)}` : ""}
                       </div>
-                      <div className="vfl-queue-item-meta" data-queue-trim-mode={queuedTrimMode}>{queuedTrimSummary}</div>
+                      <div className="vfl-queue-item-meta">{queuedTrimSummary}</div>
                       {actualOutputPath && actualOutputPath !== item.outputPath ? (
                         <div className="vfl-queue-item-meta">Actual result: {actualOutputPath}</div>
                       ) : null}
@@ -9672,7 +8913,6 @@ function App() {
                         </div>
                       ) : null}
                       {outcome?.targetResult ? <TargetResultDetails targetResult={outcome.targetResult} /> : null}
-                      {outcome?.trimResult ? <TrimResultDetails result={outcome.trimResult} /> : null}
                       {outcome ? <QueueDiagnosticsDetails outcome={outcome} summary="Latest diagnostics" /> : null}
                       {item.history.length > 1 ? (
                         <details className="vfl-queue-history">
@@ -9690,7 +8930,6 @@ function App() {
                                 ) : null}
                                 {attempt.message ? <div className="vfl-queue-item-message">{attempt.message}</div> : null}
                                 {attempt.targetResult ? <TargetResultDetails targetResult={attempt.targetResult} /> : null}
-                                {attempt.trimResult ? <TrimResultDetails result={attempt.trimResult} /> : null}
                                 <QueueDiagnosticsDetails outcome={attempt} summary={`Run ${attempt.runId} diagnostics`} />
                               </li>
                             ))}

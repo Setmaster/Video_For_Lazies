@@ -90,11 +90,10 @@ test("trim slider keys implement bounded ARIA slider behavior", () => {
 });
 
 test("crop, trim, modal, and live-status accessibility contracts are wired", async () => {
-  const [app, cropFields, trimHandle, trimMode, modal, cropper, css] = await Promise.all([
+  const [app, cropFields, trimHandle, modal, cropper, css] = await Promise.all([
     fs.readFile(path.resolve(__dirname, "../src/App.tsx"), "utf8"),
     fs.readFile(path.resolve(__dirname, "../src/components/CropPixelFields.tsx"), "utf8"),
     fs.readFile(path.resolve(__dirname, "../src/components/TrimSliderHandle.tsx"), "utf8"),
-    fs.readFile(path.resolve(__dirname, "../src/components/TrimModeControls.tsx"), "utf8"),
     fs.readFile(path.resolve(__dirname, "../src/components/ModalDialog.tsx"), "utf8"),
     fs.readFile(path.resolve(__dirname, "../src/components/VideoCropper.tsx"), "utf8"),
     fs.readFile(path.resolve(__dirname, "../src/App.css"), "utf8"),
@@ -115,14 +114,6 @@ test("crop, trim, modal, and live-status accessibility contracts are wired", asy
   assert.match(trimHandle, /aria-valuemax=\{max\}/);
   assert.match(trimHandle, /aria-valuenow=\{value\}/);
   assert.match(trimHandle, /aria-valuetext=\{valueText\}/);
-  assert.match(trimMode, /<fieldset className="vfl-fast-trim"/);
-  assert.match(trimMode, /<legend>Trim method<\/legend>/);
-  assert.match(trimMode, /type="radio"/);
-  assert.match(trimMode, /role="status"/);
-  assert.match(trimMode, /aria-live="polite"/);
-  assert.match(trimMode, /role="alert"/);
-  assert.match(trimMode, /type="checkbox"/);
-  assert.doesNotMatch(trimMode, /\.focus\(/);
   assert.match(css, /\.vfl-trim-timeline-grab \{[^}]*width: 24px;[^}]*height: 24px;/s);
 
   assert.match(modal, /createPortal/);
@@ -178,7 +169,7 @@ test("crop, trim, modal, and live-status accessibility contracts are wired", asy
   assert.doesNotMatch(autoDetect, /e instanceof Error|setCropDetectHint\(msg\)/);
   assert.match(autoDetect, /finally \{\s*if \(cropDetectionRevisionRef\.current === requestRevision\) \{\s*setCropDetecting\(false\);/s);
 
-  assert.match(app, /Reset all settings confirmation did not open with focus on the safe Cancel action\./);
+  assert.match(app, /Packaged G7 reset confirmation did not open as an alert dialog with safe Cancel focus\./);
 });
 
 test("portable Windows smoke requires mounted accessibility evidence", async () => {

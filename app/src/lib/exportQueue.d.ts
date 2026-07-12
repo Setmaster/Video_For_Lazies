@@ -1,4 +1,4 @@
-import type { EncodeRequest, ExportDiagnostics, OutputFormat, TargetResult, TrimResult } from "./types";
+import type { EncodeRequest, ExportDiagnostics, OutputFormat, TargetResult } from "./types";
 
 export type QueuePathPlatform = "auto" | "windows" | "win32" | "posix" | "linux" | "darwin";
 export type ExportQueueItemStatus = "queued" | "running" | "done" | "target-missed" | "failed" | "cancelled";
@@ -12,7 +12,6 @@ export interface ExportQueueOutcome {
   outputSizeBytes: number | null;
   targetResult: TargetResult | null;
   diagnostics: ExportDiagnostics | null;
-  trimResult: TrimResult | null;
   completedAtMs: number | null;
 }
 
@@ -50,7 +49,6 @@ export interface ExportQueueOutcomeInput {
   outputSizeBytes?: number | null;
   targetResult?: TargetResult | null;
   diagnostics?: ExportDiagnostics | null;
-  trimResult?: TrimResult | null;
   completedAtMs?: number | null;
 }
 
