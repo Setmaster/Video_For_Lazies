@@ -106,7 +106,6 @@ struct AppSmokeConfig {
     size_limit_mb: f64,
     trim_start_s: f64,
     trim_end_s: Option<f64>,
-    fast_trim: bool,
     title: Option<String>,
     audio_enabled: bool,
     strip_metadata: bool,
@@ -139,8 +138,6 @@ struct AppSmokeStatus {
     output_size_bytes: Option<u64>,
     target_result: Option<video::TargetResult>,
     diagnostics: Option<video::ExportDiagnostics>,
-    fast_trim_inspection: Option<video::FastTrimInspection>,
-    trim_result: Option<video::TrimResult>,
     queue_outcome_kind: Option<String>,
     trim_start_s: Option<f64>,
     trim_end_s: Option<f64>,
@@ -349,7 +346,6 @@ fn parse_smoke_config_from_env(
     let trim_start_s = parse_smoke_f64(env, "VFL_SMOKE_TRIM_START_S", Some(0.0))?
         .ok_or_else(|| "VFL_SMOKE_TRIM_START_S parsing failed.".to_string())?;
     let trim_end_s = parse_smoke_f64(env, "VFL_SMOKE_TRIM_END_S", None)?;
-    let fast_trim = parse_smoke_bool(env, "VFL_SMOKE_FAST_TRIM")?;
     let title = video::validate_title_metadata(env.get("VFL_SMOKE_TITLE").map(String::as_str))?;
     let audio_enabled = parse_smoke_bool_with_default(env, "VFL_SMOKE_AUDIO_ENABLED", true)?;
     let strip_metadata = parse_smoke_bool_with_default(env, "VFL_SMOKE_STRIP_METADATA", true)?;
@@ -458,7 +454,6 @@ fn parse_smoke_config_from_env(
         size_limit_mb,
         trim_start_s,
         trim_end_s,
-        fast_trim,
         title,
         audio_enabled,
         strip_metadata,
@@ -561,12 +556,6 @@ fn merge_smoke_optional_fields(existing: Option<&AppSmokeStatus>, next: &mut App
     if next.diagnostics.is_none() {
         next.diagnostics = existing.diagnostics.clone();
     }
-    if next.fast_trim_inspection.is_none() {
-        next.fast_trim_inspection = existing.fast_trim_inspection.clone();
-    }
-    if next.trim_result.is_none() {
-        next.trim_result = existing.trim_result.clone();
-    }
     if next.queue_outcome_kind.is_none() {
         next.queue_outcome_kind = existing.queue_outcome_kind.clone();
     }
@@ -611,11 +600,6 @@ fn encode_capabilities() -> Result<video::EncodeCapabilities, String> {
 #[tauri::command]
 fn inspect_srt(path: String) -> Result<video::SubtitleInspection, String> {
     video::inspect_srt(path)
-}
-
-#[tauri::command]
-fn inspect_fast_trim(request: video::EncodeRequest) -> Result<video::FastTrimInspection, String> {
-    video::inspect_fast_trim(request)
 }
 
 #[tauri::command]
@@ -761,7 +745,6 @@ fn start_encode(
                         output_path: None,
                         output_size_bytes: None,
                         target_result: None,
-                        trim_result: None,
                         message: Some(err),
                         diagnostics: Some(diagnostics),
                     },
@@ -829,7 +812,6 @@ pub fn run() {
             suggest_output_path,
             encode_capabilities,
             inspect_srt,
-            inspect_fast_trim,
             extract_frame,
             allow_preview_path,
             read_smoke_config,
@@ -853,9 +835,7 @@ mod tests {
         is_supported_preview_path, merge_smoke_optional_fields, merge_smoke_stage_history,
         parse_smoke_config_from_env,
     };
-    use crate::video::{
-        ColorPolicy, FastTrimInspection, FastTrimInspectionStatus, OutputFormat, ResizeMode,
-    };
+    use crate::video::{ColorPolicy, OutputFormat, ResizeMode};
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -930,7 +910,6 @@ mod tests {
                 size_limit_mb: 0.0,
                 trim_start_s: 0.0,
                 trim_end_s: None,
-                fast_trim: false,
                 title: None,
                 audio_enabled: true,
                 strip_metadata: true,
@@ -966,7 +945,6 @@ mod tests {
             ("VFL_SMOKE_SIZE_LIMIT_MB", "12.5"),
             ("VFL_SMOKE_TRIM_START_S", "0.25"),
             ("VFL_SMOKE_TRIM_END_S", "1.5"),
-            ("VFL_SMOKE_FAST_TRIM", "true"),
             ("VFL_SMOKE_TITLE", "  Replacement title  "),
             ("VFL_SMOKE_AUDIO_ENABLED", "false"),
             ("VFL_SMOKE_STRIP_METADATA", "false"),
@@ -996,7 +974,6 @@ mod tests {
                 size_limit_mb: 12.5,
                 trim_start_s: 0.25,
                 trim_end_s: Some(1.5),
-                fast_trim: true,
                 title: Some("Replacement title".to_string()),
                 audio_enabled: false,
                 strip_metadata: false,
@@ -1154,21 +1131,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_smoke_config_rejects_invalid_fast_flag_and_title() {
-        let status_path = temp_smoke_status_path("bad-g6-fields");
+    fn parse_smoke_config_rejects_invalid_title() {
+        let status_path = temp_smoke_status_path("bad-title");
         let base = [
             ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
             ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
             ("VFL_SMOKE_STATUS", status_path.as_str()),
         ];
-        let mut invalid_fast = smoke_env(&base);
-        invalid_fast.insert("VFL_SMOKE_FAST_TRIM".to_string(), "maybe".to_string());
-        assert!(
-            parse_smoke_config_from_env(&invalid_fast)
-                .unwrap_err()
-                .contains("VFL_SMOKE_FAST_TRIM")
-        );
-
         let mut invalid_title = smoke_env(&base);
         invalid_title.insert("VFL_SMOKE_TITLE".to_string(), "bad\ntitle".to_string());
         assert!(
@@ -1336,8 +1305,6 @@ mod tests {
             output_size_bytes: None,
             target_result: None,
             diagnostics: None,
-            fast_trim_inspection: None,
-            trim_result: None,
             queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
@@ -1373,8 +1340,6 @@ mod tests {
             output_size_bytes: None,
             target_result: None,
             diagnostics: None,
-            fast_trim_inspection: None,
-            trim_result: None,
             queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
@@ -1399,8 +1364,6 @@ mod tests {
             output_size_bytes: None,
             target_result: None,
             diagnostics: None,
-            fast_trim_inspection: None,
-            trim_result: None,
             queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
@@ -1431,21 +1394,6 @@ mod tests {
 
     #[test]
     fn merge_smoke_optional_fields_preserves_trim_metrics() {
-        let fast_trim_inspection = FastTrimInspection {
-            status: FastTrimInspectionStatus::Blocked,
-            reasons: Vec::new(),
-            requested_start_us: 600_000,
-            requested_end_us: 1_350_000,
-            effective_start_us: None,
-            effective_end_us: None,
-            start_expansion_us: None,
-            end_expansion_us: None,
-            requires_acceptance: false,
-            video_packet_count: None,
-            video_action: None,
-            audio_action: None,
-            consent: None,
-        };
         let existing = AppSmokeStatus {
             stage: "interaction-ready".to_string(),
             ok: Some(true),
@@ -1454,8 +1402,6 @@ mod tests {
             output_size_bytes: None,
             target_result: None,
             diagnostics: None,
-            fast_trim_inspection: Some(fast_trim_inspection.clone()),
-            trim_result: None,
             queue_outcome_kind: None,
             trim_start_s: Some(0.6),
             trim_end_s: Some(1.35),
@@ -1471,8 +1417,6 @@ mod tests {
             output_size_bytes: Some(1234),
             target_result: None,
             diagnostics: None,
-            fast_trim_inspection: None,
-            trim_result: None,
             queue_outcome_kind: None,
             trim_start_s: None,
             trim_end_s: None,
@@ -1486,6 +1430,5 @@ mod tests {
         assert_eq!(next.trim_start_s, Some(0.6));
         assert_eq!(next.trim_end_s, Some(1.35));
         assert_eq!(next.expected_duration_s, Some(0.75));
-        assert_eq!(next.fast_trim_inspection, Some(fast_trim_inspection));
     }
 }
