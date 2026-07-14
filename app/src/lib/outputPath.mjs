@@ -18,6 +18,20 @@ export function dirname(p) {
   return splitPath(p).dir;
 }
 
+export function formatPathForDisplay(p) {
+  const verbatimPrefix = "\\\\?\\";
+  const verbatimUncPrefix = `${verbatimPrefix}UNC\\`;
+  if (p.slice(0, verbatimUncPrefix.length).toUpperCase() === verbatimUncPrefix.toUpperCase()) {
+    return `\\\\${p.slice(verbatimUncPrefix.length)}`;
+  }
+
+  const withoutPrefix = p.slice(verbatimPrefix.length);
+  if (p.startsWith(verbatimPrefix) && /^[A-Za-z]:\\/.test(withoutPrefix)) {
+    return withoutPrefix;
+  }
+  return p;
+}
+
 export function extname(p) {
   const { base } = splitPath(p);
   const dot = base.lastIndexOf(".");

@@ -61,7 +61,7 @@ import {
   type ExportQueueState,
 } from "./lib/exportQueue";
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
-import { basename, dirname, ensureUniqueOutputPath, extname, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
+import { basename, dirname, ensureUniqueOutputPath, extname, formatPathForDisplay, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
 import { createEncodeProgressState, getActiveProgressUi, reduceEncodeProgress } from "./lib/progress";
 import { formatClock } from "./lib/timeFormat";
 import {
@@ -8721,7 +8721,7 @@ function App() {
                         {new Date(lastExport.completedAtMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </div>
                       {lastExport.message ? <div className="vfl-export-result-note">{lastExport.message}</div> : null}
-                      <div className="vfl-export-result-path">{lastExport.outputPath}</div>
+                      <div className="vfl-export-result-path">{formatPathForDisplay(lastExport.outputPath)}</div>
                       {lastExport.targetResult ? <TargetResultDetails targetResult={lastExport.targetResult} /> : null}
                       {lastExport.diagnostics ? (
                         <details className="vfl-export-diagnostics">

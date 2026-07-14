@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ensureUniqueOutputPath, replaceExtension, suggestOutputPath } from "../src/lib/outputPath.mjs";
+import {
+  ensureUniqueOutputPath,
+  formatPathForDisplay,
+  replaceExtension,
+  suggestOutputPath,
+} from "../src/lib/outputPath.mjs";
 
 test("suggestOutputPath adds -2 when no suffix", () => {
   assert.equal(suggestOutputPath("myvideo.mp4", "mp4"), "myvideo-2.mp4");
@@ -31,6 +36,22 @@ test("suggestOutputPath preserves directory separators", () => {
 test("replaceExtension swaps extension or appends if missing", () => {
   assert.equal(replaceExtension("C:\\\\Videos\\\\foo-2.mp4", "webm"), "C:\\\\Videos\\\\foo-2.webm");
   assert.equal(replaceExtension("foo", "mp4"), "foo.mp4");
+});
+
+test("formatPathForDisplay hides Windows verbatim drive and UNC prefixes", () => {
+  assert.equal(
+    formatPathForDisplay(String.raw`\\?\C:\Users\vi7or\Downloads\clip.mp4`),
+    String.raw`C:\Users\vi7or\Downloads\clip.mp4`,
+  );
+  assert.equal(
+    formatPathForDisplay(String.raw`\\?\UNC\Server\Share\clip.mp4`),
+    String.raw`\\Server\Share\clip.mp4`,
+  );
+  assert.equal(formatPathForDisplay(String.raw`C:\Videos\clip.mp4`), String.raw`C:\Videos\clip.mp4`);
+  assert.equal(
+    formatPathForDisplay(String.raw`\\?\Volume{1234}\clip.mp4`),
+    String.raw`\\?\Volume{1234}\clip.mp4`,
+  );
 });
 
 test("ensureUniqueOutputPath keeps unclaimed candidates", () => {
