@@ -22,8 +22,9 @@ test("backend builds a timeline-gated noise filter for the first frame", async (
   // Strength must stay >= 2 or the re-encode quantizes it away (see research).
   assert.match(video, /const FIRST_FRAME_PERTURB_STRENGTH: u32 = 3;/);
 
-  // It must be appended last and must force the planner to encode video.
-  assert.match(video, /Must be LAST[\s\S]*first_frame_perturb_filter\(req\)/);
+  // It must follow temporal filters and force video encoding. Range conversion
+  // may follow it without changing which frame receives the perturbation.
+  assert.match(video, /Must follow all temporal filters[\s\S]*first_frame_perturb_filter\(req\)/);
   assert.match(video, /fn video_transform_requires_encode[\s\S]*\|\| request\.perturb_first_frame/);
 });
 

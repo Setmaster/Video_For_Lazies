@@ -252,9 +252,20 @@ pub enum AudioChannelPreference {
     Mono,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorRangePreference {
+    #[default]
+    Auto,
+    Limited,
+    Full,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AdvancedEncodeSettings {
+    #[serde(default)]
+    pub color_range: ColorRangePreference,
     #[serde(default)]
     pub video_codec: Option<VideoCodecPreference>,
     #[serde(default)]
@@ -1055,6 +1066,8 @@ enum PlanReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaColorAction {
     Unchanged,
+    ToLimitedRange,
+    ToFullRange,
     Hdr10ToStandardSdr,
     HighBitDepthSdrToStandardSdr,
     NotApplicable,
@@ -1064,11 +1077,21 @@ impl MediaColorAction {
     fn diagnostic(self) -> &'static str {
         match self {
             Self::Unchanged => "Source color unchanged",
+            Self::ToLimitedRange => "Converted to limited color range",
+            Self::ToFullRange => "Converted to full color range",
             Self::Hdr10ToStandardSdr => "HDR10 converted to 8-bit limited-range BT.709 SDR",
             Self::HighBitDepthSdrToStandardSdr => {
                 "High-bit-depth SDR converted to 8-bit limited-range BT.709 SDR"
             }
             Self::NotApplicable => "Not applicable to audio-only output",
+        }
+    }
+
+    fn explicit_range(self) -> Option<&'static str> {
+        match self {
+            Self::ToLimitedRange => Some("tv"),
+            Self::ToFullRange => Some("pc"),
+            _ => None,
         }
     }
 
@@ -1717,6 +1740,9 @@ fn build_copy_candidate_args(
 
 fn push_encoded_video_format_args(args: &mut Vec<String>, media_policy: MediaPolicyPlan) {
     args.extend(["-pix_fmt", "yuv420p"].into_iter().map(String::from));
+    if let Some(range) = media_policy.color_action.explicit_range() {
+        args.extend(["-color_range", range].into_iter().map(String::from));
+    }
     if media_policy.color_action.converts_to_standard_sdr() {
         args.extend(
             [
@@ -1752,11 +1778,12 @@ fn push_video_output_policy_args(
     video_action: StreamAction,
     media_policy: MediaPolicyPlan,
 ) {
-    if format != OutputFormat::Mp4 {
-        return;
+    if format == OutputFormat::Mp4 {
+        args.extend(["-movflags", "+faststart"].into_iter().map(String::from));
     }
-    args.extend(["-movflags", "+faststart"].into_iter().map(String::from));
-    if video_action == StreamAction::Encode {
+    if video_action == StreamAction::Encode
+        && (format == OutputFormat::Mp4 || media_policy.color_action.explicit_range().is_some())
+    {
         push_encoded_video_format_args(args, media_policy);
     }
 }
@@ -2902,7 +2929,7 @@ fn resolve_media_policy(
             .to_string()
     })?;
     let high_bit_depth = source_bit_depth > 8;
-    let color_action = match probe.dynamic_range {
+    let mut color_action = match probe.dynamic_range {
         DynamicRange::DolbyVision => {
             return Err(
                 "Dolby Vision input is not supported for video export. Convert it to standard SDR first."
@@ -2943,6 +2970,28 @@ fn resolve_media_policy(
         }
         DynamicRange::Sdr | DynamicRange::Unknown => MediaColorAction::Unchanged,
     };
+
+    match request.advanced.color_range {
+        ColorRangePreference::Auto => {}
+        ColorRangePreference::Limited if !color_action.converts_to_standard_sdr() => {
+            color_action = MediaColorAction::ToLimitedRange;
+        }
+        ColorRangePreference::Limited => {}
+        ColorRangePreference::Full => {
+            if color_action.converts_to_standard_sdr() {
+                return Err(
+                    "Standard SDR conversion requires Limited or Auto color range.".to_string(),
+                );
+            }
+            if !matches!(
+                selected_video_encoder,
+                Some(VideoCodec::LibX264 | VideoCodec::LibVpxVp9)
+            ) {
+                return Err("Full color range requires H.264 or VP9 output. Choose Limited or Auto for this encoder.".to_string());
+            }
+            color_action = MediaColorAction::ToFullRange;
+        }
+    }
 
     let sar_action = if probe.sample_aspect_ratio.is_square() {
         SarAction::Unchanged
@@ -3190,7 +3239,9 @@ fn build_encode_command_plan(
         natural_video_action = StreamAction::Encode;
         video_reasons.push(PlanReason::SubtitleBurnIn);
     }
-    if media_policy.color_action.converts_to_standard_sdr() {
+    if media_policy.color_action.converts_to_standard_sdr()
+        || media_policy.color_action.explicit_range().is_some()
+    {
         natural_video_action = StreamAction::Encode;
         video_reasons.push(PlanReason::ColorConversion);
     }
@@ -5275,7 +5326,10 @@ fn build_video_filters_with_policy(
             "zscale=p=bt709:t=bt709:m=bt709:r=tv:dither=error_diffusion,format=yuv420p"
                 .to_string(),
         ),
-        MediaColorAction::Unchanged | MediaColorAction::NotApplicable => {}
+        MediaColorAction::Unchanged
+        | MediaColorAction::ToLimitedRange
+        | MediaColorAction::ToFullRange
+        | MediaColorAction::NotApplicable => {}
     }
 
     if let Some(c) = &req.color {
@@ -5322,12 +5376,21 @@ fn build_video_filters_with_policy(
         filters.push(format!("fps={cap_fps}"));
     }
 
-    // Must be LAST in the linear chain: reverse/trim/fps reorder frames, and
+    // Must follow all temporal filters: reverse/trim/fps reorder frames, and
     // enable='eq(n,0)' targets the first frame entering this filter, so this
     // lands on the true first output frame (the boomerang wrap below keeps the
     // forward segment first, so the first output frame is still this one).
     if let Some(perturb) = first_frame_perturb_filter(req) {
         filters.push(perturb);
+    }
+
+    // Convert samples after picture filters and propagate range to the encoder.
+    // Auto input honors frame metadata; unspecified YUV follows FFmpeg's normal
+    // limited-range interpretation. This is not a metadata-only override.
+    if let Some(range) = media_policy.color_action.explicit_range() {
+        filters.push(format!(
+            "scale=in_range=auto:out_range={range},format=yuv420p"
+        ));
     }
 
     let linear = if filters.is_empty() {
@@ -6814,7 +6877,13 @@ pub fn run_encode_job(
             pass1.push("-vf".to_string());
             pass1.push(vf.clone());
         }
-        if active_request.format == OutputFormat::Mp4 {
+        if active_request.format == OutputFormat::Mp4
+            || active_command_plan
+                .media_policy
+                .color_action
+                .explicit_range()
+                .is_some()
+        {
             push_encoded_video_format_args(&mut pass1, active_command_plan.media_policy);
         }
         pass1.push("-f".to_string());
@@ -8065,6 +8134,101 @@ Encoders:
         let plan = test_command_plan(&req, &probe, 1_000_000);
         assert_eq!(plan.video_action, StreamAction::Copy);
         assert_eq!(plan.audio_action, StreamAction::Encode);
+    }
+
+    #[test]
+    fn color_range_defaults_to_auto_and_rejects_unknown_values() {
+        let defaults: AdvancedEncodeSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.color_range, ColorRangePreference::Auto);
+        let limited: AdvancedEncodeSettings =
+            serde_json::from_str(r#"{"colorRange":"limited"}"#).unwrap();
+        assert_eq!(limited.color_range, ColorRangePreference::Limited);
+        assert!(
+            serde_json::from_str::<AdvancedEncodeSettings>(r#"{"colorRange":"flag-only"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_color_range_converts_and_prevents_copy() {
+        let probe = probe_10s_1920x1080_audio();
+        for size in [0.0, 4.0] {
+            for (preference, range) in [
+                (ColorRangePreference::Limited, "tv"),
+                (ColorRangePreference::Full, "pc"),
+            ] {
+                let mut req = base_request();
+                req.size_limit_mb = size;
+                assert_eq!(
+                    test_command_plan(&req, &probe, 1_000_000).video_action,
+                    StreamAction::Copy
+                );
+                req.advanced.color_range = preference;
+                let plan = test_command_plan(&req, &probe, 1_000_000);
+                assert_eq!(plan.video_action, StreamAction::Encode);
+                assert!(plan.size_copy_candidates.is_empty());
+                assert!(plan.video_filters.as_deref().unwrap().ends_with(&format!(
+                    "scale=in_range=auto:out_range={range},format=yuv420p"
+                )));
+                let mut args = Vec::new();
+                push_video_output_policy_args(
+                    &mut args,
+                    req.format,
+                    plan.video_action,
+                    plan.media_policy,
+                );
+                assert!(args.windows(2).any(|pair| pair == ["-color_range", range]));
+            }
+        }
+    }
+
+    #[test]
+    fn color_range_webm_signals_and_full_requires_capable_encoder() {
+        let probe = probe_10s_1920x1080_audio();
+        let mut req = base_request();
+        req.format = OutputFormat::Webm;
+        req.advanced.color_range = ColorRangePreference::Full;
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        let mut args = Vec::new();
+        push_video_output_policy_args(&mut args, req.format, plan.video_action, plan.media_policy);
+        assert!(args.windows(2).any(|pair| pair == ["-color_range", "pc"]));
+        assert!(!args.iter().any(|arg| arg == "-movflags"));
+        for codec in [VideoCodec::Mpeg4, VideoCodec::LibVpx] {
+            assert!(
+                resolve_media_policy(&req, &probe, Some(codec))
+                    .unwrap_err()
+                    .contains("Full color range requires")
+            );
+            req.advanced.color_range = ColorRangePreference::Limited;
+            assert!(resolve_media_policy(&req, &probe, Some(codec)).is_ok());
+            req.advanced.color_range = ColorRangePreference::Full;
+        }
+    }
+
+    #[test]
+    fn standard_sdr_range_contract_and_mp3_bypass() {
+        let mut req = base_request();
+        req.color_policy = ColorPolicy::StandardSdr;
+        req.advanced.color_range = ColorRangePreference::Limited;
+        assert!(
+            resolve_media_policy(&req, &hdr10_probe(), Some(VideoCodec::LibX264))
+                .unwrap()
+                .color_action
+                .converts_to_standard_sdr()
+        );
+        req.advanced.color_range = ColorRangePreference::Full;
+        assert!(
+            resolve_media_policy(&req, &hdr10_probe(), Some(VideoCodec::LibX264))
+                .unwrap_err()
+                .contains("Standard SDR conversion requires")
+        );
+        req.format = OutputFormat::Mp3;
+        assert_eq!(
+            resolve_media_policy(&req, &hdr10_probe(), None)
+                .unwrap()
+                .color_action,
+            MediaColorAction::NotApplicable
+        );
     }
 
     #[test]

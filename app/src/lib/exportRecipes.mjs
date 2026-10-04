@@ -80,13 +80,14 @@ export const EXPORT_RECIPES = [
   {
     id: "forum-4mb",
     label: "Forum 4 MB",
-    description: "Caps the export at 4 MB, removes audio, and makes each export unique. Leaves every other setting unchanged.",
+    description: "Targets a 4 MB export, removes audio, makes each export unique, and converts video to limited color range for upload compatibility. Leaves every other setting unchanged.",
     // Partial recipes only set (and only match) the settings they list.
     partial: true,
     settings: {
       sizeLimitMb: "4",
       audioEnabled: false,
       perturbFirstFrame: true,
+      advanced: { colorRange: "limited" },
     },
   },
   {
@@ -243,6 +244,8 @@ export function recipeMatchesSettings(recipe, settings) {
     ) {
       return false;
     }
+    if (partialSettings.advanced?.colorRange !== undefined &&
+        (settings.advanced?.colorRange ?? "auto") !== partialSettings.advanced.colorRange) return false;
     const currentStrictFit = normalizeStrictFitSettings(settings);
     if (
       "strictFit" in partialSettings &&
@@ -278,6 +281,7 @@ export function recipeMatchesSettings(recipe, settings) {
     Boolean(settings.normalizeAudio) === Boolean(recipeSettings.normalizeAudio) &&
     Boolean(settings.perturbFirstFrame) === Boolean(recipeSettings.perturbFirstFrame) &&
     currentStrictFit.strictFit === recipeStrictFit.strictFit &&
+    (currentAdvanced.colorRange ?? "auto") === (recipeAdvanced.colorRange ?? "auto") &&
     (currentAdvanced.videoCodec ?? "auto") === (recipeAdvanced.videoCodec ?? "auto") &&
     normalizeAdvancedNumber(currentAdvanced.audioBitrateKbps) === normalizeAdvancedNumber(recipeAdvanced.audioBitrateKbps) &&
     (currentAdvanced.videoQuality ?? "auto") === (recipeAdvanced.videoQuality ?? "auto") &&

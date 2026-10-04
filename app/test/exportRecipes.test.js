@@ -43,25 +43,26 @@ test("forum recipe caps size at 4 MB, drops audio, and uniquifies the first fram
 
   assert.equal(recipe.label, "Forum 4 MB");
   assert.equal(recipe.partial, true);
-  // The partial recipe must not touch anything beyond these three settings.
+  // The partial recipe must not touch anything beyond these four settings.
   assert.deepEqual(recipe.settings, {
     sizeLimitMb: "4",
     audioEnabled: false,
     perturbFirstFrame: true,
+    advanced: { colorRange: "limited" },
   });
 });
 
 test("partial forum recipe matches a 4 MB cap with audio off and frame uniquify on", () => {
   const base = findExportRecipe("quick-share").settings;
 
-  const forumFromQuickShare = { ...base, sizeLimitMb: "4", audioEnabled: false, perturbFirstFrame: true };
+  const forumFromQuickShare = { ...base, sizeLimitMb: "4", audioEnabled: false, perturbFirstFrame: true, advanced: { ...base.advanced, colorRange: "limited" } };
   assert.equal(findMatchingExportRecipe(forumFromQuickShare)?.id, "forum-4mb");
 
   const archive = findExportRecipe("archive-quality").settings;
-  const forumFromArchive = { ...archive, sizeLimitMb: "4", audioEnabled: false, perturbFirstFrame: true };
+  const forumFromArchive = { ...archive, sizeLimitMb: "4", audioEnabled: false, perturbFirstFrame: true, advanced: { ...base.advanced, colorRange: "limited" } };
   assert.equal(findMatchingExportRecipe(forumFromArchive)?.id, "forum-4mb");
 
-  // Any of the three required edits missing means it is not the forum recipe.
+  // Any of the four required edits missing means it is not the forum recipe.
   assert.equal(findMatchingExportRecipe({ ...base, sizeLimitMb: "4", perturbFirstFrame: true }), null);
   assert.equal(findMatchingExportRecipe({ ...base, audioEnabled: false, perturbFirstFrame: true }), null);
   assert.equal(findMatchingExportRecipe({ ...base, sizeLimitMb: "4", audioEnabled: false }), null);
@@ -74,6 +75,7 @@ test("partial recipes only match Strict Fit when they explicitly list it", () =>
     sizeLimitMb: "4",
     audioEnabled: false,
     perturbFirstFrame: true,
+    advanced: { colorRange: "limited" },
     strictFit: true,
   };
   assert.equal(findMatchingExportRecipe(forumSettings)?.id, "forum-4mb");
@@ -163,4 +165,14 @@ test("normalizeRecipeResizeSettings migrates legacy max edge snapshots", () => {
       lockAspect: true,
     },
   );
+});
+
+test("forum recipe requires limited range while preserving unrelated advanced matching", () => {
+  const forum = findExportRecipe("forum-4mb");
+  for (const colorRange of ["auto", "full", undefined]) {
+    assert.equal(recipeMatchesSettings(forum, { ...forum.settings, advanced: { colorRange } }), false);
+  }
+  assert.equal(recipeMatchesSettings(forum, { ...forum.settings, advanced: { colorRange: "limited", videoCodec: "vp9", encodeSpeed: "smaller" } }), true);
+  const quick = findExportRecipe("quick-share");
+  assert.equal(recipeMatchesSettings(quick, { ...quick.settings, advanced: { ...quick.settings.advanced, colorRange: "full" } }), false);
 });

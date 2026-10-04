@@ -1,6 +1,6 @@
 [package]
 name = "video_for_lazies"
-version = "2.1.1"
+version = "2.2.0"
 description = "Video For Lazies"
 authors = ["Setmaster"]
 license = "GPL-3.0-or-later"

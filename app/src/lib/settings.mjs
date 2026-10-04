@@ -25,6 +25,7 @@ export function parsePersistedSettings(raw) {
     }
     if (parsed.advanced && typeof parsed.advanced === "object") {
       const advanced = {};
+      if (["limited", "full"].includes(parsed.advanced.colorRange)) advanced.colorRange = parsed.advanced.colorRange;
       if (VALID_VIDEO_CODECS.has(parsed.advanced.videoCodec) && parsed.advanced.videoCodec !== "auto") {
         advanced.videoCodec = parsed.advanced.videoCodec;
       }
@@ -65,6 +66,7 @@ export function serializePersistedSettings(settings) {
     next.stripMetadata = false;
   }
   const advanced = {};
+  if (["limited", "full"].includes(settings?.advanced?.colorRange)) advanced.colorRange = settings.advanced.colorRange;
   if (VALID_VIDEO_CODECS.has(settings?.advanced?.videoCodec) && settings.advanced.videoCodec !== "auto") {
     advanced.videoCodec = settings.advanced.videoCodec;
   }

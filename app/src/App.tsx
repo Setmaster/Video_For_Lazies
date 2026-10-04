@@ -19,6 +19,7 @@ import type {
   AppSmokeStatus,
   AudioChannelPreference,
   ColorPolicy,
+  ColorRangePreference,
   Crop,
   ColorAdjust,
   EncodeSpeedPreference,
@@ -209,7 +210,7 @@ const SMOKE_STAGE_ORDER = [
   "g7-drop-queued",
   "g7-cancel-requested",
 ] as const;
-const APP_VERSION = "2.1.1";
+const APP_VERSION = "2.2.0";
 const APP_LINKS = {
   github: "https://github.com/Setmaster/Video_For_Lazies",
   releases: "https://github.com/Setmaster/Video_For_Lazies/releases",
@@ -687,6 +688,7 @@ function App() {
   const [normalizeAudio, setNormalizeAudio] = useState(false);
   const [perturbFirstFrame, setPerturbFirstFrame] = useState(false);
   const [colorPolicy, setColorPolicy] = useState<ColorPolicy>("auto");
+  const [advancedColorRange, setAdvancedColorRange] = useState<ColorRangePreference>("auto");
   const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
   const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
   const [advancedVideoQuality, setAdvancedVideoQuality] = useState<VideoQualityPreference>("auto");
@@ -1291,6 +1293,7 @@ function App() {
       if (parsed.advanced?.videoQuality) setAdvancedVideoQuality(parsed.advanced.videoQuality);
       if (parsed.advanced?.encodeSpeed) setAdvancedEncodeSpeed(parsed.advanced.encodeSpeed);
       if (parsed.advanced?.frameRateCapFps) setAdvancedFrameRateCapFps(String(parsed.advanced.frameRateCapFps));
+      if (parsed.advanced?.colorRange) setAdvancedColorRange(parsed.advanced.colorRange);
       if (parsed.advanced?.audioChannels) setAdvancedAudioChannels(parsed.advanced.audioChannels);
     } catch {
       // ignore
@@ -1323,6 +1326,7 @@ function App() {
             encodeSpeed: advancedEncodeSpeed,
             frameRateCapFps: advancedFrameRateCapFps === "auto" ? null : Number(advancedFrameRateCapFps),
             audioChannels: advancedAudioChannels,
+            colorRange: format === "mp3" ? "auto" : advancedColorRange,
           },
         }),
       );
@@ -1340,6 +1344,7 @@ function App() {
     advancedEncodeSpeed,
     advancedFrameRateCapFps,
     advancedAudioChannels,
+    advancedColorRange,
   ]);
 
   useEffect(() => {
@@ -1466,6 +1471,7 @@ function App() {
     setAdvancedEncodeSpeed("auto");
     setAdvancedFrameRateCapFps("auto");
     setAdvancedAudioChannels("auto");
+    setAdvancedColorRange("auto");
 
     setTrimStart("0");
     setTrimEnd("");
@@ -1516,6 +1522,7 @@ function App() {
     setAdvancedEncodeSpeed(recipeAdvanced.encodeSpeed);
     setAdvancedFrameRateCapFps(recipeAdvanced.frameRateCapFps === null ? "auto" : String(recipeAdvanced.frameRateCapFps));
     setAdvancedAudioChannels(recipeAdvanced.audioChannels);
+    setAdvancedColorRange(recipeAdvanced.colorRange ?? "auto");
     if (options.resetOutput) {
       setOutputAuto(true);
       setOutputPath("");
@@ -1550,6 +1557,7 @@ function App() {
       }
       if (partialSettings.normalizeAudio !== undefined) setNormalizeAudio(partialSettings.normalizeAudio);
       if (partialSettings.perturbFirstFrame !== undefined) setPerturbFirstFrame(partialSettings.perturbFirstFrame);
+      if (partialSettings.advanced?.colorRange !== undefined) setAdvancedColorRange(partialSettings.advanced.colorRange);
       if (partialSettings.strictFit !== undefined) setStrictFit(partialSettings.strictFit);
       showRecipeNotification(`Applied ${recipe.label}.`);
       return;
@@ -1796,6 +1804,7 @@ function App() {
     setAdvancedEncodeSpeed("auto");
     setAdvancedFrameRateCapFps("auto");
     setAdvancedAudioChannels("auto");
+    setAdvancedColorRange(smokeConfig.colorRange ?? "auto");
     setTrimStart(formatNumberInput(smokeConfig.trimStartS));
     setTrimEnd(smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined ? "" : formatNumberInput(smokeConfig.trimEndS));
     setTrimDragSnapS("0");
@@ -1954,6 +1963,7 @@ function App() {
       perturbFirstFrame ||
       Boolean(subtitlePath) ||
       colorPolicy === "standardSdr" ||
+      advancedColorRange !== "auto" ||
       hasNonSquarePixels(probe) ||
       advancedVideoCodec !== "auto" ||
       (!sizeLimitEnabled && advancedVideoQuality !== "auto") ||
@@ -2014,6 +2024,7 @@ function App() {
     advancedEncodeSpeed,
     advancedFrameRateCapFps,
     advancedAudioChannels,
+    advancedColorRange,
     normalizeAudio,
     audioEnabled,
     subtitlePath,
@@ -2217,6 +2228,7 @@ function App() {
         ? `${AUDIO_CHANNEL_LABELS[advancedAudioChannels]} when audio is included`
         : `${AUDIO_CHANNEL_LABELS[advancedAudioChannels]} audio`;
   const advancedOverrideCount =
+    (advancedColorRange === "auto" ? 0 : 1) +
     (advancedVideoCodec === "auto" ? 0 : 1) +
     (advancedAudioBitrateRequest === null ? 0 : 1) +
     (advancedVideoQuality === "auto" ? 0 : 1) +
@@ -2247,11 +2259,13 @@ function App() {
     !colorIsDefault(brightness, contrast, saturation) ||
     (format !== "mp3" && perturbFirstFrame) ||
     (format !== "mp3" && colorPolicy === "standardSdr") ||
+    (format !== "mp3" && advancedColorRange !== "auto") ||
     (format !== "mp3" && hasNonSquarePixels(probe)) ||
     (format !== "mp3" && externalSubtitleActive);
   const advancedForcesReencode =
     format !== "mp3" &&
-    (advancedVideoCodec !== "auto" ||
+    (advancedColorRange !== "auto" ||
+      advancedVideoCodec !== "auto" ||
       advancedVideoQualityApplies ||
       advancedEncodeSpeedApplies ||
       frameRateCapApplies ||
@@ -2281,6 +2295,7 @@ function App() {
         encodeSpeed: advancedEncodeSpeed,
         frameRateCapFps: advancedFrameRateCapRequest,
         audioChannels: advancedAudioChannels,
+        colorRange: format === "mp3" ? "auto" : advancedColorRange,
       },
     }),
     [
@@ -2301,6 +2316,7 @@ function App() {
       advancedEncodeSpeed,
       advancedFrameRateCapRequest,
       advancedAudioChannels,
+      advancedColorRange,
     ],
   );
   const matchingFullBuiltInRecipe = useMemo(
@@ -2371,6 +2387,18 @@ function App() {
     return describeMissingFeature("externalSubtitles", "External subtitles", { filters: ["subtitles"] });
   })();
   const externalSubtitleBlockingReason = externalSubtitleActive ? subtitlePickerBlockingReason : null;
+  const colorRangeBlockingReason = (() => {
+    if (format === "mp3" || advancedColorRange !== "full") return null;
+    if (colorSource.kind === "convertible" && colorPolicy === "standardSdr") {
+      return "Standard SDR conversion uses limited range. Choose Auto or Limited color range.";
+    }
+    const codec = advancedVideoCodec === "auto"
+      ? videoCodecOptions.find((option) => option.isDefault && option.available)?.value
+      : advancedVideoCodec;
+    return codec === "mpeg4" || codec === "vp8"
+      ? "Full color range requires H.264 or VP9. Choose Limited or another video codec."
+      : null;
+  })();
   const colorBlockingReason = (() => {
     if (format === "mp3" || colorSource.kind === "standard") return null;
     if (colorSource.kind === "unsupported") return colorSource.reason;
@@ -2794,7 +2822,8 @@ function App() {
               : hasVideoEditTransforms
                 ? "Re-encode for edits"
                 : "Auto stream copy when safe";
-  const advancedPlanSummary = `${encodeModeSummary} • ${advancedCodecSummary}`;
+  const advancedColorRangeSummary = format === "mp3" ? "Not used for MP3" : advancedColorRange === "auto" ? "Auto (preserve current behavior)" : `${advancedColorRange === "limited" ? "Limited" : "Full"} range (convert pixels and signaling)`;
+  const advancedPlanSummary = `${encodeModeSummary} • ${advancedCodecSummary}${format !== "mp3" && advancedColorRange !== "auto" ? ` • ${advancedColorRange} color range` : ""}`;
   const encodeEventBlockingReason = encodeEventsError
     ? encodeEventsError
     : !encodeEventsReady
@@ -2806,6 +2835,7 @@ function App() {
     capabilityInspectionBlockingReason ??
     rotationBlockingReason ??
     sourceDimensionBlockingReason ??
+    colorRangeBlockingReason ??
     colorBlockingReason ??
     sarBlockingReason ??
     coreCapabilityBlockingReason ??
@@ -2822,6 +2852,7 @@ function App() {
     capabilityInspectionBlockingReason ??
     rotationBlockingReason ??
     exactSampleSourceDimensionBlockingReason ??
+    colorRangeBlockingReason ??
     colorBlockingReason ??
     sarBlockingReason ??
     exactSampleCoreCapabilityBlockingReason ??
@@ -2888,6 +2919,7 @@ function App() {
     }
     if (title.trim()) chips.push("Custom title");
     if (format !== "mp3" && probe?.hasAudio && !audioEnabled) chips.push("Muted");
+    if (advancedColorRange !== "auto" && format !== "mp3") chips.push(`${advancedColorRange === "limited" ? "Limited" : "Full"} color range`);
     if (advancedVideoCodec !== "auto" && format !== "mp3") chips.push(VIDEO_CODEC_LABELS[advancedVideoCodec]);
     if (advancedVideoQuality !== "auto" && format !== "mp3") chips.push(VIDEO_QUALITY_LABELS[advancedVideoQuality]);
     if (advancedEncodeSpeed !== "auto" && format !== "mp3") chips.push(`${ENCODE_SPEED_LABELS[advancedEncodeSpeed]} encode`);
@@ -2925,6 +2957,7 @@ function App() {
     advancedFrameRateCapRequest,
     advancedAudioBitrateRequest,
     advancedAudioChannels,
+    advancedColorRange,
     normalizeAudioApplies,
     colorPolicy,
     externalSubtitleActive,
@@ -3161,6 +3194,7 @@ function App() {
     sourceFrameRate,
     frameRatePlan,
     advancedAudioChannels,
+    advancedColorRange,
     audioOverrideCanApply,
     colorSource,
     colorPolicy,
@@ -4265,6 +4299,7 @@ function App() {
       encodeSpeed: advancedEncodeSpeed,
       frameRateCapFps: advancedFrameRateCapRequest,
       audioChannels: advancedAudioChannels,
+      colorRange: format === "mp3" ? "auto" : advancedColorRange,
     };
   }
 
@@ -4556,6 +4591,7 @@ function App() {
     setAdvancedEncodeSpeed((advanced.encodeSpeed ?? "auto") as EncodeSpeedPreference);
     setAdvancedFrameRateCapFps(advanced.frameRateCapFps == null ? "auto" : String(advanced.frameRateCapFps));
     setAdvancedAudioChannels((advanced.audioChannels ?? "auto") as AudioChannelPreference);
+    setAdvancedColorRange(request.format === "mp3" ? "auto" : advanced.colorRange ?? "auto");
 
     setTrimStart(request.trim?.startS ? String(request.trim.startS) : "0");
     setTrimEnd(request.trim?.endS == null ? "" : String(request.trim.endS));
@@ -8315,6 +8351,21 @@ function App() {
                     Auto keeps the current export planner in charge; overrides apply only when a matching encoder is available.
                   </div>
                   <div className="vfl-stack-md">
+                    <div className="vfl-field">
+                      <label htmlFor="vfl-color-range">Color range</label>
+                      <select id="vfl-color-range" value={advancedColorRange}
+                        onChange={(event) => setAdvancedColorRange(event.currentTarget.value as ColorRangePreference)}
+                        disabled={encodeBusy || format === "mp3"}
+                        title="Auto preserves current behavior. Limited and Full convert pixel values and update range signaling to preserve appearance; both require video encoding.">
+                        <option value="auto">Auto</option>
+                        <option value="limited">Limited</option>
+                        <option value="full">Full</option>
+                      </select>
+                      <div className="vfl-muted">
+                        {format === "mp3" ? "Not used for MP3." : "Auto preserves current behavior. Limited improves forum upload compatibility. Explicit ranges convert pixels and signaling, preserving appearance and requiring video encoding. Full requires H.264 or VP9 and cannot be combined with standard SDR conversion."}
+                      </div>
+                      {colorRangeBlockingReason ? <div className="vfl-error" role="alert">{colorRangeBlockingReason}</div> : null}
+                    </div>
                     <div className="vfl-row2">
                       <div className="vfl-field">
                         <label htmlFor="vfl-video-codec">Video codec</label>
@@ -8534,6 +8585,7 @@ function App() {
                           setAdvancedEncodeSpeed("auto");
                           setAdvancedFrameRateCapFps("auto");
                           setAdvancedAudioChannels("auto");
+                          setAdvancedColorRange("auto");
                           setNormalizeAudio(false);
                         }}
                         disabled={encodeBusy || advancedOverrideCount === 0}
@@ -8574,6 +8626,10 @@ function App() {
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Video codec</div>
                       <div className="vfl-summary-value">{advancedCodecSummary}</div>
+                    </div>
+                    <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Color range</div>
+                      <div className="vfl-summary-value">{advancedColorRangeSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Quality</div>

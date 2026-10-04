@@ -1,5 +1,6 @@
 import type {
   AudioChannelPreference,
+  ColorRangePreference,
   EncodeSpeedPreference,
   OutputFormat,
   ResizeMode,
@@ -25,6 +26,7 @@ export type ExportRecipeSettings = {
   perturbFirstFrame?: boolean;
   strictFit: boolean;
   advanced: {
+    colorRange?: ColorRangePreference;
     videoCodec: VideoCodecPreference;
     audioBitrateKbps: number | null;
     videoQuality: VideoQualityPreference;
@@ -36,7 +38,7 @@ export type ExportRecipeSettings = {
 
 export type PartialExportRecipeSettings = Partial<
   Pick<ExportRecipeSettings, "format" | "sizeLimitMb" | "audioEnabled" | "normalizeAudio" | "perturbFirstFrame" | "strictFit">
->;
+> & { advanced?: Pick<Partial<ExportRecipeSettings["advanced"]>, "colorRange"> };
 
 export type ExportRecipe =
   | {

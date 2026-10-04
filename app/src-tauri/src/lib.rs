@@ -120,6 +120,7 @@ struct AppSmokeConfig {
     strict_fit: bool,
     subtitle_path: Option<String>,
     color_policy: video::ColorPolicy,
+    color_range: video::ColorRangePreference,
     reverse: bool,
     loop_video: bool,
     g7_operation: Option<AppSmokeG7Operation>,
@@ -230,6 +231,15 @@ fn parse_smoke_color_policy(raw: &str) -> Result<video::ColorPolicy, String> {
         "" | "auto" => Ok(video::ColorPolicy::Auto),
         "standardsdr" | "standard-sdr" | "standard_sdr" => Ok(video::ColorPolicy::StandardSdr),
         _ => Err("VFL_SMOKE_COLOR_POLICY must be one of: auto, standardSdr.".to_string()),
+    }
+}
+
+fn parse_smoke_color_range(raw: &str) -> Result<video::ColorRangePreference, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(video::ColorRangePreference::Auto),
+        "limited" => Ok(video::ColorRangePreference::Limited),
+        "full" => Ok(video::ColorRangePreference::Full),
+        _ => Err("VFL_SMOKE_COLOR_RANGE must be one of: auto, limited, full.".to_string()),
     }
 }
 
@@ -369,6 +379,11 @@ fn parse_smoke_config_from_env(
             .map(String::as_str)
             .unwrap_or("auto"),
     )?;
+    let color_range = parse_smoke_color_range(
+        env.get("VFL_SMOKE_COLOR_RANGE")
+            .map(String::as_str)
+            .unwrap_or("auto"),
+    )?;
     let reverse = parse_smoke_bool(env, "VFL_SMOKE_REVERSE")?;
     let loop_video = parse_smoke_bool(env, "VFL_SMOKE_LOOP")?;
     let g7_operation = parse_smoke_g7_operation(
@@ -458,6 +473,7 @@ fn parse_smoke_config_from_env(
         strict_fit,
         subtitle_path,
         color_policy,
+        color_range,
         reverse,
         loop_video,
         g7_operation,
@@ -821,9 +837,9 @@ mod tests {
     use super::{
         AppSmokeConfig, AppSmokeG7Operation, AppSmokeStatus, JobHandle, JobManager,
         is_supported_preview_path, merge_smoke_optional_fields, merge_smoke_stage_history,
-        parse_smoke_config_from_env,
+        parse_smoke_color_range, parse_smoke_config_from_env,
     };
-    use crate::video::{ColorPolicy, OutputFormat, ResizeMode};
+    use crate::video::{self, ColorPolicy, OutputFormat, ResizeMode};
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -880,6 +896,27 @@ mod tests {
     }
 
     #[test]
+    fn smoke_color_range_values_are_validated() {
+        assert_eq!(
+            parse_smoke_color_range("auto").unwrap(),
+            video::ColorRangePreference::Auto
+        );
+        assert_eq!(
+            parse_smoke_color_range("limited").unwrap(),
+            video::ColorRangePreference::Limited
+        );
+        assert_eq!(
+            parse_smoke_color_range("full").unwrap(),
+            video::ColorRangePreference::Full
+        );
+        assert!(
+            parse_smoke_color_range("pc")
+                .unwrap_err()
+                .contains("VFL_SMOKE_COLOR_RANGE")
+        );
+    }
+
+    #[test]
     fn parse_smoke_config_reads_defaults() {
         let status_path = temp_smoke_status_path("defaults");
         let env = smoke_env(&[
@@ -912,6 +949,7 @@ mod tests {
                 strict_fit: false,
                 subtitle_path: None,
                 color_policy: ColorPolicy::Auto,
+                color_range: video::ColorRangePreference::Auto,
                 reverse: false,
                 loop_video: false,
                 g7_operation: None,
@@ -944,6 +982,7 @@ mod tests {
             ("VFL_SMOKE_STRICT_FIT", "true"),
             ("VFL_SMOKE_SUBTITLE_PATH", r"C:\tmp\captions 字幕.srt"),
             ("VFL_SMOKE_COLOR_POLICY", "standardSdr"),
+            ("VFL_SMOKE_COLOR_RANGE", "limited"),
             ("VFL_SMOKE_REVERSE", "true"),
             ("VFL_SMOKE_LOOP", "true"),
         ]);
@@ -972,6 +1011,7 @@ mod tests {
                 strict_fit: true,
                 subtitle_path: Some(r"C:\tmp\captions 字幕.srt".to_string()),
                 color_policy: ColorPolicy::StandardSdr,
+                color_range: video::ColorRangePreference::Limited,
                 reverse: true,
                 loop_video: true,
                 g7_operation: None,

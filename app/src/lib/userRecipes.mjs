@@ -129,6 +129,8 @@ function videoCodecIsCompatible(format, codec) {
 function normalizeAdvancedSettings(value, format) {
   if (value !== undefined && value !== null && !isRecord(value)) return null;
   const advanced = isRecord(value) ? value : {};
+  const colorRange = advanced.colorRange ?? "auto";
+  if (!["auto", "limited", "full"].includes(colorRange)) return null;
   const videoCodec = advanced.videoCodec ?? "auto";
   const videoQuality = advanced.videoQuality ?? "auto";
   const encodeSpeed = advanced.encodeSpeed ?? "auto";
@@ -149,6 +151,7 @@ function normalizeAdvancedSettings(value, format) {
 
   if (format === "mp3") {
     return {
+      colorRange: "auto",
       videoCodec: "auto",
       audioBitrateKbps,
       videoQuality: "auto",
@@ -159,6 +162,7 @@ function normalizeAdvancedSettings(value, format) {
   }
 
   return {
+    colorRange,
     videoCodec,
     audioBitrateKbps,
     videoQuality,

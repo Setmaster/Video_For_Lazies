@@ -5,6 +5,7 @@ export type EncodeSpeedPreference = "auto" | "faster" | "balanced" | "smaller";
 export type AudioChannelPreference = "auto" | "stereo" | "mono";
 export type ResizeMode = "source" | "maxEdge" | "custom";
 export type StreamAction = "copy" | "encode" | "drop";
+export type ColorRangePreference = "auto" | "limited" | "full";
 export type ColorPolicy = "auto" | "standardSdr";
 export type DynamicRange = "sdr" | "hdr10" | "hlg" | "dolbyVision" | "unknown";
 
@@ -127,6 +128,7 @@ export interface EncodeRequest {
 }
 
 export interface AdvancedEncodeSettings {
+  colorRange?: ColorRangePreference | null;
   videoCodec?: VideoCodecPreference | null;
   audioBitrateKbps?: number | null;
   videoQuality?: VideoQualityPreference | null;
@@ -264,6 +266,7 @@ export interface AppSmokeConfig {
   perturbFirstFrame?: boolean | null;
   loopVideo?: boolean | null;
   colorPolicy?: ColorPolicy | null;
+  colorRange?: ColorRangePreference | null;
   reverse?: boolean | null;
   strictFit?: boolean | null;
   // Launch-only input. It is never copied into AppSmokeStatus.

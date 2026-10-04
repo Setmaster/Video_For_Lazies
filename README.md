@@ -33,7 +33,8 @@ The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports 
 - Treat decimal size limits as exact integer-byte targets. With **Strict Fit** off, the requested dimensions and audio are preserved and an oversized result is still published as a clearly marked target-miss artifact with exact byte counts.
 - Opt into **Strict Fit** for at most four ordered plans. It stops at the first result that fits, otherwise keeps the smallest measured miss. When **Include audio** is enabled, every plan retains audio and the final applicable fallback uses 32 kbps audio.
 - Inspect the effective mode, stream actions, codecs, target and actual bytes, color/SAR handling, and a redacted FFmpeg command preview after export.
-- Override codec, quality, encode speed, frame-rate cap, audio bitrate, or channel layout when Auto is not the right fit, and optionally normalize quiet or uneven speech.
+- Override codec, quality, encode speed, frame-rate cap, color range, audio bitrate, or channel layout when Auto is not the right fit, and optionally normalize quiet or uneven speech.
+- Choose **Auto**, **Limited**, or **Full** color range in Advanced. Auto preserves existing behavior; explicit choices convert pixel values and signal their range together. Full range requires H.264 or VP9 and cannot be combined with required Standard SDR conversion.
 - Strip GPS and capture metadata by default, with an explicit privacy toggle and optional title metadata.
 - Follow visible **Copying**, **Encoding**, and **Finalizing** progress. Active work stays below 100 percent until the backend reports a terminal result.
 
@@ -41,8 +42,9 @@ The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports 
 
 - Queue immutable export snapshots and run them sequentially with one FFmpeg job at a time. Completed, target-missed, failed, and canceled items keep bounded recent diagnostics and can be retried, duplicated, or applied back to the workbench with a fresh output path.
 - Add multiple files from the picker or drop them anywhere in the window. One supported file dropped while idle becomes the current source; multiple files, or files dropped during an export, are queued in order with the current reusable settings. Unsupported, duplicate, and overflow entries are reported.
-- Save, rename, apply, and delete up to 50 user recipes on the current device. Recipes use a privacy-bounded allowlist and never store media/output/subtitle paths, titles, trim, crop, transforms, color/HDR choices, diagnostics, or queue/job state.
+- Save, rename, apply, and delete up to 50 user recipes on the current device. Recipes use a privacy-bounded allowlist and never store media/output/subtitle paths, titles, trim, crop, transforms, HDR conversion choices, diagnostics, or queue/job state. The reusable Advanced color-range preference is saved.
 - Use built-in starting points for quick sharing, size-limited uploads, archive-quality MP4, smaller WebM, and audio-only MP3.
+- The **Forum 4 MB** recipe selects limited color range for upload compatibility, alongside its size target, audio removal, and unique-export setting. It preserves unrelated settings.
 - Use the separate **Cancel** action to request cancellation of the active export. **Reset all settings** asks for confirmation and does not remove the current source, output path, queue, or saved recipes.
 
 ### Guard unsafe media assumptions

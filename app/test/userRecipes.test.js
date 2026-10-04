@@ -38,6 +38,7 @@ function baseSettings(overrides = {}) {
     perturbFirstFrame: false,
     strictFit: false,
     advanced: {
+      colorRange: "auto",
       videoCodec: "h264",
       audioBitrateKbps: 128,
       videoQuality: "balanced",
@@ -122,6 +123,7 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
     stripMetadata: false,
     colorPolicy: "standardSdr",
     advanced: {
+      colorRange: "auto",
       videoCodec: "mpeg4",
       audioBitrateKbps: 192,
       videoQuality: "higher",
@@ -157,6 +159,7 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
     perturbFirstFrame: true,
     strictFit: true,
     advanced: {
+      colorRange: "auto",
       videoCodec: "mpeg4",
       audioBitrateKbps: 192,
       videoQuality: "higher",
@@ -188,6 +191,7 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
         lockAspect: false,
       },
       advanced: {
+        colorRange: "auto",
         videoCodec: "h264",
         audioBitrateKbps: 192,
         videoQuality: "higher",
@@ -211,6 +215,7 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
       perturbFirstFrame: false,
       strictFit: false,
       advanced: {
+        colorRange: "auto",
         videoCodec: "auto",
         audioBitrateKbps: 192,
         videoQuality: "auto",
@@ -631,4 +636,22 @@ test("exact serialized recipe JSON cannot contain forbidden request sentinels", 
   assert.equal(raw.includes(sentinel), false);
   assert.equal(raw.includes("stripMetadata"), false);
   assert.deepEqual(Object.keys(JSON.parse(raw)), ["schemaVersion", "recipes"]);
+});
+
+test("color range survives recipe persistence and missing legacy values default to Auto", () => {
+  for (const colorRange of ["auto", "limited", "full"]) {
+    const settings = baseSettings();
+    settings.advanced.colorRange = colorRange;
+    const store = parseUserRecipeStore(JSON.stringify({ schemaVersion: USER_RECIPE_SCHEMA_VERSION, recipes: [{ id: "range", name: "Range", settings }] }));
+    assert.equal(store.recipes[0].settings.advanced.colorRange, colorRange);
+    assert.equal(parseUserRecipeStore(serializeUserRecipeStore(store.recipes)).recipes[0].settings.advanced.colorRange, colorRange);
+  }
+  const legacy = baseSettings();
+  delete legacy.advanced.colorRange;
+  assert.equal(normalizeUserRecipeSettings(legacy).advanced.colorRange, "auto");
+  legacy.advanced.colorRange = "guess";
+  assert.equal(normalizeUserRecipeSettings(legacy), null);
+  legacy.advanced.colorRange = "full";
+  legacy.format = "mp3";
+  assert.equal(normalizeUserRecipeSettings(legacy).advanced.colorRange, "auto");
 });

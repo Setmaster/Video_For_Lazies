@@ -40,6 +40,84 @@ const mediaDepthSmokeCases = Object.freeze([
     }),
   }),
   Object.freeze({
+    id: "range-auto-preserves-full-copy",
+    fixtureId: "sdr-full-range",
+    terminalStage: "success",
+    colorPolicy: "auto",
+    colorRange: "auto",
+    reverse: false,
+    loopVideo: false,
+    sizeLimitMb: 0.1,
+    output: Object.freeze({
+      width: 320,
+      height: 180,
+      sampleAspectRatio: "1:1",
+      durationMultiplier: 1,
+      codecName: "h264",
+      bitDepth: 8,
+      colorRange: "pc",
+      videoPacketPayloadsMatchInput: true,
+      outputSizeMaximum: 100_000,
+      signalStats: Object.freeze({
+        yMinMinimum: 0,
+        yMinMaximum: 2,
+        yMaxMinimum: 253,
+        yMaxMaximum: 255,
+      }),
+    }),
+  }),
+  Object.freeze({
+    id: "range-limited-converts-full-under-size-target",
+    fixtureId: "sdr-full-range",
+    terminalStage: "success",
+    colorPolicy: "auto",
+    colorRange: "limited",
+    reverse: false,
+    loopVideo: false,
+    sizeLimitMb: 0.1,
+    output: Object.freeze({
+      width: 320,
+      height: 180,
+      sampleAspectRatio: "1:1",
+      durationMultiplier: 1,
+      codecName: "h264",
+      bitDepth: 8,
+      colorRange: "tv",
+      outputSizeMaximum: 100_000,
+      signalStats: Object.freeze({
+        yMinMinimum: 14,
+        yMinMaximum: 18,
+        yMaxMinimum: 233,
+        yMaxMaximum: 237,
+      }),
+    }),
+  }),
+  Object.freeze({
+    id: "range-full-converts-limited",
+    fixtureId: "sdr-limited-range",
+    terminalStage: "success",
+    colorPolicy: "auto",
+    colorRange: "full",
+    reverse: false,
+    loopVideo: false,
+    sizeLimitMb: 0,
+    output: Object.freeze({
+      width: 320,
+      height: 180,
+      sampleAspectRatio: "1:1",
+      durationMultiplier: 1,
+      codecName: "h264",
+      bitDepth: 8,
+      colorRange: "pc",
+      signalStats: Object.freeze({
+        yMinMinimum: 0,
+        yMinMaximum: 2,
+        yMaxMinimum: 253,
+        yMaxMaximum: 255,
+      }),
+    }),
+  }),
+  Object.freeze({
     id: "hdr10-explicit-policy-required",
     fixtureId: "hdr10-pq",
     terminalStage: "error",
@@ -327,6 +405,22 @@ function buildMediaDepthFixtureCommands(fixtureId, fixtureRoot) {
         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
       ], outputPath)];
     }
+    case "sdr-full-range":
+    case "sdr-limited-range": {
+      const fullRange = fixtureId === "sdr-full-range";
+      const range = fullRange ? "pc" : "tv";
+      const outputPath = path.resolve(root, `${fixtureId}.mp4`);
+      // Large constant patches give deterministic decoded endpoints, including after lossy encoding.
+      const levels = fullRange ? [0, 255] : [16, 235];
+      return [command([
+        "-f", "lavfi", "-i",
+        `nullsrc=size=320x180:rate=24,geq=lum='if(lt(X,W/2),${levels[0]},${levels[1]})':cb=128:cr=128,setrange=${fullRange ? "full" : "limited"}`,
+        "-t", "0.75", "-an",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-crf", "18",
+        "-x264-params", `colorprim=bt709:transfer=bt709:colormatrix=bt709:range=${range}`,
+        "-pix_fmt", "yuv420p", "-color_range", range, "-movflags", "+faststart",
+      ], outputPath)];
+    }
     case "hdr10-pq": {
       const outputPath = path.resolve(root, "hdr10-pq.mp4");
       return [command([
@@ -488,6 +582,9 @@ function buildMediaDepthSmokeEnvironment(testCase, {
   if (testCase.colorPolicy !== "auto" && testCase.colorPolicy !== "standardSdr") {
     throw new Error(`Unsupported media-depth smoke color policy: ${testCase.colorPolicy}`);
   }
+  if (!["auto", "limited", "full"].includes(testCase.colorRange ?? "auto")) {
+    throw new Error(`Unsupported media-depth smoke color range: ${testCase.colorRange}`);
+  }
   for (const [label, value] of [["inputPath", inputPath], ["outputPath", outputPath], ["statusPath", statusPath]]) {
     if (!value || !String(value).trim()) {
       throw new Error(`Portable media-depth smoke ${label} is required.`);
@@ -504,6 +601,7 @@ function buildMediaDepthSmokeEnvironment(testCase, {
     VFL_SMOKE_TRIM_START_S: "0",
     VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS: "1",
     VFL_SMOKE_COLOR_POLICY: testCase.colorPolicy,
+    VFL_SMOKE_COLOR_RANGE: testCase.colorRange ?? "auto",
     VFL_SMOKE_REVERSE: testCase.reverse ? "1" : "0",
     VFL_SMOKE_LOOP: testCase.loopVideo ? "1" : "0",
   };
@@ -637,6 +735,15 @@ function assertMediaDepthFixture(fixtureId, probe) {
       assertEqualFact(facts.video.color_space, "bt709", "SDR fixture color space");
       assertEqualFact(facts.video.color_transfer, "bt709", "SDR fixture color transfer");
       assertEqualFact(facts.video.color_primaries, "bt709", "SDR fixture color primaries");
+      break;
+    case "sdr-full-range":
+    case "sdr-limited-range":
+      assertEqualFact(facts.video.color_range, fixtureId === "sdr-full-range" ? "pc" : "tv", "range fixture color range");
+      assertEqualFact(facts.video.codec_name, "h264", "range fixture codec");
+      assertEqualFact(facts.bitDepth, 8, "range fixture bit depth");
+      if (Number(probe?.format?.size) > 100_000) {
+        throw new Error("Range fixture must fit the size target so copy would otherwise be available.");
+      }
       break;
     case "hdr10-pq":
       if (facts.bitDepth < 10) throw new Error("HDR10 fixture did not retain at least 10-bit video.");
@@ -897,6 +1004,23 @@ function parseSignalStats(rawOutput) {
   return stats;
 }
 
+function assertSignalStats(caseId, stats, expected) {
+  for (const [key, stat, direction] of [
+    ["yMinMinimum", "YMIN", "minimum"],
+    ["yMinMaximum", "YMIN", "maximum"],
+    ["yMaxMinimum", "YMAX", "minimum"],
+    ["yMaxMaximum", "YMAX", "maximum"],
+    ["saturationMeanMinimum", "SATAVG", "minimum"],
+  ]) {
+    const bound = expected[key];
+    if (bound === undefined) continue;
+    const actual = stats[stat];
+    if (!Number.isFinite(actual) || (direction === "minimum" ? actual < bound : actual > bound)) {
+      throw new Error(`Portable media-depth smoke ${caseId} first-frame ${stat} ${actual ?? "missing"} violated ${direction} ${bound}.`);
+    }
+  }
+}
+
 async function firstFrameSignalStats(ffmpegPath, outputPath) {
   const result = await runBounded(ffmpegPath, [
     "-hide_banner", "-loglevel", "error",
@@ -982,12 +1106,7 @@ async function assertMediaDepthOutput({ testCase, inputProbe, outputProbe, ffmpe
 
   if (expected.signalStats !== undefined) {
     const stats = await firstFrameSignalStats(ffmpegPath, outputPath);
-    if (!Number.isFinite(stats.YMAX) || stats.YMAX < expected.signalStats.yMaxMinimum) {
-      throw new Error(`Portable media-depth smoke ${testCase.id} first-frame YMAX ${stats.YMAX ?? "missing"} did not prove HDR tone mapping.`);
-    }
-    if (!Number.isFinite(stats.SATAVG) || stats.SATAVG < expected.signalStats.saturationMeanMinimum) {
-      throw new Error(`Portable media-depth smoke ${testCase.id} first-frame SATAVG ${stats.SATAVG ?? "missing"} did not prove HDR tone mapping.`);
-    }
+    assertSignalStats(testCase.id, stats, expected.signalStats);
   }
 }
 
@@ -1153,6 +1272,7 @@ export {
   mediaDepthSmokeCases,
   normalizeRational,
   parseSignalStats,
+  assertSignalStats,
   resolveMediaDepthSmokeCases,
   runPortableMediaDepthSmoke,
   selectPrimaryVideoStream,

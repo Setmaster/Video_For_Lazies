@@ -597,3 +597,13 @@ test("invalid transitions and invalid prepared snapshots are no-ops", () => {
     running,
   );
 });
+
+test("queued batches retain independent color range snapshots", () => {
+  const first = request("limited", { advanced: { colorRange: "limited" } });
+  const second = request("full", { advanced: { colorRange: "full" } });
+  const state = enqueue(createExportQueueState(), first, second);
+  first.advanced.colorRange = "auto";
+  second.advanced.colorRange = "auto";
+  assert.deepEqual(state.items.map((item) => item.request.advanced.colorRange), ["limited", "full"]);
+  assert.equal(getActiveExportQueueItem(beginNext(state)).request.advanced.colorRange, "limited");
+});

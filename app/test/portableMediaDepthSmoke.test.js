@@ -15,6 +15,7 @@ import {
   mediaDepthSmokeCases,
   normalizeRational,
   parseSignalStats,
+  assertSignalStats,
   resolveMediaDepthSmokeCases,
   selectPrimaryAudioStream,
   selectPrimaryVideoStream,
@@ -25,6 +26,9 @@ test("packaged media-depth matrix covers policy, geometry, stream selection, and
     mediaDepthSmokeCases.map((testCase) => testCase.id),
     [
       "sdr-baseline",
+      "range-auto-preserves-full-copy",
+      "range-limited-converts-full-under-size-target",
+      "range-full-converts-limited",
       "hdr10-explicit-policy-required",
       "hdr10-to-standard-sdr",
       "ten-bit-sdr-explicit-policy-required",
@@ -154,6 +158,7 @@ test("packaged smoke environment exposes strict color and Reverse hooks", () => 
   assert.equal(env.KEEP_ME, "yes");
   assert.equal(env.VFL_SMOKE_SKIP_PREVIEW_INTERACTIONS, "1");
   assert.equal(env.VFL_SMOKE_COLOR_POLICY, "auto");
+  assert.equal(env.VFL_SMOKE_COLOR_RANGE, "auto");
   assert.equal(env.VFL_SMOKE_REVERSE, "1");
   assert.equal(env.VFL_SMOKE_LOOP, "1");
   assert.equal(env.VFL_SMOKE_FORMAT, "mp4");
@@ -306,4 +311,34 @@ test("signalstats parser captures the first finite value for deterministic HDR p
     "lavfi.signalstats.BAD=not-a-number",
   ].join("\n"));
   assert.deepEqual(parsed, { YMAX: 237, SATAVG: 118.351 });
+});
+
+test("range smoke exercises preservation and actual pixel conversion despite a fitting size target", () => {
+  const cases = resolveMediaDepthSmokeCases([
+    "range-auto-preserves-full-copy",
+    "range-limited-converts-full-under-size-target",
+    "range-full-converts-limited",
+  ]);
+  assert.equal(cases[0].output.videoPacketPayloadsMatchInput, true);
+  assert.equal(cases[0].fixtureId, cases[1].fixtureId);
+  assert.equal(cases[1].sizeLimitMb, 0.1);
+  for (const testCase of cases) {
+    const env = buildMediaDepthSmokeEnvironment(testCase, {
+      inputPath: "/tmp/range-input.mp4",
+      outputPath: "/tmp/range-output.mp4",
+      statusPath: "/tmp/range-status.json",
+      baseEnv: { VFL_SMOKE_COLOR_RANGE: "invalid-inherited-value" },
+    });
+    assert.equal(env.VFL_SMOKE_COLOR_RANGE, testCase.colorRange);
+    const args = buildMediaDepthFixtureCommands(testCase.fixtureId, "/tmp/range-fixtures")[0].args;
+    assert.equal(args[args.indexOf("-color_range") + 1], testCase.fixtureId === "sdr-full-range" ? "pc" : "tv");
+  }
+  const limitedExpected = cases[1].output.signalStats;
+  const fullExpected = cases[2].output.signalStats;
+  assert.doesNotThrow(() => assertSignalStats("limited", { YMIN: 16, YMAX: 235 }, limitedExpected));
+  assert.doesNotThrow(() => assertSignalStats("full", { YMIN: 0, YMAX: 255 }, fullExpected));
+  assert.throws(() => assertSignalStats("limited-relabel", { YMIN: 0, YMAX: 255 }, limitedExpected), /YMIN/);
+  assert.throws(() => assertSignalStats("full-relabel", { YMIN: 16, YMAX: 235 }, fullExpected), /YMIN/);
+  assert.throws(() => assertSignalStats("missing", { YMIN: 16 }, limitedExpected), /YMAX missing/);
+  assert.throws(() => assertSignalStats("clipped", { YMIN: 16, YMAX: 255 }, limitedExpected), /YMAX/);
 });

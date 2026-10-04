@@ -146,3 +146,14 @@ test("normalizeAudio persists only when enabled and ignores garbage", () => {
   assert.deepEqual(parsePersistedSettings(JSON.stringify({ normalizeAudio: "yes" })), {});
   assert.deepEqual(parsePersistedSettings(JSON.stringify({ normalizeAudio: 1 })), {});
 });
+
+test("persisted color range round-trips explicit choices and ignores invalid or default values", () => {
+  for (const colorRange of ["limited", "full"]) {
+    const settings = { advanced: { colorRange } };
+    assert.deepEqual(parsePersistedSettings(serializePersistedSettings(settings)), settings);
+  }
+  for (const colorRange of ["auto", "guess", null]) {
+    assert.deepEqual(parsePersistedSettings(JSON.stringify({ advanced: { colorRange } })), {});
+    assert.equal(serializePersistedSettings({ advanced: { colorRange } }), "{}");
+  }
+});
