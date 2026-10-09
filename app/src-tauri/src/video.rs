@@ -143,6 +143,8 @@ pub struct VideoProbe {
     #[serde(skip)]
     pub video_start_s: f64,
     #[serde(skip)]
+    pub video_end_s: Option<f64>,
+    #[serde(skip)]
     pub input_origin_s: f64,
     /// Display-oriented sample-grid width. This intentionally retains the
     /// pre-v1.10 meaning used by crop coordinates.
@@ -4861,8 +4863,10 @@ fn prepare_temporal_probe(
         // NUT indexes omit the final packet duration. Only common A/V padding
         // needs this extra precision; loading, copying and single-stream
         // transformations retain the ordinary metadata-only probe path.
-        probe.duration_s =
+        let (duration, video_end) =
             probe_nut_timeline_duration(&default_ffprobe(), input, probe, probe.input_origin_s)?;
+        probe.duration_s = duration;
+        probe.video_end_s = video_end;
     }
     Ok(())
 }
@@ -4872,7 +4876,7 @@ fn probe_nut_timeline_duration(
     input: &Path,
     probe: &VideoProbe,
     origin: f64,
-) -> Result<f64, String> {
+) -> Result<(f64, Option<f64>), String> {
     #[derive(Deserialize)]
     struct Packet {
         stream_index: u32,
@@ -4916,6 +4920,7 @@ fn probe_nut_timeline_duration(
         return Err(invalid());
     }
     let mut endpoint: f64 = 0.0;
+    let mut video_endpoint: Option<f64> = None;
     for packet in tail.packets {
         if packet.stream_index != probe.video_stream_index
             && Some(packet.stream_index) != probe.audio_stream_index
@@ -4934,12 +4939,16 @@ fn probe_nut_timeline_duration(
             .and_then(|value| value.parse::<f64>().ok())
             .filter(|value| value.is_finite() && *value > 0.0)
             .ok_or_else(invalid)?;
-        endpoint = endpoint.max(pts + duration - origin);
+        let end = pts + duration - origin;
+        endpoint = endpoint.max(end);
+        if packet.stream_index == probe.video_stream_index {
+            video_endpoint = Some(video_endpoint.map_or(end, |previous| previous.max(end)));
+        }
     }
     if endpoint <= 0.0 || !endpoint.is_finite() {
         return Err(invalid());
     }
-    Ok(endpoint)
+    Ok((endpoint, video_endpoint))
 }
 
 #[cfg(test)]
@@ -5015,7 +5024,8 @@ fn parse_probe_output_with_pixel_formats(
         }
         None
     };
-    if let Some(video_end) = selected_end(selected_video)
+    let video_end_s = selected_end(selected_video).filter(|end| end.is_finite() && *end > 0.0);
+    if let Some(video_end) = video_end_s
         && let Some(audio_end) = selected_audio.map_or(Some(0.0), selected_end)
     {
         let selected_duration = video_end.max(audio_end);
@@ -5145,6 +5155,7 @@ fn parse_probe_output_with_pixel_formats(
     Ok(VideoProbe {
         duration_s,
         video_start_s,
+        video_end_s,
         input_origin_s: input_origin,
         width,
         height,
@@ -5512,6 +5523,21 @@ fn build_video_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
     build_video_filters_with_policy(req, probe, media_policy)
 }
 
+fn video_trailing_padding_duration(request: &EncodeRequest, probe: &VideoProbe) -> f64 {
+    let requested_end = request
+        .trim
+        .as_ref()
+        .and_then(|trim| trim.end_s)
+        .unwrap_or(probe.duration_s)
+        .min(probe.duration_s);
+    // Padding the whole interval and trimming afterwards can admit one extra
+    // black frame when a container rounds its endpoint. Give tpad only the
+    // actual gap: its native duration-to-frame conversion preserves real gaps
+    // without changing the original frames or their (possibly variable) PTS.
+    // Missing endpoint facts retain the bounded full-interval fallback.
+    (requested_end - probe.video_end_s.unwrap_or(0.0)).max(0.0)
+}
+
 fn build_video_filters_with_policy(
     req: &EncodeRequest,
     probe: &VideoProbe,
@@ -5527,14 +5553,18 @@ fn build_video_filters_with_policy(
         // no actual pictures still has black frames. This is streaming work;
         // trim discards them before expensive picture/subtitle filters or any
         // reverse buffer. One tpad handles both ends to preserve its EOF PTS.
-        let duration = probe.duration_s;
+        let trailing_gap = video_trailing_padding_duration(req, probe);
         let leading_gap = probe.video_start_s;
+        let mut pad_options = Vec::new();
         if leading_gap > 0.0 {
-            filters.push(format!(
-                "setpts=PTS-{leading_gap}/TB,tpad=start_mode=add:start_duration={leading_gap}:stop_mode=add:stop_duration={duration}"
-            ));
-        } else {
-            filters.push(format!("tpad=stop_mode=add:stop_duration={duration}"));
+            filters.push(format!("setpts=PTS-{leading_gap}/TB"));
+            pad_options.push(format!("start_mode=add:start_duration={leading_gap}"));
+        }
+        if trailing_gap > 0.0 {
+            pad_options.push(format!("stop_mode=add:stop_duration={trailing_gap}"));
+        }
+        if !pad_options.is_empty() {
+            filters.push(format!("tpad={}", pad_options.join(":")));
         }
     }
 
@@ -7885,6 +7915,7 @@ mod tests {
         VideoProbe {
             duration_s: 10.0,
             video_start_s: 0.0,
+            video_end_s: None,
             input_origin_s: 0.0,
             width: 1920,
             height: 1080,
@@ -9082,7 +9113,7 @@ Encoders:
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "tpad=stop_mode=add:stop_duration=10,trim=start=1:end=5,setpts=PTS-1/TB,crop=w=100:h=98:x=1:y=3:exact=1,transpose=1,reverse,setpts=PTS/2.000000000"
+            "tpad=stop_mode=add:stop_duration=5,trim=start=1:end=5,setpts=PTS-1/TB,crop=w=100:h=98:x=1:y=3:exact=1,transpose=1,reverse,setpts=PTS/2.000000000"
         );
     }
 
@@ -9982,6 +10013,32 @@ Encoders:
         assert_eq!(fit_max_edge_dimensions(853, 481, 900), (852, 480));
         assert_eq!(fit_max_edge_dimensions(960, 540, 500), (500, 282));
         assert_eq!(fit_max_edge_dimensions(540, 960, 501), (282, 500));
+    }
+
+    #[test]
+    fn trailing_padding_uses_only_the_gap_after_the_selected_video_endpoint() {
+        let mut request = base_request();
+        request.reverse = true;
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.duration_s = 0.667;
+        probe.video_end_s = Some(0.666);
+        assert!((video_trailing_padding_duration(&request, &probe) - 0.001).abs() < 1e-12);
+        probe.duration_s = 4.0;
+        probe.video_start_s = 1.0;
+        probe.video_end_s = Some(2.0);
+        assert_eq!(video_trailing_padding_duration(&request, &probe), 2.0);
+        request.trim = Some(Trim {
+            start_s: 0.0,
+            end_s: Some(3.0),
+        });
+        assert_eq!(video_trailing_padding_duration(&request, &probe), 1.0);
+        request.trim = Some(Trim {
+            start_s: 0.0,
+            end_s: Some(1.5),
+        });
+        assert_eq!(video_trailing_padding_duration(&request, &probe), 0.0);
+        probe.video_end_s = None;
+        assert_eq!(video_trailing_padding_duration(&request, &probe), 1.5);
     }
 
     #[test]

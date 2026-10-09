@@ -333,8 +333,10 @@ fn bundled_trim_keeps_audio_offsets_through_speed_reverse_and_loop() {
                 temp.path(),
             );
             let samples: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
                 .collect();
             let duration = (3.0 - start) / speed;
             let (tone_start, tone_end) = if reverse {
@@ -835,4 +837,260 @@ fn bundled_muted_and_high_rate_sources_preserve_existing_temporal_paths() {
             .unwrap_err()
             .contains("complete NUT media duration")
     );
+}
+
+#[test]
+#[ignore = "requires the bundled FFmpeg and FFprobe"]
+fn bundled_rounded_endpoints_do_not_add_black_frames_before_reverse() {
+    let temp = tempfile::tempdir().unwrap();
+    for variable_timestamps in [false, true] {
+        let duration = if variable_timestamps {
+            "0.683667"
+        } else {
+            "0.666667"
+        };
+        let mut fixture = vec![
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=160x90:rate=12,geq=lum='16+200*N/7':cb=128:cr=128,format=yuv420p",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=990:sample_rate=48000",
+            "-t",
+            duration,
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "flac",
+        ];
+        if variable_timestamps {
+            fixture.extend([
+                "-vf",
+                "settb=1/1000,setpts=PTS+if(gte(N\\,4)\\,17\\,0)",
+                "-fps_mode",
+                "passthrough",
+                "-enc_time_base:v",
+                "1/1000",
+            ]);
+        }
+        fixture.push("rounded.mkv");
+        ffmpeg(&fixture, temp.path());
+        let input = temp.path().join("rounded.mkv");
+        let probe = probe_video(input.to_string_lossy().into()).unwrap();
+        assert_eq!(
+            probe.video_end_s,
+            Some(if variable_timestamps { 0.683 } else { 0.666 })
+        );
+        assert_eq!(
+            probe.duration_s,
+            if variable_timestamps { 0.684 } else { 0.667 }
+        );
+        let gray_means = |raw: &[u8]| -> Vec<f64> {
+            assert_eq!(raw.len() % (160 * 90), 0);
+            raw.chunks_exact(160 * 90)
+                .map(|frame| frame.iter().map(|v| *v as u64).sum::<u64>() as f64 / (160.0 * 90.0))
+                .collect()
+        };
+        let source_frames = ffmpeg(
+            &[
+                "-i",
+                "rounded.mkv",
+                "-map",
+                "0:v:0",
+                "-vf",
+                "format=gray",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            temp.path(),
+        );
+        let source_means = gray_means(&source_frames);
+        assert_eq!(source_means.len(), 8);
+        for loop_video in [false, true] {
+            let mut req = request();
+            req.input_path = input.to_string_lossy().into();
+            req.audio_enabled = true;
+            req.reverse = true;
+            req.loop_video = loop_video;
+            let filter = build_video_filters(&req, &probe).unwrap().unwrap();
+            let baseline = if loop_video {
+                "reverse,split[fv][rv0];[rv0]reverse[rv];[fv][rv]concat=n=2:v=1"
+            } else {
+                "reverse"
+            };
+            let frames = |graph: &str| {
+                ffmpeg(
+                    &[
+                        "-i",
+                        "rounded.mkv",
+                        "-an",
+                        "-vf",
+                        graph,
+                        "-fps_mode",
+                        "passthrough",
+                        "-f",
+                        "framemd5",
+                        "-",
+                    ],
+                    temp.path(),
+                )
+            };
+            // Exact frame hashes and PTS must stay unchanged for both constant
+            // and variable timestamps when the endpoints differ by one tick.
+            assert_eq!(
+                frames(&filter),
+                frames(baseline),
+                "vfr={variable_timestamps}, loop={loop_video}; {filter}"
+            );
+            if !variable_timestamps {
+                let capabilities = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+                let codecs =
+                    select_codec_plan(req.format, &capabilities.encoder_names, &req.advanced)
+                        .unwrap();
+                let plan = build_encode_command_plan(&req, &probe, codecs, None).unwrap();
+                let mut args = build_single_pass_args("rounded.mkv", &req, &plan).unwrap();
+                args.push("rounded.mp4".into());
+                ffmpeg(
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    temp.path(),
+                );
+                let output = ffmpeg(
+                    &[
+                        "-i",
+                        "rounded.mp4",
+                        "-map",
+                        "0:v:0",
+                        "-vf",
+                        "format=gray",
+                        "-fps_mode",
+                        "passthrough",
+                        "-f",
+                        "rawvideo",
+                        "-",
+                    ],
+                    temp.path(),
+                );
+                let actual = gray_means(&output);
+                let mut expected: Vec<f64> = source_means.iter().rev().copied().collect();
+                if loop_video {
+                    expected.extend_from_slice(&source_means);
+                }
+                assert_eq!(actual.len(), expected.len());
+                assert!(
+                    actual[0] >= 150.0,
+                    "the packaged Reverse-before-Loop assertion must stay valid"
+                );
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert!((actual - expected).abs() < 3.0);
+                }
+            }
+        }
+        if !variable_timestamps {
+            // A real audio tail still needs black frames before the reversed
+            // pictures; padding must include exactly that retained gap.
+            ffmpeg(
+                &[
+                    "-i",
+                    "rounded.mkv",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=990:sample_rate=48000:duration=1",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "flac",
+                    "real-gap.mkv",
+                ],
+                temp.path(),
+            );
+            let probe =
+                probe_video(temp.path().join("real-gap.mkv").to_string_lossy().into()).unwrap();
+            let mut req = request();
+            req.audio_enabled = true;
+            req.reverse = true;
+            req.loop_video = true;
+            let filter = build_video_filters(&req, &probe).unwrap().unwrap();
+            let frames = ffmpeg(
+                &[
+                    "-i",
+                    "real-gap.mkv",
+                    "-an",
+                    "-vf",
+                    &format!("{filter},format=gray"),
+                    "-fps_mode",
+                    "passthrough",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                temp.path(),
+            );
+            let means = gray_means(&frames);
+            assert_eq!(means.len(), 24);
+            assert!(means[..4].iter().all(|mean| *mean < 1.0));
+            assert!(means[4] >= 150.0);
+
+            // A coarse source time base must not suppress a genuine one-frame
+            // gap. MP4's 1/12 clock represents this 1/12-second tail exactly.
+            ffmpeg(
+                &[
+                    "-i",
+                    "rounded.mkv",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=990:sample_rate=48000:duration=0.75",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "libx264",
+                    "-video_track_timescale",
+                    "12",
+                    "-c:a",
+                    "aac",
+                    "coarse-gap.mp4",
+                ],
+                temp.path(),
+            );
+            let probe =
+                probe_video(temp.path().join("coarse-gap.mp4").to_string_lossy().into()).unwrap();
+            assert!((probe.duration_s - 0.75).abs() < 0.000_001);
+            let filter = build_video_filters(&req, &probe).unwrap().unwrap();
+            let frames = ffmpeg(
+                &[
+                    "-i",
+                    "coarse-gap.mp4",
+                    "-an",
+                    "-vf",
+                    &format!("{filter},format=gray"),
+                    "-fps_mode",
+                    "passthrough",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                temp.path(),
+            );
+            let means = gray_means(&frames);
+            assert_eq!(means.len(), 18);
+            assert!(means[0] < 1.0);
+            assert!(means[1] >= 150.0);
+        }
+    }
 }
