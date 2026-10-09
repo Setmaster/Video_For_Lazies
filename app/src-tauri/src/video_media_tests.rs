@@ -893,7 +893,9 @@ fn bundled_rounded_endpoints_do_not_add_black_frames_before_reverse() {
         );
         let gray_means = |raw: &[u8]| -> Vec<f64> {
             assert_eq!(raw.len() % (160 * 90), 0);
-            raw.chunks_exact(160 * 90)
+            raw.as_chunks::<{ 160 * 90 }>()
+                .0
+                .iter()
                 .map(|frame| frame.iter().map(|v| *v as u64).sum::<u64>() as f64 / (160.0 * 90.0))
                 .collect()
         };
