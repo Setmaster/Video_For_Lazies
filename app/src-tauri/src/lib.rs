@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State, Window};
 
+mod command_dispatch;
 pub mod updater;
 mod video;
 
@@ -578,61 +579,79 @@ fn merge_smoke_optional_fields(existing: Option<&AppSmokeStatus>, next: &mut App
 }
 
 #[tauri::command]
-fn probe_video(path: String) -> Result<video::VideoProbe, String> {
-    video::probe_video(path)
+async fn probe_video(path: String) -> Result<video::VideoProbe, String> {
+    command_dispatch::media(move || video::probe_video(path)).await
 }
 
 #[tauri::command]
-fn detect_crop(path: String) -> Result<Option<video::Crop>, String> {
-    video::detect_crop(path)
+async fn detect_crop(path: String) -> Result<Option<video::Crop>, String> {
+    command_dispatch::media(move || video::detect_crop(path)).await
 }
 
 #[tauri::command]
-fn suggest_output_path(
+async fn suggest_output_path(
     input_path: String,
     format: video::OutputFormat,
     taken_paths: Option<Vec<String>>,
 ) -> Result<String, String> {
-    video::suggest_output_path_unique(input_path, format, &taken_paths.unwrap_or_default())
+    command_dispatch::files(move || {
+        video::suggest_output_path_unique(input_path, format, &taken_paths.unwrap_or_default())
+    })
+    .await
 }
 
 #[tauri::command]
-fn encode_capabilities() -> Result<video::EncodeCapabilities, String> {
-    video::encode_capabilities()
+async fn suggest_output_paths(
+    input_paths: Vec<String>,
+    format: video::OutputFormat,
+    taken_paths: Option<Vec<String>>,
+) -> Result<Vec<String>, String> {
+    command_dispatch::files(move || {
+        video::suggest_output_paths(input_paths, format, &taken_paths.unwrap_or_default())
+    })
+    .await
 }
 
 #[tauri::command]
-fn inspect_srt(path: String) -> Result<video::SubtitleInspection, String> {
-    video::inspect_srt(path)
+async fn encode_capabilities() -> Result<video::EncodeCapabilities, String> {
+    command_dispatch::media(video::encode_capabilities).await
+}
+
+#[tauri::command]
+async fn inspect_srt(path: String) -> Result<video::SubtitleInspection, String> {
+    command_dispatch::files(move || video::inspect_srt(path)).await
 }
 
 #[tauri::command]
 #[allow(non_snake_case)]
-fn extract_frame(inputPath: String, timeS: f64, outputPath: String) -> Result<(), String> {
-    video::extract_frame(inputPath, timeS, outputPath)
+async fn extract_frame(inputPath: String, timeS: f64, outputPath: String) -> Result<(), String> {
+    command_dispatch::media(move || video::extract_frame(inputPath, timeS, outputPath)).await
 }
 
 #[tauri::command]
-fn allow_preview_path(window: Window, path: String) -> Result<(), String> {
-    let path_buf = PathBuf::from(&path);
-    let meta =
-        std::fs::metadata(&path_buf).map_err(|e| format!("Preview file is not accessible: {e}"))?;
-    if !meta.is_file() {
-        return Err("Preview path must point to a file.".to_string());
-    }
-    if !is_supported_preview_path(&path_buf) {
-        return Err("Preview file must be one of: mp4, mov, mkv, avi, webm, m4v.".to_string());
-    }
+async fn allow_preview_path(window: Window, path: String) -> Result<(), String> {
+    command_dispatch::files(move || {
+        let path_buf = PathBuf::from(&path);
+        let meta = std::fs::metadata(&path_buf)
+            .map_err(|e| format!("Preview file is not accessible: {e}"))?;
+        if !meta.is_file() {
+            return Err("Preview path must point to a file.".to_string());
+        }
+        if !is_supported_preview_path(&path_buf) {
+            return Err("Preview file must be one of: mp4, mov, mkv, avi, webm, m4v.".to_string());
+        }
 
-    let path_buf = path_buf
-        .canonicalize()
-        .map_err(|e| format!("Preview file is not accessible: {e}"))?;
+        let path_buf = path_buf
+            .canonicalize()
+            .map_err(|e| format!("Preview file is not accessible: {e}"))?;
 
-    window
-        .app_handle()
-        .asset_protocol_scope()
-        .allow_file(path_buf)
-        .map_err(|e| format!("Failed to allow preview access: {e}"))
+        window
+            .app_handle()
+            .asset_protocol_scope()
+            .allow_file(path_buf)
+            .map_err(|e| format!("Failed to allow preview access: {e}"))
+    })
+    .await
 }
 
 fn is_supported_preview_path(path: &Path) -> bool {
@@ -814,6 +833,7 @@ pub fn run() {
             probe_video,
             detect_crop,
             suggest_output_path,
+            suggest_output_paths,
             encode_capabilities,
             inspect_srt,
             extract_frame,

@@ -15,3 +15,10 @@ export function ensureUniqueOutputPath(
   takenPaths: Iterable<string> | null | undefined,
   platform?: QueuePathPlatform,
 ): string;
+
+export function suggestOutputPaths(
+  inputPaths: string[],
+  format: string,
+  takenPaths: string[],
+  invoke: <T>(command: string, args: Record<string, unknown>) => Promise<T>,
+): Promise<string[]>;

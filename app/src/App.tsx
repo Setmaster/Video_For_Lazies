@@ -62,7 +62,7 @@ import {
   type ExportQueueState,
 } from "./lib/exportQueue";
 import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
-import { basename, dirname, ensureUniqueOutputPath, extname, formatPathForDisplay, replaceExtension, stem, suggestOutputPath } from "./lib/outputPath";
+import { basename, dirname, ensureUniqueOutputPath, extname, formatPathForDisplay, replaceExtension, stem, suggestOutputPath, suggestOutputPaths } from "./lib/outputPath";
 import { createEncodeProgressState, getActiveProgressUi, reduceEncodeProgress } from "./lib/progress";
 import { formatClock } from "./lib/timeFormat";
 import {
@@ -4521,9 +4521,9 @@ function App() {
 
       const takenPaths = claimedOutputPathsForPreparation();
       const prepared: { request: EncodeRequest; durationS: null }[] = [];
-      for (const nextInputPath of acceptedPaths) {
-        const nextOutputPath = await suggestedOutputForInput(nextInputPath, batchFormat, takenPaths);
-        takenPaths.push(nextOutputPath);
+      const outputPaths = await suggestOutputPaths(acceptedPaths, batchFormat, takenPaths, invoke);
+      for (const [index, nextInputPath] of acceptedPaths.entries()) {
+        const nextOutputPath = outputPaths[index];
         prepared.push({
           request: {
             ...cloneEncodeRequest(requestTemplate),

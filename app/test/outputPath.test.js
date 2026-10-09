@@ -6,6 +6,7 @@ import {
   formatPathForDisplay,
   replaceExtension,
   suggestOutputPath,
+  suggestOutputPaths,
 } from "../src/lib/outputPath.mjs";
 
 test("suggestOutputPath adds -2 when no suffix", () => {
@@ -87,4 +88,29 @@ test("ensureUniqueOutputPath preserves explicit POSIX case and double-slash iden
     ensureUniqueOutputPath("//Server/Share/Clip-2.mp4", ["//server/share/clip-2.mp4"], "posix"),
     "//Server/Share/Clip-2.mp4",
   );
+});
+
+test("batch suggestions use one IPC and preserve order without mutating claims", async () => {
+  const claims = ["clip-2.mp4"];
+  const calls = [];
+  const result = await suggestOutputPaths(["clip.mp4", "clip-2.mp4"], "mp4", claims, async (command, args) => {
+    calls.push({ command, args });
+    return ["clip-3.mp4", "clip-4.mp4"];
+  });
+  assert.deepEqual(result, ["clip-3.mp4", "clip-4.mp4"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "suggest_output_paths");
+  assert.deepEqual(claims, ["clip-2.mp4"]);
+});
+
+test("failed batch retains per-input recovery and reserves fallback names", async () => {
+  const calls = [];
+  const result = await suggestOutputPaths(["clip.mp4", "clip.mp4"], "mp4", ["clip-2.mp4"], async (command, args) => {
+    calls.push({ command, args });
+    if (command === "suggest_output_paths" || calls.length === 2) throw new Error("offline");
+    assert.deepEqual(args.takenPaths, ["clip-2.mp4", "clip-3.mp4"]);
+    return "clip-4.mp4";
+  });
+  assert.deepEqual(result, ["clip-3.mp4", "clip-4.mp4"]);
+  assert.equal(calls.length, 3);
 });

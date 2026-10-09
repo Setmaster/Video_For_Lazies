@@ -93,3 +93,31 @@ export function ensureUniqueOutputPath(candidate, takenPaths, platform = "auto")
   }
   return next;
 }
+
+// The native batch shares filesystem/queue claims. If it fails, retain the
+// previous per-input recovery semantics, including claims made by fallbacks.
+export async function suggestOutputPaths(inputPaths, format, takenPaths, invoke) {
+  if (!inputPaths.length) return [];
+  try {
+    const outputs = await invoke("suggest_output_paths", { inputPaths, format, takenPaths });
+    if (!Array.isArray(outputs) || outputs.length !== inputPaths.length ||
+        outputs.some((path) => typeof path !== "string" || !path)) {
+      throw new Error("Invalid filename batch response.");
+    }
+    return outputs;
+  } catch {
+    const claimed = [...takenPaths];
+    const outputs = [];
+    for (const inputPath of inputPaths) {
+      let output;
+      try {
+        output = await invoke("suggest_output_path", { inputPath, format, takenPaths: [...claimed] });
+      } catch {
+        output = ensureUniqueOutputPath(suggestOutputPath(inputPath, format), claimed);
+      }
+      claimed.push(output);
+      outputs.push(output);
+    }
+    return outputs;
+  }
+}

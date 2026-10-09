@@ -2093,53 +2093,56 @@ fn run_ffmpeg_capability_probe(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn cached_ffmpeg_capabilities(ffmpeg_bin: &str) -> Result<FfmpegRuntimeCapabilities, String> {
-    let cache = FFMPEG_CAPABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some(existing) = guard.get(ffmpeg_bin)
-    {
-        return apply_smoke_capability_mask(
-            existing.clone(),
-            &std::env::vars().collect::<HashMap<_, _>>(),
-        );
+fn cached_runtime_value<T: Clone>(
+    cache: &OnceLock<Mutex<HashMap<String, T>>>,
+    key: &str,
+    load: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // A cold lookup owns the cache until its bounded probe finishes. Concurrent
+    // callers reuse the result instead of launching duplicate subprocesses.
+    let mut entries = cache
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "FFmpeg capability cache is unavailable.".to_string())?;
+    if let Some(value) = entries.get(key) {
+        return Ok(value.clone());
     }
+    let value = load()?;
+    entries.insert(key.to_string(), value.clone());
+    Ok(value)
+}
 
-    let encoder_output =
-        run_ffmpeg_capability_probe(ffmpeg_bin, "-encoders", "ffmpeg encoder probe")?;
-    let filter_output = run_ffmpeg_capability_probe(ffmpeg_bin, "-filters", "ffmpeg filter probe")?;
-    let version_output =
-        run_ffmpeg_capability_probe(ffmpeg_bin, "-version", "ffmpeg version probe")?;
-    let parsed = FfmpegRuntimeCapabilities {
-        version: parse_ffmpeg_version(&version_output)
-            .ok_or_else(|| "ffmpeg version probe returned no recognizable version.".to_string())?,
-        encoder_names: parse_encoder_names(&encoder_output),
-        filter_names: parse_filter_names(&filter_output),
-    };
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(ffmpeg_bin.to_string(), parsed.clone());
-    }
+fn cached_ffmpeg_capabilities(ffmpeg_bin: &str) -> Result<FfmpegRuntimeCapabilities, String> {
+    let parsed = cached_runtime_value(&FFMPEG_CAPABILITY_CACHE, ffmpeg_bin, || {
+        let encoder_output =
+            run_ffmpeg_capability_probe(ffmpeg_bin, "-encoders", "ffmpeg encoder probe")?;
+        let filter_output =
+            run_ffmpeg_capability_probe(ffmpeg_bin, "-filters", "ffmpeg filter probe")?;
+        let version_output =
+            run_ffmpeg_capability_probe(ffmpeg_bin, "-version", "ffmpeg version probe")?;
+        Ok(FfmpegRuntimeCapabilities {
+            version: parse_ffmpeg_version(&version_output).ok_or_else(|| {
+                "ffmpeg version probe returned no recognizable version.".to_string()
+            })?,
+            encoder_names: parse_encoder_names(&encoder_output),
+            filter_names: parse_filter_names(&filter_output),
+        })
+    })?;
     apply_smoke_capability_mask(parsed, &std::env::vars().collect::<HashMap<_, _>>())
 }
 
 fn cached_ffmpeg_pixel_formats(
     ffmpeg_bin: &str,
 ) -> Result<HashMap<String, PixelFormatDescriptor>, String> {
-    let cache = FFMPEG_PIXEL_FORMAT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some(existing) = guard.get(ffmpeg_bin)
-    {
-        return Ok(existing.clone());
-    }
-
-    let output = run_ffmpeg_capability_probe(ffmpeg_bin, "-pix_fmts", "ffmpeg pixel-format probe")?;
-    let parsed = parse_pixel_format_descriptors(&output);
-    if parsed.is_empty() {
-        return Err("ffmpeg pixel-format probe returned no usable descriptors.".to_string());
-    }
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(ffmpeg_bin.to_string(), parsed.clone());
-    }
-    Ok(parsed)
+    cached_runtime_value(&FFMPEG_PIXEL_FORMAT_CACHE, ffmpeg_bin, || {
+        let output =
+            run_ffmpeg_capability_probe(ffmpeg_bin, "-pix_fmts", "ffmpeg pixel-format probe")?;
+        let parsed = parse_pixel_format_descriptors(&output);
+        if parsed.is_empty() {
+            return Err("ffmpeg pixel-format probe returned no usable descriptors.".to_string());
+        }
+        Ok(parsed)
+    })
 }
 
 fn is_feature_contract_name(value: &str) -> bool {
@@ -3952,6 +3955,39 @@ pub fn suggest_output_path_unique(
     format: OutputFormat,
     taken_paths: &[String],
 ) -> Result<String, String> {
+    let taken = taken_paths
+        .iter()
+        .map(|path| output_path_identity(path))
+        .collect();
+    suggest_output_path_with_claims(&input_path, format, &taken)
+}
+
+pub fn suggest_output_paths(
+    input_paths: Vec<String>,
+    format: OutputFormat,
+    taken_paths: &[String],
+) -> Result<Vec<String>, String> {
+    if input_paths.len() > 100 {
+        return Err("A filename batch cannot exceed 100 inputs.".to_string());
+    }
+    let mut taken = taken_paths
+        .iter()
+        .map(|path| output_path_identity(path))
+        .collect();
+    let mut outputs = Vec::with_capacity(input_paths.len());
+    for input in input_paths {
+        let output = suggest_output_path_with_claims(&input, format, &taken)?;
+        taken.insert(output_path_identity(&output));
+        outputs.push(output);
+    }
+    Ok(outputs)
+}
+
+fn suggest_output_path_with_claims(
+    input_path: &str,
+    format: OutputFormat,
+    taken: &HashSet<String>,
+) -> Result<String, String> {
     let input_path = PathBuf::from(input_path.trim());
     let stem = input_path
         .file_stem()
@@ -3964,19 +4000,12 @@ pub fn suggest_output_path_unique(
     let parent = input_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new(""));
-    // Paths claimed by not-yet-written outputs (queued export snapshots), which
-    // an on-disk existence check alone cannot see.
-    let taken: HashSet<String> = taken_paths
-        .iter()
-        .map(|path| output_path_identity(path))
-        .collect();
-
     let max_tries = 10_000u32;
     for i in start_n..start_n.saturating_add(max_tries) {
         let file = format!("{base}-{i}.{ext}");
         let candidate = parent.join(file);
         let candidate_str = candidate.to_string_lossy().to_string();
-        if !candidate.exists() && !taken.contains(&output_path_identity(&candidate_str)) {
+        if !taken.contains(&output_path_identity(&candidate_str)) && !candidate.exists() {
             return Ok(candidate_str);
         }
     }
@@ -7707,6 +7736,55 @@ mod tests {
         assert_ne!(
             output_path_identity("/videos/Clip-2.mp4"),
             output_path_identity("/videos/clip-2.mp4")
+        );
+    }
+
+    #[test]
+    fn runtime_cache_coalesces_concurrent_loads_and_retries_errors() {
+        let cache = OnceLock::new();
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let failed: Result<usize, String> =
+            cached_runtime_value(&cache, "runtime", || Err("retry".into()));
+        assert!(failed.is_err());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert_eq!(
+                        cached_runtime_value(&cache, "runtime", || {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(10));
+                            Ok(42)
+                        })
+                        .unwrap(),
+                        42
+                    );
+                });
+            }
+        });
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn batch_output_paths_match_sequential_claims_and_disk_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("clip.mp4").to_string_lossy().to_string();
+        fs::write(dir.path().join("clip-2.mp4"), b"existing").unwrap();
+        let mut taken = vec![dir.path().join("clip-3.mp4").to_string_lossy().to_string()];
+        let inputs = vec![input; 100];
+        let batch = suggest_output_paths(inputs.clone(), OutputFormat::Mp4, &taken).unwrap();
+        for (input, actual) in inputs.into_iter().zip(batch) {
+            let expected = suggest_output_path_unique(input, OutputFormat::Mp4, &taken).unwrap();
+            assert_eq!(actual, expected);
+            taken.push(expected);
+        }
+        assert!(
+            suggest_output_paths(vec!["clip.mp4".into(); 101], OutputFormat::Mp4, &[]).is_err()
+        );
+        assert!(suggest_output_paths(vec![String::new()], OutputFormat::Mp4, &[]).is_err());
+        assert!(
+            suggest_output_paths(vec![], OutputFormat::Mp4, &[])
+                .unwrap()
+                .is_empty()
         );
     }
 
