@@ -7203,8 +7203,15 @@ mod tests {
                         Err(e) => panic!("HTTP fixture failed: {e}"),
                     }
                 };
+                // Windows accepts inherit the listener's nonblocking mode.
+                // Only accept uses polling; request/response IO is bounded
+                // blocking work on this fixture's dedicated thread.
+                socket.set_nonblocking(false).unwrap();
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {

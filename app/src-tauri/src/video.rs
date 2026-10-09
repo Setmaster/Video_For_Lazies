@@ -4851,18 +4851,18 @@ fn aligns_retained_av_interval(request: &EncodeRequest, probe: &VideoProbe) -> b
         && (request.reverse || request.loop_video)
 }
 
-fn prepare_temporal_probe(request: &EncodeRequest, probe: &mut VideoProbe) -> Result<(), String> {
+fn prepare_temporal_probe(
+    request: &EncodeRequest,
+    input: &Path,
+    probe: &mut VideoProbe,
+) -> Result<(), String> {
     if aligns_retained_av_interval(request, probe) && probe.source_format.as_deref() == Some("nut")
     {
         // NUT indexes omit the final packet duration. Only common A/V padding
         // needs this extra precision; loading, copying and single-stream
         // transformations retain the ordinary metadata-only probe path.
-        probe.duration_s = probe_nut_timeline_duration(
-            &default_ffprobe(),
-            Path::new(request.input_path.trim()),
-            probe,
-            probe.input_origin_s,
-        )?;
+        probe.duration_s =
+            probe_nut_timeline_duration(&default_ffprobe(), input, probe, probe.input_origin_s)?;
     }
     Ok(())
 }
@@ -6561,7 +6561,7 @@ pub fn run_encode_job(
 
     let mut ffmpeg_bin = default_ffmpeg();
     let mut probe = probe_video(input_path.to_string_lossy().to_string())?;
-    prepare_temporal_probe(&request, &mut probe)?;
+    prepare_temporal_probe(&request, &input_path, &mut probe)?;
     let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
     let capability_contract = ffmpeg_capability_contract()?;
     process::check_cancelled().map_err(|error| error.to_string())?;

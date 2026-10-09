@@ -310,7 +310,7 @@ fn bundled_trim_keeps_audio_offsets_through_speed_reverse_and_loop() {
             req.speed = speed;
             req.input_path = temp.path().join("delayed.nut").to_string_lossy().into();
             let mut probe = probe.clone();
-            prepare_temporal_probe(&req, &mut probe).unwrap();
+            prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe).unwrap();
             let filters = build_audio_filters(&req, &probe).unwrap().unwrap();
             // Raw PCM has no timestamps. Materialize the output's leading offset
             // solely for the assertion; production linear trims keep stream PTS.
@@ -452,7 +452,7 @@ fn bundled_video_gaps_stay_on_the_common_timeline() {
                 req.audio_enabled = true;
                 req.input_path = temp.path().join("video-gap.nut").to_string_lossy().into();
                 let mut probe = probe.clone();
-                prepare_temporal_probe(&req, &mut probe).unwrap();
+                prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe).unwrap();
                 let policy = resolve_media_policy(&req, &probe, Some(VideoCodec::LibX264)).unwrap();
                 let filters = build_video_filters_with_policy(&req, &probe, policy)
                     .unwrap()
@@ -559,7 +559,7 @@ fn bundled_common_origin_and_untrimmed_endpoints_preserve_all_media() {
             req.audio_enabled = true;
             req.reverse = true;
             req.input_path = temp.path().join(&file).to_string_lossy().into();
-            prepare_temporal_probe(&req, &mut probe).unwrap();
+            prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe).unwrap();
             let vf = build_video_filters(&req, &probe).unwrap().unwrap();
             let af = build_audio_filters(&req, &probe).unwrap().unwrap();
             let frames = ffmpeg(
@@ -683,7 +683,7 @@ fn bundled_unselected_long_track_does_not_extend_primary_timeline() {
         req.audio_enabled = true;
         req.reverse = true;
         req.input_path = temp.path().join(&file).to_string_lossy().into();
-        prepare_temporal_probe(&req, &mut probe).unwrap();
+        prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe).unwrap();
         assert_eq!(probe.audio_stream_index, Some(1));
         assert!(
             (probe.duration_s - 4.0).abs() < 0.04,
@@ -760,7 +760,7 @@ fn bundled_muted_and_high_rate_sources_preserve_existing_temporal_paths() {
     let mut req = request();
     req.reverse = true;
     req.input_path = temp.path().join("muted.mkv").to_string_lossy().into();
-    prepare_temporal_probe(&req, &mut probe).unwrap();
+    prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe).unwrap();
     let vf = build_video_filters(&req, &probe).unwrap().unwrap();
     assert!(!vf.contains("tpad"));
     let frames = ffmpeg(
@@ -809,9 +809,9 @@ fn bundled_muted_and_high_rate_sources_preserve_existing_temporal_paths() {
     let mut probe = probe_video(temp.path().join("dense.nut").to_string_lossy().into()).unwrap();
     let mut req = request();
     req.input_path = temp.path().join("dense.nut").to_string_lossy().into();
-    prepare_temporal_probe(&req, &mut probe).unwrap(); // ordinary import/export
+    prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe).unwrap(); // ordinary import/export
     req.reverse = true;
-    prepare_temporal_probe(&req, &mut probe).unwrap(); // muted temporal export
+    prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe).unwrap(); // muted temporal export
     let vf = build_video_filters(&req, &probe).unwrap().unwrap();
     let frames = ffmpeg(
         &[
@@ -831,7 +831,7 @@ fn bundled_muted_and_high_rate_sources_preserve_existing_temporal_paths() {
     assert_eq!(frames.len() / (16 * 16), 5000);
     req.audio_enabled = true;
     assert!(
-        prepare_temporal_probe(&req, &mut probe)
+        prepare_temporal_probe(&req, Path::new(req.input_path.trim()), &mut probe)
             .unwrap_err()
             .contains("complete NUT media duration")
     );

@@ -166,7 +166,8 @@ test("existing-output refusal stays ahead of probing and FFmpeg execution", asyn
   );
   const runEncodeJobStart = backendSource.indexOf("pub fn run_encode_job(");
   const outputValidation = backendSource.indexOf("let output_path = validate_output_path(", runEncodeJobStart);
-  const sourceProbe = backendSource.indexOf("let probe = probe_video(", runEncodeJobStart);
+  const probeMatch = /let (?:mut )?probe = probe_video\(/.exec(backendSource.slice(runEncodeJobStart));
+  const sourceProbe = probeMatch ? runEncodeJobStart + probeMatch.index : -1;
   const firstFfmpegExecution = backendSource.indexOf("run_ffmpeg_with_progress(", runEncodeJobStart);
 
   assert.ok(runEncodeJobStart >= 0, "run_encode_job must remain present");
