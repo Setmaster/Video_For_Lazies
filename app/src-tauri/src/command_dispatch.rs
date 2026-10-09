@@ -43,6 +43,46 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn abandoned_caller_keeps_lane_until_blocking_work_finishes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let lane = Arc::new(OnceLock::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_lane = lane.clone();
+        let first = tauri::async_runtime::spawn(async move {
+            dispatch(&first_lane, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        first.abort();
+
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let second = tauri::async_runtime::spawn(async move {
+            queued_tx.send(()).unwrap();
+            dispatch(&lane, move || {
+                ran_tx.send(()).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        queued_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            ran_rx.recv_timeout(Duration::from_millis(40)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        tauri::async_runtime::block_on(second).unwrap().unwrap();
+        ran_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
     fn queued_commands_bound_blocking_work_and_release_lane_after_errors() {
         let lane = Arc::new(OnceLock::new());
         let running = Arc::new(AtomicUsize::new(0));
