@@ -52,6 +52,9 @@ const COPY_RETRIES: usize = 80;
 const COPY_RETRY_DELAY_MS: u64 = 250;
 const PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PARENT_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(45);
+const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(600);
+const PREFS_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SIGNATURE_SUFFIX: &str = ".sig";
 const UPDATE_PUBLIC_KEYS: &[&str] = &[
     "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ3ODU2M0VEQUIwRkNEQTYKUldTbXpRK3I3V09GMTdIUnBHaDlkMzBEN0FRYnJyTUVEa2FRN0Q0Ylh4RDMxT09hYy9vR3hEd2IK",
@@ -596,10 +599,11 @@ pub async fn record_update_prompt_choice(
         let choice = PromptChoice::parse(&choice).map_err(UpdatePublicError::preferences_failed)?;
         let version = parse_semver(&version).map_err(UpdatePublicError::preferences_failed)?;
         let now = now_ms();
-        let mut prefs = load_prefs(&app).map_err(UpdatePublicError::preferences_failed)?;
-
-        apply_prompt_choice(&mut prefs, choice, &version, now);
-        save_prefs(&app, &prefs).map_err(UpdatePublicError::preferences_failed)
+        update_prefs(&app, |prefs| {
+            apply_prompt_choice(prefs, choice, &version, now);
+            Ok(())
+        })
+        .map_err(UpdatePublicError::preferences_failed)
     })
     .await
     .map_err(|_| UpdatePublicError::preferences_failed("update worker stopped".to_string()))?
@@ -631,7 +635,11 @@ fn prepare_and_apply_update_inner(
         UpdatePhase::Checking,
         "Checking the signed update manifest...",
     );
-    let check = check_for_update_inner(&app, true)?;
+    let client = update_http_client()?;
+    let checked = check_for_update_at(&prefs_path(&app)?, true, || {
+        fetch_verified_update_manifest_with_client(&client)
+    })?;
+    let check = checked.response;
     if check.status != "available" {
         return Err(check
             .reason
@@ -644,8 +652,10 @@ fn prepare_and_apply_update_inner(
     }
     let mut staging_claim = acquire_staging_lock(&install_dir)?;
 
-    let manifest_bundle = fetch_verified_update_manifest()?;
-    let manifest = manifest_bundle.manifest;
+    let manifest = checked
+        .verified_manifest
+        .ok_or_else(|| "The update check did not retain its verified manifest.".to_string())?
+        .manifest;
     let target = current_target()?;
     let artifact = manifest
         .artifacts
@@ -655,7 +665,7 @@ fn prepare_and_apply_update_inner(
     validate_update_manifest(&manifest, Some(&load_prefs(&app)?))?;
     validate_artifact(target, &artifact)?;
 
-    let plan = stage_update(&app, &manifest, &artifact, target, reporter)?;
+    let plan = stage_update(&app, &client, &manifest, &artifact, target, reporter)?;
     reporter.emit(
         UpdatePhase::LaunchingHelper,
         "Starting the protected update helper...",
@@ -1207,76 +1217,86 @@ struct VerifiedManifest {
     manifest: UpdateManifest,
 }
 
+struct CheckedUpdate {
+    response: UpdateCheckResponse,
+    verified_manifest: Option<VerifiedManifest>,
+}
+
 fn check_for_update_inner(app: &AppHandle, force: bool) -> Result<UpdateCheckResponse, String> {
+    check_for_update_at(&prefs_path(app)?, force, fetch_verified_update_manifest)
+        .map(|checked| checked.response)
+}
+
+fn check_for_update_at(
+    path: &Path,
+    force: bool,
+    fetch: impl FnOnce() -> Result<VerifiedManifest, String>,
+) -> Result<CheckedUpdate, String> {
     let now = now_ms();
-    let mut prefs = load_prefs(app)?;
-    if let Some(until) = prefs.suppress_prompts_until_ms
-        && !force
-        && now < until
+    let prefs = {
+        let _lock = acquire_prefs_lock(path, PREFS_LOCK_TIMEOUT)?;
+        read_prefs_at(path)?
+    };
+    let skip_reason = if prefs
+        .suppress_prompts_until_ms
+        .is_some_and(|until| now < until)
     {
-        return Ok(skipped_response(
-            now,
-            "Update prompts are paused for now.".to_string(),
-        ));
-    }
-
-    if !force
-        && prefs.remind_later_version.is_none()
-        && let Some(last_checked) = prefs.last_checked_at_ms
-        && now.saturating_sub(last_checked) < CHECK_INTERVAL_MS
+        Some("Update prompts are paused for now.")
+    } else if prefs.remind_later_version.is_none()
+        && prefs
+            .last_checked_at_ms
+            .is_some_and(|last| now.saturating_sub(last) < CHECK_INTERVAL_MS)
     {
-        return Ok(skipped_response(
-            now,
-            "The daily update check already ran.".to_string(),
-        ));
-    }
-
-    let bundle = fetch_verified_update_manifest()?;
-    let manifest = bundle.manifest;
-    validate_update_manifest(&manifest, Some(&prefs))?;
-    let latest = parse_semver(&manifest.version)?;
-    let current = parse_semver(current_version())?;
-
-    if latest <= current {
-        record_update_check_result(&mut prefs, &latest, &current, now);
-        save_prefs(app, &prefs)?;
-        return Ok(UpdateCheckResponse {
-            status: "current".to_string(),
-            current_version: current_version().to_string(),
-            latest_version: Some(latest.to_string()),
-            release_url: Some(manifest.release_url),
-            notes: Some(manifest.notes),
-            artifact: None,
-            checked_at_ms: now,
-            reason: Some("Video For Lazies is up to date.".to_string()),
+        Some("The daily update check already ran.")
+    } else {
+        None
+    };
+    if !force && let Some(reason) = skip_reason {
+        return Ok(CheckedUpdate {
+            response: skipped_response(now, reason.to_string()),
+            verified_manifest: None,
         });
     }
 
-    let target = current_target()?;
-    let artifact = manifest
-        .artifacts
-        .get(target)
-        .ok_or_else(|| "The update manifest does not include this platform.".to_string())?;
-    validate_artifact(target, artifact)?;
-
-    record_update_check_result(&mut prefs, &latest, &current, now);
-    save_prefs(app, &prefs)?;
-
-    Ok(UpdateCheckResponse {
-        status: "available".to_string(),
-        current_version: current_version().to_string(),
-        latest_version: Some(latest.to_string()),
-        release_url: Some(manifest.release_url),
-        notes: Some(manifest.notes),
-        artifact: Some(UpdateArtifactInfo {
+    // Fetch outside the preferences lock. The freshly verified snapshot is
+    // retained for this apply operation, never cached across user actions.
+    let bundle = fetch()?;
+    let manifest = &bundle.manifest;
+    validate_update_manifest(manifest, Some(&prefs))?;
+    let latest = parse_semver(&manifest.version)?;
+    let current = parse_semver(current_version())?;
+    let available = latest > current;
+    let artifact = if available {
+        let target = current_target()?;
+        let artifact = manifest
+            .artifacts
+            .get(target)
+            .ok_or_else(|| "The update manifest does not include this platform.".to_string())?;
+        validate_artifact(target, artifact)?;
+        Some(UpdateArtifactInfo {
             target: target.to_string(),
             file_name: artifact.file_name.clone(),
             size_bytes: artifact.size_bytes,
             url: artifact.url.clone(),
             sha256: artifact.sha256.clone(),
-        }),
+        })
+    } else {
+        None
+    };
+    commit_update_check(path, manifest, &latest, &current, now)?;
+    let response = UpdateCheckResponse {
+        status: if available { "available" } else { "current" }.to_string(),
+        current_version: current_version().to_string(),
+        latest_version: Some(latest.to_string()),
+        release_url: Some(manifest.release_url.clone()),
+        notes: Some(manifest.notes.clone()),
+        artifact,
         checked_at_ms: now,
-        reason: None,
+        reason: (!available).then(|| "Video For Lazies is up to date.".to_string()),
+    };
+    Ok(CheckedUpdate {
+        response,
+        verified_manifest: Some(bundle),
     })
 }
 
@@ -1321,6 +1341,12 @@ fn record_update_check_result(
 }
 
 fn fetch_verified_update_manifest() -> Result<VerifiedManifest, String> {
+    fetch_verified_update_manifest_with_client(&update_http_client()?)
+}
+
+fn fetch_verified_update_manifest_with_client(
+    client: &reqwest::blocking::Client,
+) -> Result<VerifiedManifest, String> {
     #[cfg(debug_assertions)]
     if let Some(manifest) = load_digest_bound_debug_manifest()? {
         return Ok(VerifiedManifest { manifest });
@@ -1335,13 +1361,22 @@ fn fetch_verified_update_manifest() -> Result<VerifiedManifest, String> {
     validate_manifest_url(&manifest_url, allow_local_http)?;
     validate_manifest_url(&signature_url, allow_local_http)?;
 
-    let manifest_bytes = download_bytes(&manifest_url, 5 * 1024 * 1024)?;
-    let signature_bytes = download_bytes(&signature_url, 1024 * 1024)?;
-    verify_manifest_signature(&manifest_bytes, &signature_bytes)?;
+    let manifest_bytes = download_signed_metadata(client, &manifest_url, &signature_url)?;
 
     let manifest: UpdateManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| format!("Update manifest is not valid JSON: {e}"))?;
     Ok(VerifiedManifest { manifest })
+}
+
+fn download_signed_metadata(
+    client: &reqwest::blocking::Client,
+    manifest_url: &str,
+    signature_url: &str,
+) -> Result<Vec<u8>, String> {
+    let manifest_bytes = download_bytes(client, manifest_url, 5 * 1024 * 1024)?;
+    let signature_bytes = download_bytes(client, signature_url, 1024 * 1024)?;
+    verify_manifest_signature(&manifest_bytes, &signature_bytes)?;
+    Ok(manifest_bytes)
 }
 
 #[cfg(debug_assertions)]
@@ -1550,6 +1585,7 @@ fn update_local_http_allowed() -> bool {
 
 fn stage_update(
     app: &AppHandle,
+    client: &reqwest::blocking::Client,
     manifest: &UpdateManifest,
     artifact: &UpdateArtifact,
     target: &str,
@@ -1580,6 +1616,7 @@ fn stage_update(
         );
         let mut last_reported_bytes = 0u64;
         download_file(
+            client,
             &artifact.url,
             &zip_path,
             artifact.size_bytes,
@@ -1646,9 +1683,11 @@ fn stage_update(
         }
         atomic_write_json(&plan_path, &plan, "update plan")?;
         let staging_state_result = (|| {
-            let mut prefs = load_prefs(app)?;
-            set_highest_trusted_version(&mut prefs, &parse_semver(&manifest.version)?);
-            save_prefs(app, &prefs)?;
+            update_prefs(app, |prefs| {
+                validate_update_manifest(manifest, Some(prefs))?;
+                set_highest_trusted_version(prefs, &parse_semver(&manifest.version)?);
+                Ok(())
+            })?;
             let journal = UpdateJournal::new(&plan, UpdateJournalPhase::Staged);
             write_update_journal(&journal)
         })();
@@ -2122,7 +2161,7 @@ fn validate_target_parent_chain(install_dir: &Path, relative_path: &Path) -> Res
         };
         current.push(part);
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() => {
                 return Err(
                     "The update would traverse an unknown non-directory entry in the portable folder."
                         .to_string(),
@@ -2138,6 +2177,22 @@ fn validate_target_parent_chain(install_dir: &Path, relative_path: &Path) -> Res
         }
     }
     Ok(())
+}
+
+fn metadata_is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Junctions and other reparse points can redirect directory traversal
+        // even when they are not reported as a symbolic link.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn lexical_path_exists(path: &Path) -> Result<bool, String> {
@@ -2621,6 +2676,7 @@ fn replace_owned_files(
         {
             return Err("A staged update file changed before replacement.".to_string());
         }
+        validate_target_parent_chain(&plan.install_dir, relative_path)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create update target directory: {e}"))?;
@@ -2648,7 +2704,7 @@ fn replace_owned_files(
     // the helper dies earlier, obsolete files are merely left in place and the
     // old executable remains a valid recovery entry point.
     for relative_path in old_paths.difference(new_paths) {
-        remove_file_with_retries(&plan.install_dir.join(relative_path))?;
+        remove_owned_file_with_retries(plan, relative_path)?;
         replacements += 1;
         if fault.fail_after_replacements == Some(replacements) {
             return Err("Injected replacement interruption.".to_string());
@@ -2713,9 +2769,9 @@ fn publish_verified_update_file(
     }
 
     if replace_existing {
-        retry_atomic_replace_file(&incoming, target)?;
+        retry_atomic_replace_file(plan, relative_path, &incoming, target)?;
     } else {
-        retry_atomic_publish_new_file(&incoming, target)?;
+        retry_atomic_publish_new_file(plan, relative_path, &incoming, target)?;
     }
     let target_metadata = fs::symlink_metadata(target)
         .map_err(|e| format!("Failed to inspect published update file: {e}"))?;
@@ -2797,16 +2853,28 @@ fn pause_at_digest_bound_debug_gate(plan: &UpdateApplyPlan, phase: &str) -> Resu
     }
 }
 
-fn retry_atomic_replace_file(source: &Path, target: &Path) -> Result<(), String> {
-    retry_io(
+fn retry_atomic_replace_file(
+    plan: &UpdateApplyPlan,
+    relative_path: &Path,
+    source: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    retry_io_with_guard(
         || atomic_replace_file(source, target),
         || format!("Failed to atomically publish {}", target.display()),
+        || validate_target_parent_chain(&plan.install_dir, relative_path),
     )
 }
 
-fn retry_atomic_publish_new_file(source: &Path, target: &Path) -> Result<(), String> {
+fn retry_atomic_publish_new_file(
+    plan: &UpdateApplyPlan,
+    relative_path: &Path,
+    source: &Path,
+    target: &Path,
+) -> Result<(), String> {
     let mut last_error = None;
     for attempt in 0..COPY_RETRIES {
+        validate_target_parent_chain(&plan.install_dir, relative_path)?;
         match atomic_publish_new_file(source, target) {
             Ok(()) => return Ok(()),
             Err(error) if publish_target_already_exists(&error) => {
@@ -3004,6 +3072,7 @@ fn restore_backup_with_fault(
                 relative_path.display()
             ));
         }
+        validate_target_parent_chain(&plan.install_dir, relative_path)?;
         if let Some(parent) = target.parent()
             && let Err(error) = fs::create_dir_all(parent)
         {
@@ -3053,6 +3122,10 @@ fn restore_backup_with_fault(
             continue;
         };
         let target = plan.install_dir.join(relative_path);
+        if let Err(error) = validate_target_parent_chain(&plan.install_dir, relative_path) {
+            failures.push(error);
+            continue;
+        }
         match verified_payload_file_matches(
             &target,
             expected_hash,
@@ -3061,7 +3134,7 @@ fn restore_backup_with_fault(
             &plan.target,
         ) {
             Ok(true) => {
-                if let Err(error) = remove_file_with_retries(&target) {
+                if let Err(error) = remove_owned_file_with_retries(plan, relative_path) {
                     failures.push(error);
                 }
             }
@@ -3133,6 +3206,7 @@ fn atomic_restore_file(
     let parent = target
         .parent()
         .ok_or_else(|| "Recovery target has no parent directory.".to_string())?;
+    validate_target_parent_chain(&plan.install_dir, relative_path)?;
     fs::create_dir_all(parent)
         .map_err(|e| format!("Failed to create recovery target directory: {e}"))?;
     let source_metadata = fs::symlink_metadata(source)
@@ -3182,7 +3256,8 @@ fn atomic_restore_file(
     // incoming copy over the current target is one same-volume atomic step,
     // so a hard kill leaves either the pre-recovery or restored executable at
     // the canonical path, never a gap between two renames.
-    retry_atomic_replace_file(&incoming_path, target)?;
+    validate_target_parent_chain(&plan.install_dir, relative_path)?;
+    retry_atomic_replace_file(plan, relative_path, &incoming_path, target)?;
     let target_metadata = fs::symlink_metadata(target)
         .map_err(|e| format!("Failed to inspect published rollback file: {e}"))?;
     if target_metadata.file_type().is_symlink()
@@ -3445,7 +3520,23 @@ fn clear_windows_readonly(permissions: &mut fs::Permissions) {
 }
 
 fn remove_file_with_retries(path: &Path) -> Result<(), String> {
-    retry_io(
+    remove_file_with_guard(path, || Ok(()))
+}
+
+fn remove_owned_file_with_retries(
+    plan: &UpdateApplyPlan,
+    relative_path: &Path,
+) -> Result<(), String> {
+    remove_file_with_guard(&plan.install_dir.join(relative_path), || {
+        validate_target_parent_chain(&plan.install_dir, relative_path)
+    })
+}
+
+fn remove_file_with_guard(
+    path: &Path,
+    guard: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    retry_io_with_guard(
         || match fs::remove_file(path) {
             Ok(()) => {
                 if let Some(parent) = path.parent() {
@@ -3457,16 +3548,29 @@ fn remove_file_with_retries(path: &Path) -> Result<(), String> {
             Err(err) => Err(err),
         },
         || format!("Failed to remove {}", path.display()),
+        guard,
     )
 }
 
-fn retry_io<F, L>(mut operation: F, label: L) -> Result<(), String>
+fn retry_io<F, L>(operation: F, label: L) -> Result<(), String>
 where
     F: FnMut() -> io::Result<()>,
     L: Fn() -> String,
 {
+    retry_io_with_guard(operation, label, || Ok(()))
+}
+
+fn retry_io_with_guard<F, L, G>(mut operation: F, label: L, mut guard: G) -> Result<(), String>
+where
+    F: FnMut() -> io::Result<()>,
+    L: Fn() -> String,
+    G: FnMut() -> Result<(), String>,
+{
     let mut last_error = None;
     for _ in 0..COPY_RETRIES {
+        // A sharing violation can delay retries for seconds. Recheck target
+        // ancestors before every attempt, not only before the first one.
+        guard()?;
         match operation() {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -3743,6 +3847,14 @@ fn set_mode_if_needed(path: &Path, mode: Option<u32>) -> Result<(), String> {
 }
 
 fn extract_update_zip(zip_path: &Path, output_dir: &Path) -> Result<(), String> {
+    extract_update_zip_with_limit(zip_path, output_dir, MAX_EXTRACTED_BYTES)
+}
+
+fn extract_update_zip_with_limit(
+    zip_path: &Path,
+    output_dir: &Path,
+    max_extracted_bytes: u64,
+) -> Result<(), String> {
     let file = File::open(zip_path).map_err(|e| format!("Failed to open update archive: {e}"))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Failed to read update archive: {e}"))?;
@@ -3767,7 +3879,7 @@ fn extract_update_zip(zip_path: &Path, output_dir: &Path) -> Result<(), String> 
         extracted_bytes = extracted_bytes
             .checked_add(file.size())
             .ok_or_else(|| "Update archive is too large.".to_string())?;
-        if extracted_bytes > MAX_EXTRACTED_BYTES {
+        if extracted_bytes > max_extracted_bytes {
             return Err("Update archive expands beyond the supported size.".to_string());
         }
 
@@ -3786,8 +3898,21 @@ fn extract_update_zip(zip_path: &Path, output_dir: &Path) -> Result<(), String> 
         }
         let mut output = File::create(&output_path)
             .map_err(|e| format!("Failed to extract update file: {e}"))?;
-        io::copy(&mut file, &mut output)
-            .map_err(|e| format!("Failed to write update file: {e}"))?;
+        let declared_size = file.size();
+        // Header sizes are not enforced by all ZIP decompressors. Read at
+        // most one excess byte, retaining EOF/CRC validation for valid files.
+        // Earlier entries matched their declarations, so this also bounds
+        // total output to the aggregate limit plus one detection byte.
+        let copied = io::copy(
+            &mut file.by_ref().take(declared_size.saturating_add(1)),
+            &mut output,
+        )
+        .map_err(|e| format!("Failed to write update file: {e}"))?;
+        if copied != declared_size {
+            return Err(
+                "Update archive entry size does not match its declared length.".to_string(),
+            );
+        }
         if let Some(mode) = file.unix_mode() {
             set_mode_if_needed(&output_path, Some(mode & 0o777))?;
         }
@@ -3795,14 +3920,27 @@ fn extract_update_zip(zip_path: &Path, output_dir: &Path) -> Result<(), String> 
     Ok(())
 }
 
-fn download_bytes(url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(45))
+fn update_http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
         .user_agent("Video For Lazies updater")
         .build()
-        .map_err(|e| format!("Failed to create update client: {e}"))?;
-    let mut response = client
-        .get(url)
+        .map_err(|e| format!("Failed to create update client: {e}"))
+}
+
+fn update_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    timeout: Duration,
+) -> reqwest::blocking::RequestBuilder {
+    client.get(url).timeout(timeout)
+}
+
+fn download_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let mut response = update_request(client, url, METADATA_TIMEOUT)
         .send()
         .map_err(|e| format!("Failed to download update metadata: {e}"))?;
     if !response.status().is_success() {
@@ -3827,7 +3965,24 @@ fn download_bytes(url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
 }
 
 fn download_file<F>(
+    client: &reqwest::blocking::Client,
     url: &str,
+    output_path: &Path,
+    expected_size: u64,
+    on_progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64, u64),
+{
+    validate_download_url(url, update_local_http_allowed())?;
+    let response = update_request(client, url, ARCHIVE_TIMEOUT)
+        .send()
+        .map_err(|e| format!("Failed to download update archive: {e}"))?;
+    persist_update_archive(response, output_path, expected_size, on_progress)
+}
+
+fn persist_update_archive<F>(
+    mut response: reqwest::blocking::Response,
     output_path: &Path,
     expected_size: u64,
     mut on_progress: F,
@@ -3835,16 +3990,6 @@ fn download_file<F>(
 where
     F: FnMut(u64, u64),
 {
-    validate_download_url(url, update_local_http_allowed())?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .user_agent("Video For Lazies updater")
-        .build()
-        .map_err(|e| format!("Failed to create update client: {e}"))?;
-    let mut response = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("Failed to download update archive: {e}"))?;
     if !response.status().is_success() {
         return Err(format!(
             "Update archive download failed with HTTP {}.",
@@ -3924,24 +4069,94 @@ fn validate_sha256(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn load_prefs(app: &AppHandle) -> Result<UpdatePrefs, String> {
-    let path = prefs_path(app)?;
-    if !atomic_path_exists(&path) {
+// The lock file is stable and is never rotated/deleted. Locking the JSON
+// inode itself would stop protecting it as soon as atomic_write renames it.
+// File drop releases the OS lock even when a process exits or is killed.
+fn acquire_prefs_lock(path: &Path, timeout: Duration) -> Result<File, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Failed to locate the update preferences directory.".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create the update preferences directory: {e}"))?;
+    let lock_path = path.with_extension("json.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| format!("Failed to open the update preferences lock: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "Another app process is saving update preferences. Try again.".to_string(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(format!("Failed to lock update preferences: {error}"));
+            }
+        }
+    }
+}
+
+// Callers hold acquire_prefs_lock across this read and any following write,
+// so the .previous rotation and the complete read/modify/write are serialized.
+fn read_prefs_at(path: &Path) -> Result<UpdatePrefs, String> {
+    if !atomic_path_exists(path) {
         return Ok(UpdatePrefs {
             schema: Some(UPDATE_PREFS_SCHEMA.to_string()),
             ..UpdatePrefs::default()
         });
     }
-    let mut prefs: UpdatePrefs = read_atomic_json(&path, "update preferences")?;
+    let mut prefs: UpdatePrefs = read_atomic_json(path, "update preferences")?;
     prefs.schema = Some(UPDATE_PREFS_SCHEMA.to_string());
     Ok(prefs)
 }
 
-fn save_prefs(app: &AppHandle, prefs: &UpdatePrefs) -> Result<(), String> {
+fn load_prefs(app: &AppHandle) -> Result<UpdatePrefs, String> {
     let path = prefs_path(app)?;
-    let mut prefs = prefs.clone();
-    prefs.schema = Some(UPDATE_PREFS_SCHEMA.to_string());
-    atomic_write_json(&path, &prefs, "update preferences")
+    let _lock = acquire_prefs_lock(&path, PREFS_LOCK_TIMEOUT)?;
+    read_prefs_at(&path)
+}
+
+fn update_prefs_at<T>(
+    path: &Path,
+    update: impl FnOnce(&mut UpdatePrefs) -> Result<T, String>,
+) -> Result<T, String> {
+    let _lock = acquire_prefs_lock(path, PREFS_LOCK_TIMEOUT)?;
+    let mut prefs = read_prefs_at(path)?;
+    let result = update(&mut prefs)?;
+    atomic_write_json(path, &prefs, "update preferences")?;
+    Ok(result)
+}
+
+fn update_prefs<T>(
+    app: &AppHandle,
+    update: impl FnOnce(&mut UpdatePrefs) -> Result<T, String>,
+) -> Result<T, String> {
+    update_prefs_at(&prefs_path(app)?, update)
+}
+
+fn commit_update_check(
+    path: &Path,
+    manifest: &UpdateManifest,
+    latest: &Version,
+    current: &Version,
+    now: u64,
+) -> Result<(), String> {
+    update_prefs_at(path, |prefs| {
+        // A different app may have trusted a newer release during the HTTP
+        // request. Validate against the current floor while holding the lock.
+        validate_update_manifest(manifest, Some(prefs))?;
+        record_update_check_result(prefs, latest, current, now);
+        Ok(())
+    })
 }
 
 fn prefs_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -4739,10 +4954,11 @@ fn wait_for_recovery_handoff(plan: &UpdateApplyPlan, timeout: Duration) -> Resul
 }
 
 fn complete_successful_update(app: &AppHandle, plan: &UpdateApplyPlan) -> Result<(), String> {
-    let mut prefs = load_prefs(app)?;
-    prefs.remind_later_version = None;
-    set_highest_trusted_version(&mut prefs, &parse_semver(&plan.to_version)?);
-    save_prefs(app, &prefs)?;
+    update_prefs(app, |prefs| {
+        prefs.remind_later_version = None;
+        set_highest_trusted_version(prefs, &parse_semver(&plan.to_version)?);
+        Ok(())
+    })?;
     cleanup_update_artifacts(plan, true)
 }
 
@@ -4828,10 +5044,15 @@ mod tests {
 
     #[test]
     fn verifies_tauri_signer_signature_fixture() {
+        let (manifest, signature) = signed_metadata_fixture();
+        verify_manifest_signature(manifest, signature).unwrap();
+    }
+
+    fn signed_metadata_fixture() -> (&'static [u8], &'static [u8]) {
         let manifest = br#"{"schema":"test"}
 "#;
         let signature = b"dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbXpRK3I3V09GMXgxcjdwRTNaZ01iaXVXUzF2VVZoU2N2ajR0a3ZyNjlvNWFCRGJXdmNpYW9WV3BiMW1JSGkrZ01GNXhuWXZEYkV1YXdOQTJkNUczZlVxSHVxYnVEeVFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3ODQyMjQyCWZpbGU6dmZsLXVwZGF0ZS1tYW5pZmVzdC12MS5qc29uCnFMVTBldERQS1JyaWtDUG5DYmp0NDl0QlBxTFpVN0xrVHZqanE2ZklMWldRNWhqZ3pDUzFOamNGaTRGZlA5TG5Wcmd2SnNJMWlqUnBlN1NibFZheUF3PT0K";
-        verify_manifest_signature(manifest, signature).unwrap();
+        (manifest, signature)
     }
 
     #[test]
@@ -6520,5 +6741,568 @@ mod tests {
             root_dir: PORTABLE_ROOT_DIR_NAME.to_string(),
             files,
         }
+    }
+    #[test]
+    fn recovery_preserves_unknown_parent_links() {
+        let (temp, install_dir, plan, plan_path) =
+            create_apply_fixture("review-symlink-recovery", "1.1.0", "1.1.1");
+        let mut apply = prepare_replacing_state_for_test(&plan_path);
+        apply.release().unwrap();
+
+        // Both the installed tree and this unrelated directory are children
+        // of the same TempDir. The test never touches a real installation.
+        let external_dir = temp.path().join("unrelated-user-directory");
+        fs::create_dir_all(&external_dir).unwrap();
+        let external_sentinel = external_dir.join("LICENSE.txt");
+        let sentinel_bytes = b"UNRELATED USER DATA, MUST SURVIVE";
+        fs::write(&external_sentinel, sentinel_bytes).unwrap();
+        fs::remove_dir_all(install_dir.join("ffmpeg-sidecar")).unwrap();
+        create_test_directory_link(&external_dir, &install_dir.join("ffmpeg-sidecar"));
+
+        // Follow the same production helper recovery path as the existing
+        // successful recovery fixture, with relaunch disabled.
+        let claim = acquire_recovery_staging_lock(&plan).unwrap();
+        let mut journal: UpdateJournal =
+            read_atomic_json(&update_journal_path(&install_dir), "update journal").unwrap();
+        journal.transition(
+            UpdateJournalPhase::RollingBack,
+            Some("automatic-recovery-requested"),
+        );
+        write_update_journal(&journal).unwrap();
+        claim.handoff_to_helper(&plan, std::process::id()).unwrap();
+
+        let result = recover_update_plan(&plan_path, 0, false);
+        let after: UpdateJournal =
+            read_atomic_json(&update_journal_path(&install_dir), "update journal").unwrap();
+        let sentinel_after = fs::read(&external_sentinel).unwrap();
+        assert_eq!(
+            sentinel_after, sentinel_bytes,
+            "Recovery must preserve files behind an unknown parent symlink"
+        );
+        assert!(result.is_err());
+        assert_eq!(after.phase, UpdateJournalPhase::RecoveryRequired);
+        assert!(plan.backup_dir.exists());
+        assert!(plan.stage_dir.exists());
+    }
+
+    fn create_test_directory_link(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            // A directory junction needs no developer mode or admin token.
+            let output = Command::new("cmd")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
+    fn start_fixture_recovery(plan: &UpdateApplyPlan) {
+        let claim = acquire_recovery_staging_lock(plan).unwrap();
+        let mut journal: UpdateJournal =
+            read_atomic_json(&update_journal_path(&plan.install_dir), "update journal").unwrap();
+        journal.transition(UpdateJournalPhase::RollingBack, Some("test-recovery"));
+        write_update_journal(&journal).unwrap();
+        claim.handoff_to_helper(plan, std::process::id()).unwrap();
+    }
+
+    #[test]
+    fn recovery_recreates_missing_owned_directories() {
+        let (_temp, install, plan, plan_path) =
+            create_apply_fixture("missing-directory", "1.1.0", "1.1.1");
+        let mut apply = prepare_replacing_state_for_test(&plan_path);
+        apply.release().unwrap();
+        fs::remove_dir_all(install.join("ffmpeg-sidecar")).unwrap();
+        start_fixture_recovery(&plan);
+        recover_update_plan(&plan_path, 0, false).unwrap();
+        assert_eq!(
+            fs::read(install.join("ffmpeg-sidecar/LICENSE.txt")).unwrap(),
+            b"old"
+        );
+        assert_eq!(fs::read(install.join("user-note.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn recovery_preserves_new_only_files_behind_parent_links() {
+        let (temp, install, mut plan, plan_path) =
+            create_apply_fixture("new-only-parent", "1.1.0", "1.1.1");
+        write_payload_file(
+            &plan.stage_dir,
+            "new-dir/file.txt",
+            b"new",
+            platform_mode(0o644),
+        );
+        let manifest = manifest_from_dir(&plan.stage_dir, &plan.to_version, &plan.target);
+        fs::write(
+            plan.stage_dir.join(PAYLOAD_MANIFEST_FILE_NAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        plan.expected_payload_manifest_sha256 =
+            Some(sha256_file(&plan.stage_dir.join(PAYLOAD_MANIFEST_FILE_NAME)).unwrap());
+        atomic_write_json(&plan_path, &plan, "test plan").unwrap();
+        write_update_journal(&UpdateJournal::new(&plan, UpdateJournalPhase::Staged)).unwrap();
+        let mut apply = prepare_replacing_state_for_test(&plan_path);
+        apply.release().unwrap();
+        let outside = temp.path().join("unrelated");
+        fs::create_dir_all(&outside).unwrap();
+        // Even identical signed bytes do not make this unrelated file owned.
+        write_payload_file(&outside, "file.txt", b"new", platform_mode(0o644));
+        create_test_directory_link(&outside, &install.join("new-dir"));
+        start_fixture_recovery(&plan);
+        assert!(recover_update_plan(&plan_path, 0, false).is_err());
+        assert_eq!(fs::read(outside.join("file.txt")).unwrap(), b"new");
+        let journal: UpdateJournal =
+            read_atomic_json(&update_journal_path(&install), "journal").unwrap();
+        assert_eq!(journal.phase, UpdateJournalPhase::RecoveryRequired);
+        assert!(plan.backup_dir.exists());
+    }
+
+    fn write_test_zip(path: &Path, method: zip::CompressionMethod, files: &[(&str, &[u8])]) {
+        let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default().compression_method(method);
+        for (name, bytes) in files {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn zip_extraction_rejects_understated_and_overstated_lengths() {
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            for declared in [1u32, 1_048_577] {
+                let temp = tempfile::tempdir().unwrap();
+                let archive = temp.path().join("payload.zip");
+                let output = temp.path().join("extract");
+                write_test_zip(
+                    &archive,
+                    method,
+                    &[("Video_For_Lazies/file.bin", &vec![b'x'; 1_048_576])],
+                );
+                let mut bytes = fs::read(&archive).unwrap();
+                let local = bytes.windows(4).position(|b| b == b"PK\x03\x04").unwrap();
+                let central = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+                bytes[local + 22..local + 26].copy_from_slice(&declared.to_le_bytes());
+                bytes[central + 24..central + 28].copy_from_slice(&declared.to_le_bytes());
+                fs::write(&archive, bytes).unwrap();
+                assert!(
+                    extract_update_zip(&archive, &output)
+                        .unwrap_err()
+                        .contains("declared length")
+                );
+                assert!(
+                    fs::metadata(output.join("Video_For_Lazies/file.bin"))
+                        .unwrap()
+                        .len()
+                        <= u64::from(declared) + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zip_extraction_enforces_aggregate_limit_and_retains_crc_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("payload.zip");
+        write_test_zip(
+            &archive,
+            zip::CompressionMethod::Stored,
+            &[
+                ("Video_For_Lazies/a", b"12345"),
+                ("Video_For_Lazies/b", b"123456"),
+            ],
+        );
+        let output = temp.path().join("bounded");
+        assert!(
+            extract_update_zip_with_limit(&archive, &output, 10)
+                .unwrap_err()
+                .contains("supported size")
+        );
+        assert_eq!(
+            fs::read(output.join("Video_For_Lazies/a")).unwrap(),
+            b"12345"
+        );
+        assert!(!output.join("Video_For_Lazies/b").exists());
+        extract_update_zip_with_limit(&archive, &temp.path().join("valid"), 11).unwrap();
+        let mut bytes = fs::read(&archive).unwrap();
+        let payload = bytes.windows(5).position(|b| b == b"12345").unwrap();
+        bytes[payload] ^= 1;
+        fs::write(&archive, bytes).unwrap();
+        assert!(extract_update_zip(&archive, &temp.path().join("crc")).is_err());
+    }
+
+    #[test]
+    fn zip_extraction_rejects_unsafe_paths_and_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("payload.zip");
+        write_test_zip(
+            &archive,
+            zip::CompressionMethod::Stored,
+            &[("../escaped", b"no")],
+        );
+        assert!(extract_update_zip(&archive, &temp.path().join("extract")).is_err());
+        assert!(!temp.path().join("escaped").exists());
+        fs::write(&archive, b"PK\x03\x04").unwrap();
+        assert!(extract_update_zip(&archive, &temp.path().join("truncated")).is_err());
+    }
+
+    #[test]
+    fn preferences_revalidate_trust_after_fetch_and_preserve_prompt_choices() {
+        let (temp, _install, plan, _plan_path) = create_apply_fixture("prefs", "1.1.0", "9.0.0");
+        let path = temp.path().join("prefs.json");
+        let manifest = test_manifest_for_preferences(&plan, "9.0.0");
+        let result = check_for_update_at(&path, true, || {
+            // This transaction must succeed while fetching, proving that the
+            // outer check released its lock before network work.
+            update_prefs_at(&path, |prefs| {
+                set_highest_trusted_version(prefs, &Version::parse("10.0.0").unwrap());
+                apply_prompt_choice(
+                    prefs,
+                    PromptChoice::Skip7Days,
+                    &Version::parse("10.0.0").unwrap(),
+                    123,
+                );
+                Ok(())
+            })?;
+            Ok(VerifiedManifest { manifest })
+        });
+        assert!(result.err().unwrap().contains("previously trusted"));
+        let stored = read_prefs_at(&path).unwrap();
+        assert_eq!(stored.highest_trusted_version.as_deref(), Some("10.0.0"));
+        assert_eq!(
+            stored.suppress_prompts_until_ms,
+            Some(123 + SKIP_INTERVAL_MS)
+        );
+        assert_eq!(stored.last_checked_at_ms, None);
+    }
+
+    #[test]
+    fn checked_update_retains_one_fresh_snapshot_and_skips_without_fetching() {
+        let (temp, _install, plan, _plan_path) = create_apply_fixture("snapshot", "1.1.0", "9.0.0");
+        let path = temp.path().join("prefs.json");
+        let mut fetches = 0;
+        let checked = check_for_update_at(&path, true, || {
+            fetches += 1;
+            Ok(VerifiedManifest {
+                manifest: test_manifest_for_preferences(&plan, "9.0.0"),
+            })
+        })
+        .unwrap();
+        assert_eq!(fetches, 1);
+        assert_eq!(checked.response.status, "available");
+        let snapshot = checked.verified_manifest.unwrap().manifest;
+        assert_eq!(snapshot.version, "9.0.0");
+        update_prefs_at(&path, |prefs| {
+            apply_prompt_choice(
+                prefs,
+                PromptChoice::Skip7Days,
+                &Version::parse("9.0.0").unwrap(),
+                now_ms(),
+            );
+            Ok(())
+        })
+        .unwrap();
+        let skipped =
+            check_for_update_at(&path, false, || panic!("suppression must avoid HTTP")).unwrap();
+        assert_eq!(skipped.response.status, "skipped");
+        assert!(skipped.verified_manifest.is_none());
+    }
+
+    fn test_manifest_for_preferences(plan: &UpdateApplyPlan, version: &str) -> UpdateManifest {
+        UpdateManifest {
+            schema: UPDATE_MANIFEST_SCHEMA.to_string(),
+            app_id: APP_ID.to_string(),
+            channel: UPDATE_CHANNEL.to_string(),
+            version: version.to_string(),
+            release_tag: format!("v{version}"),
+            release_url: format!(
+                "https://github.com/Setmaster/Video_For_Lazies/releases/tag/v{version}"
+            ),
+            published_at: "2026-10-08T00:00:00Z".to_string(),
+            min_updater_protocol: UPDATE_PROTOCOL_VERSION,
+            notes: UpdateNotes {
+                title: "Fixture".to_string(),
+                summary: "Fixture".to_string(),
+                url: format!(
+                    "https://github.com/Setmaster/Video_For_Lazies/releases/tag/v{version}"
+                ),
+            },
+            artifacts: HashMap::from([(
+                plan.target.clone(),
+                UpdateArtifact {
+                    file_name: "safe.zip".to_string(),
+                    url: format!(
+                        "https://github.com/Setmaster/Video_For_Lazies/releases/download/v{version}/safe.zip"
+                    ),
+                    sha256: "a".repeat(64),
+                    size_bytes: 1,
+                    root_dir: PORTABLE_ROOT_DIR_NAME.to_string(),
+                    payload_manifest: UpdatePayloadReference {
+                        path: format!("{PORTABLE_ROOT_DIR_NAME}/{PAYLOAD_MANIFEST_FILE_NAME}"),
+                        sha256: "b".repeat(64),
+                    },
+                },
+            )]),
+        }
+    }
+
+    fn spawn_prefs_fixture_child(root: &Path, mode: &str) -> std::process::Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "updater::tests::preferences_fixture_child",
+                "--nocapture",
+            ])
+            .env("VFL_PREFS_FIXTURE_ROOT", root)
+            .env("VFL_PREFS_FIXTURE_MODE", mode)
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_fixture_marker(path: &Path, child: &mut std::process::Child) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "fixture child exited early"
+            );
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixture marker timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn preferences_serialize_processes_and_release_locks_after_process_death() {
+        let temp = tempfile::Builder::new()
+            .prefix("vfl-prefs-test-")
+            .tempdir()
+            .unwrap();
+        let path = temp.path().join("update-prefs.json");
+        let mut advance = spawn_prefs_fixture_child(temp.path(), "advance");
+        let mut skip = spawn_prefs_fixture_child(temp.path(), "skip");
+        wait_fixture_marker(&temp.path().join("advance-ready"), &mut advance);
+        wait_fixture_marker(&temp.path().join("skip-ready"), &mut skip);
+        fs::write(temp.path().join("go"), b"go").unwrap();
+        assert!(advance.wait().unwrap().success());
+        assert!(skip.wait().unwrap().success());
+        let prefs = read_prefs_at(&path).unwrap();
+        assert_eq!(prefs.highest_trusted_version.as_deref(), Some("9.0.19"));
+        assert_eq!(
+            prefs.suppress_prompts_until_ms,
+            Some(123 + SKIP_INTERVAL_MS)
+        );
+        assert!(!atomic_previous_path(&path).exists());
+        let mut holder = spawn_prefs_fixture_child(temp.path(), "hold");
+        wait_fixture_marker(&temp.path().join("hold-ready"), &mut holder);
+        assert!(acquire_prefs_lock(&path, Duration::from_millis(30)).is_err());
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        update_prefs_at(&path, |prefs| {
+            prefs.remind_later_version = None;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            read_prefs_at(&path)
+                .unwrap()
+                .highest_trusted_version
+                .as_deref(),
+            Some("9.0.19")
+        );
+    }
+
+    #[test]
+    fn preferences_fixture_child() {
+        let Ok(root) = std::env::var("VFL_PREFS_FIXTURE_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        // Guard inherited environment before any mutation: this child only
+        // accepts a dedicated fixture directory inside the OS temporary root.
+        assert!(root.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("vfl-prefs-test-")
+        );
+        let mode = std::env::var("VFL_PREFS_FIXTURE_MODE").unwrap();
+        let path = root.join("update-prefs.json");
+        if mode == "hold" {
+            let _lock = acquire_prefs_lock(&path, PREFS_LOCK_TIMEOUT).unwrap();
+            fs::write(root.join("hold-ready"), b"ready").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        assert!(matches!(mode.as_str(), "advance" | "skip"));
+        fs::write(root.join(format!("{mode}-ready")), b"ready").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !root.join("go").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for index in 0..20 {
+            update_prefs_at(&path, |prefs| {
+                if mode == "advance" {
+                    set_highest_trusted_version(
+                        prefs,
+                        &Version::parse(&format!("9.0.{index}")).unwrap(),
+                    );
+                } else {
+                    apply_prompt_choice(
+                        prefs,
+                        PromptChoice::Skip7Days,
+                        &Version::parse("9.0.0").unwrap(),
+                        123,
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+    fn fixture_http_response(body: &[u8], extra_headers: &str) -> Vec<u8> {
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{extra_headers}\r\n").into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn serve_http_fixture(
+        responses: Vec<Vec<u8>>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "HTTP fixture timed out"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("HTTP fixture failed: {e}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                socket.write_all(&response).unwrap();
+            }
+            requests
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn shared_http_client_downloads_one_signed_pair_and_rejects_tampering() {
+        let (manifest, signature) = signed_metadata_fixture();
+        let (url, server) = serve_http_fixture(vec![
+            fixture_http_response(manifest, ""),
+            fixture_http_response(signature, ""),
+            fixture_http_response(b"tampered manifest", ""),
+            fixture_http_response(signature, ""),
+        ]);
+        let client = update_http_client().unwrap();
+        let manifest_url = format!("{url}/manifest");
+        let signature_url = format!("{url}/manifest.sig");
+        assert_eq!(
+            download_signed_metadata(&client, &manifest_url, &signature_url).unwrap(),
+            manifest
+        );
+        assert!(download_signed_metadata(&client, &manifest_url, &signature_url).is_err());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("GET /manifest HTTP/1.1"));
+        assert!(requests[1].starts_with("GET /manifest.sig HTTP/1.1"));
+        assert!(
+            requests
+                .iter()
+                .all(|r| !r.to_ascii_lowercase().contains("cookie:"))
+        );
+    }
+
+    #[test]
+    fn updater_http_reads_remain_bounded_without_content_length() {
+        let (url, server) = serve_http_fixture(vec![
+            fixture_http_response(b"12345", ""),
+            fixture_http_response(b"12345", "Content-Length: 5\r\n"),
+            fixture_http_response(b"12345", ""),
+            fixture_http_response(b"123", ""),
+            fixture_http_response(b"1234", ""),
+            fixture_http_response(b"12345", "Content-Length: 5\r\n"),
+        ]);
+        let client = update_http_client().unwrap();
+        assert!(
+            download_bytes(&client, &url, 4)
+                .unwrap_err()
+                .contains("larger than expected")
+        );
+        assert!(
+            download_bytes(&client, &url, 4)
+                .unwrap_err()
+                .contains("larger than expected")
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let mut progress = Vec::new();
+        for (index, should_pass) in [false, false, true, false].into_iter().enumerate() {
+            let response = update_request(&client, &url, ARCHIVE_TIMEOUT)
+                .send()
+                .unwrap();
+            let path = temp.path().join(format!("archive-{index}"));
+            let result = persist_update_archive(response, &path, 4, |written, total| {
+                progress.push((written, total))
+            });
+            assert_eq!(result.is_ok(), should_pass);
+            if path.exists() {
+                assert!(fs::metadata(&path).unwrap().len() <= 5);
+            }
+        }
+        assert!(
+            progress
+                .iter()
+                .all(|&(written, total)| written <= total && total == 4)
+        );
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn shared_http_client_keeps_distinct_request_deadlines() {
+        let client = update_http_client().unwrap();
+        let metadata = update_request(&client, "http://127.0.0.1/metadata", METADATA_TIMEOUT)
+            .build()
+            .unwrap();
+        let archive = update_request(&client, "http://127.0.0.1/archive", ARCHIVE_TIMEOUT)
+            .build()
+            .unwrap();
+        assert_eq!(metadata.timeout(), Some(&Duration::from_secs(45)));
+        assert_eq!(archive.timeout(), Some(&Duration::from_secs(600)));
     }
 }
