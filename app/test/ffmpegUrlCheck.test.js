@@ -9,7 +9,7 @@ test("pinned bundle URL list covers binaries and all source archives", () => {
   assert.ok(PINNED_BUNDLE_URLS.some((url) => url.includes("win64-gpl-shared")));
   assert.ok(PINNED_BUNDLE_URLS.some((url) => url.includes("linux64-gpl-shared")));
   assert.ok(PINNED_BUNDLE_URLS.some((url) => url.includes("codeload.github.com/FFmpeg/FFmpeg")));
-  assert.ok(PINNED_BUNDLE_URLS.some((url) => url.includes("code.videolan.org/videolan/x264")));
+  assert.ok(PINNED_BUNDLE_URLS.some((url) => url.includes("codeload.github.com/mirror/x264/tar.gz/")));
 });
 
 test("checkUrl reports ok for reachable URLs", async () => {

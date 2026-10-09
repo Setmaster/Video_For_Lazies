@@ -77,7 +77,7 @@ export const windowsBuildScriptsArchiveName = `btbn-ffmpeg-builds-${WINDOWS_X64_
 export const windowsBuildScriptsUrl = `https://github.com/BtbN/FFmpeg-Builds/archive/${WINDOWS_X64_BUNDLE.buildScriptsCommit}.tar.gz`;
 export const windowsBuildScriptsArchivePath = path.resolve(windowsDownloadsDir, windowsBuildScriptsArchiveName);
 export const windowsX264SourceArchiveName = `x264-${WINDOWS_X64_BUNDLE.x264Commit}.tar.gz`;
-export const windowsX264SourceUrl = `https://code.videolan.org/videolan/x264/-/archive/${WINDOWS_X64_BUNDLE.x264Commit}/${windowsX264SourceArchiveName}`;
+export const windowsX264SourceUrl = `https://codeload.github.com/mirror/x264/tar.gz/${WINDOWS_X64_BUNDLE.x264Commit}`;
 export const windowsX264SourceArchivePath = path.resolve(windowsDownloadsDir, windowsX264SourceArchiveName);
 export const windowsSourceArchiveNames = Object.freeze([
   windowsSourceArchiveName,
@@ -95,7 +95,7 @@ export const linuxBuildScriptsArchiveName = `btbn-ffmpeg-builds-${LINUX_X64_BUND
 export const linuxBuildScriptsUrl = `https://github.com/BtbN/FFmpeg-Builds/archive/${LINUX_X64_BUNDLE.buildScriptsCommit}.tar.gz`;
 export const linuxBuildScriptsArchivePath = path.resolve(linuxDownloadsDir, linuxBuildScriptsArchiveName);
 export const linuxX264SourceArchiveName = `x264-${LINUX_X64_BUNDLE.x264Commit}.tar.gz`;
-export const linuxX264SourceUrl = `https://code.videolan.org/videolan/x264/-/archive/${LINUX_X64_BUNDLE.x264Commit}/${linuxX264SourceArchiveName}`;
+export const linuxX264SourceUrl = `https://codeload.github.com/mirror/x264/tar.gz/${LINUX_X64_BUNDLE.x264Commit}`;
 export const linuxX264SourceArchivePath = path.resolve(linuxDownloadsDir, linuxX264SourceArchiveName);
 export const linuxSourceArchiveNames = Object.freeze([
   linuxSourceArchiveName,

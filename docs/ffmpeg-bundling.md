@@ -83,8 +83,8 @@ Note:
 
 - Upstream repository:
   `https://code.videolan.org/videolan/x264`
-- Exact x264 source archive:
-  `https://code.videolan.org/videolan/x264/-/archive/0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz`
+- Exact x264 source archive (GitHub mirror):
+  `https://codeload.github.com/mirror/x264/tar.gz/0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee`
 - x264 source archive SHA256:
   `d0967a1348c85dfde363bb52610403be898171493100561efa0dd05d5fd1ae50`
 - x264 commit referenced by the pinned BtbN recipe:
