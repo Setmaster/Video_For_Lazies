@@ -41,8 +41,8 @@ test("replaceExtension swaps extension or appends if missing", () => {
 
 test("formatPathForDisplay hides Windows verbatim drive and UNC prefixes", () => {
   assert.equal(
-    formatPathForDisplay(String.raw`\\?\C:\Users\vi7or\Downloads\clip.mp4`),
-    String.raw`C:\Users\vi7or\Downloads\clip.mp4`,
+    formatPathForDisplay(String.raw`\\?\C:\Users\Example\Downloads\clip.mp4`),
+    String.raw`C:\Users\Example\Downloads\clip.mp4`,
   );
   assert.equal(
     formatPathForDisplay(String.raw`\\?\UNC\Server\Share\clip.mp4`),
