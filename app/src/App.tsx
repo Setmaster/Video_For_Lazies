@@ -2716,6 +2716,7 @@ function App() {
           ? 1.5
           : null,
       normalizeAudio,
+      audioChannelPreference: advancedAudioChannels,
       audioEnabled: Boolean(plannedEncodeSummary.audioIncluded),
       videoEnabled: format !== "mp3",
     });
@@ -2730,6 +2731,7 @@ function App() {
     advancedFrameRateCapRequest,
     audioEnabled,
     normalizeAudio,
+    advancedAudioChannels,
     colorSource,
     colorPolicy,
   ]);
@@ -2774,6 +2776,7 @@ function App() {
           ? 1.5
           : null,
       normalizeAudio,
+      audioChannelPreference: advancedAudioChannels,
       audioEnabled: Boolean(exactSamplePlannedEncodeSummary.audioIncluded),
       videoEnabled: format !== "mp3",
     });
@@ -2787,6 +2790,7 @@ function App() {
     speed,
     advancedFrameRateCapRequest,
     normalizeAudio,
+    advancedAudioChannels,
     colorSource,
     colorPolicy,
   ]);

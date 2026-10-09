@@ -90,6 +90,7 @@ export function estimateTransformMemory(options: {
   height: number;
   decodedVideoBytesPerPixel?: number | null;
   normalizeAudio?: boolean;
+  audioChannelPreference?: "auto" | "mono" | "stereo";
   audioEnabled?: boolean;
   videoEnabled?: boolean;
 }): {

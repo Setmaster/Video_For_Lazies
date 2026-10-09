@@ -54,12 +54,14 @@
       "releaseRequired": true,
       "encoders": [],
       "filters": [
+        "apad",
         "areverse",
         "asetnsamples",
         "asplit",
         "concat",
         "reverse",
-        "split"
+        "split",
+        "tpad"
       ]
     },
     "externalSubtitles": {

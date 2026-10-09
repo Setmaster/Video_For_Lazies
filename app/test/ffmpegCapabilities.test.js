@@ -57,7 +57,7 @@ const shippedContractExpectation = {
     reverseLoop: {
       releaseRequired: true,
       encoders: [],
-      filters: ["areverse", "asetnsamples", "asplit", "concat", "reverse", "split"],
+      filters: ["apad", "areverse", "asetnsamples", "asplit", "concat", "reverse", "split", "tpad"],
     },
     externalSubtitles: {
       releaseRequired: true,

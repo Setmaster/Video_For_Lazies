@@ -48,15 +48,16 @@ export function fitMaxEdgeDimensions(width, height, maxEdge) {
   const safeWidth = Math.max(2, Number(width));
   const safeHeight = Math.max(2, Number(height));
   const safeMaxEdge = Number(maxEdge);
-  const longEdge = Math.max(safeWidth, safeHeight);
-  if (!Number.isFinite(safeMaxEdge) || safeMaxEdge <= 0 || longEdge <= safeMaxEdge) {
+  if (!Number.isFinite(safeMaxEdge) || safeMaxEdge <= 0) {
     return { width: evenAtLeastTwo(safeWidth), height: evenAtLeastTwo(safeHeight) };
   }
-  const scale = safeMaxEdge / longEdge;
-  return {
-    width: evenAtLeastTwo(Math.round(safeWidth * scale)),
-    height: evenAtLeastTwo(Math.round(safeHeight * scale)),
-  };
+  const cap = evenAtLeastTwo(safeMaxEdge);
+  if (safeWidth >= safeHeight) {
+    const outputWidth = evenAtLeastTwo(Math.min(safeWidth, cap));
+    return { width: outputWidth, height: Math.max(2, Math.round(safeHeight * outputWidth / safeWidth / 2) * 2) };
+  }
+  const outputHeight = evenAtLeastTwo(Math.min(safeHeight, cap));
+  return { width: Math.max(2, Math.round(safeWidth * outputHeight / safeHeight / 2) * 2), height: outputHeight };
 }
 
 export function fitMaxEdgeDisplayDimensions({ probe, width, height, maxEdge, manualRotateDeg = 0 }) {
@@ -244,6 +245,7 @@ export function estimateTransformMemory({
   height,
   decodedVideoBytesPerPixel = null,
   normalizeAudio = false,
+  audioChannelPreference = "auto",
   audioEnabled = true,
   videoEnabled = true,
 }) {
@@ -286,7 +288,8 @@ export function estimateTransformMemory({
   let audioBytes = 0;
   if (audioEnabled && probe?.hasAudio) {
     const sampleRate = normalizeAudio ? 48_000 : finitePositive(probe?.audioSampleRate);
-    const channels = finitePositive(probe?.audioChannels);
+    const sourceChannels = finitePositive(probe?.audioChannels);
+    const channels = sourceChannels === null ? null : Math.max(sourceChannels, audioChannelPreference === "stereo" ? 2 : 1);
     const bytesPerSample = normalizeAudio ? 8 : finitePositive(probe?.decodedAudioBytesPerSample);
     if (sampleRate === null || channels === null || bytesPerSample === null) {
       return {
@@ -299,12 +302,12 @@ export function estimateTransformMemory({
     }
     const reverseSamples = Math.ceil(retainedDuration * sampleRate);
     const loopSamples = Math.ceil((retainedDuration / safeSpeed) * sampleRate);
-    const retainedSamples = (reverse ? reverseSamples : 0) + (loopVideo ? loopSamples : 0);
+    const loopSampleBytes = Math.abs(safeSpeed - 1) > 1e-9 ? 8 : bytesPerSample;
     const retainedFrames =
       (reverse ? Math.ceil(reverseSamples / TRANSFORM_AUDIO_FRAME_SAMPLES) : 0) +
       (loopVideo ? Math.ceil(loopSamples / TRANSFORM_AUDIO_FRAME_SAMPLES) : 0);
     audioBytes =
-      channels * bytesPerSample * retainedSamples +
+      channels * ((reverse ? bytesPerSample * reverseSamples : 0) + (loopVideo ? loopSampleBytes * loopSamples : 0)) +
       retainedFrames * TRANSFORM_AUDIO_FRAME_OVERHEAD_BYTES;
   }
 

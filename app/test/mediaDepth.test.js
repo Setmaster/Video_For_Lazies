@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   TRANSFORM_MEMORY_BLOCK_BYTES,
+  TRANSFORM_AUDIO_FRAME_OVERHEAD_BYTES,
   TRANSFORM_VIDEO_FRAME_OVERHEAD_BYTES,
   TRANSFORM_MEMORY_WARN_BYTES,
   classifyColorSource,
@@ -108,6 +109,8 @@ test("SAR helpers preserve display shape through source and manual rotation", ()
   );
   assert.deepEqual(fitMaxEdgeDimensions(853, 481, 720), { width: 720, height: 406 });
   assert.deepEqual(fitMaxEdgeDimensions(853, 481, 900), { width: 852, height: 480 });
+  assert.deepEqual(fitMaxEdgeDimensions(960, 540, 500), { width: 500, height: 282 });
+  assert.deepEqual(fitMaxEdgeDimensions(540, 960, 501), { width: 282, height: 500 });
   assert.deepEqual(
     fitMaxEdgeDisplayDimensions({
       probe: { ...baseProbe, sampleAspectRatio: { numerator: 32, denominator: 27 } },
@@ -336,4 +339,15 @@ test("retained audio facts fail closed instead of assuming an ordinary layout", 
     normalizeAudio: true,
   });
   assert.equal(normalized.severity, "ok");
+});
+
+test("audio buffer estimates include stereo upmix and negotiated tempo samples", () => {
+  const monoProbe = { ...baseProbe, audioChannels: 1, decodedAudioBytesPerSample: 2 };
+  const options = { probe: monoProbe, reverse: true, loopVideo: false, videoEnabled: false };
+  const mono = estimateTransformMemory(options);
+  const stereo = estimateTransformMemory({ ...options, audioChannelPreference: "stereo" });
+  assert.equal(stereo.audioBytes - mono.audioBytes, baseProbe.durationS * baseProbe.audioSampleRate * 2 * 1.5);
+  const loop = estimateTransformMemory({ ...options, reverse: false, loopVideo: true, speed: 2, audioChannelPreference: "stereo" });
+  const samples = baseProbe.durationS / 2 * baseProbe.audioSampleRate;
+  assert.equal(loop.audioBytes, (samples * 2 * 8 + Math.ceil(samples / 1024) * TRANSFORM_AUDIO_FRAME_OVERHEAD_BYTES) * 1.5);
 });

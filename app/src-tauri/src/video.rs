@@ -2,7 +2,7 @@ use crate::process::{self, JobContext, JobScope, ManagedChild, ProcessControl};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -139,6 +139,11 @@ fn command_no_window(bin: &str) -> Command {
 #[serde(rename_all = "camelCase")]
 pub struct VideoProbe {
     pub duration_s: f64,
+    /// Selected video's first timestamp on FFmpeg's default input timeline.
+    #[serde(skip)]
+    pub video_start_s: f64,
+    #[serde(skip)]
+    pub input_origin_s: f64,
     /// Display-oriented sample-grid width. This intentionally retains the
     /// pre-v1.10 meaning used by crop coordinates.
     pub width: u32,
@@ -3012,7 +3017,9 @@ fn resolve_media_policy(
         }
     }
 
-    let sar_action = if probe.sample_aspect_ratio.is_square() {
+    let sar_action = if probe.sample_aspect_ratio.is_square()
+        && !matches!(requested_resize(request)?, ResizePlan::Custom { .. })
+    {
         SarAction::Unchanged
     } else {
         let (width, height) = estimated_output_dimensions(request, probe)?;
@@ -3132,7 +3139,7 @@ fn reverse_buffer_estimate(
         let channels = probe.audio_channels.ok_or_else(|| {
             "Reverse/Loop is unavailable because the retained audio channel count could not be determined."
                 .to_string()
-        })? as u128;
+        })?.max(audio_channel_count(request).unwrap_or(0) as u32) as u128;
         let bytes_per_sample = if request.normalize_audio {
             8
         } else {
@@ -3155,8 +3162,15 @@ fn reverse_buffer_estimate(
             let sample_count = (retained_duration_s / effective_speed(request) * sample_rate as f64)
                 .ceil() as u128;
             let frame_count = sample_count.div_ceil(REVERSE_AUDIO_FRAME_SAMPLES);
+            // atempo may negotiate a wider sample format before the Loop
+            // buffer. Eight bytes covers every supported decoded sample type.
+            let loop_sample_bytes = if (effective_speed(request) - 1.0).abs() > 1e-9 {
+                8
+            } else {
+                bytes_per_sample
+            };
             total_bytes = total_bytes
-                .saturating_add(sample_count.saturating_mul(bytes_per_audio_frame))
+                .saturating_add(sample_count.saturating_mul(channels * loop_sample_bytes))
                 .saturating_add(
                     frame_count.saturating_mul(REVERSE_BUFFER_AUDIO_FRAME_OVERHEAD_BYTES),
                 );
@@ -3750,26 +3764,22 @@ fn oriented_sample_aspect_ratio(req: &EncodeRequest, probe: &VideoProbe) -> f64 
     ratio
 }
 
-#[cfg(test)]
 fn fit_max_edge_dimensions(width: u32, height: u32, max_edge_px: u32) -> (u32, u32) {
-    let long_edge = width.max(height);
-    if long_edge <= max_edge_px {
-        return (even_at_least_two(width), even_at_least_two(height));
-    }
+    // Match scale's explicit even long edge and -2 short edge. FFmpeg rounds
+    // directly to the nearest multiple of two, not to an integer then down.
+    let cap = even_at_least_two(max_edge_px);
     if width >= height {
-        let scaled_height =
-            (((height as f64) * (max_edge_px as f64)) / (width as f64)).round() as u32;
-        (
-            even_at_least_two(max_edge_px),
-            even_at_least_two(scaled_height),
-        )
+        let out_width = even_at_least_two(width.min(cap));
+        let out_height = ((height as f64 * out_width as f64 / width as f64 / 2.0).round() as u32)
+            .saturating_mul(2)
+            .max(2);
+        (out_width, out_height)
     } else {
-        let scaled_width =
-            (((width as f64) * (max_edge_px as f64)) / (height as f64)).round() as u32;
-        (
-            even_at_least_two(scaled_width),
-            even_at_least_two(max_edge_px),
-        )
+        let out_height = even_at_least_two(height.min(cap));
+        let out_width = ((width as f64 * out_height as f64 / height as f64 / 2.0).round() as u32)
+            .saturating_mul(2)
+            .max(2);
+        (out_width, out_height)
     }
 }
 
@@ -3822,8 +3832,12 @@ fn estimated_output_dimensions(
             } else {
                 1.0
             };
-            width = even_at_least_two((logical_width * scale).round() as u32);
-            height = even_at_least_two((logical_height * scale).round() as u32);
+            if probe.sample_aspect_ratio.is_square() {
+                (width, height) = fit_max_edge_dimensions(width, height, max_edge_px);
+            } else {
+                width = even_at_least_two((logical_width * scale).round() as u32);
+                height = even_at_least_two((logical_height * scale).round() as u32);
+            }
         }
         ResizePlan::Custom {
             width_px,
@@ -4083,9 +4097,57 @@ pub fn extract_frame(input_path: String, time_s: f64, output_path: String) -> Re
         return Err(format!("Frame export failed.\n\n{tail}"));
     }
 
+    validate_frame_output(&temp_path)?;
     publish_output_file(temp_path, &output_path)?;
 
     Ok(())
+}
+
+fn validate_frame_output(path: &Path) -> Result<(), String> {
+    let invalid = || {
+        "No complete PNG frame was produced at the selected time. Choose an earlier frame and try again.".to_string()
+    };
+    let mut file = fs::File::open(path).map_err(|_| invalid())?;
+    let length = file.metadata().map_err(|_| invalid())?.len();
+    // An IHDR, at least one nonempty IDAT and IEND must all be present. Read
+    // only bounded headers; the successful PNG encoder owns pixel encoding.
+    let mut signature = [0u8; 8];
+    file.read_exact(&mut signature).map_err(|_| invalid())?;
+    if signature != *b"\x89PNG\r\n\x1a\n" {
+        return Err(invalid());
+    }
+    let mut position = 8u64;
+    let mut saw_header = false;
+    let mut saw_pixels = false;
+    while position.saturating_add(12) <= length {
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header).map_err(|_| invalid())?;
+        let chunk_length = u32::from_be_bytes(header[..4].try_into().unwrap()) as u64;
+        let end = position.saturating_add(chunk_length).saturating_add(12);
+        if end > length {
+            return Err(invalid());
+        }
+        match &header[4..] {
+            b"IHDR" if !saw_header && position == 8 && chunk_length == 13 => {
+                let mut dimensions = [0u8; 8];
+                file.read_exact(&mut dimensions).map_err(|_| invalid())?;
+                if dimensions[..4] == [0; 4] || dimensions[4..] == [0; 4] {
+                    return Err(invalid());
+                }
+                saw_header = true;
+            }
+            b"IDAT" if saw_header && chunk_length > 0 => saw_pixels = true,
+            b"IEND" if saw_header && saw_pixels && chunk_length == 0 && end == length => {
+                return Ok(());
+            }
+            b"IHDR" | b"IEND" => return Err(invalid()),
+            _ if !saw_header => return Err(invalid()),
+            _ => {}
+        }
+        file.seek(SeekFrom::Start(end)).map_err(|_| invalid())?;
+        position = end;
+    }
+    Err(invalid())
 }
 
 fn frame_extract_command_args(
@@ -4128,6 +4190,7 @@ struct FFProbeOutput {
 #[derive(Debug, Deserialize, Default)]
 struct FFProbeFormat {
     duration: Option<String>,
+    start_time: Option<String>,
     format_name: Option<String>,
 }
 
@@ -4186,6 +4249,7 @@ struct FFProbeStream {
     codec_name: Option<String>,
     codec_type: Option<String>,
     duration: Option<String>,
+    start_time: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     pix_fmt: Option<String>,
@@ -4780,6 +4844,104 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     parse_probe_output_with_pixel_formats(&stdout, Some(&pixel_formats))
 }
 
+fn aligns_retained_av_interval(request: &EncodeRequest, probe: &VideoProbe) -> bool {
+    request.format != OutputFormat::Mp3
+        && request.audio_enabled
+        && probe.has_audio
+        && (request.reverse || request.loop_video)
+}
+
+fn prepare_temporal_probe(request: &EncodeRequest, probe: &mut VideoProbe) -> Result<(), String> {
+    if aligns_retained_av_interval(request, probe) && probe.source_format.as_deref() == Some("nut")
+    {
+        // NUT indexes omit the final packet duration. Only common A/V padding
+        // needs this extra precision; loading, copying and single-stream
+        // transformations retain the ordinary metadata-only probe path.
+        probe.duration_s = probe_nut_timeline_duration(
+            &default_ffprobe(),
+            Path::new(request.input_path.trim()),
+            probe,
+            probe.input_origin_s,
+        )?;
+    }
+    Ok(())
+}
+
+fn probe_nut_timeline_duration(
+    ffprobe_bin: &str,
+    input: &Path,
+    probe: &VideoProbe,
+    origin: f64,
+) -> Result<f64, String> {
+    #[derive(Deserialize)]
+    struct Packet {
+        stream_index: u32,
+        pts_time: Option<String>,
+        duration_time: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Tail {
+        packets: Vec<Packet>,
+    }
+    const MAX_TAIL_PACKETS: usize = 4096;
+    let mut command = command_no_window(ffprobe_bin);
+    command
+        .args(["-v", "error", "-of", "json", "-read_intervals"])
+        .arg(format!(
+            "{}%+#{MAX_TAIL_PACKETS}",
+            origin + (probe.duration_s - 2.0).max(0.0)
+        ))
+        .args([
+            "-show_packets",
+            "-show_entries",
+            "packet=stream_index,pts_time,duration_time",
+        ])
+        .arg(input);
+    let output = run_command_output_with_timeout(
+        command,
+        "ffprobe",
+        "VFL_FFPROBE_PATH",
+        ffprobe_bin,
+        "NUT end timestamp probe",
+        FFPROBE_TIMEOUT,
+    )?;
+    let invalid = || "Could not determine the complete NUT media duration (ffprobe).".to_string();
+    if !output.status.success() {
+        return Err(invalid());
+    }
+    let tail: Tail = serde_json::from_slice(&output.stdout).map_err(|_| invalid())?;
+    // A seek can land on an earlier keyframe. Reaching the packet cap means
+    // EOF was not proven, so fail closed instead of publishing a partial span.
+    if tail.packets.len() >= MAX_TAIL_PACKETS {
+        return Err(invalid());
+    }
+    let mut endpoint: f64 = 0.0;
+    for packet in tail.packets {
+        if packet.stream_index != probe.video_stream_index
+            && Some(packet.stream_index) != probe.audio_stream_index
+        {
+            continue;
+        }
+        let pts = packet
+            .pts_time
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .ok_or_else(invalid)?;
+        let duration = packet
+            .duration_time
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(invalid)?;
+        endpoint = endpoint.max(pts + duration - origin);
+    }
+    if endpoint <= 0.0 || !endpoint.is_finite() {
+        return Err(invalid());
+    }
+    Ok(endpoint)
+}
+
 #[cfg(test)]
 fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
     parse_probe_output_with_pixel_formats(stdout, None)
@@ -4797,12 +4959,70 @@ fn parse_probe_output_with_pixel_formats(
     })?;
     let selected_audio = select_primary_audio_stream(&parsed.streams);
 
+    let parse_time = |value: Option<&str>| {
+        value
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+    };
+    let input_origin = parse_time(parsed.format.start_time.as_deref()).unwrap_or(0.0);
     let mut duration_s = parsed
         .format
         .duration
         .as_deref()
         .and_then(|d| d.parse::<f64>().ok())
         .unwrap_or(0.0);
+
+    // NUT's index and Matroska/WebM's Info.Duration expose an end timestamp,
+    // whereas MOV/MP4 and MPEG-TS report a span. Match the default FFmpeg input
+    // timeline only for these known endpoint demuxers; never subtract a common
+    // origin from every container duration.
+    if input_origin > 0.0
+        && parsed.format.format_name.as_deref().is_some_and(|names| {
+            names
+                .split(',')
+                .any(|name| matches!(name, "nut" | "matroska" | "webm"))
+        })
+    {
+        duration_s -= input_origin;
+    }
+
+    // Selected stream spans are stronger than a container duration that may
+    // include longer, unselected tracks. Matroska's DURATION tag is an endpoint.
+    let selected_end = |stream: &FFProbeStream| {
+        if let Some(duration) = parse_time(stream.duration.as_deref()).filter(|d| *d > 0.0) {
+            return Some(
+                parse_time(stream.start_time.as_deref()).unwrap_or(input_origin) + duration
+                    - input_origin,
+            );
+        }
+        if parsed.format.format_name.as_deref().is_some_and(|names| {
+            names
+                .split(',')
+                .any(|name| matches!(name, "matroska" | "webm"))
+        }) {
+            let tag = ffprobe_tag_value(&stream.tags, "DURATION")?;
+            let mut parts = tag.split(':');
+            let hours = parts.next()?.parse::<f64>().ok()?;
+            let minutes = parts.next()?.parse::<f64>().ok()?;
+            let seconds = parts.next()?.parse::<f64>().ok()?;
+            if parts.next().is_none()
+                && hours.is_finite()
+                && minutes.is_finite()
+                && seconds.is_finite()
+            {
+                return Some(hours * 3600.0 + minutes * 60.0 + seconds - input_origin);
+            }
+        }
+        None
+    };
+    if let Some(video_end) = selected_end(selected_video)
+        && let Some(audio_end) = selected_audio.map_or(Some(0.0), selected_end)
+    {
+        let selected_duration = video_end.max(audio_end);
+        if selected_duration.is_finite() && selected_duration > 0.0 {
+            duration_s = selected_duration;
+        }
+    }
 
     if duration_s <= 0.0 || !duration_s.is_finite() {
         duration_s = selected_video
@@ -4918,8 +5138,14 @@ fn parse_probe_output_with_pixel_formats(
         .count()
         .min(u32::MAX as usize) as u32;
 
+    let video_start_s = parse_time(selected_video.start_time.as_deref())
+        .map(|start| (start - input_origin).max(0.0))
+        .unwrap_or(0.0);
+
     Ok(VideoProbe {
         duration_s,
+        video_start_s,
+        input_origin_s: input_origin,
         width,
         height,
         coded_width,
@@ -5292,8 +5518,25 @@ fn build_video_filters_with_policy(
     media_policy: MediaPolicyPlan,
 ) -> Result<Option<String>, String> {
     let mut filters: Vec<String> = Vec::new();
-    let mut deferred_trim_filters: Vec<String> = Vec::new();
+    let mut deferred_timestamp_reset: Option<String> = None;
     let subtitle_active = req.subtitle_path.is_some();
+
+    let align_interval = aligns_retained_av_interval(req, probe);
+    if align_interval {
+        // Pad the source timeline before selecting a trim, so an interval with
+        // no actual pictures still has black frames. This is streaming work;
+        // trim discards them before expensive picture/subtitle filters or any
+        // reverse buffer. One tpad handles both ends to preserve its EOF PTS.
+        let duration = probe.duration_s;
+        let leading_gap = probe.video_start_s;
+        if leading_gap > 0.0 {
+            filters.push(format!(
+                "setpts=PTS-{leading_gap}/TB,tpad=start_mode=add:start_duration={leading_gap}:stop_mode=add:stop_duration={duration}"
+            ));
+        } else {
+            filters.push(format!("tpad=stop_mode=add:stop_duration={duration}"));
+        }
+    }
 
     if let Some(t) = &req.trim {
         let start = t.start_s.max(0.0);
@@ -5301,15 +5544,20 @@ fn build_video_filters_with_policy(
         if end <= start {
             return Err("Trim end must be greater than start.".to_string());
         }
-        let trim_filters = [
-            format!("trim=start={start}:end={end}"),
-            "setpts=PTS-STARTPTS".to_string(),
-        ];
+        // Selection does not change source PTS, so it can precede expensive
+        // picture/subtitle work. Rebase both streams against the same requested
+        // trim epoch, not each stream's independently first retained timestamp.
+        filters.push(format!("trim=start={start}:end={end}"));
+        let reset = format!("setpts=PTS-{start}/TB");
         if subtitle_active {
-            deferred_trim_filters.extend(trim_filters);
+            deferred_timestamp_reset = Some(reset);
         } else {
-            filters.extend(trim_filters);
+            filters.push(reset);
         }
+    }
+
+    if req.trim.is_none() && align_interval {
+        filters.push(format!("trim=end={}", probe.duration_s));
     }
 
     if let Some(c) = &req.crop {
@@ -5406,7 +5654,9 @@ fn build_video_filters_with_policy(
             "subtitles=filename=vfl_external.srt:fontsdir=fonts:force_style='FontName=DejaVu Sans,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginL=24,MarginR=24,MarginV=24'"
                 .to_string(),
         );
-        filters.append(&mut deferred_trim_filters);
+        if let Some(reset) = deferred_timestamp_reset {
+            filters.push(reset);
+        }
     }
 
     if req.reverse {
@@ -5509,7 +5759,7 @@ fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
             return Err("Trim end must be greater than start.".to_string());
         }
         filters.push(format!("atrim=start={start}:end={end}"));
-        filters.push("asetpts=PTS-STARTPTS".to_string());
+        filters.push(format!("asetpts=PTS-{start}/TB"));
     }
 
     if req.normalize_audio {
@@ -5518,13 +5768,58 @@ fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         filters.push("aresample=48000".to_string());
     }
 
+    // Reverse and Loop operate on an entire common interval. Materialize gaps
+    // after loudnorm so silence does not change its analysis of retained audio.
+    let aligned_interval = aligns_retained_av_interval(req, probe);
+    if req.reverse || (req.loop_video && req.format != OutputFormat::Mp3) {
+        let duration = retained_source_duration_s(req, probe)?;
+        let sample_rate = if req.normalize_audio {
+            48_000
+        } else {
+            probe.audio_sample_rate.ok_or_else(|| {
+                "Reverse/Loop is unavailable because the retained audio sample rate could not be determined.".to_string()
+            })?
+        };
+        let sample_format = if req.normalize_audio {
+            "dbl"
+        } else {
+            probe.audio_sample_format.as_deref().filter(|format| {
+                decoded_audio_bytes_per_sample(Some(format)).is_some()
+            }).ok_or_else(|| {
+                "Reverse/Loop is unavailable because the retained decoded audio sample format could not be determined.".to_string()
+            })?
+        };
+        // Pin the layout: otherwise aresample can negotiate a wider buffer than
+        // the source-based memory guard accounts for before the reverse stage.
+        let timing = if aligned_interval {
+            "async=1:first_pts=0:"
+        } else {
+            ""
+        };
+        filters.push(format!(
+            "aresample={timing}osr={sample_rate}:osf={sample_format}"
+        ));
+        if aligned_interval {
+            filters.push(format!("apad=whole_dur={duration},atrim=end={duration}"));
+        }
+    }
+
     if req.reverse {
         filters.push(format!("asetnsamples=n={REVERSE_AUDIO_FRAME_SAMPLES}:p=0"));
         filters.push("areverse".to_string());
     }
 
     if (req.speed - 1.0).abs() > 1e-9 {
+        // atempo changes sample count but preserves the first input timestamp.
+        // Scale that origin as well so an unpadded track's delay follows video.
+        filters.push(format!("asetpts=PTS/{:.9}", req.speed));
         filters.push(atempo_chain(req.speed)?);
+        if aligned_interval {
+            // atempo's finite analysis window can shorten its tail slightly.
+            // Keep each Loop segment on the same duration as the video.
+            let duration = retained_source_duration_s(req, probe)? / req.speed;
+            filters.push(format!("apad=whole_dur={duration},atrim=end={duration}"));
+        }
     }
 
     let linear = if filters.is_empty() {
@@ -6265,7 +6560,8 @@ pub fn run_encode_job(
     let input_str = input_path.to_string_lossy().to_string();
 
     let mut ffmpeg_bin = default_ffmpeg();
-    let probe = probe_video(input_path.to_string_lossy().to_string())?;
+    let mut probe = probe_video(input_path.to_string_lossy().to_string())?;
+    prepare_temporal_probe(&request, &mut probe)?;
     let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
     let capability_contract = ffmpeg_capability_contract()?;
     process::check_cancelled().map_err(|error| error.to_string())?;
@@ -7310,10 +7606,14 @@ pub fn run_encode_job(
 }
 
 #[cfg(test)]
+#[path = "video_media_tests.rs"]
+mod media_integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn base_request() -> EncodeRequest {
+    pub(super) fn base_request() -> EncodeRequest {
         EncodeRequest {
             input_path: "in.mp4".to_string(),
             output_path: "out.mp4".to_string(),
@@ -7584,6 +7884,8 @@ mod tests {
     fn probe_10s_1920x1080_audio() -> VideoProbe {
         VideoProbe {
             duration_s: 10.0,
+            video_start_s: 0.0,
+            input_origin_s: 0.0,
             width: 1920,
             height: 1080,
             coded_width: 1920,
@@ -8688,11 +8990,11 @@ Encoders:
         let mut req = base_request();
         req.loop_video = true;
         let probe = probe_10s_1920x1080_audio();
-        // With no other transforms, the whole -vf is the boomerang.
+        // The boomerang wraps the complete common video/audio interval.
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "split[fv][rv0];[rv0]reverse[rv];[fv][rv]concat=n=2:v=1"
+            "tpad=stop_mode=add:stop_duration=10,trim=end=10,split[fv][rv0];[rv0]reverse[rv];[fv][rv]concat=n=2:v=1"
         );
 
         // With other transforms, the boomerang wraps the linear chain.
@@ -8702,7 +9004,7 @@ Encoders:
             saturation: 1.0,
         });
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
-        assert!(filters.starts_with("eq=brightness"));
+        assert!(filters.contains("eq=brightness"));
         assert!(filters.ends_with(",split[fv][rv0];[rv0]reverse[rv];[fv][rv]concat=n=2:v=1"));
     }
 
@@ -8715,7 +9017,7 @@ Encoders:
         let af = build_audio_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             af,
-            "asetnsamples=n=1024:p=0,asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
+            "aresample=async=1:first_pts=0:osr=48000:osf=fltp,apad=whole_dur=10,atrim=end=10,asetnsamples=n=1024:p=0,asplit[fa][ra0];[ra0]areverse[ra];[fa][ra]concat=n=2:v=0:a=1"
         );
         req.reverse = true;
         let reverse_and_loop = build_audio_filters(&req, &probe).unwrap().unwrap();
@@ -8739,7 +9041,7 @@ Encoders:
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         // Perturb sits in the linear chain (before split), so the forward
         // segment's first frame is the perturbed one and it stays first.
-        assert!(filters.starts_with("noise=alls=3:allf=u:all_seed=9:enable='eq(n\\,0)',split[fv]"));
+        assert!(filters.contains("noise=alls=3:allf=u:all_seed=9:enable='eq(n\\,0)',split[fv]"));
         assert!(filters.ends_with("concat=n=2:v=1"));
     }
 
@@ -8780,7 +9082,7 @@ Encoders:
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "trim=start=1:end=5,setpts=PTS-STARTPTS,crop=w=100:h=98:x=1:y=3:exact=1,transpose=1,reverse,setpts=PTS/2.000000000"
+            "tpad=stop_mode=add:stop_duration=10,trim=start=1:end=5,setpts=PTS-1/TB,crop=w=100:h=98:x=1:y=3:exact=1,transpose=1,reverse,setpts=PTS/2.000000000"
         );
     }
 
@@ -8803,11 +9105,12 @@ Encoders:
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
         let subtitle_index = filters.find("subtitles=filename=vfl_external.srt").unwrap();
         let trim_index = filters.find("trim=start=5:end=9").unwrap();
-        assert!(filters.starts_with("crop=w=1280:h=720:x=0:y=0:exact=1"));
-        assert!(subtitle_index < trim_index);
+        assert!(filters.starts_with("trim=start=5:end=9,crop=w=1280:h=720:x=0:y=0:exact=1"));
+        assert!(trim_index < subtitle_index);
+        assert!(subtitle_index < filters.find("setpts=PTS-5/TB").unwrap());
         assert!(filters.contains("fontsdir=fonts"));
         assert!(filters.contains("FontName=DejaVu Sans"));
-        assert!(!filters.contains("/"));
+        assert!(filters.contains("filename=vfl_external.srt:fontsdir=fonts:"));
         assert!(!filters.contains("\\"));
 
         req.subtitle_path = Some("C:\\private\\captions [draft].srt".to_string());
@@ -8934,7 +9237,7 @@ Encoders:
 
         let probe = probe_10s_1920x1080_audio();
         let filters = build_video_filters(&req, &probe).unwrap().unwrap();
-        assert_eq!(filters, "scale=w=800:h=450");
+        assert_eq!(filters, "scale=w=800:h=450,setsar=1");
     }
 
     #[test]
@@ -9038,7 +9341,7 @@ Encoders:
         let filters = build_audio_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "atrim=start=1:end=5,asetpts=PTS-STARTPTS,asetnsamples=n=1024:p=0,areverse,atempo=2.0,atempo=2.000000"
+            "atrim=start=1:end=5,asetpts=PTS-1/TB,aresample=async=1:first_pts=0:osr=48000:osf=fltp,apad=whole_dur=4,atrim=end=4,asetnsamples=n=1024:p=0,areverse,asetpts=PTS/4.000000000,atempo=2.0,atempo=2.000000,apad=whole_dur=1,atrim=end=1"
         );
     }
 
@@ -9055,7 +9358,7 @@ Encoders:
         let filters = build_audio_filters(&req, &probe).unwrap().unwrap();
         assert_eq!(
             filters,
-            "atrim=start=1:end=5,asetpts=PTS-STARTPTS,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"
+            "atrim=start=1:end=5,asetpts=PTS-1/TB,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"
         );
 
         let silent_probe = VideoProbe {
@@ -9677,6 +9980,28 @@ Encoders:
     fn max_edge_dimension_rounding_matches_the_frontend_mirror() {
         assert_eq!(fit_max_edge_dimensions(853, 481, 720), (720, 406));
         assert_eq!(fit_max_edge_dimensions(853, 481, 900), (852, 480));
+        assert_eq!(fit_max_edge_dimensions(960, 540, 500), (500, 282));
+        assert_eq!(fit_max_edge_dimensions(540, 960, 501), (282, 500));
+    }
+
+    #[test]
+    fn probe_video_start_uses_the_common_input_origin() {
+        let probe = parse_probe_output(
+            r#"{
+            "format":{"duration":"4","start_time":"10"},
+            "streams":[{"index":0,"codec_type":"video","codec_name":"h264",
+              "width":160,"height":90,"pix_fmt":"yuv420p","start_time":"11",
+              "duration":"3","avg_frame_rate":"30/1"}]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(probe.video_start_s, 1.0);
+        assert!(
+            serde_json::to_value(&probe)
+                .unwrap()
+                .get("videoStartS")
+                .is_none()
+        );
     }
 
     #[test]
@@ -10864,7 +11189,7 @@ IO... xv36le                  3             36      12-12-12\n",
             .unwrap()
             .unwrap();
         // video Loop stage: (10/2)*30 frames; audio Loop stage: 5 seconds.
-        assert_eq!(estimate.bytes, 707_450_880);
+        assert_eq!(estimate.bytes, 710_330_880);
         assert_eq!(estimate.action, ReverseBufferAction::Warning);
     }
 
@@ -10878,7 +11203,7 @@ IO... xv36le                  3             36      12-12-12\n",
         let estimate = reverse_buffer_estimate(&req, &probe, policy, true)
             .unwrap()
             .unwrap();
-        assert_eq!(estimate.bytes, 1_409_134_080);
+        assert_eq!(estimate.bytes, 1_412_014_080);
     }
 
     #[test]
@@ -10997,6 +11322,50 @@ IO... xv36le                  3             36      12-12-12\n",
         request.normalize_audio = true;
         let error = reverse_buffer_estimate(&request, &probe, policy, true).unwrap_err();
         assert!(error.contains("2 GiB safety limit"));
+    }
+
+    #[test]
+    fn reverse_audio_estimate_covers_stereo_upmix_and_loop_tempo_negotiation() {
+        let mut request = base_request();
+        request.format = OutputFormat::Mp3;
+        request.reverse = true;
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.audio_channels = Some(1);
+        probe.audio_sample_format = Some("s16".to_string());
+        probe.decoded_audio_bytes_per_sample = Some(2);
+        let policy = resolve_media_policy(&request, &probe, None).unwrap();
+        let mono = reverse_buffer_estimate(&request, &probe, policy, true)
+            .unwrap()
+            .unwrap()
+            .bytes;
+        request.advanced.audio_channels = Some(AudioChannelPreference::Stereo);
+        let stereo = reverse_buffer_estimate(&request, &probe, policy, true)
+            .unwrap()
+            .unwrap()
+            .bytes;
+        assert_eq!(stereo - mono, 10 * 48_000 * 2 * 3 / 2);
+        let filters = build_audio_filters(&request, &probe).unwrap().unwrap();
+        assert!(filters.contains("aresample=osr=48000:osf=s16"));
+
+        request.format = OutputFormat::Mp4;
+        request.reverse = false;
+        request.loop_video = true;
+        request.speed = 2.0;
+        let with_audio = reverse_buffer_estimate(&request, &probe, policy, true)
+            .unwrap()
+            .unwrap()
+            .bytes;
+        let without_audio = reverse_buffer_estimate(&request, &probe, policy, false)
+            .unwrap()
+            .unwrap()
+            .bytes;
+        let samples = 5u64 * 48_000;
+        let expected = (samples * 2 * 8
+            + samples.div_ceil(REVERSE_AUDIO_FRAME_SAMPLES as u64)
+                * REVERSE_BUFFER_AUDIO_FRAME_OVERHEAD_BYTES as u64)
+            * 3
+            / 2;
+        assert_eq!(with_audio - without_audio, expected);
     }
 
     #[test]
