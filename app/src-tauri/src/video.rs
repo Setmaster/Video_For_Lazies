@@ -1,9 +1,10 @@
+use crate::process::{self, JobContext, JobScope, ManagedChild, ProcessControl};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1546,72 +1547,75 @@ fn binary_not_found_message(binary_name: &str, env_var: &str, tried: &str) -> St
 }
 
 fn run_command_output_with_timeout(
-    mut cmd: Command,
+    cmd: Command,
     binary_name: &str,
     env_var: &str,
     tried: &str,
     action: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+    let mut child = ManagedChild::spawn(cmd).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            e.to_string()
+        } else if e.kind() == std::io::ErrorKind::NotFound {
             binary_not_found_message(binary_name, env_var, tried)
         } else {
             format!("Failed to start {action} ({tried}): {e}")
         }
     })?;
 
-    // Drain both pipes while polling; a child that fills an unread pipe buffer
+    // Drain both pipes while waiting; a child that fills an unread pipe buffer
     // blocks forever and would be misreported as a timeout.
     fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
         reader: Option<R>,
-    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    ) -> Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>> {
         reader.map(|mut r| {
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                let _ = r.read_to_end(&mut buf);
-                buf
+                r.read_to_end(&mut buf)?;
+                Ok(buf)
             })
         })
     }
     let mut stdout_reader = spawn_pipe_reader(child.stdout.take());
     let mut stderr_reader = spawn_pipe_reader(child.stderr.take());
-    let join_pipe = |handle: &mut Option<std::thread::JoinHandle<Vec<u8>>>| {
-        handle
-            .take()
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default()
+    let join_pipe = |handle: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>| {
+        handle.take().map_or_else(
+            || Ok(Vec::new()),
+            |handle| {
+                handle
+                    .join()
+                    .map_err(|_| "Process output reader stopped.".to_string())?
+                    .map_err(|error| format!("Failed reading {action} output: {error}"))
+            },
+        )
     };
 
-    let started_at = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = join_pipe(&mut stdout_reader);
-                let stderr = join_pipe(&mut stderr_reader);
-                return Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                if started_at.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = join_pipe(&mut stdout_reader);
-                    let _ = join_pipe(&mut stderr_reader);
-                    return Err(format!(
-                        "{action} timed out after {} seconds.",
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(format!("Failed while waiting for {action}: {e}")),
+    // Exit notification wakes immediately for short probes. A timeout kills
+    // the entire process tree before joining either pipe reader.
+    let status = match child.wait_timeout(timeout) {
+        Ok(Some(status)) => Ok(status),
+        Ok(None) => {
+            let _ = child.control.kill();
+            let _ = child.wait();
+            Err(format!(
+                "{action} timed out after {} seconds.",
+                timeout.as_secs()
+            ))
         }
-    }
+        Err(error) => {
+            let _ = child.control.kill();
+            Err(format!("Failed while waiting for {action}: {error}"))
+        }
+    };
+    let stdout = join_pipe(&mut stdout_reader);
+    let stderr = join_pipe(&mut stderr_reader);
+    process::check_cancelled().map_err(|error| error.to_string())?;
+    Ok(Output {
+        status: status?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
 }
 
 fn canonical_destination_path(path: &Path) -> Result<PathBuf, String> {
@@ -1698,6 +1702,7 @@ fn base_ffmpeg_args(input: &str) -> Vec<String> {
         "-progress".to_string(),
         "pipe:1".to_string(),
         "-nostats".to_string(),
+        "-nostdin".to_string(),
     ]
 }
 
@@ -2100,10 +2105,21 @@ fn cached_runtime_value<T: Clone>(
 ) -> Result<T, String> {
     // A cold lookup owns the cache until its bounded probe finishes. Concurrent
     // callers reuse the result instead of launching duplicate subprocesses.
-    let mut entries = cache
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| "FFmpeg capability cache is unavailable.".to_string())?;
+    let cache = cache.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = loop {
+        process::check_cancelled().map_err(|error| error.to_string())?;
+        match cache.try_lock() {
+            Ok(entries) => break entries,
+            // Only complete values are inserted. A failed loader must not make
+            // the cache permanently unusable after a caught worker panic.
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // The cold loader is bounded, but an unrelated inspection must
+                // not make a canceled export wait for all of its probes.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
     if let Some(value) = entries.get(key) {
         return Ok(value.clone());
     }
@@ -5671,24 +5687,6 @@ fn emit_operation_finalization(window: &Window, attempt_id: u64, job_id: u64) {
     );
 }
 
-fn publish_child_with_cancel_latch<T>(
-    child_slot: &Mutex<Option<T>>,
-    child: T,
-    cancel: &AtomicBool,
-    cancel_child: impl FnOnce(&mut T),
-) -> Result<(), String> {
-    let mut guard = child_slot
-        .lock()
-        .map_err(|_| "Internal error (child lock poisoned).".to_string())?;
-    *guard = Some(child);
-    if cancel.load(Ordering::Relaxed)
-        && let Some(child) = guard.as_mut()
-    {
-        cancel_child(child);
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_with_progress(
     window: Option<&Window>,
@@ -5701,21 +5699,30 @@ fn run_ffmpeg_with_progress(
     duration_us: u64,
     user_finalization_is_terminal: bool,
     limits: FfmpegRunLimits,
-    cancel: &AtomicBool,
-    child_slot: &Arc<Mutex<Option<Child>>>,
+    cancel: &Arc<AtomicBool>,
+    child_slot: &Arc<Mutex<Option<ProcessControl>>>,
 ) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Canceled.".to_string());
     }
 
     let mut cmd = command_no_window(ffmpeg_bin);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args);
     if let Some(working_dir) = working_dir {
         cmd.current_dir(working_dir);
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+    let mut child = ManagedChild::spawn_for_job(
+        cmd,
+        JobContext {
+            cancel: cancel.clone(),
+            child: child_slot.clone(),
+        },
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            e.to_string()
+        } else if e.kind() == std::io::ErrorKind::NotFound {
             binary_not_found_message("ffmpeg", "VFL_FFMPEG_PATH", ffmpeg_bin)
         } else {
             format!("Failed to start ffmpeg ({ffmpeg_bin}): {e}")
@@ -5730,18 +5737,23 @@ fn run_ffmpeg_with_progress(
         .take()
         .ok_or_else(|| "Failed to capture ffmpeg error output.".to_string())?;
 
-    publish_child_with_cancel_latch(child_slot, child, cancel, |child| {
-        let _ = child.kill();
-    })?;
-
     let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_tail_thread = stderr_tail.clone();
     let stderr_thread = std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line_res in reader.lines() {
-            let Ok(line) = line_res else {
+        let mut reader = BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            if reader
+                .read_until(b'\n', &mut bytes)
+                .map_err(|error| format!("Failed reading ffmpeg error output: {error}"))?
+                == 0
+            {
                 break;
-            };
+            }
+            // Diagnostic metadata may contain non-UTF-8 bytes. It is still
+            // diagnostic text, while actual pipe failures must fail the run.
+            let line = String::from_utf8_lossy(&bytes);
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -5753,16 +5765,15 @@ fn run_ffmpeg_with_progress(
                 }
             }
         }
+        Ok::<(), String>(())
     });
 
-    let process_done = Arc::new(AtomicBool::new(false));
     let watchdog_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let watchdog_phase = Arc::new(AtomicU8::new(FfmpegWatchdogPhase::WaitingForInitial as u8));
     let last_media_advance_at = Arc::new(Mutex::new(Instant::now()));
     let finalization_started_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let process_started_at = Instant::now();
-    let watchdog_child_slot = child_slot.clone();
-    let watchdog_done = process_done.clone();
+    let watchdog_child = child.control.clone();
     let watchdog_error_thread = watchdog_error.clone();
     let watchdog_phase_thread = watchdog_phase.clone();
     let watchdog_last_media_advance = last_media_advance_at.clone();
@@ -5770,8 +5781,7 @@ fn run_ffmpeg_with_progress(
     let watchdog_thread = std::thread::spawn(move || {
         let mut output_fingerprint = None;
         let mut last_file_activity_at: Option<Instant> = None;
-        while !watchdog_done.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(50));
+        while !watchdog_child.wait_for_exit(Duration::from_millis(50)) {
             let now = Instant::now();
             let output_size_error = limits.output_size_limit.as_ref().and_then(
                 |(output_path, max_bytes)| {
@@ -5851,11 +5861,7 @@ fn run_ffmpeg_with_progress(
                 if let Ok(mut slot) = watchdog_error_thread.lock() {
                     *slot = Some(error);
                 }
-                if let Ok(mut guard) = watchdog_child_slot.lock()
-                    && let Some(child) = guard.as_mut()
-                {
-                    let _ = child.kill();
-                }
+                let _ = watchdog_child.kill();
                 break;
             }
         }
@@ -5880,11 +5886,7 @@ fn run_ffmpeg_with_progress(
 
     for line_res in reader.lines() {
         if cancel.load(Ordering::Relaxed) {
-            if let Ok(mut guard) = child_slot.lock()
-                && let Some(child) = guard.as_mut()
-            {
-                let _ = child.kill();
-            }
+            let _ = child.control.kill();
             break;
         }
 
@@ -5892,11 +5894,7 @@ fn run_ffmpeg_with_progress(
             Ok(line) => line,
             Err(e) => {
                 read_error = Some(format!("Failed reading ffmpeg output: {e}"));
-                if let Ok(mut guard) = child_slot.lock()
-                    && let Some(child) = guard.as_mut()
-                {
-                    let _ = child.kill();
-                }
+                let _ = child.control.kill();
                 break;
             }
         };
@@ -5998,21 +5996,11 @@ fn run_ffmpeg_with_progress(
         }
     }
 
-    let status = {
-        let mut guard = child_slot
-            .lock()
-            .map_err(|_| "Internal error (child lock poisoned).".to_string())?;
-        let mut child = guard
-            .take()
-            .ok_or_else(|| "ffmpeg child missing.".to_string())?;
-        child
-            .wait()
-            .map_err(|e| format!("Failed waiting for ffmpeg: {e}"))?
-    };
-
-    process_done.store(true, Ordering::Relaxed);
+    let status = child.wait();
     let _ = watchdog_thread.join();
-    let _ = stderr_thread.join();
+    let stderr_result = stderr_thread
+        .join()
+        .unwrap_or_else(|_| Err("FFmpeg error output reader stopped.".to_string()));
     let tail_snapshot = stderr_tail
         .lock()
         .ok()
@@ -6030,7 +6018,9 @@ fn run_ffmpeg_with_progress(
     if let Some(error) = read_error {
         return Err(error);
     }
+    stderr_result?;
 
+    let status = status.map_err(|e| format!("Failed waiting for ffmpeg: {e}"))?;
     if !status.success() {
         let start = tail_snapshot.len().saturating_sub(15);
         let tail_str = tail_snapshot[start..].join("\n");
@@ -6234,9 +6224,14 @@ pub fn run_encode_job(
     attempt_id: u64,
     job_id: u64,
     cancel: &Arc<AtomicBool>,
-    child_slot: &Arc<Mutex<Option<Child>>>,
+    child_slot: &Arc<Mutex<Option<ProcessControl>>>,
     mut request: EncodeRequest,
 ) -> Result<EncodeFinishedPayload, String> {
+    let _job_scope = JobScope::enter(JobContext {
+        cancel: cancel.clone(),
+        child: child_slot.clone(),
+    });
+    process::check_cancelled().map_err(|error| error.to_string())?;
     request.title = validate_title_metadata(request.title.as_deref())?;
     validate_base_request_scalars(&request)?;
     let input_path = PathBuf::from(request.input_path.trim());
@@ -6273,6 +6268,7 @@ pub fn run_encode_job(
     let probe = probe_video(input_path.to_string_lossy().to_string())?;
     let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
     let capability_contract = ffmpeg_capability_contract()?;
+    process::check_cancelled().map_err(|error| error.to_string())?;
     let prepared_subtitle = if let Some(subtitle_path) = request
         .subtitle_path
         .as_deref()
@@ -6390,7 +6386,7 @@ pub fn run_encode_job(
             duration_us,
             true,
             ffmpeg_run_limits(request.reverse).with_output_activity(&temp_path),
-            cancel.as_ref(),
+            cancel,
             child_slot,
         )?;
 
@@ -6523,7 +6519,7 @@ pub fn run_encode_job(
                 duration_us,
                 false,
                 size_copy_run_limits(target_bytes, temp_path.as_ref()),
-                cancel.as_ref(),
+                cancel,
                 child_slot,
             ) {
                 Ok(()) => {
@@ -6725,7 +6721,7 @@ pub fn run_encode_job(
                 duration_us,
                 !initial_contains_copy || execution_attempts >= 2,
                 ffmpeg_run_limits(request.reverse).with_output_activity(&temp_path),
-                cancel.as_ref(),
+                cancel,
                 child_slot,
             ) {
                 Ok(()) => {
@@ -6936,7 +6932,7 @@ pub fn run_encode_job(
             duration_us,
             false,
             ffmpeg_run_limits(active_request.reverse),
-            cancel.as_ref(),
+            cancel,
             child_slot,
         ) {
             return Err(map_mpeg4_size_limit_error(
@@ -7056,7 +7052,7 @@ pub fn run_encode_job(
             duration_us,
             false,
             ffmpeg_run_limits(active_request.reverse).with_output_activity(&temp_output),
-            cancel.as_ref(),
+            cancel,
             child_slot,
         ) {
             return Err(map_mpeg4_size_limit_error(
@@ -7737,6 +7733,39 @@ mod tests {
             output_path_identity("/videos/Clip-2.mp4"),
             output_path_identity("/videos/clip-2.mp4")
         );
+    }
+
+    #[test]
+    fn canceled_preflight_does_not_wait_for_an_unrelated_cache_load() {
+        let cache = Arc::new(OnceLock::new());
+        let guard = cache
+            .get_or_init(|| Mutex::new(HashMap::<String, usize>::new()))
+            .lock()
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(Mutex::new(None));
+        let worker_cache = cache.clone();
+        let worker_cancel = cancel.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _scope = process::JobScope::enter(process::JobContext {
+                cancel: worker_cancel,
+                child,
+            });
+            started_tx.send(()).unwrap();
+            let result = cached_runtime_value(&worker_cache, "runtime", || {
+                panic!("canceled work must not load")
+            });
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        cancel.store(true, Ordering::Relaxed);
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Err("Canceled.".to_string()));
     }
 
     #[test]
@@ -10452,7 +10481,7 @@ IO... xv36le                  3             36      12-12-12\n",
     ) -> Result<(), String> {
         let mut args = vec!["-c".to_string(), script.to_string()];
         args.extend(extra_args.iter().cloned());
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let child_slot = Arc::new(Mutex::new(None));
         run_ffmpeg_with_progress(
             None,
@@ -10468,6 +10497,193 @@ IO... xv36le                  3             36      12-12-12\n",
             &cancel,
             &child_slot,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ffmpeg_stdout_eof_does_not_block_watchdog_termination() {
+        let started = Instant::now();
+        let limits = FfmpegRunLimits {
+            initial_progress_timeout: Duration::from_millis(80),
+            idle_timeout: Duration::from_millis(80),
+            finalization_timeout: Duration::from_millis(180),
+            output_size_limit: None,
+            output_activity_path: None,
+        };
+        let error = run_fake_ffmpeg("exec 1>&-; exec sleep 5", &[], limits).unwrap_err();
+        assert!(error.contains("no initial progress"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ffmpeg_non_utf8_diagnostics_remain_diagnostics() {
+        for exit_code in [0, 1] {
+            let limits = FfmpegRunLimits {
+                initial_progress_timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(5),
+                finalization_timeout: Duration::from_secs(5),
+                output_size_limit: None,
+                output_activity_path: None,
+            };
+            let result = run_fake_ffmpeg(
+                &format!(
+                    "printf 'metadata=\\377\\n' >&2; printf 'progress=end\\n'; exit {exit_code}"
+                ),
+                &[],
+                limits,
+            );
+            if exit_code == 0 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("ffmpeg failed (exit 1)"), "{error}");
+                assert!(error.contains("metadata=\u{fffd}"), "{error}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_deadline_kills_descendants_and_joins_pipe_readers() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5 & wait"]);
+        let started = Instant::now();
+        let error = run_command_output_with_timeout(
+            command,
+            "sh",
+            "VFL_FFMPEG_PATH",
+            "sh",
+            "test probe",
+            Duration::from_millis(80),
+        )
+        .unwrap_err();
+        assert!(error.contains("test probe timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_rejects_escaped_pipe_writers_after_exit_and_timeout() {
+        for stream in ["stdout", "stderr"] {
+            for wait in [false, true] {
+                let (_fixture, command) = process::tests::EscapedFixture::new(stream, wait);
+                let started = Instant::now();
+                let error = run_command_output_with_timeout(
+                    command,
+                    "fixture",
+                    "UNUSED",
+                    "fixture",
+                    "test probe",
+                    Duration::from_millis(300),
+                )
+                .unwrap_err();
+                if wait {
+                    assert!(error.contains("test probe timed out"), "{error}");
+                } else {
+                    assert!(error.contains("pipe remained open"), "{error}");
+                }
+                assert!(started.elapsed() < Duration::from_secs(2));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encode_rejects_escaped_stdout_and_stderr_writers() {
+        for stream in ["stdout", "stderr"] {
+            let (_fixture, command) = process::tests::EscapedFixture::new(stream, false);
+            // Set fixture environment only in this child, without modifying the
+            // test runner's process-wide environment during parallel tests.
+            let mut args: Vec<String> = command
+                .get_envs()
+                .map(|(name, value)| {
+                    format!(
+                        "{}={}",
+                        name.to_str().unwrap(),
+                        value.unwrap().to_str().unwrap()
+                    )
+                })
+                .collect();
+            args.push(command.get_program().to_str().unwrap().to_string());
+            args.extend(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap().to_string()),
+            );
+            let started = Instant::now();
+            let error = run_ffmpeg_with_progress(
+                None,
+                91,
+                17,
+                "env",
+                &args,
+                None,
+                EncodeProgressStep::single(EncodeProgressPhase::Encoding),
+                60_000_000,
+                false,
+                FfmpegRunLimits {
+                    initial_progress_timeout: Duration::from_secs(5),
+                    idle_timeout: Duration::from_secs(5),
+                    finalization_timeout: Duration::from_secs(5),
+                    output_size_limit: None,
+                    output_activity_path: None,
+                },
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(Mutex::new(None)),
+            )
+            .unwrap_err();
+            assert!(error.contains("pipe remained open"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encode_preflight_probe_is_cancelled_and_unregisters_its_child() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(Mutex::new(None));
+        let context = JobContext {
+            cancel: cancel.clone(),
+            child: child.clone(),
+        };
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                let _scope = JobScope::enter(context);
+                let mut command = Command::new("sh");
+                command.args(["-c", "sleep 5 & wait"]);
+                run_command_output_with_timeout(
+                    command,
+                    "sh",
+                    "VFL_FFPROBE_PATH",
+                    "sh",
+                    "ffprobe",
+                    Duration::from_secs(30),
+                )
+            });
+            let control = loop {
+                if let Some(control) = child.lock().unwrap().as_ref().cloned() {
+                    break control;
+                }
+                assert!(started.elapsed() < Duration::from_secs(2));
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            cancel.store(true, Ordering::Relaxed);
+            control.kill().unwrap();
+            assert_eq!(worker.join().unwrap().unwrap_err(), "Canceled.");
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(child.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn encode_commands_disable_ffmpeg_interactive_input() {
+        assert!(
+            base_ffmpeg_args("input.mp4")
+                .iter()
+                .any(|arg| arg == "-nostdin")
+        );
     }
 
     #[cfg(unix)]
@@ -10634,26 +10850,6 @@ IO... xv36le                  3             36      12-12-12\n",
         for pair in events.windows(2) {
             assert!(pair[1].overall_pct >= pair[0].overall_pct);
         }
-    }
-
-    #[test]
-    fn child_publication_honors_a_cancel_latched_before_the_slot_is_filled() {
-        #[derive(Debug)]
-        struct FakeChild {
-            killed: bool,
-        }
-
-        let child_slot = Mutex::new(None);
-        let cancel = AtomicBool::new(true);
-        publish_child_with_cancel_latch(
-            &child_slot,
-            FakeChild { killed: false },
-            &cancel,
-            |child| child.killed = true,
-        )
-        .unwrap();
-
-        assert!(child_slot.lock().unwrap().as_ref().unwrap().killed);
     }
 
     #[test]

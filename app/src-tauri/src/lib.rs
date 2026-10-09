@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -8,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State, Window};
 
 mod command_dispatch;
+mod process;
 pub mod updater;
 mod video;
 
@@ -17,7 +17,7 @@ struct JobHandle {
     job_id: u64,
     attempt_id: u64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<process::ProcessControl>>>,
 }
 
 struct JobManager {
@@ -827,6 +827,7 @@ pub fn run() {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 let manager: State<'_, JobManager> = window.app_handle().state();
                 manager.kill_active_job();
+                process::shutdown_all();
             }
         })
         .invoke_handler(tauri::generate_handler![
