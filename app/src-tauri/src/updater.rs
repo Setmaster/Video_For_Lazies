@@ -6892,10 +6892,13 @@ mod tests {
                 bytes[local + 22..local + 26].copy_from_slice(&declared.to_le_bytes());
                 bytes[central + 24..central + 28].copy_from_slice(&declared.to_le_bytes());
                 fs::write(&archive, bytes).unwrap();
+                let error = extract_update_zip(&archive, &output).unwrap_err();
+                // The ZIP reader may reject the size mismatch before our own
+                // bounded-copy check. Both must reject and keep output bounded.
                 assert!(
-                    extract_update_zip(&archive, &output)
-                        .unwrap_err()
-                        .contains("declared length")
+                    error.contains("declared length")
+                        || error.contains("declared uncompressed size"),
+                    "{method:?}/{declared}: {error}"
                 );
                 assert!(
                     fs::metadata(output.join("Video_For_Lazies/file.bin"))
