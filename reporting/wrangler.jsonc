@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vfl-bug-reports",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-16",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "vfl-bugs.7dev.io", "custom_domain": true }],
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "vars": { "REPORTING_ENABLED": "true" },
+  "observability": { "enabled": false },
+  "triggers": { "crons": ["17 3 * * *"] },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "vfl-bug-reports",
+    "database_id": "3720e751-af85-4c5d-a5bd-8927036471f3",
+    "migrations_dir": "migrations"
+  }]
+}

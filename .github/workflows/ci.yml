@@ -13,6 +13,42 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  reporting:
+    name: Test bug reporting service
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: reporting
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: reporting/package-lock.json
+
+      - name: Install reporting dependencies
+        run: npm ci
+
+      - name: Audit reporting dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Test reporting service
+        run: npm test
+
+      - name: Verify Worker and D1 runtime
+        run: npm run test:runtime
+
+      - name: Check reporting JavaScript
+        run: npm run check
+
+      - name: Build Worker without deploying
+        run: npm run build
+
   workflow-lint:
     name: Lint workflows
     runs-on: ubuntu-latest

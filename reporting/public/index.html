@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Report a bug · Video For Lazies</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/form.js" type="module"></script>
+</head>
+<body>
+<main>
+  <p class="eyebrow">VIDEO FOR LAZIES</p>
+  <h1>Report a bug</h1>
+  <p>No GitHub account needed. Describe what happened, review your report, then publish it as a public GitHub issue.</p>
+  <aside aria-label="Privacy notice">
+    <strong>Your report will be public.</strong>
+    <p>Remove names, email addresses, local paths, filenames, secrets, and private media details. Nothing is collected from the app automatically except its version and operating system when supplied in the link. There are no file uploads.</p>
+    <p>Security problem? <a href="https://github.com/Setmaster/Video_For_Lazies/security/advisories/new">Use private vulnerability reporting</a> instead.</p>
+  </aside>
+  <noscript><p>JavaScript is needed to submit this form. You can also <a href="https://github.com/Setmaster/Video_For_Lazies/issues/new">open an issue on GitHub</a>.</p></noscript>
+  <form id="report-form">
+    <p class="hint">All fields are required except diagnostics. Your draft stays in this tab on errors. Copy or save it before closing or reloading the page.</p>
+    <label for="title">Short title</label>
+    <input id="title" name="title" maxlength="160" required placeholder="What went wrong?">
+    <div class="row">
+      <div><label for="version">App version</label><input id="version" name="version" maxlength="80" pattern="[a-zA-Z0-9.+_\-]+" required placeholder="2.2.1 or unknown"></div>
+      <div><label for="platform">Operating system</label><select id="platform" name="platform" required><option value="">Select one</option><option>Windows</option><option>Linux</option><option>macOS</option><option>Other</option></select></div>
+    </div>
+    <label for="steps">Steps to reproduce</label>
+    <textarea id="steps" name="steps" maxlength="4000" rows="5" required placeholder="1. Open the app&#10;2. ..."></textarea>
+    <label for="expected">Expected result</label>
+    <textarea id="expected" name="expected" maxlength="2000" rows="3" required></textarea>
+    <label for="actual">Actual result</label>
+    <textarea id="actual" name="actual" maxlength="4000" rows="4" required></textarea>
+    <label for="diagnostics">Diagnostics <span class="hint">(optional, text only)</span></label>
+    <p id="diagnostic-help" class="hint">Paste only the details needed to explain the bug. Review and remove private information yourself. Diagnostics are not automatically redacted.</p>
+    <textarea id="diagnostics" name="diagnostics" maxlength="8000" rows="4" aria-describedby="diagnostic-help"></textarea>
+    <div class="trap" aria-hidden="true"><label for="website">Leave this field empty</label><input id="website" name="website" tabindex="-1" autocomplete="off"></div>
+    <label class="consent"><input id="consent" name="consent" type="checkbox" required><span>I reviewed this report, removed private information, and agree to publish all these fields publicly on GitHub.</span></label>
+    <div class="actions"><button id="submit" type="submit">Publish public report</button><button id="copy" type="button" class="secondary">Copy report</button><button id="save" type="button" class="secondary">Save report</button></div>
+    <button id="refresh" type="button" class="secondary" hidden>Refresh form session</button>
+  </form>
+  <div id="status" role="status" aria-live="polite" tabindex="-1"></div>
+  <p id="local-status" role="status" aria-live="polite"></p>
+  <p class="hint">The service uses your IP address transiently to limit abuse, storing a keyed value rather than the address. Report references and keyed metadata are retained for up to 8 days; report text is sent to GitHub and is not stored in the relay database. Cloudflare and GitHub process requests under their own privacy policies.</p>
+  <footer><a href="https://github.com/Setmaster/Video_For_Lazies/issues">Browse existing reports</a> · <a href="https://github.com/Setmaster/Video_For_Lazies">Project on GitHub</a></footer>
+</main>
+</body>
+</html>

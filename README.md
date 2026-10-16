@@ -91,6 +91,12 @@ Expand-Archive .\Video_For_Lazies-vX.Y.Z-win-x64.zip -DestinationPath .
 .\Video_For_Lazies\Video_For_Lazies.exe
 ```
 
+## Report a Bug
+
+[Submit a bug report](https://vfl-bugs.7dev.io/) without a GitHub account. Reports become public GitHub issues, so remove private information before submitting. You can copy or save your draft if submission fails.
+
+For security vulnerabilities, use [private vulnerability reporting](https://github.com/Setmaster/Video_For_Lazies/security/advisories/new). Service setup and maintenance are documented in [docs/reporting.md](docs/reporting.md).
+
 ## Usage Notes
 
 - Size targets use decimal MB: `1 MB = 1,000,000 bytes`.

@@ -65,6 +65,7 @@ import { DEFAULT_OUTPUT_FORMAT, DEFAULT_SIZE_LIMIT_MB } from "./lib/defaults";
 import { basename, dirname, ensureUniqueOutputPath, extname, formatPathForDisplay, replaceExtension, stem, suggestOutputPath, suggestOutputPaths } from "./lib/outputPath";
 import { createEncodeProgressState, getActiveProgressUi, reduceEncodeProgress } from "./lib/progress";
 import { formatClock } from "./lib/timeFormat";
+import { buildBugReportUrl } from "./lib/bugReport";
 import {
   acceptsEncodeEvent,
   beginEncodeAttempt,
@@ -7246,6 +7247,13 @@ function App() {
               </div>
             </div>
             <div className="vfl-about-links" aria-label="Project links">
+              <button
+                type="button"
+                title="Opens an anonymous form in your browser with only the app version and platform prefilled."
+                onClick={() => void openExternalUrl(buildBugReportUrl(APP_VERSION, navigator.platform))}
+              >
+                Report a bug
+              </button>
               <button type="button" onClick={() => void openExternalUrl(APP_LINKS.github)}>
                 GitHub
               </button>

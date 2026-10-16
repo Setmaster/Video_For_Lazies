@@ -1,0 +1,28 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; color: #e8eef5; background: #101923; line-height: 1.55; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 760px; margin: 0 auto; padding: 36px 24px 48px; }
+h1 { font-size: clamp(2rem, 6vw, 2.75rem); line-height: 1.15; margin: 0 0 20px; }
+.eyebrow { color: #7ae3ce; font-weight: 700; font-size: .8rem; letter-spacing: .14em; }
+a { color: #7ae3ce; text-underline-offset: 3px; }
+aside { background: #1d2c3b; border-left: 4px solid #7ae3ce; border-radius: 4px; padding: 16px 20px; margin: 24px 0; }
+aside p:last-child { margin-bottom: 0; }
+.hint { color: #bac7d6; font-size: .9rem; }
+label { display: block; font-weight: 650; margin-top: 22px; margin-bottom: 6px; }
+input, select, textarea, button { font: inherit; }
+input:not([type=checkbox]), select, textarea { width: 100%; padding: 10px 12px; background: #172331; color: inherit; border: 1px solid #8191a2; border-radius: 6px; }
+textarea { resize: vertical; min-height: 90px; }
+input::placeholder, textarea::placeholder { color: #abb9ca; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.consent { display: flex; gap: 12px; font-weight: 400; align-items: flex-start; }
+.consent input { flex: 0 0 auto; width: 20px; height: 20px; margin: 3px 0 0; accent-color: #7ae3ce; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 26px 0 16px; }
+button { border: 1px solid transparent; border-radius: 6px; background: #7ae3ce; color: #10201e; padding: 11px 16px; font-weight: 650; cursor: pointer; min-height: 44px; }
+button.secondary { background: #213244; border-color: #8191a2; color: #e8eef5; }
+button:disabled { opacity: .65; cursor: wait; }
+:focus-visible { outline: 3px solid #ffda7a; outline-offset: 3px; }
+#status:not(:empty) { border: 1px solid #8191a2; border-radius: 6px; padding: 16px; margin: 24px 0; overflow-wrap: anywhere; }
+footer { margin-top: 28px; font-size: .9rem; }
+.trap { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
+[hidden] { display: none !important; }
+@media (max-width: 480px) { main { padding: 24px 16px 36px; } .row { grid-template-columns: 1fr; gap: 0; } .actions button { flex: 1 1 auto; } }
