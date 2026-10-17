@@ -113,7 +113,11 @@ export function ModalDialog({
     const dialog = dialogRef.current;
     if (!dialog) return;
     const active = document.activeElement;
-    if (active instanceof Node && dialog.contains(active)) return;
+    if (
+      active instanceof Node &&
+      dialog.contains(active) &&
+      !(active instanceof HTMLElement && active.matches(":disabled"))
+    ) return;
 
     const target = initialFocus === "first" ? focusableElements(dialog)[0] ?? dialog : dialog;
     target.focus({ preventScroll: true });

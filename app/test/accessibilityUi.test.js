@@ -120,7 +120,8 @@ test("crop, trim, modal, and live-status accessibility contracts are wired", asy
   assert.match(modal, /root\.inert = true;/);
   assert.match(modal, /root\.setAttribute\("aria-hidden", "true"\);/);
   assert.match(modal, /document\.addEventListener\("focusin", handleFocusIn, true\);/);
-  assert.match(modal, /if \(active instanceof Node && dialog\.contains\(active\)\) return;/);
+  assert.match(modal, /dialog\.contains\(active\) &&/);
+  assert.match(modal, /!\(active instanceof HTMLElement && active\.matches\(":disabled"\)\)/);
   assert.match(modal, /requestCloseRef\.current\?\.\(\);/);
   assert.match(modal, /returnFocus\?\.isConnected/);
   assert.match(app, /role="alertdialog"/);
