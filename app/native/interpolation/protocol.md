@@ -1,0 +1,12 @@
+# RIFE worker protocol 1
+
+The executable is `vfl-rife` on Linux and `vfl-rife.exe` on Windows. Windows execution uses an embedded `asInvoker` manifest. Logs and fixed failure codes go to stderr; stdout contains only the selected machine interface. Failure exit code is 2.
+
+- `--capabilities`: emit `{ "protocol": 1, "devices": [{ "id": 0, "name": "..." }], "cpu": true }`. This list contains eligible hardware Vulkan devices. CPU/software Vulkan implementations are excluded. IDs retain their native ncnn enumeration values.
+- `--self-test --model DIR --gpu auto|-1|ID`: load once, run actual synthetic inference at alpha 0.25 and 0.75 with odd dimensions, verify finite/nontrivial differing output, emit `{ "protocol": 1, "ok": true, "deviceName": "..." }`.
+- `--available-space PATH`: query the filesystem containing the existing path and emit `{ "availableBytes": 123 }`. This mode does not initialize Vulkan or load a model.
+- `--stream --model DIR --width W --height H --gpu auto|-1|ID`: load once, then accept repeated records of little-endian IEEE float32 alpha followed by `W*H*3` left-frame RGB bytes and `W*H*3` right-frame RGB bytes. Emit one `W*H*3` RGB frame and flush it for every complete record. There is no header, length prefix or text in the binary stream.
+
+`auto` selects ncnn's default eligible hardware Vulkan device, or another eligible hardware device if needed. It fails with `vulkan-hardware-unavailable` if only CPU/software Vulkan is present. `-1` explicitly uses CPU; an explicit numeric ID may select software Vulkan for developer qualification. A bad device, model or inference operation fails without silently switching backends. Alpha is finite in the closed interval [0,1]; endpoints return their source bytes exactly. Width/height are positive integers up to 8192 with total area at most 3840*2160; portrait video is allowed. Memory and GPU limits may be stricter than the protocol maximum. The caller must perform its resource and compatibility admission checks.
+
+EOF before the next alpha is a clean exit. EOF inside alpha or either frame is `truncated-record`. NaN/infinite/out-of-range alpha, malformed dimensions, unknown/duplicate arguments, missing files, output failures and unexpected model shape fail with a fixed diagnostic. The caller owns process lifetime, input backpressure, wall-clock timeouts, stderr draining and cancellation. Hard terminate and join the worker to cancel in-flight inference. The caller owns timestamps, cuts, geometry, color conversion, source/output endpoint policy and atomic final publication.

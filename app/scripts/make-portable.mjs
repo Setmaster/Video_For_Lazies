@@ -9,6 +9,7 @@ import {
   listPortableCompanionDirs,
   listPortableCompanionFiles,
 } from "./ffmpegBundle.mjs";
+import { getInterpolationSidecarDir } from "./interpolationBundle.mjs";
 import { generatePortableDocs } from "./generate-portable-docs.mjs";
 import { copyPortableArtifacts } from "./portableArtifacts.mjs";
 import { getProjectVersion } from "./versioning.mjs";
@@ -47,7 +48,14 @@ async function main() {
   await copyPortableArtifacts({
     builtBinaryPath,
     outPath,
-    companionDirs: listPortableCompanionDirs(),
+    companionDirs: [
+      ...listPortableCompanionDirs(),
+      {
+        name: "interpolation-sidecar",
+        sourcePath: getInterpolationSidecarDir(),
+        outputPath: path.resolve(outDir, "interpolation-sidecar"),
+      },
+    ],
     companionFiles: [
       ...listPortableCompanionFiles(generatedDocs),
       {

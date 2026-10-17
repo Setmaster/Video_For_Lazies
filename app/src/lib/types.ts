@@ -97,6 +97,30 @@ export interface ResizeSettings {
   heightPx?: number | null;
 }
 
+export type InterpolationModelId = "rife-v4.25" | "rife-v4.26";
+export interface InterpolationSettings {
+  targetFps: 60 | 120;
+  modelId: InterpolationModelId;
+}
+export interface InterpolationStatus {
+  state: "missing" | "ready" | "unavailable" | "failed";
+  modelId: InterpolationModelId;
+  message: string;
+  downloadBytes: number;
+  installedBytes: number;
+  deviceName?: string | null;
+  bundled: boolean;
+}
+export type InterpolationOperationId = string | number;
+export interface InterpolationInstallProgress {
+  operationId: InterpolationOperationId;
+  modelId: InterpolationModelId;
+  state: "downloading" | "verifying" | "testing" | "ready" | "canceled" | "failed";
+  completedBytes: number;
+  totalBytes: number;
+  message: string;
+}
+
 export interface EncodeRequest {
   inputPath: string;
   outputPath: string;
@@ -108,6 +132,7 @@ export interface EncodeRequest {
   stripMetadata: boolean;
   colorPolicy: ColorPolicy;
   advanced?: AdvancedEncodeSettings | null;
+  interpolation?: InterpolationSettings | null;
 
   trim?: Trim | null;
   crop?: Crop | null;
@@ -165,7 +190,7 @@ export interface EncodeFeatureCapability {
 export interface EncodeProgressPayload {
   attemptId: number;
   jobId: number;
-  phase: "copying" | "encoding" | "finalizing";
+  phase: "preparing" | "interpolating" | "copying" | "encoding" | "finalizing";
   stepIndex: number;
   stepCount: number;
   pass: number;
@@ -246,6 +271,7 @@ export interface ExportDiagnostics {
 }
 
 export interface AppSmokeConfig {
+  interpolation?: InterpolationSettings | null;
   inputPath: string;
   outputPath: string;
   statusPath: string;

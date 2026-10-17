@@ -20,3 +20,5 @@ For reproducible release checks, use:
 cd app
 npm run release:portable
 ```
+
+Native AI interpolation source, pinned dependency archives, complete notices and build/model provenance are included under `interpolation-sidecar/source/`, `interpolation-sidecar/licenses/` and `interpolation-sidecar/bundle-provenance.json`. The worker sources/build instructions are in [app/native/interpolation](app/native/interpolation/README.md); converted model origins and hashes are in [app/interpolation-models.json](app/interpolation-models.json). Model conversion is not independently reproduced by the build.

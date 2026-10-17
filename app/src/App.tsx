@@ -6,6 +6,8 @@ import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { confirm as confirmDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { SmoothMotionControl } from "./components/SmoothMotionControl";
+import { normalizeInterpolation, interpolationConflict } from "./lib/interpolation";
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
@@ -29,6 +31,8 @@ import type {
   EncodeRequest,
   ExportDiagnostics,
   OutputFormat,
+  InterpolationSettings,
+  InterpolationStatus,
   ResizeMode,
   StreamAction,
   SubtitleInspection,
@@ -78,7 +82,7 @@ import {
   type EncodeAttemptState,
 } from "./lib/encodeAttempt";
 import { installEncodeEventListeners } from "./lib/encodeEvents";
-import { createUpdateProgressState, getUpdateProgressUi, reduceUpdateProgress } from "./lib/updateState";
+import { createUpdateProgressState, finalizeStartupOnce, getUpdateProgressUi, reduceUpdateProgress } from "./lib/updateState";
 import { parsePersistedSettings, serializePersistedSettings } from "./lib/settings";
 import {
   EXPORT_RECIPES,
@@ -689,6 +693,16 @@ function App() {
   const [normalizeAudio, setNormalizeAudio] = useState(false);
   const [perturbFirstFrame, setPerturbFirstFrame] = useState(false);
   const [colorPolicy, setColorPolicy] = useState<ColorPolicy>("auto");
+  const [interpolation, setInterpolation] = useState<InterpolationSettings | null>(null);
+  const [interpolationStatus, setInterpolationStatus] = useState<InterpolationStatus | null>(null);
+  const [interpolationInstalling, setInterpolationInstalling] = useState(false);
+  const interpolationInstallingRef = useRef(false);
+
+  function handleInterpolationBusy(busy: boolean) {
+    interpolationInstallingRef.current = busy;
+    setInterpolationInstalling(busy);
+  }
+
   const [advancedColorRange, setAdvancedColorRange] = useState<ColorRangePreference>("auto");
   const [advancedVideoCodec, setAdvancedVideoCodec] = useState<VideoCodecPreference>("auto");
   const [advancedAudioBitrateKbps, setAdvancedAudioBitrateKbps] = useState("auto");
@@ -752,6 +766,8 @@ function App() {
     isFading: boolean;
   } | null>(null);
   const [resetConfirmationOpen, setResetConfirmationOpen] = useState(false);
+  const [updateStartupReady, setUpdateStartupReady] = useState(() => !hasTauriRuntime());
+  const updateStartupFinalizationRef = useRef<Promise<UpdateStartupResponse> | null>(null);
   const [updateNotice, setUpdateNotice] = useState<UpdateCheckResponse | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
@@ -1089,9 +1105,10 @@ function App() {
 
     void (async () => {
       try {
-        const startup = await invoke<UpdateStartupResponse>("finalize_update_startup", {
+        const startup = await finalizeStartupOnce(updateStartupFinalizationRef, () => invoke<UpdateStartupResponse>("finalize_update_startup", {
           onEvent: createUpdateProgressChannel(),
-        });
+        }));
+        if (stop) return;
         if (startup.status === "recoveryRequired") {
           if (!stop) setUpdateStartupNotice({ kind: "error", message: startup.message });
           return;
@@ -1122,9 +1139,11 @@ function App() {
           }
           return;
         }
-      } catch (error) {
-        console.warn("Failed to check elevated update state:", error);
+      } catch {
+        if (!stop) setUpdateStartupNotice({ kind: "error", message: "The app could not finish checking its update state. Restart before exporting or setting up Smooth motion." });
+        return;
       }
+      if (!stop) setUpdateStartupReady(true);
 
       try {
         const result = await invoke<UpdateCheckResponse>("check_for_update", {
@@ -1227,7 +1246,8 @@ function App() {
           const encoding = jobIdRef.current !== null || pendingEncodeRef.current !== null;
           const preparing = queuePreparationCountRef.current > 0;
           const updating = updateBusyRef.current;
-          if (!encoding && queuedCount === 0 && !preparing && !updating) return;
+          const installing = interpolationInstallingRef.current;
+          if (!encoding && queuedCount === 0 && !preparing && !updating && !installing) return;
 
           const unfinished = [
             encoding ? "an export is still running" : null,
@@ -1236,6 +1256,7 @@ function App() {
               : null,
             preparing ? "selected queue files are still being prepared" : null,
             updating ? "an update is still being prepared" : null,
+            installing ? "Smooth motion is still being checked or installed" : null,
           ].filter((part): part is string => Boolean(part));
           const summary = `${unfinished.join(", and ")}.`;
           const ok = await confirmDialog(`${summary} Close anyway?`, {
@@ -1287,6 +1308,7 @@ function App() {
     try {
       const parsed = parsePersistedSettings(localStorage.getItem(SETTINGS_KEY));
       if (parsed.format) setFormat(parsed.format);
+      setInterpolation(parsed.interpolation ?? null);
       if (parsed.normalizeAudio) setNormalizeAudio(true);
       if (parsed.stripMetadata === false) setStripMetadata(false);
       if (parsed.advanced?.videoCodec) setAdvancedVideoCodec(parsed.advanced.videoCodec);
@@ -1320,6 +1342,7 @@ function App() {
           format,
           normalizeAudio,
           stripMetadata,
+          interpolation,
           advanced: {
             videoCodec: advancedVideoCodec,
             audioBitrateKbps: advancedAudioBitrateKbps === "auto" ? null : Number(advancedAudioBitrateKbps),
@@ -1336,6 +1359,7 @@ function App() {
     }
   }, [
     settingsReady,
+    interpolation,
     format,
     normalizeAudio,
     stripMetadata,
@@ -1418,7 +1442,8 @@ function App() {
       pendingEncodeRef.current !== null ||
       exportQueueStateRef.current.autoRun ||
       queueSnapshotApplyingRef.current ||
-      updateBusyRef.current
+      updateBusyRef.current ||
+      interpolationInstallingRef.current
     ) return;
     supersedeQueueSnapshotApply();
     setOutputAuto(true);
@@ -1439,7 +1464,8 @@ function App() {
       pendingEncodeRef.current !== null ||
       exportQueueStateRef.current.autoRun ||
       queueSnapshotApplyingRef.current ||
-      updateBusyRef.current
+      updateBusyRef.current ||
+      interpolationInstallingRef.current
     ) {
       setResetConfirmationOpen(false);
       return;
@@ -1465,6 +1491,7 @@ function App() {
     setStripMetadata(true);
     setSampleDurationS(10);
     setSampleEstimate(null);
+    setInterpolation(null);
     autoMutedRef.current = false;
     setAdvancedVideoCodec("auto");
     setAdvancedAudioBitrateKbps("auto");
@@ -1505,6 +1532,7 @@ function App() {
     const recipeWantsAudio = recipeSettings.format === "mp3" || recipeSettings.audioEnabled;
     const sourceHasAudio = probe ? probe.hasAudio : true;
 
+    setInterpolation(normalizeInterpolation(recipeSettings.interpolation));
     setFormat(recipeSettings.format);
     setSizeLimitMb(recipeSettings.sizeLimitMb);
     setResizeMode(recipeResize.mode);
@@ -1806,6 +1834,7 @@ function App() {
     setAdvancedFrameRateCapFps("auto");
     setAdvancedAudioChannels("auto");
     setAdvancedColorRange(smokeConfig.colorRange ?? "auto");
+    setInterpolation(normalizeInterpolation(smokeConfig.interpolation));
     setTrimStart(formatNumberInput(smokeConfig.trimStartS));
     setTrimEnd(smokeConfig.trimEndS === null || smokeConfig.trimEndS === undefined ? "" : formatNumberInput(smokeConfig.trimEndS));
     setTrimDragSnapS("0");
@@ -1952,6 +1981,7 @@ function App() {
       (probe.frameRate === null || probe.frameRate === undefined ||
         probe.frameRate * speedNum > planningFrameRateCap + 0.01);
     const videoEncodeAlreadyDefinite =
+      interpolation !== null ||
       !sourceVideoCopyCompatibleForPlanning ||
       trimRequestIsActive({ startS: startRaw, endS: endRaw, durationS: probe.durationS }) ||
       planningCropIsActive ||
@@ -2006,6 +2036,7 @@ function App() {
     format,
     loopVideo,
     squarePixelVideoDimensions,
+    interpolation,
     shapedVideoDimensions,
     resizeMode,
     maxEdgePx,
@@ -2132,6 +2163,14 @@ function App() {
     advancedFrameRateCapValue !== null &&
     FRAME_RATE_CAP_PRESETS_FPS.includes(advancedFrameRateCapValue as (typeof FRAME_RATE_CAP_PRESETS_FPS)[number]);
   const advancedFrameRateCapRequest = advancedFrameRateCapValid ? advancedFrameRateCapValue : null;
+  const interpolationConflictReason = interpolationConflict(interpolation, format, advancedFrameRateCapRequest);
+  const interpolationBlockingReason = interpolationInstalling
+    ? "Wait for Smooth motion setup to finish, or cancel an active installation."
+    : interpolationConflictReason ?? (interpolation
+      ? interpolationStatus?.modelId === interpolation.modelId && interpolationStatus.state === "ready"
+        ? null
+        : "Check or install the selected Smooth motion model before exporting."
+      : null);
   const advancedAudioApplies = !sizeLimitEnabled && advancedAudioBitrateRequest !== null;
   const sourceFrameRate = probe?.frameRate ?? null;
   const frameRatePlan = effectiveFrameRatePlan({
@@ -2250,6 +2289,7 @@ function App() {
   );
   const externalSubtitleActive = Boolean(subtitlePath);
   const hasVideoEditTransforms =
+    (format !== "mp3" && interpolation !== null) ||
     trimForcesReencode ||
     cropFilterPlanned ||
     reverse ||
@@ -2277,6 +2317,7 @@ function App() {
   const currentRecipeSettings = useMemo(
     () => ({
       format,
+      interpolation,
       sizeLimitMb,
       resize: {
         mode: resizeMode,
@@ -2301,6 +2342,7 @@ function App() {
     }),
     [
       format,
+      interpolation,
       sizeLimitMb,
       resizeMode,
       maxEdgePx,
@@ -2704,6 +2746,7 @@ function App() {
     }
     return estimateTransformMemory({
       probe,
+      interpolationTargetFps: format !== "mp3" ? interpolation?.targetFps : null,
       reverse,
       loopVideo: format !== "mp3" && loopVideo,
       trimStartS: trimTimeline?.start ?? 0,
@@ -2722,6 +2765,7 @@ function App() {
       videoEnabled: format !== "mp3",
     });
   }, [
+    interpolation,
     probe,
     plannedEncodeSummary,
     reverse,
@@ -2764,6 +2808,7 @@ function App() {
     }
     return estimateTransformMemory({
       probe,
+      interpolationTargetFps: format !== "mp3" ? interpolation?.targetFps : null,
       reverse,
       loopVideo: format !== "mp3" && loopVideo,
       trimStartS: 0,
@@ -2782,6 +2827,7 @@ function App() {
       videoEnabled: format !== "mp3",
     });
   }, [
+    interpolation,
     probe,
     exactSampleSourceDurationS,
     exactSamplePlannedEncodeSummary,
@@ -2810,8 +2856,8 @@ function App() {
         ? `${plannedEncodeSummary.w}x${plannedEncodeSummary.h}`
         : "audio only";
     const bitrate = plannedEncodeSummary.totalKbps !== null ? `~${plannedEncodeSummary.totalKbps} kbps` : "no size limit";
-    return `${shape} • ${formatClock(currentPlannedDurationS ?? plannedEncodeSummary.durationS)} • ${bitrate}`;
-  }, [plannedEncodeSummary, currentPlannedDurationS]);
+    return `${shape}${interpolation && format !== "mp3" ? ` • ${interpolation.targetFps} fps` : ""} • ${formatClock(currentPlannedDurationS ?? plannedEncodeSummary.durationS)} • ${bitrate}`;
+  }, [plannedEncodeSummary, currentPlannedDurationS, interpolation, format]);
   const trimAccuracySummary = !trimIsActive
     ? "No active trim"
     : "Frame/sample accurate boundaries";
@@ -2835,6 +2881,8 @@ function App() {
       ? "Preparing export event handling."
       : null;
   const exactExportPlanBlockingReason =
+    (!updateStartupReady ? "Finishing the app startup check before export." : null) ??
+    interpolationBlockingReason ??
     encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
     capabilityInspectionBlockingReason ??
@@ -2852,6 +2900,8 @@ function App() {
     queueOutputBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting." : null);
   const exactSamplePlanBlockingReason =
+    (!updateStartupReady ? "Finishing the app startup check before export." : null) ??
+    interpolationBlockingReason ??
     encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
     capabilityInspectionBlockingReason ??
@@ -2928,6 +2978,7 @@ function App() {
     if (advancedVideoCodec !== "auto" && format !== "mp3") chips.push(VIDEO_CODEC_LABELS[advancedVideoCodec]);
     if (advancedVideoQuality !== "auto" && format !== "mp3") chips.push(VIDEO_QUALITY_LABELS[advancedVideoQuality]);
     if (advancedEncodeSpeed !== "auto" && format !== "mp3") chips.push(`${ENCODE_SPEED_LABELS[advancedEncodeSpeed]} encode`);
+    if (interpolation && format !== "mp3") chips.push(`Smooth motion ${interpolation.targetFps} fps`);
     if (advancedFrameRateCapRequest !== null && format !== "mp3") chips.push(`${advancedFrameRateCapRequest} fps cap`);
     if (advancedAudioBitrateRequest !== null) chips.push(`Audio ${advancedAudioBitrateRequest}k`);
     if (advancedAudioChannels !== "auto") chips.push(AUDIO_CHANNEL_LABELS[advancedAudioChannels]);
@@ -2940,6 +2991,7 @@ function App() {
     return chips;
   }, [
     trimIsActive,
+    interpolation,
     cropFilterPlanned,
     speed,
     rotateDeg,
@@ -2997,7 +3049,7 @@ function App() {
   const progressUi = getActiveProgressUi(encodeProgress, jobId !== null);
   const updateProgressUi = getUpdateProgressUi(updateProgress);
   const attemptUi = deriveEncodeAttemptPresentation(latestAttempt);
-  const encodeBusy =
+  const exportWorkBusy =
     attemptUi.isActive ||
     queueRunning ||
     queuePreparationBusy ||
@@ -3006,6 +3058,7 @@ function App() {
     cropDetecting ||
     frameSaving ||
     updateBusy;
+  const encodeBusy = exportWorkBusy || interpolationInstalling;
   const lastExportIsCurrentOutcome =
     latestAttempt.kind === "succeeded" || latestAttempt.kind === "target-missed";
   const latestAttemptOutputPath =
@@ -3015,7 +3068,9 @@ function App() {
       ? "Finalizing output..."
       : progressUi.phase === "copying"
         ? "Copying media..."
-        : "Encoding..."
+        : progressUi.phase === "preparing" || progressUi.phase === "interpolating"
+          ? `${progressUi.label}...`
+          : "Encoding..."
     : status;
 
   const footerKicker =
@@ -3170,6 +3225,7 @@ function App() {
     }
 
     if (
+      interpolation === null &&
       advancedFrameRateCapRequest !== null &&
       frameRatePlan.postSpeedFps !== null &&
       !frameRatePlan.capApplies
@@ -3185,6 +3241,7 @@ function App() {
 
     return warnings;
   }, [
+    interpolation,
     probe,
     plannedEncodeSummary,
     format,
@@ -3216,6 +3273,12 @@ function App() {
   ]);
 
   const handleDroppedPaths = useEffectEvent(async (paths: string[]) => {
+    if (interpolationInstallingRef.current) {
+      setDragActive(false);
+      const message = "Finish or cancel frame interpolation installation before adding media files.";
+      setStatus(message);
+      return { kind: "status" as const, message, clearDragActive: true };
+    }
     if (updateBusyRef.current) {
       setDragActive(false);
       const message = "Finish the current update before adding media files.";
@@ -3499,6 +3562,21 @@ function App() {
     }
 
     if (inputPath !== smokeConfig.inputPath || !probe) return;
+    if (!updateStartupReady) return;
+    const smokeInterpolation = normalizeInterpolation(smokeConfig.interpolation);
+    if (smokeInterpolation) {
+      if (
+        interpolation?.modelId !== smokeInterpolation.modelId ||
+        interpolation.targetFps !== smokeInterpolation.targetFps ||
+        interpolationInstalling ||
+        !interpolationStatus ||
+        interpolationStatus.modelId !== smokeInterpolation.modelId
+      ) return;
+      if (interpolationBlockingReason) {
+        void reportSmokeFailure(`Packaged app smoke Smooth motion is not ready: ${interpolationStatus.message || interpolationBlockingReason}`);
+        return;
+      }
+    }
 
     void reportSmokeStatus("probe-ready", {
       message: `Source probed: ${probe.width}x${probe.height}, ${formatClock(probe.durationS)}`,
@@ -3648,6 +3726,11 @@ function App() {
     encodeCapabilitiesError,
     encodeEventsReady,
     encodeEventsError,
+    updateStartupReady,
+    interpolation,
+    interpolationStatus,
+    interpolationInstalling,
+    interpolationBlockingReason,
   ]);
 
   useEffect(() => {
@@ -4309,6 +4392,7 @@ function App() {
   }
 
   function buildSettingsOnlyRequest(nextInputPath: string, nextOutputPath: string): EncodeRequest {
+    if (interpolationConflictReason) throw new Error(interpolationConflictReason);
     const size = parseNum("Size limit (MB)", sizeLimitMb, { min: 0 });
     if (size !== 0 && size < 0.1) throw new Error("Size limit must be >= 0.1 MB (or 0/empty to disable).");
     if (exactTargetBytesFromMegabytes(size) === null) throw new Error(SIZE_TARGET_EXACTNESS_ERROR);
@@ -4328,6 +4412,7 @@ function App() {
       // added without probing must make their own explicit choice later.
       colorPolicy: "auto",
       advanced: buildAdvancedSettings(),
+      interpolation: normalizeInterpolation(interpolation),
       trim: null,
       crop: null,
       reverse: false,
@@ -4345,6 +4430,7 @@ function App() {
   }
 
   function buildRequest(): EncodeRequest {
+    if (interpolationBlockingReason) throw new Error(interpolationBlockingReason);
     if (!inputPath) throw new Error("Pick an input file first.");
     if (!outputPath) throw new Error("Pick an output path first.");
     if (!probe) throw new Error("Probe not ready yet.");
@@ -4398,6 +4484,7 @@ function App() {
       stripMetadata,
       colorPolicy,
       advanced: buildAdvancedSettings(),
+      interpolation: normalizeInterpolation(interpolation),
       trim,
       crop,
       reverse,
@@ -4597,6 +4684,7 @@ function App() {
     setAdvancedFrameRateCapFps(advanced.frameRateCapFps == null ? "auto" : String(advanced.frameRateCapFps));
     setAdvancedAudioChannels((advanced.audioChannels ?? "auto") as AudioChannelPreference);
     setAdvancedColorRange(request.format === "mp3" ? "auto" : advanced.colorRange ?? "auto");
+    setInterpolation(normalizeInterpolation(request.interpolation));
 
     setTrimStart(request.trim?.startS ? String(request.trim.startS) : "0");
     setTrimEnd(request.trim?.endS == null ? "" : String(request.trim.endS));
@@ -4784,6 +4872,10 @@ function App() {
   }
 
   async function addCurrentPlanToQueue() {
+    if (interpolationInstallingRef.current) {
+      setStatus("Wait for Smooth motion setup to finish, or cancel an active installation.");
+      return;
+    }
     if (updateBusyRef.current) {
       setStatus("Finish the current update before changing the export queue.");
       return;
@@ -4824,6 +4916,10 @@ function App() {
   }
 
   async function addFilesToQueue() {
+    if (interpolationInstallingRef.current) {
+      setStatus("Wait for Smooth motion setup to finish, or cancel an active installation.");
+      return;
+    }
     if (updateBusyRef.current) {
       setStatus("Finish the current update before changing the export queue.");
       return;
@@ -4901,7 +4997,8 @@ function App() {
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
       queuePreparationCountRef.current > 0 ||
-      updateBusyRef.current
+      updateBusyRef.current ||
+      interpolationInstallingRef.current
     ) return;
 
     const claimed = dispatchExportQueue({ type: "claim-next" });
@@ -4946,6 +5043,10 @@ function App() {
   }
 
   function runQueue() {
+    if (interpolationInstallingRef.current) {
+      setStatus("Wait for Smooth motion setup to finish, or cancel an active installation.");
+      return;
+    }
     if (updateBusyRef.current) {
       setStatus("Finish the current update before running the export queue.");
       return;
@@ -5024,6 +5125,10 @@ function App() {
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
     reportAsSmokeResult?: boolean;
   }): Promise<StartEncodeResult> {
+    if (!updateStartupReady) return { ok: false, message: "Wait for the app startup check to finish." };
+    if (interpolationInstallingRef.current) {
+      return { ok: false, message: "Wait for Smooth motion setup to finish, or cancel an active installation." };
+    }
     if (updateBusyRef.current) {
       return { ok: false, message: "Finish the current update before starting an export." };
     }
@@ -5058,11 +5163,11 @@ function App() {
       const sourceRate = requestUsesLoadedSource ? probe.frameRate ?? null : null;
       const speedAdjustedRate = sourceRate === null ? null : sourceRate * request.speed;
       const requestedRateCap = request.advanced?.frameRateCapFps ?? null;
-      const plannedFrameRateFps = speedAdjustedRate === null
+      const plannedFrameRateFps = request.interpolation?.targetFps ?? (speedAdjustedRate === null
         ? null
         : requestedRateCap && requestedRateCap > 0
           ? Math.min(speedAdjustedRate, requestedRateCap)
-          : speedAdjustedRate;
+          : speedAdjustedRate);
       pendingEncodeRef.current = {
         attemptId,
         jobId: null,
@@ -7099,6 +7204,7 @@ function App() {
   async function applyUpdate() {
     if (
       updateBusyRef.current ||
+      interpolationInstallingRef.current ||
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
       exportQueueStateRef.current.autoRun ||
@@ -7837,6 +7943,17 @@ function App() {
             ) : null}
           </RailCard>
 
+          <SmoothMotionControl
+            value={interpolation}
+            format={format}
+            frameRateCap={advancedFrameRateCapRequest}
+            disabled={exportWorkBusy}
+            startupReady={updateStartupReady}
+            onChange={setInterpolation}
+            onRemoveCap={() => setAdvancedFrameRateCapFps("auto")}
+            onStatus={setInterpolationStatus}
+            onBusy={handleInterpolationBusy}
+          />
           <RailCard
             title="Export settings"
             summary={`${format.toUpperCase()}${sizeLimitEnabled ? ` • ${sizeLimitMb} MB` : ""}`}
@@ -8500,8 +8617,10 @@ function App() {
                         <div className="vfl-inline-hint">
                           {format === "mp3"
                             ? "MP3 exports are audio-only."
-                            : advancedFrameRateCapRequest === null
-                              ? "Auto keeps the source frame rate."
+                            : interpolation
+                              ? interpolationConflictReason ?? `Smooth motion output is ${interpolation.targetFps} fps. A cap at or above the target keeps the generated frames.`
+                              : advancedFrameRateCapRequest === null
+                                ? "Auto keeps the source frame rate."
                               : frameRateCapApplies
                                 ? frameRatePlan.postSpeedFps !== null
                                   ? `Effective post-speed rate is about ${frameRatePlan.postSpeedFps.toFixed(1)} fps; frames above ${advancedFrameRateCapRequest} fps will be reduced.`
@@ -8653,7 +8772,7 @@ function App() {
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Frame rate</div>
-                      <div className="vfl-summary-value">{advancedFrameRateSummary}</div>
+                      <div className="vfl-summary-value">{interpolation ? `Smooth motion: ${interpolation.targetFps} fps (${interpolation.modelId === "rife-v4.25" ? "Standard" : "Alternative"})` : advancedFrameRateSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Audio bitrate</div>

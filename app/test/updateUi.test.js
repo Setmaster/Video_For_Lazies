@@ -37,7 +37,7 @@ test("update application streams safe phase progress and blocks conflicting medi
   assert.match(raw, /status === "recoveryRequired"/);
   assert.doesNotMatch(raw, /setUpdateStatus\(coerceErrorMessage\(error/);
 
-  const busyStart = raw.indexOf("const encodeBusy =");
+  const busyStart = raw.indexOf("const exportWorkBusy =");
   const busyEnd = raw.indexOf("const lastExportIsCurrentOutcome", busyStart);
   const encodeBusy = raw.slice(busyStart, busyEnd);
   assert.match(encodeBusy, /cropDetecting/);

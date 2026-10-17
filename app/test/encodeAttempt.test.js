@@ -372,11 +372,12 @@ test("App routes both backend event types through attempt identity before effect
   assert.match(app, /settleEncodeFinished\(/);
   assert.match(app, /async function startEncode[\s\S]*?if \(!encodeEventsReadyRef\.current\)/);
   assert.match(app, /function runQueue\(\) \{[\s\S]*?if \(!encodeEventsReadyRef\.current\)/s);
-  assert.match(app, /function runQueue\(\) \{\s*if \(updateBusyRef\.current\)/s);
+  assert.match(app, /function runQueue\(\) \{[\s\S]*?if \(updateBusyRef\.current\)/s);
   assert.match(app, /if \(encodeEventsError\)[\s\S]*?if \(!encodeEventsReady\) return;/);
   assert.match(app, /ENCODE_EVENT_SETUP_SMOKE_ERROR/);
   assert.match(app, /id="vfl-encode-event-setup-error"[\s\S]*?role="alert"[\s\S]*?aria-live="assertive"/);
-  assert.match(app, /const encodeBusy =[\s\S]*?attemptUi\.isActive[\s\S]*?subtitleInspecting \|\|[\s\S]*?updateBusy;/);
+  assert.match(app, /const (?:exportWorkBusy|encodeBusy) =[\s\S]*?attemptUi\.isActive[\s\S]*?subtitleInspecting \|\|[\s\S]*?updateBusy;/);
+  assert.match(app, /const encodeBusy = exportWorkBusy \|\| interpolationInstalling;/);
   assert.match(app, /data-smoke-id="export"/);
   assert.match(app, /data-smoke-id="cancel-export"/);
   assert.match(app, /latestAttempt\.kind === "cancelling" \? "Cancelling…" : "Exporting…"/);

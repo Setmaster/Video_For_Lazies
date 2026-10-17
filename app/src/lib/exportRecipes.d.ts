@@ -3,6 +3,7 @@ import type {
   ColorRangePreference,
   EncodeSpeedPreference,
   OutputFormat,
+  InterpolationSettings,
   ResizeMode,
   VideoCodecPreference,
   VideoQualityPreference,
@@ -18,6 +19,7 @@ export type ExportRecipeResizeSettings = {
 
 export type ExportRecipeSettings = {
   format: OutputFormat;
+  interpolation?: InterpolationSettings | null;
   sizeLimitMb: string;
   resize: ExportRecipeResizeSettings;
   maxEdgePx?: string;

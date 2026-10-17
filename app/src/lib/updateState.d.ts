@@ -2,6 +2,11 @@ import type { UpdatePhase, UpdateProgressEvent } from "./types";
 
 export const UPDATE_PHASES: readonly UpdatePhase[];
 
+export function finalizeStartupOnce<T>(
+  holder: { current: Promise<T> | null },
+  start: () => Promise<T> | T,
+): Promise<T>;
+
 export interface UpdateProgressState {
   operationId: string | null;
   phase: UpdatePhase | null;

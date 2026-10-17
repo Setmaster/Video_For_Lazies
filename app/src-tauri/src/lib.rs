@@ -6,7 +6,12 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State, Window};
 
+mod activity;
 mod command_dispatch;
+mod interpolation_commands;
+mod interpolation_components;
+mod interpolation_media;
+mod interpolation_timeline;
 mod process;
 pub mod updater;
 mod video;
@@ -17,7 +22,7 @@ struct JobHandle {
     job_id: u64,
     attempt_id: u64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
-    child: Arc<Mutex<Option<process::ProcessControl>>>,
+    child: process::ProcessGroup,
 }
 
 struct JobManager {
@@ -100,6 +105,7 @@ struct AppSmokeG7Evidence {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSmokeConfig {
+    interpolation: Option<video::InterpolationSettings>,
     input_path: String,
     output_path: String,
     status_path: String,
@@ -182,11 +188,7 @@ impl JobManager {
             return;
         };
         handle.cancel.store(true, Ordering::Relaxed);
-        if let Ok(mut child_guard) = handle.child.lock()
-            && let Some(child) = child_guard.as_mut()
-        {
-            let _ = child.kill();
-        }
+        process::kill_process_group(&handle.child);
     }
 }
 
@@ -385,6 +387,28 @@ fn parse_smoke_config_from_env(
             .map(String::as_str)
             .unwrap_or("auto"),
     )?;
+    let interpolation = env
+        .get("VFL_SMOKE_INTERPOLATION_FPS")
+        .map(|value| {
+            let target_fps = value
+                .parse::<u32>()
+                .map_err(|_| "VFL_SMOKE_INTERPOLATION_FPS must be 60 or 120.".to_string())?;
+            if !matches!(target_fps, 60 | 120) {
+                return Err("VFL_SMOKE_INTERPOLATION_FPS must be 60 or 120.".to_string());
+            }
+            let model_id = env
+                .get("VFL_SMOKE_INTERPOLATION_MODEL")
+                .map(String::as_str)
+                .unwrap_or("rife-v4.25");
+            if !matches!(model_id, "rife-v4.25" | "rife-v4.26") {
+                return Err("VFL_SMOKE_INTERPOLATION_MODEL is not supported.".to_string());
+            }
+            Ok(video::InterpolationSettings {
+                target_fps,
+                model_id: model_id.to_string(),
+            })
+        })
+        .transpose()?;
     let reverse = parse_smoke_bool(env, "VFL_SMOKE_REVERSE")?;
     let loop_video = parse_smoke_bool(env, "VFL_SMOKE_LOOP")?;
     let g7_operation = parse_smoke_g7_operation(
@@ -453,6 +477,7 @@ fn parse_smoke_config_from_env(
     }
 
     Ok(Some(AppSmokeConfig {
+        interpolation,
         input_path: input_path.to_string(),
         output_path: output_path.to_string(),
         status_path,
@@ -692,6 +717,7 @@ fn write_smoke_status(status: AppSmokeStatus) -> Result<(), String> {
 fn start_encode(
     window: Window,
     state: State<'_, JobManager>,
+    activity: State<'_, activity::ActivityCoordinator>,
     attempt_id: u64,
     request: video::EncodeRequest,
 ) -> Result<u64, String> {
@@ -699,6 +725,7 @@ fn start_encode(
         return Err("Encode attempt ID must be a positive safe integer.".to_string());
     }
 
+    let activity_lease = activity.begin("export")?;
     let mut current = state
         .current
         .lock()
@@ -710,7 +737,7 @@ fn start_encode(
 
     let job_id = state.alloc_job_id();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let child = Arc::new(Mutex::new(None));
+    let child = Arc::new(Mutex::new(Vec::new()));
 
     *current = Some(JobHandle {
         job_id,
@@ -732,6 +759,7 @@ fn start_encode(
     );
 
     std::thread::spawn(move || {
+        let _activity_lease = activity_lease;
         if settle_g7_active_controls {
             // Packaged smoke only: give React one bounded frame window to
             // expose the running Export/Cancel contract before a fast local
@@ -754,6 +782,9 @@ fn start_encode(
 
         let manager: State<'_, JobManager> = app_handle.state();
         manager.clear_if_matches(job_id, attempt_id);
+        // A queue may immediately start its next item when it receives this
+        // terminal event. Release admission before publishing completion.
+        drop(_activity_lease);
 
         let _ = match result {
             Ok(done) => window.emit("encode-finished", done),
@@ -797,11 +828,7 @@ fn cancel_encode(state: State<'_, JobManager>, jobId: u64) -> Result<(), String>
 
     handle.cancel.store(true, Ordering::Relaxed);
 
-    if let Ok(mut guard) = handle.child.lock()
-        && let Some(child) = guard.as_mut()
-    {
-        let _ = child.kill();
-    }
+    process::kill_process_group(&handle.child);
 
     Ok(())
 }
@@ -817,6 +844,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(JobManager::new())
+        .manage(activity::ActivityCoordinator::startup_pending())
+        .manage(interpolation_commands::InterpolationInstaller::default())
         .manage(updater::UpdaterCoordinator::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -825,6 +854,12 @@ pub fn run() {
         // outlive the app.
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
+                let activity: State<'_, activity::ActivityCoordinator> =
+                    window.app_handle().state();
+                activity.shutdown();
+                let installer: State<'_, interpolation_commands::InterpolationInstaller> =
+                    window.app_handle().state();
+                installer.cancel_active();
                 let manager: State<'_, JobManager> = window.app_handle().state();
                 manager.kill_active_job();
                 process::shutdown_all();
@@ -836,6 +871,10 @@ pub fn run() {
             suggest_output_path,
             suggest_output_paths,
             encode_capabilities,
+            interpolation_commands::interpolation_status,
+            interpolation_commands::start_interpolation_install,
+            interpolation_commands::cancel_interpolation_install,
+            interpolation_commands::remove_interpolation_model,
             inspect_srt,
             extract_frame,
             allow_preview_path,
@@ -890,7 +929,7 @@ mod tests {
             job_id: 4,
             attempt_id: 44,
             cancel: Arc::new(AtomicBool::new(false)),
-            child: Arc::new(Mutex::new(None)),
+            child: Arc::new(Mutex::new(Vec::new())),
         });
 
         assert!(!manager.clear_if_matches(3, 44));
@@ -904,6 +943,25 @@ mod tests {
     fn parse_smoke_config_returns_none_without_input() {
         let env = smoke_env(&[]);
         assert_eq!(parse_smoke_config_from_env(&env).unwrap(), None);
+    }
+
+    #[test]
+    fn smoke_interpolation_uses_only_supported_targets_and_models() {
+        let mut env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", r"C:\tmp\input.mp4"),
+            ("VFL_SMOKE_OUTPUT", r"C:\tmp\output.mp4"),
+            ("VFL_SMOKE_STATUS", &temp_smoke_status_path("interpolation")),
+            ("VFL_SMOKE_INTERPOLATION_FPS", "120"),
+        ]);
+        let config = parse_smoke_config_from_env(&env).unwrap().unwrap();
+        let interpolation = config.interpolation.unwrap();
+        assert_eq!(interpolation.target_fps, 120);
+        assert_eq!(interpolation.model_id, "rife-v4.25");
+        env.insert("VFL_SMOKE_INTERPOLATION_FPS".into(), "90".into());
+        assert!(parse_smoke_config_from_env(&env).is_err());
+        env.insert("VFL_SMOKE_INTERPOLATION_FPS".into(), "60".into());
+        env.insert("VFL_SMOKE_INTERPOLATION_MODEL".into(), "untrusted".into());
+        assert!(parse_smoke_config_from_env(&env).is_err());
     }
 
     #[test]
@@ -949,6 +1007,7 @@ mod tests {
         assert_eq!(
             parse_smoke_config_from_env(&env).unwrap(),
             Some(AppSmokeConfig {
+                interpolation: None,
                 input_path: r"C:\tmp\input.mp4".to_string(),
                 output_path: r"C:\tmp\output.mp4".to_string(),
                 status_path,
@@ -1011,6 +1070,7 @@ mod tests {
         assert_eq!(
             parse_smoke_config_from_env(&env).unwrap(),
             Some(AppSmokeConfig {
+                interpolation: None,
                 input_path: r"C:\tmp\input.mp4".to_string(),
                 output_path: r"C:\tmp\output.webm".to_string(),
                 status_path,

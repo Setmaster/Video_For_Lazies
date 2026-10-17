@@ -68,6 +68,8 @@ jobs:
           install-timeout-seconds: "1800"
           packages: |
             build-essential
+            cmake
+            ninja-build
             curl
             dbus-x11
             file

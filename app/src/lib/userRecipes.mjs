@@ -1,5 +1,7 @@
+import { normalizeInterpolation, interpolationConflict } from "./interpolation.mjs";
+
 export const USER_RECIPE_STORAGE_KEY = "vfl:user-recipes";
-export const USER_RECIPE_SCHEMA_VERSION = 3;
+export const USER_RECIPE_SCHEMA_VERSION = 4;
 export const USER_RECIPE_MAX_COUNT = 50;
 export const USER_RECIPE_NAME_MAX_LENGTH = 64;
 export const USER_RECIPE_DESCRIPTION_MAX_LENGTH = 160;
@@ -198,6 +200,9 @@ export function normalizeUserRecipeSettings(value, options = {}) {
   if (value.normalizeAudio !== undefined && typeof value.normalizeAudio !== "boolean") return null;
   if (value.perturbFirstFrame !== undefined && typeof value.perturbFirstFrame !== "boolean") return null;
   if (value.strictFit !== undefined && typeof value.strictFit !== "boolean") return null;
+  const interpolation = normalizeInterpolation(value.interpolation);
+  if (value.interpolation != null && !interpolation) return null;
+  if (interpolationConflict(interpolation, format, advanced.frameRateCapFps)) return null;
   const audioEnabled = format === "mp3" ? true : value.audioEnabled;
   const hasPositiveSizeTarget = Number(sizeLimitMb) > 0;
   const strictFit = format !== "mp3" && hasPositiveSizeTarget && value.strictFit === true;
@@ -210,6 +215,7 @@ export function normalizeUserRecipeSettings(value, options = {}) {
     normalizeAudio: value.normalizeAudio === true,
     perturbFirstFrame: format === "mp3" ? false : value.perturbFirstFrame === true,
     strictFit,
+    interpolation,
     advanced,
   };
 }
@@ -238,6 +244,7 @@ export function reusableSettingsFromEncodeRequest(request) {
     perturbFirstFrame: request.perturbFirstFrame,
     strictFit: request.strictFit,
     advanced: request.advanced,
+    interpolation: request.interpolation,
   });
 }
 
@@ -265,6 +272,7 @@ function migrateSchemaZeroRecipe(value, index) {
   const settings = normalizeUserRecipeSettings(
     {
       ...rawSettings,
+      interpolation: null,
       strictFit: false,
     },
     { legacyMaxEdgePx },
@@ -279,6 +287,7 @@ function migrateSchemaOneRecipe(value) {
   const name = normalizeName(value.name);
   const settings = normalizeUserRecipeSettings({
     ...value.settings,
+    interpolation: null,
     strictFit: false,
   });
   if (!id || !name || !settings) return null;
@@ -289,12 +298,12 @@ function migrateSchemaTwoRecipe(value) {
   if (!isRecord(value)) return null;
   const id = normalizeId(value.id);
   const name = normalizeName(value.name);
-  const settings = normalizeUserRecipeSettings(value.settings);
+  const settings = normalizeUserRecipeSettings({ ...value.settings, interpolation: null });
   if (!id || !name || !settings) return null;
   return { id, name, description: "", settings };
 }
 
-function normalizeSchemaThreeRecipe(value) {
+function normalizeCurrentRecipe(value) {
   if (!isRecord(value)) return null;
   const id = normalizeId(value.id);
   const name = normalizeName(value.name);
@@ -302,6 +311,11 @@ function normalizeSchemaThreeRecipe(value) {
   const settings = normalizeUserRecipeSettings(value.settings);
   if (!id || !name || description === null || !settings) return null;
   return { id, name, description, settings };
+}
+
+function migrateSchemaThreeRecipe(value) {
+  if (!isRecord(value) || !isRecord(value.settings)) return null;
+  return normalizeCurrentRecipe({ ...value, settings: { ...value.settings, interpolation: null } });
 }
 
 function salvageRecipes(values, normalizeRecipe) {
@@ -376,6 +390,7 @@ export function parseUserRecipeStore(raw) {
     sourceSchemaVersion !== 0 &&
     sourceSchemaVersion !== 1 &&
     sourceSchemaVersion !== 2 &&
+    sourceSchemaVersion !== 3 &&
     sourceSchemaVersion !== USER_RECIPE_SCHEMA_VERSION
   ) {
     return makeStore([], {
@@ -392,7 +407,9 @@ export function parseUserRecipeStore(raw) {
       ? migrateSchemaOneRecipe
       : sourceSchemaVersion === 2
         ? migrateSchemaTwoRecipe
-        : normalizeSchemaThreeRecipe;
+        : sourceSchemaVersion === 3
+          ? migrateSchemaThreeRecipe
+          : normalizeCurrentRecipe;
   const salvaged = salvageRecipes(values, normalizeRecipe);
   if (migrating) {
     salvaged.warnings.unshift("Saved recipes were migrated to the current format.");
@@ -424,7 +441,7 @@ function normalizeRecipeListForWrite(recipes) {
   const ids = new Set();
   const names = new Set();
   for (const value of recipes) {
-    const recipe = normalizeSchemaThreeRecipe(value);
+    const recipe = normalizeCurrentRecipe(value);
     if (!recipe) throw new TypeError("A recipe contains invalid data.");
     const idKey = recipe.id.toLowerCase();
     const nameKey = recipe.name.toLowerCase();

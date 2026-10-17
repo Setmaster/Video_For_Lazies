@@ -43,6 +43,13 @@ function formatByteCount(value) {
   return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
 }
 
+// Keep the native startup lease shared across React effect cleanup/replay.
+// Retain rejections too: retrying finalization is unsafe until the app restarts.
+export function finalizeStartupOnce(holder, start) {
+  if (!holder.current) holder.current = Promise.resolve().then(start);
+  return holder.current;
+}
+
 export function createUpdateProgressState() {
   return {
     operationId: null,

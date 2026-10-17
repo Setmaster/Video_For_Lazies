@@ -64,6 +64,11 @@ const shippedContractExpectation = {
       encoders: [],
       filters: ["subtitles"],
     },
+    aiInterpolation: {
+      releaseRequired: true,
+      encoders: ["ffv1", "rawvideo"],
+      filters: ["format", "settb", "showinfo"],
+    },
   },
 };
 

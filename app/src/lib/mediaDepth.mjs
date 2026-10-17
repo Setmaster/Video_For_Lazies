@@ -241,6 +241,7 @@ export function estimateTransformMemory({
   trimEndS = null,
   speed = 1,
   frameRateCapFps = null,
+  interpolationTargetFps = null,
   width,
   height,
   decodedVideoBytesPerPixel = null,
@@ -255,9 +256,17 @@ export function estimateTransformMemory({
 
   const sourceDuration = finitePositive(probe?.durationS);
   const safeSpeed = finitePositive(speed);
-  const fps = videoEnabled ? finitePositive(probe?.frameRate) : 1;
+  const preparedTargetFps = finitePositive(interpolationTargetFps);
+  // Interpolation is prepared on the source epoch before reverse/speed/loop.
+  // Its source-epoch rate is target / speed; the prepared RGB decode uses a
+  // conservative four bytes/pixel regardless of the original pixel format.
+  const fps = videoEnabled
+    ? preparedTargetFps !== null && safeSpeed !== null
+      ? preparedTargetFps / safeSpeed
+      : finitePositive(probe?.frameRate)
+    : 1;
   const bytesPerPixel = videoEnabled
-    ? finitePositive(decodedVideoBytesPerPixel) ?? finitePositive(probe?.decodedVideoBytesPerPixel)
+    ? preparedTargetFps !== null ? 4 : finitePositive(decodedVideoBytesPerPixel) ?? finitePositive(probe?.decodedVideoBytesPerPixel)
     : 1;
   const safeWidth = videoEnabled ? finitePositive(width) : 1;
   const safeHeight = videoEnabled ? finitePositive(height) : 1;

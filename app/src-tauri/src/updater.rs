@@ -619,9 +619,18 @@ pub async fn prepare_and_apply_update(
     let coordinator = coordinator.inner().clone();
     let channel = on_event.map(|id| id.channel_on(webview));
     tauri::async_runtime::spawn_blocking(move || {
+        let activity = app.state::<crate::activity::ActivityCoordinator>();
+        let _activity_lease = activity
+            .begin("app update")
+            .map_err(UpdatePublicError::prepare_failed)?;
         let operation = coordinator.begin("apply")?;
         let reporter = ProgressReporter::new(operation.operation_id.clone(), channel);
-        prepare_and_apply_update_inner(app, &reporter).map_err(UpdatePublicError::prepare_failed)
+        let response = prepare_and_apply_update_inner(app.clone(), &reporter)
+            .map_err(UpdatePublicError::prepare_failed)?;
+        if matches!(response.status.as_str(), "restarting" | "elevating") {
+            activity.shutdown();
+        }
+        Ok(response)
     })
     .await
     .map_err(|_| UpdatePublicError::prepare_failed("update worker stopped".to_string()))?
@@ -857,11 +866,18 @@ pub async fn finalize_update_startup(
     let coordinator = coordinator.inner().clone();
     let channel = on_event.map(|id| id.channel_on(webview));
     tauri::async_runtime::spawn_blocking(move || {
+        let activity = app.state::<crate::activity::ActivityCoordinator>();
+        let _activity_lease = activity
+            .begin_startup()
+            .map_err(UpdatePublicError::finalize_failed)?;
         let operation = coordinator.begin("finalize")?;
         let reporter = ProgressReporter::new(operation.operation_id.clone(), channel);
         reporter.emit(UpdatePhase::Recovering, "Checking saved update state...");
         let response =
             finalize_update_startup_inner(&app).map_err(UpdatePublicError::finalize_failed)?;
+        if matches!(response.status.as_str(), "recovering" | "elevatingRecovery") {
+            activity.shutdown();
+        }
         reporter.emit(UpdatePhase::Completed, "Saved update state checked.");
         Ok(response)
     })

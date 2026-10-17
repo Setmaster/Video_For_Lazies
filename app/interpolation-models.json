@@ -1,0 +1,43 @@
+{
+  "catalogVersion": "tntwise-13338e38-v1",
+  "sourceCommit": "13338e38debe2e400b3eeecf6792312d01a692f9",
+  "defaultModelId": "rife-v4.25",
+  "models": [
+    {
+      "id": "rife-v4.25",
+      "label": "RIFE 4.25",
+      "files": [
+        {
+          "name": "flownet.bin",
+          "url": "https://raw.githubusercontent.com/TNTwise/rife-ncnn-vulkan/13338e38debe2e400b3eeecf6792312d01a692f9/models/rife-v4.25/flownet.bin",
+          "bytes": 11360684,
+          "sha256": "10de487a095e61cb2971c39e3b5e17005a70fba6201c77fb96e063f4423b583f"
+        },
+        {
+          "name": "flownet.param",
+          "url": "https://raw.githubusercontent.com/TNTwise/rife-ncnn-vulkan/13338e38debe2e400b3eeecf6792312d01a692f9/models/rife-v4.25/flownet.param",
+          "bytes": 31289,
+          "sha256": "6ba231fb00e4ae82b120f938d9b2df91db32fbf322bd110f29450efaf61848d6"
+        }
+      ]
+    },
+    {
+      "id": "rife-v4.26",
+      "label": "RIFE 4.26",
+      "files": [
+        {
+          "name": "flownet.bin",
+          "url": "https://raw.githubusercontent.com/TNTwise/rife-ncnn-vulkan/13338e38debe2e400b3eeecf6792312d01a692f9/models/rife-v4.26/flownet.bin",
+          "bytes": 11360684,
+          "sha256": "94d58e30b75d7c7609cfa6f3bdad524deddd14f5f75e85c36d2f827ef5c64731"
+        },
+        {
+          "name": "flownet.param",
+          "url": "https://raw.githubusercontent.com/TNTwise/rife-ncnn-vulkan/13338e38debe2e400b3eeecf6792312d01a692f9/models/rife-v4.26/flownet.param",
+          "bytes": 67885,
+          "sha256": "79f16c28903f93f8308f0c4c947f8c7e0c17d99a57b85473e5f298dd578d137b"
+        }
+      ]
+    }
+  ]
+}

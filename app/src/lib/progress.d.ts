@@ -1,8 +1,8 @@
 export const ACTIVE_PROGRESS_DISPLAY_CAP: 0.99;
 export const FINALIZING_PROGRESS_THRESHOLD: 0.999;
-export const ENCODE_PROGRESS_PHASES: readonly ["copying", "encoding", "finalizing"];
+export const ENCODE_PROGRESS_PHASES: readonly ["preparing", "interpolating", "copying", "encoding", "finalizing"];
 
-export type EncodeProgressPhase = "copying" | "encoding" | "finalizing";
+export type EncodeProgressPhase = "preparing" | "interpolating" | "copying" | "encoding" | "finalizing";
 
 export interface EncodeProgressState {
   attemptId: number | null;

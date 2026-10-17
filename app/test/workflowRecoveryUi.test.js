@@ -47,7 +47,7 @@ test("App uses one reducer-backed queue identity and closes queue continuation r
   );
   assert.match(app, /setJobId\(null\);\s*jobIdRef\.current = null;/);
   assert.match(app, /setJobId\(id\);\s*jobIdRef\.current = id;/);
-  assert.match(app, /const encodeBusy =[\s\S]*?attemptUi\.isActive[\s\S]*?queueSnapshotApplying[\s\S]*?updateBusy;/);
+  assert.match(app, /const (?:exportWorkBusy|encodeBusy) =[\s\S]*?attemptUi\.isActive[\s\S]*?queueSnapshotApplying[\s\S]*?updateBusy;/);
 });
 
 test("drop, output claims, retry, snapshot, and diagnostics are wired through production paths", async () => {
@@ -173,7 +173,7 @@ test("user recipes share the main grid and provide accessible persist-first crea
   assert.match(dialog, /Delete recipe/);
   assert.doesNotMatch(dialog, /Saved fields:|Never saved:|Current values:/);
   assert.match(recipes, /USER_RECIPE_STORAGE_KEY = "vfl:user-recipes"/);
-  assert.match(recipes, /USER_RECIPE_SCHEMA_VERSION = 3/);
+  assert.match(recipes, /USER_RECIPE_SCHEMA_VERSION = 4/);
   assert.doesNotMatch(app, /vfl:queue|localStorage\.(?:setItem|getItem)\([^\n]*queue/i);
 });
 

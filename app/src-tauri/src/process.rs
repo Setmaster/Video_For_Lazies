@@ -4,16 +4,25 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+pub(crate) type ProcessGroup = Arc<Mutex<Vec<ProcessControl>>>;
+
+pub(crate) fn kill_process_group(group: &ProcessGroup) {
+    let controls = group.lock().unwrap_or_else(|error| error.into_inner());
+    for control in controls.iter() {
+        let _ = control.kill();
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct JobContext {
     pub cancel: Arc<AtomicBool>,
-    pub child: Arc<Mutex<Option<ProcessControl>>>,
+    pub child: ProcessGroup,
 }
 
 thread_local! {
@@ -166,6 +175,7 @@ pub(crate) fn shutdown_all() {
 }
 
 pub(crate) struct ManagedChild {
+    pub stdin: Option<ChildStdin>,
     pub stdout: Option<PipeReader<ChildStdout>>,
     pub stderr: Option<PipeReader<ChildStderr>>,
     pub control: ProcessControl,
@@ -177,17 +187,37 @@ pub(crate) struct ManagedChild {
 impl ManagedChild {
     pub fn spawn(command: Command) -> io::Result<Self> {
         let job = JOB_CONTEXT.with_borrow(Clone::clone);
-        Self::spawn_in(command, job, REGISTRY.get_or_init(Mutex::default))
+        Self::spawn_in_with_stdin(command, job, REGISTRY.get_or_init(Mutex::default), false)
     }
 
     pub fn spawn_for_job(command: Command, job: JobContext) -> io::Result<Self> {
-        Self::spawn_in(command, Some(job), REGISTRY.get_or_init(Mutex::default))
+        Self::spawn_in_with_stdin(
+            command,
+            Some(job),
+            REGISTRY.get_or_init(Mutex::default),
+            false,
+        )
     }
 
+    pub fn spawn_with_stdin(command: Command) -> io::Result<Self> {
+        let job = JOB_CONTEXT.with_borrow(Clone::clone);
+        Self::spawn_in_with_stdin(command, job, REGISTRY.get_or_init(Mutex::default), true)
+    }
+
+    #[cfg(test)]
     fn spawn_in(
+        command: Command,
+        job: Option<JobContext>,
+        registry: &Mutex<Registry>,
+    ) -> io::Result<Self> {
+        Self::spawn_in_with_stdin(command, job, registry, false)
+    }
+
+    fn spawn_in_with_stdin(
         mut command: Command,
         job: Option<JobContext>,
         registry: &Mutex<Registry>,
+        piped_stdin: bool,
     ) -> io::Result<Self> {
         if job
             .as_ref()
@@ -204,7 +234,11 @@ impl ManagedChild {
             ));
         }
         command
-            .stdin(Stdio::null())
+            .stdin(if piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -225,11 +259,12 @@ impl ManagedChild {
         registry.processes.push(Arc::downgrade(&control.0));
         if let Some(job) = &job {
             let mut slot = job.child.lock().unwrap_or_else(|error| error.into_inner());
-            *slot = Some(control.clone());
+            slot.push(control.clone());
             if job.cancel.load(Ordering::Relaxed) {
                 let _ = control.kill();
             }
         }
+        let stdin = child.stdin.take();
         let stdout = child
             .stdout
             .take()
@@ -262,13 +297,17 @@ impl ManagedChild {
                 }
                 control.mark_exited();
                 if let Some(job) = &job {
-                    *job.child.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                    job.child
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .retain(|entry| !Arc::ptr_eq(&entry.0, &control.0));
                 }
                 return Err(error);
             }
         };
         drop(registry);
         Ok(Self {
+            stdin,
             stdout,
             stderr,
             control,
@@ -349,18 +388,14 @@ impl<R: io::Read + std::os::fd::AsRawFd> io::Read for PipeReader<R> {
 
 impl Drop for ManagedChild {
     fn drop(&mut self) {
+        drop(self.stdin.take());
         let _ = self.control.kill();
         if let Some(waiter) = self.waiter.take() {
             let _ = waiter.join();
         }
         if let Some(job) = &self.job {
             let mut slot = job.child.lock().unwrap_or_else(|error| error.into_inner());
-            if slot
-                .as_ref()
-                .is_some_and(|control| Arc::ptr_eq(&control.0, &self.control.0))
-            {
-                *slot = None;
-            }
+            slot.retain(|control| !Arc::ptr_eq(&control.0, &self.control.0));
         }
     }
 }
@@ -657,6 +692,12 @@ pub(crate) mod tests {
                 // its owner after the bounded reader returned an error.
                 std::process::exit(0);
             }
+            "stdin-echo" => {
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input).unwrap();
+                assert_eq!(input, b"persistent-input");
+                println!("piped-input-received");
+            }
             "stdin" => {
                 let mut input = Vec::new();
                 std::io::stdin().read_to_end(&mut input).unwrap();
@@ -802,15 +843,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn process_group_cancels_all_concurrent_children_and_drop_removes_only_self() {
+        let job = JobContext {
+            cancel: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(Mutex::new(Vec::new())),
+        };
+        let _scope = JobScope::enter(job.clone());
+        let first = ManagedChild::spawn(fixture_command("sleep")).unwrap();
+        let second = ManagedChild::spawn(fixture_command("sleep")).unwrap();
+        assert_eq!(job.child.lock().unwrap().len(), 2);
+        job.cancel.store(true, Ordering::Relaxed);
+        kill_process_group(&job.child);
+        assert!(
+            !first
+                .wait_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !second
+                .wait_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        drop(first);
+        assert_eq!(job.child.lock().unwrap().len(), 1);
+        drop(second);
+        assert!(job.child.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn process_explicit_stdin_stream_is_owned_and_closed() {
+        let mut child = ManagedChild::spawn_with_stdin(fixture_command("stdin-echo")).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"persistent-input")
+            .unwrap();
+        let (status, output, _) = collect(child);
+        assert!(status.success());
+        assert!(String::from_utf8_lossy(&output).contains("piped-input-received"));
+    }
+
+    #[test]
     fn process_job_scope_tracks_preflight_and_blocks_later_work_after_cancel() {
         let job = JobContext {
             cancel: Arc::new(AtomicBool::new(false)),
-            child: Arc::new(Mutex::new(None)),
+            child: Arc::new(Mutex::new(Vec::new())),
         };
         {
             let _scope = JobScope::enter(job.clone());
             let child = ManagedChild::spawn(fixture_command("sleep")).unwrap();
-            let control = job.child.lock().unwrap().as_ref().unwrap().clone();
+            let control = job.child.lock().unwrap()[0].clone();
             job.cancel.store(true, Ordering::Relaxed);
             control.kill().unwrap();
             assert!(
@@ -821,7 +908,7 @@ pub(crate) mod tests {
                     .success()
             );
             drop(child);
-            assert!(job.child.lock().unwrap().is_none());
+            assert!(job.child.lock().unwrap().is_empty());
             assert_eq!(
                 check_cancelled().unwrap_err().kind(),
                 io::ErrorKind::Interrupted
@@ -838,7 +925,7 @@ pub(crate) mod tests {
         let registry = Arc::new(Mutex::new(Registry::default()));
         let job = JobContext {
             cancel: Arc::new(AtomicBool::new(false)),
-            child: Arc::new(Mutex::new(None)),
+            child: Arc::new(Mutex::new(Vec::new())),
         };
         // Hold publication so cancellation deterministically falls after the
         // initial flag check but before the handle is placed into the slot.
@@ -874,7 +961,7 @@ pub(crate) mod tests {
                 .success()
         );
         drop(child);
-        assert!(job.child.lock().unwrap().is_none());
+        assert!(job.child.lock().unwrap().is_empty());
     }
 
     #[test]

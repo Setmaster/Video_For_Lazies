@@ -86,6 +86,7 @@ export function estimateTransformMemory(options: {
   trimEndS?: number | null;
   speed?: number;
   frameRateCapFps?: number | null;
+  interpolationTargetFps?: number | null;
   width: number;
   height: number;
   decodedVideoBytesPerPixel?: number | null;

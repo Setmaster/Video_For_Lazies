@@ -1096,3 +1096,1015 @@ fn bundled_rounded_endpoints_do_not_add_black_frames_before_reverse() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_composes_trim_subtitles_geometry_speed_reverse_loop() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=64x48:r=24:d=1.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1.5",
+            "-c:v",
+            "ffv1",
+            "-c:a",
+            "pcm_s16le",
+            "source.mkv",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("source.mkv");
+    let probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let runtime = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+    for (index, speed, reverse, loop_video, trim, subtitle) in [
+        (
+            0,
+            1.0,
+            false,
+            false,
+            Some(Trim {
+                start_s: 0.017,
+                end_s: Some(0.225),
+            }),
+            false,
+        ),
+        (1, 2.0, true, false, None, false),
+        (2, 0.5, false, true, None, false),
+        (
+            3,
+            1.0,
+            true,
+            true,
+            Some(Trim {
+                start_s: 0.0,
+                end_s: Some(0.25),
+            }),
+            true,
+        ),
+        (
+            5,
+            1.0,
+            false,
+            false,
+            Some(Trim {
+                start_s: -0.5,
+                end_s: Some(0.25),
+            }),
+            false,
+        ),
+        (
+            4,
+            1.25,
+            false,
+            false,
+            Some(Trim {
+                start_s: 0.123,
+                end_s: Some(1.123),
+            }),
+            true,
+        ),
+    ] {
+        let mut req = request();
+        req.input_path = source.to_string_lossy().into_owned();
+        req.output_path = temp
+            .path()
+            .join(format!("ai-{index}.mp4"))
+            .to_string_lossy()
+            .into_owned();
+        req.audio_enabled = true;
+        req.speed = speed;
+        req.reverse = reverse;
+        req.loop_video = loop_video;
+        req.trim = trim;
+        req.crop = Some(Crop {
+            x: 2,
+            y: 2,
+            width: 60,
+            height: 44,
+        });
+        req.rotate_deg = 90;
+        req.resize = Some(ResizeSettings {
+            mode: ResizeMode::Custom,
+            width_px: Some(48),
+            height_px: Some(64),
+            max_edge_px: None,
+        });
+        req.interpolation = Some(InterpolationSettings {
+            target_fps: 60,
+            model_id: "rife-v4.25".into(),
+        });
+        let subtitle_stage = if subtitle {
+            let srt = temp.path().join("source.srt");
+            fs::write(&srt, "1\n00:00:00,000 --> 00:00:00,250\nAI timing\n").unwrap();
+            Some(prepare_external_subtitle(&srt).unwrap())
+        } else {
+            None
+        };
+        if subtitle {
+            req.subtitle_path = Some(EXTERNAL_SUBTITLE_FILE_NAME.into());
+        }
+        validate_interpolation_request(&req, &probe).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let group = Arc::new(Mutex::new(Vec::new()));
+        let _scope = JobScope::enter(JobContext {
+            cancel: cancel.clone(),
+            child: group.clone(),
+        });
+        let mut prepared = crate::interpolation_media::prepare(
+            &default_ffmpeg(),
+            &source,
+            &probe,
+            &req,
+            &model,
+            &cancel,
+            &group,
+            |_| {},
+        )
+        .unwrap();
+        prepared.format_mp4 = true;
+        let selection =
+            select_codec_plan(req.format, &runtime.encoder_names, &req.advanced).unwrap();
+        let plan = build_encode_command_plan(&req, &probe, selection, None).unwrap();
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        let mut args = build_single_pass_args(&source.to_string_lossy(), &req, &plan).unwrap();
+        args.push(req.output_path.clone());
+        let duration =
+            estimate_output_duration_s(probe.duration_s, &req.trim, speed, loop_video).unwrap();
+        run_ffmpeg_with_progress(
+            None,
+            1,
+            1,
+            &default_ffmpeg(),
+            &args,
+            subtitle_stage.as_ref().map(PreparedSubtitle::working_dir),
+            EncodeProgressStep::single(EncodeProgressPhase::Encoding),
+            (duration * 1e6) as u64,
+            true,
+            ffmpeg_run_limits(reverse).with_output_activity(Path::new(&req.output_path)),
+            &cancel,
+            &group,
+            Some(&prepared),
+        )
+        .unwrap();
+        let streams = probe_streams(Path::new(&req.output_path));
+        let selected = select_primary_video_stream(&streams.streams).unwrap();
+        assert_eq!((selected.width, selected.height), (Some(48), Some(64)));
+        assert!(select_primary_audio_stream(&streams.streams).is_some());
+        let mut command = command_no_window(&default_ffprobe());
+        command
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_frames",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "json",
+            ])
+            .arg(&req.output_path);
+        let result = run_command_output_with_timeout(
+            command,
+            "ffprobe",
+            "VFL_FFPROBE_PATH",
+            &default_ffprobe(),
+            "AI output timestamps",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        let frames = json["frames"].as_array().unwrap();
+        assert_eq!(
+            frames.len() as u64,
+            prepared.diagnostics.output_frames * if loop_video { 2 } else { 1 }
+        );
+        for (frame_index, frame) in frames.iter().enumerate() {
+            let pts: f64 = frame["best_effort_timestamp_time"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                (pts - frame_index as f64 / 60.0).abs() < 0.00003,
+                "case {index}, frame {frame_index}, pts {pts}"
+            );
+        }
+    }
+}
+
+fn interpolation_fixture_export(
+    req: &EncodeRequest,
+    probe: &VideoProbe,
+    model: &crate::interpolation_components::ResolvedModel,
+) -> crate::interpolation_media::InterpolationDiagnostics {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let group = Arc::new(Mutex::new(Vec::new()));
+    let _scope = JobScope::enter(JobContext {
+        cancel: cancel.clone(),
+        child: group.clone(),
+    });
+    let mut prepared = crate::interpolation_media::prepare(
+        &default_ffmpeg(),
+        Path::new(&req.input_path),
+        probe,
+        req,
+        model,
+        &cancel,
+        &group,
+        |_| {},
+    )
+    .unwrap();
+    prepared.format_mp4 = req.format == OutputFormat::Mp4;
+    let runtime = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+    let codec = select_codec_plan(req.format, &runtime.encoder_names, &req.advanced).unwrap();
+    let staged_subtitle = req
+        .subtitle_path
+        .as_deref()
+        .map(|path| prepare_external_subtitle(Path::new(path)).unwrap());
+    let mut resolved = req.clone();
+    if staged_subtitle.is_some() {
+        resolved.subtitle_path = Some(EXTERNAL_SUBTITLE_FILE_NAME.into());
+    }
+    let plan = build_encode_command_plan(&resolved, probe, codec, None).unwrap();
+    let mut args = build_single_pass_args(&req.input_path, &resolved, &plan).unwrap();
+    if let Some(index) = args.iter().position(|arg| arg == "-crf") {
+        args[index + 1] = "0".into();
+    }
+    args.push(req.output_path.clone());
+    let duration =
+        estimate_output_duration_s(probe.duration_s, &req.trim, req.speed, req.loop_video).unwrap();
+    run_ffmpeg_with_progress(
+        None,
+        1,
+        1,
+        &default_ffmpeg(),
+        &args,
+        staged_subtitle.as_ref().map(PreparedSubtitle::working_dir),
+        EncodeProgressStep::single(EncodeProgressPhase::Encoding),
+        (duration * 1e6) as u64,
+        true,
+        ffmpeg_run_limits(req.reverse).with_output_activity(Path::new(&req.output_path)),
+        &cancel,
+        &group,
+        Some(&prepared),
+    )
+    .unwrap();
+    assert!(group.lock().unwrap().is_empty());
+    prepared.diagnostics.clone()
+}
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_retains_real_video_gaps_through_temporal_transforms() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-itsoffset",
+            "0.1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=64x48:r=20:d=0.2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.5",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "ffv1",
+            "-c:a",
+            "pcm_s16le",
+            "gap.mkv",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("gap.mkv");
+    let probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    assert!((probe.video_start_s - 0.1).abs() < 0.00001);
+    assert!((probe.video_end_s.unwrap() - 0.3).abs() < 0.00001);
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    for (index, (start, reverse, loop_video, speed)) in [
+        (0.0, false, false, 1.0),
+        (0.0, true, false, 1.0),
+        (0.0, false, true, 1.0),
+        (0.15, true, true, 1.0),
+        (0.15, true, false, 1.25),
+        (0.0, false, true, 2.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut req = request();
+        req.audio_enabled = true;
+        req.input_path = source.to_string_lossy().into_owned();
+        req.output_path = temp
+            .path()
+            .join(format!("gap-ai-{index}.mp4"))
+            .to_string_lossy()
+            .into_owned();
+        req.trim = Some(Trim {
+            start_s: start,
+            end_s: Some(0.5),
+        });
+        req.reverse = reverse;
+        req.loop_video = loop_video;
+        req.speed = speed;
+        req.interpolation = Some(InterpolationSettings {
+            target_fps: 60,
+            model_id: "rife-v4.25".into(),
+        });
+        let diagnostics = interpolation_fixture_export(&req, &probe, &model);
+        let frames = ffmpeg(
+            &[
+                "-i",
+                &req.output_path,
+                "-vf",
+                "format=gray",
+                "-an",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            temp.path(),
+        );
+        let size = 64 * 48;
+        if frames.len() / size
+            != diagnostics.output_frames as usize * if loop_video { 2 } else { 1 }
+        {
+            let output = Command::new(default_ffprobe())
+                .args([
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-show_streams",
+                    "-show_format",
+                    "-of",
+                    "json",
+                ])
+                .arg(&req.output_path)
+                .output()
+                .unwrap();
+            eprintln!(
+                "gap case {index}, probe {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        assert_eq!(
+            frames.len() / size,
+            diagnostics.output_frames as usize * if loop_video { 2 } else { 1 },
+            "gap case {index}"
+        );
+        let segment = diagnostics.output_frames as f64 / 60.0;
+        for (frame_index, frame) in frames.chunks_exact(size).enumerate() {
+            let time = (frame_index as f64 + 0.5) / 60.0;
+            let local = if loop_video && time >= segment {
+                2.0 * segment - time
+            } else {
+                time
+            };
+            let source_time = if reverse {
+                0.5 - local * speed
+            } else {
+                start + local * speed
+            };
+            if (source_time - 0.1).abs() < 0.04 * speed || (source_time - 0.3).abs() < 0.04 * speed
+            {
+                continue;
+            }
+            let red = source_time > 0.1 && source_time < 0.3;
+            let mean = frame.iter().map(|x| u64::from(*x)).sum::<u64>() as f64 / size as f64;
+            assert_eq!(
+                mean > 30.0,
+                red,
+                "gap case {index} frame {frame_index} source {source_time} mean {mean}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_saturated_bt709_roundtrip_matches_existing_encoder() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "smptehdbars=s=128x96:r=24:d=0.25",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "0",
+            "-x264-params",
+            "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "bars.mkv",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("bars.mkv");
+    let probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    assert_eq!(
+        probe.color_primaries.as_deref(),
+        Some("bt709"),
+        "Fixture must contain real source primaries"
+    );
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let mut req = request();
+    req.input_path = source.to_string_lossy().into_owned();
+    req.output_path = temp
+        .path()
+        .join("bars-ai.mp4")
+        .to_string_lossy()
+        .into_owned();
+    req.interpolation = Some(InterpolationSettings {
+        target_fps: 60,
+        model_id: "rife-v4.25".into(),
+    });
+    let diagnostics = interpolation_fixture_export(&req, &probe, &model);
+    assert_eq!(
+        diagnostics.inferred_frames, 0,
+        "Static frames should not be inferred or changed"
+    );
+    ffmpeg(
+        &[
+            "-i",
+            "bars.mkv",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "bars-baseline.mp4",
+        ],
+        temp.path(),
+    );
+    let baseline = ffmpeg(
+        &[
+            "-i",
+            "bars-baseline.mp4",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        temp.path(),
+    );
+    let actual = ffmpeg(
+        &[
+            "-i",
+            "bars-ai.mp4",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        temp.path(),
+    );
+    assert_eq!(actual.len(), baseline.len());
+    let mean = actual
+        .iter()
+        .zip(baseline.iter())
+        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+        .sum::<u64>() as f64
+        / actual.len() as f64;
+    assert!(
+        mean < 2.0,
+        "Saturated BT709 roundtrip mean RGB difference {mean}"
+    );
+    let output = probe_video(req.output_path).unwrap();
+    assert_eq!(output.color_space.as_deref(), Some("bt709"));
+    assert_eq!(output.color_primaries.as_deref(), Some("bt709"));
+}
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_cuts_never_infer_excluded_picture_mixtures_and_cancel_quiesces() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=64x48:r=10:d=0.1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:s=64x48:r=10:d=0.1",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map",
+            "[v]",
+            "-c:v",
+            "ffv1",
+            "cut.mkv",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("cut.mkv");
+    let probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let mut req = request();
+    req.input_path = source.to_string_lossy().into_owned();
+    req.output_path = temp
+        .path()
+        .join("cut-ai.mp4")
+        .to_string_lossy()
+        .into_owned();
+    req.interpolation = Some(InterpolationSettings {
+        target_fps: 60,
+        model_id: "rife-v4.25".into(),
+    });
+    let diagnostics = interpolation_fixture_export(&req, &probe, &model);
+    assert_eq!(diagnostics.inferred_frames, 0);
+    assert_eq!(diagnostics.cut_pairs, 1);
+    let frames = ffmpeg(
+        &[
+            "-i",
+            &req.output_path,
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        temp.path(),
+    );
+    assert_eq!(frames.len() / (64 * 48 * 3), 12);
+    for (index, frame) in frames.chunks_exact(64 * 48 * 3).enumerate() {
+        let r = frame.chunks_exact(3).map(|p| u64::from(p[0])).sum::<u64>() / (64 * 48);
+        let b = frame.chunks_exact(3).map(|p| u64::from(p[2])).sum::<u64>() / (64 * 48);
+        assert!(
+            if index < 6 {
+                r > 180 && b < 30
+            } else {
+                b > 180 && r < 30
+            },
+            "cut frame {index} R{r} B{b}"
+        );
+    }
+    // Cancel a real inference pair rather than the cut-only optimization.
+    // Distinct gray steps stay far below the cut threshold; target pictures
+    // one and two therefore require successful native stream responses.
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=64x48:r=24:d=0.5",
+            "-vf",
+            "geq=lum='40+10*N':cb=128:cr=128",
+            "-c:v",
+            "ffv1",
+            "cancel-motion.mkv",
+        ],
+        temp.path(),
+    );
+    let cancel_source = temp.path().join("cancel-motion.mkv");
+    let cancel_probe = probe_video(cancel_source.to_string_lossy().into_owned()).unwrap();
+    let first_pair = ffmpeg(
+        &[
+            "-i",
+            "cancel-motion.mkv",
+            "-frames:v",
+            "2",
+            "-fps_mode",
+            "passthrough",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        temp.path(),
+    );
+    let frame_size = 64 * 48 * 3;
+    assert_eq!(first_pair.len(), frame_size * 2);
+    assert_ne!(&first_pair[..frame_size], &first_pair[frame_size..]);
+    assert!(!crate::interpolation_timeline::is_scene_cut(
+        &first_pair[..frame_size],
+        &first_pair[frame_size..]
+    ));
+    req.input_path = cancel_source.to_string_lossy().into_owned();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let group = Arc::new(Mutex::new(Vec::new()));
+    let _scope = JobScope::enter(JobContext {
+        cancel: cancel.clone(),
+        child: group.clone(),
+    });
+    req.output_path = temp
+        .path()
+        .join("never-published.mp4")
+        .to_string_lossy()
+        .into_owned();
+    let started = Instant::now();
+    let result = crate::interpolation_media::prepare(
+        &default_ffmpeg(),
+        &cancel_source,
+        &cancel_probe,
+        &req,
+        &model,
+        &cancel,
+        &group,
+        |fraction| {
+            if fraction >= 0.1 {
+                cancel.store(true, Ordering::Relaxed);
+                process::kill_process_group(&group);
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(group.lock().unwrap().is_empty());
+    assert!(!Path::new(&req.output_path).exists());
+}
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_reuses_one_lossless_spool_for_four_two_pass_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=64x48:r=24:d=0.25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.25",
+            "-c:v",
+            "ffv1",
+            "-c:a",
+            "pcm_s16le",
+            "source.mkv",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("source.mkv");
+    let probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let mut req = request();
+    req.input_path = source.to_string_lossy().into_owned();
+    req.audio_enabled = true;
+    req.interpolation = Some(InterpolationSettings {
+        target_fps: 60,
+        model_id: "rife-v4.25".into(),
+    });
+    req.strict_fit = true;
+    req.size_limit_mb = 0.1;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let group = Arc::new(Mutex::new(Vec::new()));
+    let _scope = JobScope::enter(JobContext {
+        cancel: cancel.clone(),
+        child: group.clone(),
+    });
+    // Exactly one native preparation. All eight encoder passes below receive
+    // this immutable file and cannot invoke the inference module themselves.
+    let prepared = crate::interpolation_media::prepare(
+        &default_ffmpeg(),
+        &source,
+        &probe,
+        &req,
+        &model,
+        &cancel,
+        &group,
+        |_| {},
+    )
+    .unwrap();
+    assert!(prepared.diagnostics.inferred_frames > 0);
+    let saved = fs::read(&prepared.path).unwrap();
+    let runtime = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+    let selection = select_codec_plan(req.format, &runtime.encoder_names, &req.advanced).unwrap();
+    let plan = build_mutated_size_reencode_plan(&req, &probe, selection, None).unwrap();
+    for (index, bitrate) in [120, 100, 80, 60].into_iter().enumerate() {
+        let log = temp.path().join(format!("plan{index}"));
+        for pass in [1, 2] {
+            let output = temp.path().join(format!("candidate-{index}.mp4"));
+            let mut args = base_ffmpeg_args(&req.input_path);
+            push_absolute_map(&mut args, probe.video_stream_index);
+            args.extend([
+                "-c:v".into(),
+                "libx264".into(),
+                "-b:v".into(),
+                format!("{bitrate}k"),
+                "-pass".into(),
+                pass.to_string(),
+                "-passlogfile".into(),
+                log.to_string_lossy().into_owned(),
+                "-pix_fmt".into(),
+                "yuv420p".into(),
+            ]);
+            if let Some(filters) = &plan.video_filters {
+                args.extend(["-vf".into(), filters.clone()]);
+            }
+            if pass == 1 {
+                args.extend(["-an".into(), "-f".into(), "null".into(), null_sink().into()]);
+            } else {
+                push_absolute_map(&mut args, probe.audio_stream_index.unwrap());
+                args.extend([
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    "96k".into(),
+                    output.to_string_lossy().into_owned(),
+                ]);
+            }
+            run_ffmpeg_with_progress(
+                None,
+                1,
+                1,
+                &default_ffmpeg(),
+                &args,
+                None,
+                EncodeProgressStep::new(
+                    EncodeProgressPhase::Encoding,
+                    (index * 2 + pass) as u8,
+                    8,
+                    pass as u8,
+                    2,
+                ),
+                250000,
+                false,
+                if pass == 1 {
+                    ffmpeg_run_limits(false)
+                } else {
+                    ffmpeg_run_limits(false).with_output_activity(&output)
+                },
+                &cancel,
+                &group,
+                Some(&prepared),
+            )
+            .unwrap();
+            if pass == 2 {
+                assert!(
+                    probe_video(output.to_string_lossy().into_owned())
+                        .unwrap()
+                        .has_audio
+                );
+            }
+        }
+        assert_eq!(fs::read(&prepared.path).unwrap(), saved);
+    }
+    assert!(group.lock().unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_vfr_clock_and_excluded_trim_context_are_exact() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:s=32x32:r=25:d=0.12",
+            "-vf",
+            "drawbox=color=red:t=fill:enable='eq(n,0)',drawbox=color=blue:t=fill:enable='eq(n,1)',drawbox=color=green:t=fill:enable='eq(n,2)',settb=1/1000,setpts=if(eq(N\\,0)\\,0\\,if(eq(N\\,1)\\,40\\,100))",
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "1:1000",
+            "-c:v",
+            "ffv1",
+            "vfr.mkv",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("vfr.mkv");
+    let probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    assert!((probe.duration_s - 0.14).abs() < 0.00001);
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let mut req = request();
+    req.input_path = source.to_string_lossy().into_owned();
+    req.interpolation = Some(InterpolationSettings {
+        target_fps: 60,
+        model_id: "rife-v4.25".into(),
+    });
+    for trimmed in [false, true] {
+        req.output_path = temp
+            .path()
+            .join(format!("vfr-{trimmed}.mp4"))
+            .to_string_lossy()
+            .into_owned();
+        req.trim = trimmed.then_some(Trim {
+            start_s: 0.01,
+            end_s: Some(0.09),
+        });
+        let diagnostic = interpolation_fixture_export(&req, &probe, &model);
+        assert_eq!(diagnostic.input_frames, if trimmed { 1 } else { 3 });
+        assert_eq!(diagnostic.inferred_frames, 0);
+        let frames = ffmpeg(
+            &[
+                "-i",
+                &req.output_path,
+                "-fps_mode",
+                "passthrough",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            temp.path(),
+        );
+        assert_eq!(frames.len() / (32 * 32 * 3), if trimmed { 5 } else { 9 });
+        for (index, frame) in frames.chunks_exact(32 * 32 * 3).enumerate() {
+            let channel = if trimmed || (3..6).contains(&index) {
+                2
+            } else if index < 3 {
+                0
+            } else {
+                1
+            };
+            let center = &frame[(16 * 32 + 16) * 3..][..3];
+            assert!(
+                center[channel] > if channel == 1 { 80 } else { 180 },
+                "VFR frame {index} {center:?}"
+            );
+            for other in 0..3 {
+                if other != channel {
+                    assert!(center[other] < 30, "VFR frame {index} {center:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_source_epoch_subtitle_pixels_survive_point123_trim() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:s=128x96:r=24:d=1.5",
+            "-c:v",
+            "ffv1",
+            "blue.mkv",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("blue.mkv");
+    let srt = temp.path().join("cue.srt");
+    fs::write(&srt, "1\n00:00:00,200 --> 00:00:00,233\nX\n").unwrap();
+    let probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let mut req = request();
+    req.input_path = source.to_string_lossy().into_owned();
+    req.output_path = temp
+        .path()
+        .join("subtitle.mp4")
+        .to_string_lossy()
+        .into_owned();
+    req.trim = Some(Trim {
+        start_s: 0.123,
+        end_s: Some(1.123),
+    });
+    req.subtitle_path = Some(srt.to_string_lossy().into_owned());
+    req.interpolation = Some(InterpolationSettings {
+        target_fps: 60,
+        model_id: "rife-v4.25".into(),
+    });
+    let diagnostic = interpolation_fixture_export(&req, &probe, &model);
+    assert_eq!(diagnostic.output_frames, 60);
+    let frames = ffmpeg(
+        &[
+            "-i",
+            &req.output_path,
+            "-fps_mode",
+            "passthrough",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        temp.path(),
+    );
+    assert_eq!(frames.len() / (128 * 96 * 3), 60);
+    for (index, frame) in frames.chunks_exact(128 * 96 * 3).enumerate() {
+        // This fixed font scales to about eight pixels in the 128x96
+        // fixture. Its antialiased glyph peaks at 170, not pure white.
+        // Non-cue blue frames have exactly zero RGB minimum brightness.
+        let peak = frame
+            .chunks_exact(3)
+            .map(|pixel| *pixel.iter().min().unwrap())
+            .max()
+            .unwrap();
+        assert_eq!(
+            peak > 150,
+            matches!(index, 5 | 6),
+            "subtitle frame {index}: glyph peak {peak}"
+        );
+        if !matches!(index, 5 | 6) {
+            assert!(
+                peak <= 3,
+                "Unexpected subtitle pixels in frame {index}: {peak}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the built native interpolation worker and catalog models"]
+fn bundled_interpolation_nut_endpoint_probe_preserves_normal_export_gaps() {
+    let temp = tempfile::tempdir().unwrap();
+    ffmpeg(
+        &[
+            "-itsoffset",
+            "0.1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=64x48:r=20:d=0.2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.5",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "ffv1",
+            "-c:a",
+            "pcm_s16le",
+            "gap.nut",
+        ],
+        temp.path(),
+    );
+    let source = temp.path().join("gap.nut");
+    let mut probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let mut req = request();
+    req.audio_enabled = true;
+    req.input_path = source.to_string_lossy().into_owned();
+    req.output_path = temp
+        .path()
+        .join("nut-ai.mp4")
+        .to_string_lossy()
+        .into_owned();
+    req.interpolation = Some(InterpolationSettings {
+        target_fps: 60,
+        model_id: "rife-v4.25".into(),
+    });
+    // Ordinary AI (without reverse/loop) still needs exact selected endpoints.
+    assert!(!req.reverse && !req.loop_video);
+    prepare_temporal_probe(&req, &source, &mut probe).unwrap();
+    assert!((probe.duration_s - 0.5).abs() < 0.00001);
+    assert!((probe.video_end_s.unwrap() - 0.3).abs() < 0.00001);
+    let diagnostic = interpolation_fixture_export(&req, &probe, &model);
+    assert_eq!(diagnostic.output_frames, 30);
+    let frames = ffmpeg(
+        &[
+            "-i",
+            &req.output_path,
+            "-fps_mode",
+            "passthrough",
+            "-vf",
+            "format=gray",
+            "-an",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        temp.path(),
+    );
+    assert_eq!(frames.len() / (64 * 48), 30);
+    for (index, frame) in frames.chunks_exact(64 * 48).enumerate() {
+        let mean =
+            frame.iter().map(|pixel| u64::from(*pixel)).sum::<u64>() as f64 / (64 * 48) as f64;
+        assert_eq!(
+            mean > 30.0,
+            (6..18).contains(&index),
+            "NUT gap frame {index} mean{mean}"
+        );
+    }
+}

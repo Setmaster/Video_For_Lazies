@@ -1,3 +1,5 @@
+import { normalizeInterpolation } from "./interpolation.mjs";
+
 export const EXPORT_RECIPES = [
   {
     id: "quick-share",
@@ -275,6 +277,7 @@ export function recipeMatchesSettings(recipe, settings) {
 
   return (
     settings.format === recipeSettings.format &&
+    JSON.stringify(normalizeInterpolation(settings.interpolation)) === JSON.stringify(normalizeInterpolation(recipeSettings.interpolation)) &&
     normalizeTextSetting(settings.sizeLimitMb) === normalizeTextSetting(recipeSettings.sizeLimitMb) &&
     resizeMatches &&
     Boolean(settings.audioEnabled) === Boolean(recipeSettings.audioEnabled) &&

@@ -1,4 +1,4 @@
-use crate::process::{self, JobContext, JobScope, ManagedChild, ProcessControl};
+use crate::process::{self, JobContext, JobScope, ManagedChild, ProcessGroup};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::interpolation_media::{self, InterpolationDiagnostics, PreparedVideo};
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Window};
+use tauri::{Emitter, Manager, Window};
 use tempfile::{Builder as TempFileBuilder, TempDir, TempPath};
 
 const MB_BYTES: u64 = 1_000_000;
@@ -310,9 +311,18 @@ pub struct ResizeSettings {
     pub height_px: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InterpolationSettings {
+    pub target_fps: u32,
+    pub model_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeRequest {
+    #[serde(default)]
+    pub interpolation: Option<InterpolationSettings>,
     pub input_path: String,
     pub output_path: String,
     pub format: OutputFormat,
@@ -376,6 +386,8 @@ pub struct EncodeProgressPayload {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum EncodeProgressPhase {
+    Preparing,
+    Interpolating,
     Copying,
     Encoding,
     Finalizing,
@@ -441,6 +453,8 @@ pub struct SubtitleInspection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<InterpolationDiagnostics>,
     pub mode: String,
     pub video_action: Option<StreamAction>,
     pub audio_action: Option<StreamAction>,
@@ -485,6 +499,7 @@ pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> Expor
     let requested_size_bytes = target_bytes_from_size_limit_mb(request.size_limit_mb);
     let redacted_reason = safe_failure_diagnostic_reason(request, reason);
     ExportDiagnostics {
+        interpolation: None,
         mode: "failed".to_string(),
         video_action: None,
         audio_action: None,
@@ -1051,6 +1066,7 @@ impl EncodeMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanReason {
+    AiInterpolation,
     CompatibleSourceCodec,
     IncompatibleSourceCodec,
     MissingStream,
@@ -1193,6 +1209,7 @@ struct EncodeProgressStep {
     step_count: u8,
     pass: u8,
     total_passes: u8,
+    start_permille: u16,
 }
 
 impl EncodeProgressStep {
@@ -1211,6 +1228,7 @@ impl EncodeProgressStep {
             step_count: step_count.max(1),
             pass: pass.max(1),
             total_passes: total_passes.max(1),
+            start_permille: 0,
         }
     }
 
@@ -2780,6 +2798,12 @@ fn frame_rate_cap_filter_fps(
     let Some(cap_fps) = requested_frame_rate_cap_fps(request)? else {
         return Ok(None);
     };
+    if let Some(interpolation) = &request.interpolation {
+        if cap_fps < interpolation.target_fps {
+            return Err("The frame-rate cap is below the AI interpolation target. Raise or disable the cap.".into());
+        }
+        return Ok(None);
+    }
     let Some(source_fps) = probe.frame_rate.filter(|fps| fps.is_finite() && *fps > 0.0) else {
         return Ok(Some(cap_fps));
     };
@@ -2796,7 +2820,9 @@ fn output_frame_rate_for_planning(
     request: &EncodeRequest,
     probe: &VideoProbe,
 ) -> Result<Option<f64>, String> {
-    if let Some(cap_fps) = frame_rate_cap_filter_fps(request, probe)? {
+    if let Some(interpolation) = &request.interpolation {
+        Ok(Some(f64::from(interpolation.target_fps)))
+    } else if let Some(cap_fps) = frame_rate_cap_filter_fps(request, probe)? {
         Ok(Some(cap_fps as f64))
     } else {
         Ok(probe.frame_rate.map(|fps| fps * effective_speed(request)))
@@ -2846,7 +2872,8 @@ fn timeline_requires_encode(request: &EncodeRequest) -> bool {
 }
 
 fn video_transform_requires_encode(request: &EncodeRequest) -> Result<bool, String> {
-    Ok(timeline_requires_encode(request)
+    Ok(request.interpolation.is_some()
+        || timeline_requires_encode(request)
         || request.crop.is_some()
         || request.rotate_deg != 0
         || !matches!(requested_resize(request)?, ResizePlan::Source)
@@ -3080,14 +3107,20 @@ fn reverse_buffer_estimate(
     let mut total_bytes = 0u128;
 
     if reverse_video || loop_video {
-        let frame_rate = probe
-            .frame_rate
+        let interpolation_frame_rate = request
+            .interpolation
+            .as_ref()
+            .map(|settings| f64::from(settings.target_fps) / effective_speed(request));
+        let frame_rate = interpolation_frame_rate
+            .or(probe.frame_rate)
             .filter(|fps| fps.is_finite() && *fps > 0.0)
             .ok_or_else(|| {
                 "Reverse/Loop is unavailable because the source frame rate could not be determined."
                     .to_string()
             })?;
-        let bytes_per_pixel = if media_policy.color_action.converts_to_standard_sdr() {
+        let bytes_per_pixel = if request.interpolation.is_some() {
+            4.0
+        } else if media_policy.color_action.converts_to_standard_sdr() {
             1.5
         } else {
             probe.decoded_video_bytes_per_pixel.ok_or_else(|| {
@@ -3269,6 +3302,10 @@ fn build_encode_command_plan(
         } else {
             PlanReason::VideoTransform
         });
+    }
+    if request.interpolation.is_some() {
+        natural_video_action = StreamAction::Encode;
+        video_reasons.push(PlanReason::AiInterpolation);
     }
     if request.subtitle_path.is_some() {
         natural_video_action = StreamAction::Encode;
@@ -4303,6 +4340,52 @@ pub(crate) fn validate_title_metadata(title: Option<&str>) -> Result<Option<Stri
     Ok(Some(title.to_string()))
 }
 
+fn validate_interpolation_request(
+    request: &EncodeRequest,
+    probe: &VideoProbe,
+) -> Result<(), String> {
+    let Some(settings) = &request.interpolation else {
+        return Ok(());
+    };
+    if !matches!(settings.target_fps, 60 | 120)
+        || !matches!(settings.model_id.as_str(), "rife-v4.25" | "rife-v4.26")
+    {
+        return Err("Choose a supported AI model and a 60 or 120 fps target.".into());
+    }
+    if request.format == OutputFormat::Mp3 {
+        return Err("AI interpolation requires MP4 or WebM video output.".into());
+    }
+    if probe.bit_depth != Some(8)
+        || !matches!(
+            probe.dynamic_range,
+            DynamicRange::Sdr | DynamicRange::Unknown
+        )
+    {
+        return Err("AI interpolation currently requires an 8-bit SDR source. Export a Standard SDR video first, then interpolate that video.".into());
+    }
+    if let Some(matrix) = probe.color_space.as_deref()
+        && !matches!(
+            matrix,
+            "bt709" | "bt470bg" | "smpte170m" | "smpte240m" | "bt2020nc" | "bt2020_ncl"
+        )
+    {
+        return Err("This source color matrix is not supported by AI interpolation. Convert it to an 8-bit SDR BT.709 video first.".into());
+    }
+    let pixel = probe.pixel_format.as_deref().ok_or("The source pixel layout could not be determined for AI interpolation. Convert it to 8-bit SDR first.")?;
+    if pixel.starts_with("yuva")
+        || pixel.starts_with("gbrap")
+        || matches!(
+            pixel,
+            "rgba" | "bgra" | "argb" | "abgr" | "pal8" | "ya8" | "vuya" | "ayuv" | "uyva"
+        )
+    {
+        return Err("AI interpolation does not support alpha or palette video. Flatten it to 8-bit SDR first.".into());
+    }
+    frame_rate_cap_filter_fps(request, probe)?;
+    let _ = crate::interpolation_timeline::Rate::for_playback(settings.target_fps, request.speed)?;
+    Ok(())
+}
+
 fn validate_base_request_scalars(request: &EncodeRequest) -> Result<(), String> {
     if request.speed <= 0.0 || !request.speed.is_finite() {
         return Err("Speed must be > 0.".to_string());
@@ -4858,13 +4941,17 @@ fn prepare_temporal_probe(
     input: &Path,
     probe: &mut VideoProbe,
 ) -> Result<(), String> {
-    if aligns_retained_av_interval(request, probe) && probe.source_format.as_deref() == Some("nut")
+    if (aligns_retained_av_interval(request, probe) || request.interpolation.is_some())
+        && probe.source_format.as_deref() == Some("nut")
     {
         // NUT indexes omit the final packet duration. Only common A/V padding
-        // needs this extra precision; loading, copying and single-stream
-        // transformations retain the ordinary metadata-only probe path.
+        // and AI's target grid need this precision; loading, copying and
+        // other single-stream transformations retain the metadata-only path.
         let (duration, video_end) =
             probe_nut_timeline_duration(&default_ffprobe(), input, probe, probe.input_origin_s)?;
+        if request.interpolation.is_some() && video_end.is_none() {
+            return Err("The complete NUT video interval could not be determined for AI interpolation. Export an MP4 first, then interpolate that video.".into());
+        }
         probe.duration_s = duration;
         probe.video_end_s = video_end;
     }
@@ -5547,7 +5634,9 @@ fn build_video_filters_with_policy(
     let mut deferred_timestamp_reset: Option<String> = None;
     let subtitle_active = req.subtitle_path.is_some();
 
-    let align_interval = aligns_retained_av_interval(req, probe);
+    // Interpolation already materializes the retained source video interval,
+    // including real leading/trailing black gaps. Never pad it a second time.
+    let align_interval = req.interpolation.is_none() && aligns_retained_av_interval(req, probe);
     if align_interval {
         // Pad the source timeline before selecting a trim, so an interval with
         // no actual pictures still has black frames. This is streaming work;
@@ -5910,7 +5999,8 @@ fn encode_progress_fractions(
     let pass_pct = (out_time_us as f64 / duration_us as f64).clamp(0.0, 1.0);
     let overall_pct = (((progress.step_index.saturating_sub(1)) as f64) + pass_pct)
         / (progress.step_count as f64);
-    Some((pass_pct, overall_pct))
+    let offset = f64::from(progress.start_permille) / 1000.0;
+    Some((pass_pct, offset + (1.0 - offset) * overall_pct))
 }
 
 fn emit_progress(
@@ -6025,8 +6115,25 @@ fn run_ffmpeg_with_progress(
     user_finalization_is_terminal: bool,
     limits: FfmpegRunLimits,
     cancel: &Arc<AtomicBool>,
-    child_slot: &Arc<Mutex<Option<ProcessControl>>>,
+    child_slot: &ProcessGroup,
+    prepared_video: Option<&PreparedVideo>,
 ) -> Result<(), String> {
+    let mut progress = progress;
+    let mut limits = limits;
+    let rewritten_args;
+    let args = if let Some(prepared) = prepared_video {
+        prepared.identity.verify(&prepared.source)?;
+        progress.start_permille = 350;
+        if let Some(path) = limits.output_activity_path.clone() {
+            let budget = prepared.output_budget_for(&path)?;
+            limits.output_size_limit = Some((path, budget));
+        }
+        rewritten_args =
+            prepared.rewrite_args(args, prepared.video_stream_index, prepared.format_mp4);
+        rewritten_args.as_slice()
+    } else {
+        args
+    };
     if cancel.load(Ordering::Relaxed) {
         return Err("Canceled.".to_string());
     }
@@ -6115,7 +6222,7 @@ fn run_ffmpeg_with_progress(
                         .filter(|metadata| metadata.len() > *max_bytes)
                         .map(|metadata| {
                             format!(
-                                "Compatible stream-copy output exceeded the bounded {} byte temporary-file limit ({} bytes written).",
+                                "Temporary export output exceeded the bounded {} byte temporary-file limit ({} bytes written).",
                                 max_bytes,
                                 metadata.len()
                             )
@@ -6403,6 +6510,22 @@ fn ffmpeg_command_preview(args: &[String], replacements: &[(&str, &str)]) -> Str
     format!("ffmpeg {preview_args}")
 }
 
+fn prepared_ffmpeg_command_preview(
+    args: &[String],
+    replacements: &[(&str, &str)],
+    prepared: Option<&PreparedVideo>,
+) -> String {
+    if let Some(prepared) = prepared {
+        let args = prepared.rewrite_args(args, prepared.video_stream_index, prepared.format_mp4);
+        let path = prepared.path.to_string_lossy();
+        let mut replacements = replacements.to_vec();
+        replacements.push((&path, "<interpolation-cache>"));
+        ffmpeg_command_preview(&args, &replacements)
+    } else {
+        ffmpeg_command_preview(args, replacements)
+    }
+}
+
 fn map_mpeg4_size_limit_error(
     format: OutputFormat,
     codec: VideoCodec,
@@ -6549,7 +6672,7 @@ pub fn run_encode_job(
     attempt_id: u64,
     job_id: u64,
     cancel: &Arc<AtomicBool>,
-    child_slot: &Arc<Mutex<Option<ProcessControl>>>,
+    child_slot: &ProcessGroup,
     mut request: EncodeRequest,
 ) -> Result<EncodeFinishedPayload, String> {
     let _job_scope = JobScope::enter(JobContext {
@@ -6589,6 +6712,11 @@ pub fn run_encode_job(
         .map_err(|error| format!("Failed to resolve input file: {error}"))?;
     let input_str = input_path.to_string_lossy().to_string();
 
+    let source_identity = request
+        .interpolation
+        .as_ref()
+        .map(|_| interpolation_media::SourceIdentity::capture(&input_path))
+        .transpose()?;
     let mut ffmpeg_bin = default_ffmpeg();
     let mut probe = probe_video(input_path.to_string_lossy().to_string())?;
     prepare_temporal_probe(&request, &input_path, &mut probe)?;
@@ -6647,6 +6775,88 @@ pub fn run_encode_job(
         &runtime_capabilities,
     )?;
 
+    let resolved_model = if let Some(settings) = &request.interpolation {
+        validate_interpolation_request(&request, &probe)?;
+        require_ffmpeg_capability_subset(
+            "AI interpolation",
+            ["ffv1", "rawvideo"],
+            [
+                "settb", "showinfo", "format", "scale", "trim", "setpts", "fps",
+            ],
+            &capability_contract,
+            &runtime_capabilities,
+        )?;
+        Some(crate::interpolation_components::resolve_model(
+            window.app_handle(),
+            &settings.model_id,
+        )?)
+    } else {
+        None
+    };
+    if let Some(identity) = &source_identity {
+        identity.verify(&input_path)?;
+    }
+    let prepared_video = if let Some(model) = &resolved_model {
+        emit_progress_payload(
+            Some(window),
+            EncodeProgressPayload {
+                attempt_id,
+                job_id,
+                phase: EncodeProgressPhase::Preparing,
+                step_index: 1,
+                step_count: 1,
+                pass: 1,
+                total_passes: 1,
+                pass_pct: 0.0,
+                overall_pct: 0.0,
+            },
+        );
+        let mut last_progress = Instant::now() - PROGRESS_EMIT_EVERY;
+        let result = interpolation_media::prepare(
+            &ffmpeg_bin,
+            &input_path,
+            &probe,
+            &request,
+            model,
+            cancel,
+            child_slot,
+            |fraction| {
+                if last_progress.elapsed() >= PROGRESS_EMIT_EVERY || fraction >= 1.0 {
+                    emit_progress_payload(
+                        Some(window),
+                        EncodeProgressPayload {
+                            attempt_id,
+                            job_id,
+                            phase: EncodeProgressPhase::Interpolating,
+                            step_index: 1,
+                            step_count: 1,
+                            pass: 1,
+                            total_passes: 1,
+                            pass_pct: fraction,
+                            overall_pct: 0.35 * fraction,
+                        },
+                    );
+                    last_progress = Instant::now();
+                }
+            },
+        );
+        let mut prepared = result.map_err(|error| {
+            if cancel.load(Ordering::Relaxed) {
+                "Canceled.".to_string()
+            } else {
+                error
+            }
+        })?;
+        if let Some(identity) = &source_identity {
+            identity.verify(&input_path)?;
+        }
+        prepared.video_stream_index = probe.video_stream_index;
+        prepared.format_mp4 = request.format == OutputFormat::Mp4;
+        Some(prepared)
+    } else {
+        None
+    };
+
     let output_duration_s = estimate_output_duration_s(
         probe.duration_s,
         &request.trim,
@@ -6698,8 +6908,11 @@ pub fn run_encode_job(
         let temp_path = create_temp_output(&output_path, job_id, "mp3")?;
         args.push(temp_path.to_string_lossy().to_string());
         let temp_str = temp_path.to_string_lossy().to_string();
-        let command_preview =
-            ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
+        let command_preview = prepared_ffmpeg_command_preview(
+            &args,
+            &[(&input_str, "<input>"), (&temp_str, "<output>")],
+            prepared_video.as_ref(),
+        );
 
         run_ffmpeg_with_progress(
             Some(window),
@@ -6714,6 +6927,7 @@ pub fn run_encode_job(
             ffmpeg_run_limits(request.reverse).with_output_activity(&temp_path),
             cancel,
             child_slot,
+            prepared_video.as_ref(),
         )?;
 
         let out_size = fs::metadata(&temp_path)
@@ -6748,6 +6962,9 @@ pub fn run_encode_job(
             return Err("Canceled.".to_string());
         }
         emit_operation_finalization(window, attempt_id, job_id);
+        if let Some(prepared) = &prepared_video {
+            prepared.identity.verify(&prepared.source)?;
+        }
         publish_output_file(temp_path, &output_path)?;
 
         return Ok(EncodeFinishedPayload {
@@ -6761,6 +6978,9 @@ pub fn run_encode_job(
                 .as_ref()
                 .map(|result| exact_target_message(result.status, out_size, target_bytes)),
             diagnostics: Some(ExportDiagnostics {
+                interpolation: prepared_video
+                    .as_ref()
+                    .map(|video| video.diagnostics.clone()),
                 mode: command_plan.mode.label().to_string(),
                 video_action: None,
                 audio_action: Some(StreamAction::Encode),
@@ -6825,8 +7045,11 @@ pub fn run_encode_job(
             let temp_path = create_temp_output(&output_path, job_id, &label)?;
             args.push(temp_path.to_string_lossy().to_string());
             let temp_str = temp_path.to_string_lossy().to_string();
-            let command_preview =
-                ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
+            let command_preview = prepared_ffmpeg_command_preview(
+                &args,
+                &[(&input_str, "<input>"), (&temp_str, "<output>")],
+                prepared_video.as_ref(),
+            );
 
             match run_ffmpeg_with_progress(
                 Some(window),
@@ -6847,6 +7070,7 @@ pub fn run_encode_job(
                 size_copy_run_limits(target_bytes, temp_path.as_ref()),
                 cancel,
                 child_slot,
+                prepared_video.as_ref(),
             ) {
                 Ok(()) => {
                     let out_size = fs::metadata(&temp_path)
@@ -6891,6 +7115,9 @@ pub fn run_encode_job(
                             plans: fit_plan_history.clone(),
                         };
                         emit_operation_finalization(window, attempt_id, job_id);
+                        if let Some(prepared) = &prepared_video {
+                            prepared.identity.verify(&prepared.source)?;
+                        }
                         publish_output_file(temp_path, &output_path)?;
                         return Ok(EncodeFinishedPayload {
                             attempt_id,
@@ -6901,6 +7128,9 @@ pub fn run_encode_job(
                             target_result: Some(target_result),
                             message: Some("Fit confirmed by exact output bytes.".to_string()),
                             diagnostics: Some(ExportDiagnostics {
+                                interpolation: prepared_video
+                                    .as_ref()
+                                    .map(|video| video.diagnostics.clone()),
                                 mode: EncodeMode::Remux.label().to_string(),
                                 video_action: Some(StreamAction::Copy),
                                 audio_action: Some(candidate.audio_action),
@@ -7020,8 +7250,11 @@ pub fn run_encode_job(
             )?;
             args.push(temp_path.to_string_lossy().to_string());
             let temp_str = temp_path.to_string_lossy().to_string();
-            let command_preview =
-                ffmpeg_command_preview(&args, &[(&input_str, "<input>"), (&temp_str, "<output>")]);
+            let command_preview = prepared_ffmpeg_command_preview(
+                &args,
+                &[(&input_str, "<input>"), (&temp_str, "<output>")],
+                prepared_video.as_ref(),
+            );
             let progress_phase = if executed_plan.video_action == StreamAction::Encode
                 || executed_plan.audio_action == StreamAction::Encode
             {
@@ -7049,6 +7282,7 @@ pub fn run_encode_job(
                 ffmpeg_run_limits(request.reverse).with_output_activity(&temp_path),
                 cancel,
                 child_slot,
+                prepared_video.as_ref(),
             ) {
                 Ok(()) => {
                     let out_size = fs::metadata(&temp_path)
@@ -7058,6 +7292,9 @@ pub fn run_encode_job(
                         return Err("Canceled.".to_string());
                     }
                     emit_operation_finalization(window, attempt_id, job_id);
+                    if let Some(prepared) = &prepared_video {
+                        prepared.identity.verify(&prepared.source)?;
+                    }
                     publish_output_file(temp_path, &output_path)?;
                     let selected_audio_bitrate_kbps =
                         (executed_plan.audio_action == StreamAction::Encode).then(|| {
@@ -7078,6 +7315,9 @@ pub fn run_encode_job(
                         target_result: None,
                         message: None,
                         diagnostics: Some(ExportDiagnostics {
+                            interpolation: prepared_video
+                                .as_ref()
+                                .map(|video| video.diagnostics.clone()),
                             mode: executed_plan.mode.label().to_string(),
                             video_action: Some(executed_plan.video_action),
                             audio_action: Some(executed_plan.audio_action),
@@ -7260,6 +7500,7 @@ pub fn run_encode_job(
             ffmpeg_run_limits(active_request.reverse),
             cancel,
             child_slot,
+            prepared_video.as_ref(),
         ) {
             return Err(map_mpeg4_size_limit_error(
                 active_request.format,
@@ -7352,13 +7593,14 @@ pub fn run_encode_job(
             create_temp_output(&output_path, job_id, &format!("pass2-{reencode_attempt}"))?;
         pass2.push(temp_output.to_string_lossy().to_string());
         let temp_output_str = temp_output.to_string_lossy().to_string();
-        let command_preview = ffmpeg_command_preview(
+        let command_preview = prepared_ffmpeg_command_preview(
             &pass2,
             &[
                 (&input_str, "<input>"),
                 (&temp_output_str, "<output>"),
                 (&passlog_str, "<passlog>"),
             ],
+            prepared_video.as_ref(),
         );
 
         if let Err(error) = run_ffmpeg_with_progress(
@@ -7380,6 +7622,7 @@ pub fn run_encode_job(
             ffmpeg_run_limits(active_request.reverse).with_output_activity(&temp_output),
             cancel,
             child_slot,
+            prepared_video.as_ref(),
         ) {
             return Err(map_mpeg4_size_limit_error(
                 active_request.format,
@@ -7574,6 +7817,9 @@ pub fn run_encode_job(
         .map(|encoder| encoder.as_codec_name().to_string());
     let message = exact_target_message(final_status, selected.actual_size_bytes, target_bytes);
     let diagnostics = ExportDiagnostics {
+        interpolation: prepared_video
+            .as_ref()
+            .map(|video| video.diagnostics.clone()),
         mode: selected.command_plan.mode.label().to_string(),
         video_action: Some(selected.command_plan.video_action),
         audio_action: Some(selected.audio_action),
@@ -7622,6 +7868,9 @@ pub fn run_encode_job(
     };
     let output_size_bytes = selected.actual_size_bytes;
     emit_operation_finalization(window, attempt_id, job_id);
+    if let Some(prepared) = &prepared_video {
+        prepared.identity.verify(&prepared.source)?;
+    }
     publish_output_file(selected.temp_output, &output_path)?;
     Ok(EncodeFinishedPayload {
         attempt_id,
@@ -7645,6 +7894,7 @@ mod tests {
 
     pub(super) fn base_request() -> EncodeRequest {
         EncodeRequest {
+            interpolation: None,
             input_path: "in.mp4".to_string(),
             output_path: "out.mp4".to_string(),
             format: OutputFormat::Mp4,
@@ -7669,6 +7919,59 @@ mod tests {
             perturb_seed: None,
             loop_video: false,
         }
+    }
+
+    #[test]
+    fn interpolation_validates_targets_color_and_frame_cap_and_updates_memory_planning() {
+        let mut req = base_request();
+        let mut probe = probe_10s_1920x1080_audio();
+        req.interpolation = Some(InterpolationSettings {
+            target_fps: 60,
+            model_id: "rife-v4.25".into(),
+        });
+        assert!(validate_interpolation_request(&req, &probe).is_ok());
+        req.advanced.frame_rate_cap_fps = Some(30);
+        assert!(
+            validate_interpolation_request(&req, &probe)
+                .unwrap_err()
+                .contains("cap")
+        );
+        req.advanced.frame_rate_cap_fps = Some(60);
+        assert_eq!(frame_rate_cap_filter_fps(&req, &probe).unwrap(), None);
+        assert_eq!(
+            output_frame_rate_for_planning(&req, &probe).unwrap(),
+            Some(60.0)
+        );
+        for matrix in ["gbr", "fcc", "ycgco", "bt2020c"] {
+            probe.color_space = Some(matrix.into());
+            assert!(
+                validate_interpolation_request(&req, &probe)
+                    .unwrap_err()
+                    .contains("color matrix")
+            );
+        }
+        probe.color_space = Some("bt709".into());
+        for pixel in [
+            "ya8", "vuya", "ayuv", "uyva", "rgba", "bgra", "argb", "abgr", "yuva420p", "gbrap",
+            "pal8",
+        ] {
+            probe.pixel_format = Some(pixel.into());
+            assert!(
+                validate_interpolation_request(&req, &probe)
+                    .unwrap_err()
+                    .contains("alpha"),
+                "{pixel}"
+            );
+        }
+        probe.pixel_format = None;
+        assert!(
+            validate_interpolation_request(&req, &probe)
+                .unwrap_err()
+                .contains("pixel layout")
+        );
+        probe.pixel_format = Some("yuv420p".into());
+        req.format = OutputFormat::Mp3;
+        assert!(validate_interpolation_request(&req, &probe).is_err());
     }
 
     #[test]
@@ -8076,7 +8379,7 @@ mod tests {
             .lock()
             .unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(Mutex::new(None));
+        let child = Arc::new(Mutex::new(Vec::new()));
         let worker_cache = cache.clone();
         let worker_cancel = cancel.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -10864,7 +11167,7 @@ IO... xv36le                  3             36      12-12-12\n",
         let mut args = vec!["-c".to_string(), script.to_string()];
         args.extend(extra_args.iter().cloned());
         let cancel = Arc::new(AtomicBool::new(false));
-        let child_slot = Arc::new(Mutex::new(None));
+        let child_slot = Arc::new(Mutex::new(Vec::new()));
         run_ffmpeg_with_progress(
             None,
             91,
@@ -10878,6 +11181,7 @@ IO... xv36le                  3             36      12-12-12\n",
             limits,
             &cancel,
             &child_slot,
+            None,
         )
     }
 
@@ -11012,7 +11316,8 @@ IO... xv36le                  3             36      12-12-12\n",
                     output_activity_path: None,
                 },
                 &Arc::new(AtomicBool::new(false)),
-                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(Vec::new())),
+                None,
             )
             .unwrap_err();
             assert!(error.contains("pipe remained open"), "{error}");
@@ -11024,7 +11329,7 @@ IO... xv36le                  3             36      12-12-12\n",
     #[test]
     fn encode_preflight_probe_is_cancelled_and_unregisters_its_child() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(Mutex::new(None));
+        let child = Arc::new(Mutex::new(Vec::new()));
         let context = JobContext {
             cancel: cancel.clone(),
             child: child.clone(),
@@ -11045,7 +11350,7 @@ IO... xv36le                  3             36      12-12-12\n",
                 )
             });
             let control = loop {
-                if let Some(control) = child.lock().unwrap().as_ref().cloned() {
+                if let Some(control) = child.lock().unwrap().first().cloned() {
                     break control;
                 }
                 assert!(started.elapsed() < Duration::from_secs(2));
@@ -11056,7 +11361,7 @@ IO... xv36le                  3             36      12-12-12\n",
             assert_eq!(worker.join().unwrap().unwrap_err(), "Canceled.");
         });
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(child.lock().unwrap().is_none());
+        assert!(child.lock().unwrap().is_empty());
     }
 
     #[test]

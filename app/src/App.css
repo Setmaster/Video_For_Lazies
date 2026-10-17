@@ -1959,3 +1959,20 @@ input[type="range"]:focus-visible {
     transition: none !important;
   }
 }
+
+.vfl-smooth-motion {
+  display: grid;
+  gap: 0.65rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 0.85rem 0;
+}
+.vfl-smooth-motion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.vfl-smooth-motion .vfl-error button {
+  display: block;
+  margin-top: 0.5rem;
+}

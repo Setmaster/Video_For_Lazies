@@ -1,5 +1,6 @@
 fn main() {
     ensure_ffmpeg_sidecar_placeholder();
+    ensure_interpolation_sidecar_placeholder();
     let attributes = configure_windows_binary_manifests();
     tauri_build::try_build(attributes).expect("failed to run the Tauri build script")
 }
@@ -73,6 +74,28 @@ fn ensure_ffmpeg_sidecar_placeholder() {
         let _ = fs::write(
             placeholder_path,
             "FFmpeg sidecar resources are populated on supported release build hosts.\n",
+        );
+    }
+}
+
+fn ensure_interpolation_sidecar_placeholder() {
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()),
+    );
+    let sidecar = manifest_dir
+        .join("..")
+        .join(".interpolation-bundle")
+        .join("current")
+        .join("interpolation-sidecar");
+    let _ = std::fs::create_dir_all(&sidecar);
+    if std::fs::read_dir(&sidecar)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_none()
+    {
+        let _ = std::fs::write(
+            sidecar.join("README.txt"),
+            "The native interpolation runtime is prepared by npm run prepare:interpolation-sidecar.\n",
         );
     }
 }

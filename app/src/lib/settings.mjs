@@ -1,3 +1,5 @@
+import { normalizeInterpolation } from "./interpolation.mjs";
+
 const VALID_FORMATS = new Set(["mp4", "webm", "mp3"]);
 const VALID_VIDEO_CODECS = new Set(["auto", "h264", "mpeg4", "vp9", "vp8"]);
 const VALID_AUDIO_BITRATES = new Set([96, 128, 192, 256, 320]);
@@ -14,6 +16,8 @@ export function parsePersistedSettings(raw) {
     if (!parsed || typeof parsed !== "object") return {};
 
     const next = {};
+    const interpolation = normalizeInterpolation(parsed.interpolation);
+    if (interpolation) next.interpolation = interpolation;
     if (VALID_FORMATS.has(parsed.format)) {
       next.format = parsed.format;
     }
@@ -56,6 +60,8 @@ export function parsePersistedSettings(raw) {
 
 export function serializePersistedSettings(settings) {
   const next = {};
+  const interpolation = normalizeInterpolation(settings?.interpolation);
+  if (interpolation) next.interpolation = interpolation;
   if (VALID_FORMATS.has(settings?.format)) {
     next.format = settings.format;
   }

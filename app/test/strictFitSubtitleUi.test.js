@@ -115,7 +115,7 @@ test("Strict Fit and subtitle controls preserve accessible status, focus, and ex
   assert.doesNotMatch(app, /Allow the final applicable plan to remove audio/);
   assert.match(app, /<label className="vfl-check vfl-strict-fit-toggle">[\s\S]*?id="vfl-strict-fit"[\s\S]*?<span>Strict Fit<\/span>[\s\S]*?<\/label>/);
   assert.match(app, /subtitleInspecting \? "Wait for external subtitle validation to finish\." : null/);
-  assert.match(app, /const encodeBusy =[^;]*subtitleInspecting/);
+  assert.match(app, /const (?:exportWorkBusy|encodeBusy) =[^;]*subtitleInspecting/);
   assert.match(app, /if \(subtitleInspecting\) throw new Error\("Wait for external subtitle validation to finish\."\)/);
   assert.match(app, /if \(subtitleInspecting\) \{[\s\S]*?return \{ ok: false, message: "Wait for external subtitle validation to finish\." \}/);
   assert.match(app, /Max edge \(px\)/);

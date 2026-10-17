@@ -23,6 +23,7 @@ The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports 
 - Crop by drawing over the preview, editing labelled source-pixel fields, or running crop detection. Quarter-turn rotation keeps the preview, pointer mapping, and source crop coordinates aligned.
 - Resize by original dimensions, max edge, or custom dimensions; rotate, reverse, create a forward-then-reverse loop, change playback speed, and adjust brightness, contrast, and saturation.
 - Apply a frame-rate cap to the post-speed frame rate. The current plan reports when the cap changes the output.
+- Enable **Smooth motion** for local AI frame interpolation at 60 or 120 fps. Portable builds include the native worker and Standard model; the Alternative model installs with one button, without Python or CUDA setup.
 - Burn one validated UTF-8 `.srt` file into MP4 or WebM using source-timeline timing and a fixed bottom-centered style. Subtitles force video re-encoding; inline HTML/ASS styling and positioning overrides are rejected.
 - Save the current preview frame as PNG when the source has standard 8-bit SDR color and square pixels.
 
@@ -107,14 +108,23 @@ For security vulnerabilities, use [private vulnerability reporting](https://gith
 - Bundled MP4 export uses H.264. In Auto mode, a custom FFmpeg without `libx264` can fall back to `mpeg4` when that encoder is available; an explicit H.264 or standard-SDR plan fails closed instead.
 - Process media files you trust. Video For Lazies runs FFmpeg locally as your user, so hostile media exercises the active FFmpeg build.
 
+### Smooth motion
+
+Turn on **Smooth motion**, choose 60 or 120 fps, and export MP4 or WebM. The ordinary preview shows your source; **Export exact sample** in Advanced runs the interpolation pipeline for a short output you can inspect first. The setting is saved in recipes and queue snapshots.
+
+The Standard RIFE 4.25 model is included in the portable folder. Select Alternative RIFE 4.26 and click **Install frame interpolation** to download it. Downloads show progress and support cancellation and retry. The app verifies model sizes and SHA256 hashes and runs a local inference test before activating a download. Video frames stay on your device. A hardware Vulkan GPU and its vendor driver are required; unsupported devices show an explanation instead of silently using the CPU.
+
+Interpolation currently accepts supported 8-bit SDR video with known frame timing. The app rejects incompatible media before export. A frame-rate cap below the chosen target must be removed or raised. Generated frames are cached once per export and reused by size-target attempts; allow temporary disk space for the lossless video cache. Interpolation can take substantially longer than an ordinary export, especially at high resolutions. Inspect a sample for artifacts around cuts, fine details and fast motion.
+
 ## From Source
 
 Requirements:
 
 - Node.js
 - Rust toolchain
-- Windows x64 and Linux x64 builds stage the pinned FFmpeg and FFprobe sidecars automatically.
-- Other development platforms and custom runtimes need FFmpeg and FFprobe on `PATH`, or `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH`.
+- CMake and a C++17 compiler for the native interpolation worker; Linux also needs Ninja. Windows needs the Visual Studio C++ tools and CMake component.
+- Supported source targets are Windows x64 and Linux x64. Both stage pinned FFmpeg/FFprobe and build the native interpolation worker automatically.
+- Custom FFmpeg runtimes can use `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH`.
 
 Run the app:
 
@@ -138,7 +148,7 @@ cd app
 npm run portable
 ```
 
-This writes `release/Video_For_Lazies/` with the app executable, update helper, bundled `ffmpeg-sidecar/`, capability contract, payload manifest, embedded subtitle support, and required project/legal files. The portable command performs the platform build; Windows also runs its baseline packaged-window startup check.
+This writes `release/Video_For_Lazies/` with the app executable, update helper, bundled `ffmpeg-sidecar/`, `interpolation-sidecar/` worker and Standard model, capability contract, payload manifest, embedded subtitle support, and required project/legal files. Keep the whole folder together. The portable command performs the platform build; Windows also runs its baseline packaged-window startup check.
 
 To create and fully verify a release archive:
 

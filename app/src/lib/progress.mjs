@@ -1,6 +1,6 @@
 export const ACTIVE_PROGRESS_DISPLAY_CAP = 0.99;
 export const FINALIZING_PROGRESS_THRESHOLD = 0.999;
-export const ENCODE_PROGRESS_PHASES = Object.freeze(["copying", "encoding", "finalizing"]);
+export const ENCODE_PROGRESS_PHASES = Object.freeze(["preparing", "interpolating", "copying", "encoding", "finalizing"]);
 
 export function clampProgress(value) {
   const numeric = Number(value);
@@ -72,11 +72,15 @@ export function getActiveProgressUi(rawProgress, isActive) {
   const totalPasses = Math.max(pass, safePositiveInteger(progressState?.totalPasses));
   const phaseLabel = isFinalizing
     ? "Finalizing output"
-    : phase === "copying"
-      ? "Copying media"
-      : totalPasses > 1
-        ? `Encoding pass ${pass} of ${totalPasses}`
-        : "Encoding";
+    : phase === "preparing"
+      ? "Preparing smooth motion"
+      : phase === "interpolating"
+        ? "Creating smooth motion"
+        : phase === "copying"
+          ? "Copying media"
+          : totalPasses > 1
+            ? `Encoding pass ${pass} of ${totalPasses}`
+            : "Encoding";
   const stepText = stepCount > 1 ? `, step ${stepIndex} of ${stepCount}` : "";
 
   return {

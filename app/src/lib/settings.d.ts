@@ -1,7 +1,8 @@
-import type { AdvancedEncodeSettings, OutputFormat } from "./types";
+import type { AdvancedEncodeSettings, InterpolationSettings, OutputFormat } from "./types";
 
 export type PersistedSettings = {
   format?: OutputFormat;
+  interpolation?: InterpolationSettings | null;
   normalizeAudio?: boolean;
   stripMetadata?: boolean;
   advanced?: AdvancedEncodeSettings;

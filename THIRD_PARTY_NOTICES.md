@@ -13,6 +13,12 @@ Windows x64 and Linux x64 portable builds bundle pinned GPL FFmpeg runtimes as `
 
 The staged sidecar includes upstream FFmpeg license text, bundle notices, and source/provenance archives under `ffmpeg-sidecar/source/`.
 
+## Native AI Frame Interpolation
+
+Portable builds include a native RIFE worker and the default RIFE 4.25 model in `interpolation-sidecar/`. The VFL worker is GPL-3.0-or-later and uses ncnn (BSD-3-Clause), glslang (its multi-party license), and a modified RIFE Warp layer (MIT). Practical-RIFE explicitly applies MIT to its linked trained models. The exact converted model files, immutable origin, byte counts and SHA256 digests are pinned in [app/interpolation-models.json](app/interpolation-models.json).
+
+The sidecar includes `INTERPOLATION_NOTICES.txt`, exact license texts, source archives/native build sources and `bundle-provenance.json`. See [native build documentation](app/native/interpolation/README.md). The build verifies published converted weights; it does not reproduce their conversion from the original checkpoints. GPU drivers remain an operating-system/vendor prerequisite.
+
 ## Embedded Subtitle Font
 
 External SRT burn-in uses DejaVu Sans 2.37, embedded in the application and staged privately for FFmpeg/libass so the fixed base face is available on every supported platform. Glyphs outside DejaVu Sans coverage may still require platform fallback.

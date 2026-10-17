@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 .ffmpeg-bundle
+.interpolation-bundle
 dist
 dist-ssr
 *.local

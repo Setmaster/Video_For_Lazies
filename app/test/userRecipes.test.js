@@ -37,6 +37,7 @@ function baseSettings(overrides = {}) {
     normalizeAudio: false,
     perturbFirstFrame: false,
     strictFit: false,
+    interpolation: null,
     advanced: {
       colorRange: "auto",
       videoCodec: "h264",
@@ -158,6 +159,7 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
     normalizeAudio: true,
     perturbFirstFrame: true,
     strictFit: true,
+    interpolation: null,
     advanced: {
       colorRange: "auto",
       videoCodec: "mpeg4",
@@ -214,6 +216,7 @@ test("MP3 recipes canonicalize video-only settings and always retain audio", () 
       normalizeAudio: false,
       perturbFirstFrame: false,
       strictFit: false,
+      interpolation: null,
       advanced: {
         colorRange: "auto",
         videoCodec: "auto",
@@ -289,7 +292,7 @@ test("invalid reusable values fail closed instead of becoming auto defaults", ()
   );
 });
 
-test("schema v3 serialization has a stable exact shape and round trips", () => {
+test("schema v4 serialization has a stable exact shape and round trips", () => {
   const input = [recipe()];
   const raw = serializeUserRecipeStore(input);
   assert.equal(
@@ -302,16 +305,16 @@ test("schema v3 serialization has a stable exact shape and round trips", () => {
 
   const parsed = parseUserRecipeStore(raw);
   assert.deepEqual(parsed, {
-    schemaVersion: 3,
+    schemaVersion: USER_RECIPE_SCHEMA_VERSION,
     recipes: input,
     warnings: [],
     migrated: false,
     readOnly: false,
-    sourceSchemaVersion: 3,
+    sourceSchemaVersion: USER_RECIPE_SCHEMA_VERSION,
   });
 });
 
-test("schema v1 records migrate to v3 with Strict Fit disabled and an empty description", () => {
+test("schema v1 records migrate to v4 with Strict Fit disabled and an empty description", () => {
   const schemaOneSettings = baseSettings();
   delete schemaOneSettings.strictFit;
   const parsed = parseUserRecipeStore(JSON.stringify({
@@ -319,7 +322,7 @@ test("schema v1 records migrate to v3 with Strict Fit disabled and an empty desc
     recipes: [{ id: "user:old", name: "Old", settings: schemaOneSettings }],
   }));
 
-  assert.equal(parsed.schemaVersion, 3);
+  assert.equal(parsed.schemaVersion, USER_RECIPE_SCHEMA_VERSION);
   assert.equal(parsed.sourceSchemaVersion, 1);
   assert.equal(parsed.migrated, true);
   assert.match(parsed.warnings[0], /migrated/);
@@ -327,7 +330,7 @@ test("schema v1 records migrate to v3 with Strict Fit disabled and an empty desc
   assert.equal(parsed.recipes[0].settings.strictFit, false);
 });
 
-test("unversioned label/maxEdge records migrate to schema v3", () => {
+test("unversioned label/maxEdge records migrate to schema v4", () => {
   const parsed = parseUserRecipeStore(JSON.stringify([
     {
       id: "legacy-one",
@@ -389,7 +392,7 @@ test("explicit schema zero objects migrate label and record-level maxEdge fields
   assert.equal(parsed.recipes[0].description, "");
 });
 
-test("schema v2 records migrate to v3, add descriptions, and discard the removed Strict Fit permission", () => {
+test("schema v2 records migrate to v4, add descriptions, and discard the removed Strict Fit permission", () => {
   const parsed = parseUserRecipeStore(JSON.stringify({
     schemaVersion: 2,
     recipes: [{
@@ -400,7 +403,7 @@ test("schema v2 records migrate to v3, add descriptions, and discard the removed
     }],
   }));
 
-  assert.equal(parsed.schemaVersion, 3);
+  assert.equal(parsed.schemaVersion, USER_RECIPE_SCHEMA_VERSION);
   assert.equal(parsed.sourceSchemaVersion, 2);
   assert.equal(parsed.migrated, true);
   assert.equal(parsed.recipes[0].description, "");
@@ -408,9 +411,9 @@ test("schema v2 records migrate to v3, add descriptions, and discard the removed
   assert.equal("strictFitAllowAudioRemoval" in parsed.recipes[0].settings, false);
 });
 
-test("schema v3 validates descriptions instead of silently accepting malformed current records", () => {
+test("schema v4 validates descriptions instead of silently accepting malformed current records", () => {
   const parsed = parseUserRecipeStore(JSON.stringify({
-    schemaVersion: 3,
+    schemaVersion: USER_RECIPE_SCHEMA_VERSION,
     recipes: [
       recipe("user:valid", "Valid", "Short description"),
       { ...recipe("user:invalid", "Invalid"), description: 123 },
@@ -423,7 +426,7 @@ test("schema v3 validates descriptions instead of silently accepting malformed c
 
 test("supported stores salvage valid records and report invalid and duplicate records", () => {
   const parsed = parseUserRecipeStore(JSON.stringify({
-    schemaVersion: 3,
+    schemaVersion: USER_RECIPE_SCHEMA_VERSION,
     recipes: [
       recipe("User:One", "Share"),
       { ...recipe("user:one", "Different"), name: "Different" },
@@ -447,7 +450,7 @@ test("malformed and structurally corrupt stores recover without throwing", () =>
   assert.match(malformed.warnings[0], /could not be read/);
   assert.equal(malformed.readOnly, false);
 
-  const missingList = parseUserRecipeStore(JSON.stringify({ schemaVersion: 3, recipes: {} }));
+  const missingList = parseUserRecipeStore(JSON.stringify({ schemaVersion: USER_RECIPE_SCHEMA_VERSION, recipes: {} }));
   assert.deepEqual(missingList.recipes, []);
   assert.match(missingList.warnings[0], /did not contain a recipe list/);
 
@@ -460,12 +463,12 @@ test("malformed and structurally corrupt stores recover without throwing", () =>
 });
 
 test("future schemas are read-only and persist never overwrites them", () => {
-  const raw = JSON.stringify({ schemaVersion: 4, recipes: [recipe()] });
+  const raw = JSON.stringify({ schemaVersion: USER_RECIPE_SCHEMA_VERSION + 1, recipes: [recipe()] });
   const current = parseUserRecipeStore(raw);
   const storage = memoryStorage(new Map([[USER_RECIPE_STORAGE_KEY, raw]]));
 
   assert.equal(current.readOnly, true);
-  assert.equal(current.sourceSchemaVersion, 4);
+  assert.equal(current.sourceSchemaVersion, USER_RECIPE_SCHEMA_VERSION + 1);
   assert.match(current.warnings[0], /newer app version/);
 
   const result = persistUserRecipeStore(storage, current, []);
@@ -511,7 +514,7 @@ test("serializer rejects invalid, duplicate, and oversized stores", () => {
 
 test("parser caps supported stores at 50 valid records with a warning", () => {
   const recipes = Array.from({ length: USER_RECIPE_MAX_COUNT + 2 }, (_, index) => recipe(`user:${index}`, `Recipe ${index}`));
-  const parsed = parseUserRecipeStore(JSON.stringify({ schemaVersion: 3, recipes }));
+  const parsed = parseUserRecipeStore(JSON.stringify({ schemaVersion: USER_RECIPE_SCHEMA_VERSION, recipes }));
 
   assert.equal(parsed.recipes.length, USER_RECIPE_MAX_COUNT);
   assert.match(parsed.warnings.at(-1), /first 50/);
