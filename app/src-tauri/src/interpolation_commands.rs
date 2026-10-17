@@ -1,4 +1,4 @@
-use crate::activity::ActivityCoordinator;
+use crate::activity::{ActivityCoordinator, allocate_operation_id};
 use crate::interpolation_components::{self, InterpolationStatus};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,14 +80,8 @@ pub(crate) fn start_interpolation_install(
 ) -> Result<u64, String> {
     validate_model_id(&model_id)?;
     let lease = activity.begin("model installation")?;
-    let previous_id = state
-        .next_id
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            id.checked_add(1)
-                .filter(|next| *next <= 9_007_199_254_740_991)
-        })
-        .map_err(|_| "Restart the app before another model installation.".to_string())?;
-    let operation_id = previous_id + 1;
+    let operation_id = allocate_operation_id(&state.next_id, 9_007_199_254_740_991)
+        .ok_or_else(|| "Restart the app before another model installation.".to_string())?;
     let cancel = Arc::new(AtomicBool::new(activity.is_closing()));
     {
         let mut current = state

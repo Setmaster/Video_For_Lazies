@@ -167,6 +167,7 @@ export function renderReleaseNotes({
 
   lines.push("## Runtime Notes", "");
   lines.push("- Windows x64 and Linux x64 portable releases bundle pinned GPL FFmpeg sidecars and include FFmpeg source plus build-provenance archives in the portable payload.");
+  lines.push("- AI Smooth motion bundles its native RIFE worker and Standard model. Hardware Vulkan and supported 8-bit SDR video are required; optional model downloads need no Python or CUDA toolkit setup.");
   lines.push("- Portable updates are accepted only after the app verifies the signed release manifest, archive SHA256 and size, and the embedded payload manifest.");
   lines.push("- Updates use an app-managed staging directory, a durable journal, and a verified backup for automatic recovery or rollback after an interrupted replacement. If saved state cannot be trusted, the app preserves the staged files and backup for explicit recovery.");
   lines.push("- Windows portable executables are not Authenticode-signed and may trigger SmartScreen or antivirus reputation warnings. Verify the matching entry in `SHA256SUMS.txt` before running.");

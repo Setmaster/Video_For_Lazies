@@ -20,6 +20,18 @@ pub(crate) struct ActivityLease {
     id: u64,
 }
 
+/// Allocate a positive ID without wrapping or advancing an exhausted counter.
+pub(crate) fn allocate_operation_id(counter: &AtomicU64, maximum: u64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).filter(|next| *next <= maximum)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(next),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 impl ActivityCoordinator {
     /// Reserve admission before the WebView can dispatch any commands.
     pub(crate) fn startup_pending() -> Self {
@@ -56,11 +68,8 @@ impl ActivityCoordinator {
         {
             return Err(format!("Wait for the current {} to finish.", current.label));
         }
-        let previous_id = self
-            .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| "Restart the app before starting another operation.".to_string())?;
-        let id = previous_id + 1;
+        let id = allocate_operation_id(&self.next_id, u64::MAX)
+            .ok_or_else(|| "Restart the app before starting another operation.".to_string())?;
         *active = Some(ActiveActivity { id, label });
         Ok(ActivityLease {
             coordinator: self.clone(),
@@ -92,6 +101,37 @@ impl Drop for ActivityLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_ids_stop_at_the_limit_without_wrapping_or_advancing() {
+        for maximum in [9_007_199_254_740_991, u64::MAX] {
+            let counter = AtomicU64::new(maximum - 1);
+            assert_eq!(allocate_operation_id(&counter, maximum), Some(maximum));
+            assert_eq!(allocate_operation_id(&counter, maximum), None);
+            assert_eq!(counter.load(Ordering::Relaxed), maximum);
+        }
+    }
+
+    #[test]
+    fn concurrent_operation_ids_remain_unique_and_contiguous() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..32)
+                        .map(|_| allocate_operation_id(&counter, u64::MAX).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut ids: Vec<_> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=128).collect::<Vec<_>>());
+    }
 
     #[test]
     fn resource_mutations_and_exports_share_one_atomic_claim() {

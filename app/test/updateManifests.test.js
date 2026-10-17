@@ -243,6 +243,15 @@ test("v2.0.0 update manifest explains the trim simplification without rewriting 
   assert.match(getUpdateNotesSummary("1.10.0"), /guarded Fast Trim/);
 });
 
+test("v2.4.0 update summary discloses local AI setup and hardware requirements", () => {
+  const summary = getUpdateNotesSummary("2.4.0");
+  assert.match(summary, /60 or 120 fps/);
+  assert.match(summary, /bundled Standard model/);
+  assert.match(summary, /hardware Vulkan/);
+  assert.ok(summary.length <= UPDATE_NOTES_SUMMARY_MAX_CHARS);
+  assert.doesNotMatch(summary, /[\u0000-\u001f\u007f]/);
+});
+
 test("update manifest rejects a payload sidecar that differs from its embedded ZIP manifest", async () => {
   const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-update-sidecar-pairing-test-"));
   try {

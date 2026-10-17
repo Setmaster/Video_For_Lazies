@@ -229,6 +229,7 @@ Required portable payload on all platforms:
 Additional required sidecar payload on Windows and Linux:
 
 - `ffmpeg-sidecar/` with FFmpeg binaries, FFmpeg license text, bundle notices, `FFMPEG_CAPABILITIES.json`, and source/provenance archives
+- `interpolation-sidecar/` with the native RIFE worker, Standard model pair, pinned model catalog, bundle provenance, source archives, licenses and notices; verify model hashes and real inference separately from UI fixtures
 - the pinned FFmpeg, BtbN build-recipe, and x264 source archives under `ffmpeg-sidecar/source/` (exact names and hashes come from `app/scripts/ffmpegBundle.mjs`; the human-readable copy is `docs/ffmpeg-bundling.md`)
 
 Linux sidecar-specific payload also includes root `ffmpeg` and `ffprobe` wrapper scripts, `bin/ffmpeg`, `bin/ffprobe`, and the required shared libraries in `ffmpeg-sidecar/lib/`.

@@ -1655,9 +1655,21 @@ fn bundled_interpolation_cuts_never_infer_excluded_picture_mixtures_and_cancel_q
         temp.path(),
     );
     assert_eq!(frames.len() / (64 * 48 * 3), 12);
-    for (index, frame) in frames.chunks_exact(64 * 48 * 3).enumerate() {
-        let r = frame.chunks_exact(3).map(|p| u64::from(p[0])).sum::<u64>() / (64 * 48);
-        let b = frame.chunks_exact(3).map(|p| u64::from(p[2])).sum::<u64>() / (64 * 48);
+    for (index, frame) in frames.as_chunks::<{ 64 * 48 * 3 }>().0.iter().enumerate() {
+        let r = frame
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| u64::from(p[0]))
+            .sum::<u64>()
+            / (64 * 48);
+        let b = frame
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| u64::from(p[2]))
+            .sum::<u64>()
+            / (64 * 48);
         assert!(
             if index < 6 {
                 r > 180 && b < 30
@@ -1933,7 +1945,7 @@ fn bundled_interpolation_vfr_clock_and_excluded_trim_context_are_exact() {
             temp.path(),
         );
         assert_eq!(frames.len() / (32 * 32 * 3), if trimmed { 5 } else { 9 });
-        for (index, frame) in frames.chunks_exact(32 * 32 * 3).enumerate() {
+        for (index, frame) in frames.as_chunks::<{ 32 * 32 * 3 }>().0.iter().enumerate() {
             let channel = if trimmed || (3..6).contains(&index) {
                 2
             } else if index < 3 {
@@ -2009,12 +2021,14 @@ fn bundled_interpolation_source_epoch_subtitle_pixels_survive_point123_trim() {
         temp.path(),
     );
     assert_eq!(frames.len() / (128 * 96 * 3), 60);
-    for (index, frame) in frames.chunks_exact(128 * 96 * 3).enumerate() {
+    for (index, frame) in frames.as_chunks::<{ 128 * 96 * 3 }>().0.iter().enumerate() {
         // This fixed font scales to about eight pixels in the 128x96
         // fixture. Its antialiased glyph peaks at 170, not pure white.
         // Non-cue blue frames have exactly zero RGB minimum brightness.
         let peak = frame
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|pixel| *pixel.iter().min().unwrap())
             .max()
             .unwrap();
@@ -2098,7 +2112,7 @@ fn bundled_interpolation_nut_endpoint_probe_preserves_normal_export_gaps() {
         temp.path(),
     );
     assert_eq!(frames.len() / (64 * 48), 30);
-    for (index, frame) in frames.chunks_exact(64 * 48).enumerate() {
+    for (index, frame) in frames.as_chunks::<{ 64 * 48 }>().0.iter().enumerate() {
         let mean =
             frame.iter().map(|pixel| u64::from(*pixel)).sum::<u64>() as f64 / (64 * 48) as f64;
         assert_eq!(
