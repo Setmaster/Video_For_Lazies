@@ -207,7 +207,7 @@ export function SmoothMotionControl({ value, format, frameRateCap, disabled, sta
   const downloaded = install.totalBytes > 0 ? Math.min(100, Math.floor(install.completedBytes / install.totalBytes * 100)) : 0;
   return (
     <section ref={sectionRef} className="vfl-smooth-motion" aria-labelledby="vfl-smooth-motion-title">
-      <label className="vfl-check" id="vfl-smooth-motion-title">
+      <label className="vfl-check vfl-check-card" id="vfl-smooth-motion-title">
         <input id="vfl-smooth-motion" type="checkbox" checked={value !== null} disabled={disabled || !startupReady || busy || checking || (format === "mp3" && value === null)}
           onChange={(event) => {
             if (event.currentTarget.checked) onChange({ targetFps: target, modelId });
@@ -216,7 +216,7 @@ export function SmoothMotionControl({ value, format, frameRateCap, disabled, sta
               onChange(null);
             }
           }} />
-        <span>Smooth motion</span>
+        <span>Enable Smooth motion</span>
       </label>
       <div className="vfl-inline-hint">{format === "mp3" ? "Available for MP4 and WebM video exports." : value ? "AI creates frames for smoother motion. Duration and normal-speed audio stay the same." : "Off. Keeps the source motion without creating frames."}</div>
       {value ? <>

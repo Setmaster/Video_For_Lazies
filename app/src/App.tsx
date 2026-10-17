@@ -222,10 +222,11 @@ const APP_LINKS = {
   security: "https://github.com/Setmaster/Video_For_Lazies/security/advisories/new",
 } as const;
 
-type RailCardKey = "source" | "recipes" | "output" | "crop" | "transform" | "advanced" | "plan" | "queue";
+type RailCardKey = "source" | "recipes" | "smoothMotion" | "output" | "crop" | "transform" | "advanced" | "plan" | "queue";
 const DEFAULT_OPEN_CARDS: Record<RailCardKey, boolean> = {
   source: true,
   recipes: true,
+  smoothMotion: false,
   output: true,
   crop: false,
   transform: false,
@@ -240,10 +241,11 @@ type RailCardProps = {
   summary?: string | null;
   open: boolean;
   onToggle: () => void;
+  keepMounted?: boolean;
   children: ReactNode;
 };
 
-function RailCard({ title, summary, open, onToggle, children }: RailCardProps) {
+function RailCard({ title, summary, open, onToggle, keepMounted = false, children }: RailCardProps) {
   return (
     <section className={`vfl-card ${open ? "is-open" : ""}`}>
       <button type="button" className="vfl-card-head" aria-expanded={open} onClick={onToggle}>
@@ -253,7 +255,7 @@ function RailCard({ title, summary, open, onToggle, children }: RailCardProps) {
           <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.6" />
         </svg>
       </button>
-      {open ? <div className="vfl-card-body">{children}</div> : null}
+      {open || keepMounted ? <div className="vfl-card-body" hidden={!open}>{children}</div> : null}
     </section>
   );
 }
@@ -7943,17 +7945,25 @@ function App() {
             ) : null}
           </RailCard>
 
-          <SmoothMotionControl
-            value={interpolation}
-            format={format}
-            frameRateCap={advancedFrameRateCapRequest}
-            disabled={exportWorkBusy}
-            startupReady={updateStartupReady}
-            onChange={setInterpolation}
-            onRemoveCap={() => setAdvancedFrameRateCapFps("auto")}
-            onStatus={setInterpolationStatus}
-            onBusy={handleInterpolationBusy}
-          />
+          <RailCard
+            title="Smooth motion"
+            summary={interpolation ? `${interpolation.targetFps} fps${interpolationInstalling ? " • Checking / installing" : ""}` : "Off"}
+            open={openCards.smoothMotion}
+            onToggle={() => toggleCard("smoothMotion")}
+            keepMounted
+          >
+            <SmoothMotionControl
+              value={interpolation}
+              format={format}
+              frameRateCap={advancedFrameRateCapRequest}
+              disabled={exportWorkBusy}
+              startupReady={updateStartupReady}
+              onChange={setInterpolation}
+              onRemoveCap={() => setAdvancedFrameRateCapFps("auto")}
+              onStatus={setInterpolationStatus}
+              onBusy={handleInterpolationBusy}
+            />
+          </RailCard>
           <RailCard
             title="Export settings"
             summary={`${format.toUpperCase()}${sizeLimitEnabled ? ` • ${sizeLimitMb} MB` : ""}`}
