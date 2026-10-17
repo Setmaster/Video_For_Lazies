@@ -1503,12 +1503,12 @@ fn bundled_interpolation_saturated_bt709_roundtrip_matches_existing_encoder() {
             "lavfi",
             "-i",
             "smptehdbars=s=128x96:r=24:d=0.25",
+            "-vf",
+            "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=limited",
             "-c:v",
             "libx264",
             "-crf",
             "0",
-            "-x264-params",
-            "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv",
             "-colorspace",
             "bt709",
             "-color_primaries",
@@ -1526,6 +1526,9 @@ fn bundled_interpolation_saturated_bt709_roundtrip_matches_existing_encoder() {
         Some("bt709"),
         "Fixture must contain real source primaries"
     );
+    assert_eq!(probe.color_transfer.as_deref(), Some("bt709"));
+    assert_eq!(probe.color_space.as_deref(), Some("bt709"));
+    assert_eq!(probe.color_range.as_deref(), Some("tv"));
     let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
     let mut req = request();
     req.input_path = source.to_string_lossy().into_owned();
@@ -1599,6 +1602,8 @@ fn bundled_interpolation_saturated_bt709_roundtrip_matches_existing_encoder() {
     let output = probe_video(req.output_path).unwrap();
     assert_eq!(output.color_space.as_deref(), Some("bt709"));
     assert_eq!(output.color_primaries.as_deref(), Some("bt709"));
+    assert_eq!(output.color_transfer.as_deref(), Some("bt709"));
+    assert_eq!(output.color_range.as_deref(), Some("tv"));
 }
 
 #[test]
