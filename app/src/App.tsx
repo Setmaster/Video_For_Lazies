@@ -7174,7 +7174,7 @@ function App() {
   }
 
   async function checkForUpdatesNow() {
-    if (manualUpdateBusy || updateBusy) return;
+    if (!updateStartupReady || manualUpdateBusy || updateBusy) return;
 
     setManualUpdateBusy(true);
     setManualUpdateStatus("Checking for updates...");
@@ -7341,7 +7341,7 @@ function App() {
               <div className="vfl-legal-row">
                 <div className="vfl-summary-label">Updates</div>
                 <div className="vfl-update-row-content">
-                  <button onClick={() => void checkForUpdatesNow()} disabled={manualUpdateBusy || updateBusy}>
+                  <button onClick={() => void checkForUpdatesNow()} disabled={!updateStartupReady || manualUpdateBusy || updateBusy}>
                     {manualUpdateBusy ? "Checking..." : "Check for updates"}
                   </button>
                   {manualUpdateStatus ? (

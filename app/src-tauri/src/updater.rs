@@ -4,7 +4,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -72,11 +72,54 @@ static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Default)]
 pub struct UpdaterCoordinator {
     active_operation: Arc<Mutex<Option<String>>>,
+    startup_result: Arc<OnceLock<Result<UpdateStartupResponse, UpdatePublicError>>>,
 }
 
 impl UpdaterCoordinator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Recovery belongs to the process, including across WebView reloads.
+    /// Keep failures too: another document must not retry recovery in this process.
+    fn finalize_startup_once(
+        &self,
+        run: impl FnOnce() -> Result<UpdateStartupResponse, UpdatePublicError>,
+    ) -> Result<UpdateStartupResponse, UpdatePublicError> {
+        self.startup_result
+            .get_or_init(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| {
+                    Err(UpdatePublicError::finalize_failed(
+                        "update worker stopped".to_string(),
+                    ))
+                })
+            })
+            .clone()
+    }
+
+    fn begin_update_check(&self) -> Result<UpdaterOperationGuard, UpdatePublicError> {
+        match self.startup_result.get() {
+            Some(Ok(response))
+                if matches!(response.status.as_str(), "none" | "completed" | "recovered") =>
+            {
+                self.begin("check")
+            }
+            Some(Err(error)) => Err(error.clone()),
+            Some(Ok(_)) => Err(UpdatePublicError::new(
+                "update-recovery-required",
+                UpdatePhase::Recovering,
+                false,
+                "restartApp",
+                "Finish recovering the app update before checking for updates.",
+            )),
+            None => Err(UpdatePublicError::new(
+                "update-startup-pending",
+                UpdatePhase::Recovering,
+                true,
+                "waitAndRetry",
+                "Wait for the app startup check to finish before checking for updates.",
+            )),
+        }
     }
 
     fn begin(&self, operation: &str) -> Result<UpdaterOperationGuard, UpdatePublicError> {
@@ -574,7 +617,7 @@ pub async fn check_for_update(
     let coordinator = coordinator.inner().clone();
     let channel = on_event.map(|id| id.channel_on(webview));
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = coordinator.begin("check")?;
+        let operation = coordinator.begin_update_check()?;
         let reporter = ProgressReporter::new(operation.operation_id.clone(), channel);
         reporter.emit(UpdatePhase::Checking, "Checking for updates...");
         let response =
@@ -866,20 +909,22 @@ pub async fn finalize_update_startup(
     let coordinator = coordinator.inner().clone();
     let channel = on_event.map(|id| id.channel_on(webview));
     tauri::async_runtime::spawn_blocking(move || {
-        let activity = app.state::<crate::activity::ActivityCoordinator>();
-        let _activity_lease = activity
-            .begin_startup()
-            .map_err(UpdatePublicError::finalize_failed)?;
-        let operation = coordinator.begin("finalize")?;
-        let reporter = ProgressReporter::new(operation.operation_id.clone(), channel);
-        reporter.emit(UpdatePhase::Recovering, "Checking saved update state...");
-        let response =
-            finalize_update_startup_inner(&app).map_err(UpdatePublicError::finalize_failed)?;
-        if matches!(response.status.as_str(), "recovering" | "elevatingRecovery") {
-            activity.shutdown();
-        }
-        reporter.emit(UpdatePhase::Completed, "Saved update state checked.");
-        Ok(response)
+        coordinator.finalize_startup_once(|| {
+            let activity = app.state::<crate::activity::ActivityCoordinator>();
+            let _activity_lease = activity
+                .begin_startup()
+                .map_err(UpdatePublicError::finalize_failed)?;
+            let operation = coordinator.begin("finalize")?;
+            let reporter = ProgressReporter::new(operation.operation_id.clone(), channel);
+            reporter.emit(UpdatePhase::Recovering, "Checking saved update state...");
+            let response =
+                finalize_update_startup_inner(&app).map_err(UpdatePublicError::finalize_failed)?;
+            if matches!(response.status.as_str(), "recovering" | "elevatingRecovery") {
+                activity.shutdown();
+            }
+            reporter.emit(UpdatePhase::Completed, "Saved update state checked.");
+            Ok(response)
+        })
     })
     .await
     .map_err(|_| UpdatePublicError::finalize_failed("update worker stopped".to_string()))?
@@ -5475,6 +5520,161 @@ mod tests {
 
         drop(first);
         assert!(coordinator.begin("apply").is_ok());
+    }
+
+    #[test]
+    fn reloaded_document_reuses_startup_while_previous_update_check_is_active() {
+        let coordinator = UpdaterCoordinator::new();
+        let activity = crate::activity::ActivityCoordinator::startup_pending();
+        let first = coordinator
+            .finalize_startup_once(|| {
+                let _activity = activity.begin_startup().unwrap();
+                let _operation = coordinator.begin("finalize")?;
+                Ok(UpdateStartupResponse {
+                    status: "none".into(),
+                    message: "No saved update state.".into(),
+                })
+            })
+            .unwrap();
+
+        let previous_document_check = coordinator.begin_update_check().unwrap();
+        let reloaded = coordinator
+            .clone()
+            .finalize_startup_once(|| panic!("Reload must not reacquire either startup lease"))
+            .unwrap();
+        assert_eq!(reloaded, first);
+        assert_eq!(
+            coordinator.begin("apply").err().unwrap().code,
+            "update-busy"
+        );
+        assert!(activity.begin("export").is_ok());
+        drop(previous_document_check);
+        assert!(coordinator.begin_update_check().is_ok());
+    }
+
+    #[test]
+    fn early_update_check_cannot_preempt_or_poison_first_startup() {
+        let coordinator = UpdaterCoordinator::new();
+        let pending = coordinator.begin_update_check().err().unwrap();
+        assert_eq!(pending.code, "update-startup-pending");
+        assert_eq!(pending.action, "waitAndRetry");
+        assert!(coordinator.active_operation.lock().unwrap().is_none());
+        assert!(coordinator.startup_result.get().is_none());
+
+        coordinator
+            .finalize_startup_once(|| {
+                let _operation = coordinator.begin("finalize")?;
+                assert_eq!(
+                    coordinator.begin_update_check().err().unwrap().code,
+                    "update-startup-pending"
+                );
+                Ok(UpdateStartupResponse {
+                    status: "none".into(),
+                    message: "Startup completed after rejecting early checks.".into(),
+                })
+            })
+            .unwrap();
+        assert!(coordinator.begin_update_check().is_ok());
+    }
+
+    #[test]
+    fn recovery_startup_statuses_never_admit_update_checks() {
+        for status in [
+            "recoveryRequired",
+            "recovering",
+            "elevatingRecovery",
+            "unknownFutureStatus",
+        ] {
+            let coordinator = UpdaterCoordinator::new();
+            coordinator
+                .finalize_startup_once(|| {
+                    Ok(UpdateStartupResponse {
+                        status: status.into(),
+                        message: "Recovery must finish first.".into(),
+                    })
+                })
+                .unwrap();
+            let error = coordinator.begin_update_check().err().unwrap();
+            assert_eq!(error.code, "update-recovery-required", "{status}");
+            assert_eq!(error.action, "restartApp");
+            assert!(coordinator.active_operation.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn concurrent_startup_documents_wait_for_one_recovery() {
+        let coordinator = UpdaterCoordinator::new();
+        let activity = crate::activity::ActivityCoordinator::startup_pending();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let coordinator = coordinator.clone();
+                let activity = activity.clone();
+                let calls = calls.clone();
+                let start = start.clone();
+                let entered = entered_tx.clone();
+                let release = release_rx.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    coordinator.finalize_startup_once(|| {
+                        calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        let _activity = activity.begin_startup().unwrap();
+                        let _operation = coordinator.begin("finalize")?;
+                        entered.send(()).unwrap();
+                        release.lock().unwrap().recv().unwrap();
+                        Ok(UpdateStartupResponse {
+                            status: "completed".into(),
+                            message: "Saved state checked once.".into(),
+                        })
+                    })
+                })
+            })
+            .collect();
+        start.wait();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(activity.begin("export").is_err());
+        assert!(coordinator.begin("check").is_err());
+        assert_eq!(
+            coordinator.begin_update_check().err().unwrap().code,
+            "update-startup-pending"
+        );
+        release_tx.send(()).unwrap();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().unwrap().status, "completed");
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(activity.begin("export").is_ok());
+        assert!(coordinator.begin_update_check().is_ok());
+    }
+
+    #[test]
+    fn startup_failure_stays_failed_after_document_reload() {
+        let coordinator = UpdaterCoordinator::new();
+        let expected = UpdatePublicError::finalize_failed("untrusted saved state".into());
+        let first = coordinator.finalize_startup_once(|| Err(expected.clone()));
+        let reloaded = coordinator
+            .clone()
+            .finalize_startup_once(|| panic!("Failed recovery requires a new process"));
+        assert_eq!(first, Err(expected.clone()));
+        assert_eq!(reloaded, Err(expected.clone()));
+        assert_eq!(coordinator.begin_update_check().err(), Some(expected));
+        assert!(coordinator.active_operation.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_worker_panic_is_cached_as_restart_required_failure() {
+        let coordinator = UpdaterCoordinator::new();
+        let first = coordinator.finalize_startup_once(|| panic!("worker stopped"));
+        let reloaded = coordinator
+            .clone()
+            .finalize_startup_once(|| panic!("Stopped worker must not be retried"));
+        assert_eq!(first, reloaded);
+        assert_eq!(first.unwrap_err().code, "update-finalize-failed");
     }
 
     #[test]
