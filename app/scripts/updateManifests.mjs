@@ -33,6 +33,7 @@ export const UPDATE_NOTES_SUMMARY_MAX_CHARS = 240;
 
 const DEFAULT_UPDATE_NOTES_SUMMARY = "See the GitHub release notes for changes.";
 const VERSIONED_UPDATE_NOTES_SUMMARIES = Object.freeze({
+  "2.4.1": "Smooth motion now has its own collapsible section matching Recipes and Crop. Model choices and active installation are preserved when the section is collapsed.",
   "2.4.0": "Adds local AI Smooth motion at 60 or 120 fps, with a bundled Standard model and one-click Alternative model setup. Includes verified downloads, cancellation, recipes and queue support. Requires hardware Vulkan and supported 8-bit SDR video.",
   "2.2.0": "Adds Auto, Limited, and Full color-range controls. Forum 4 MB now converts to limited range for upload compatibility while preserving appearance. Includes dependency security updates.",
   "1.10.0": "Adds codec-aware exports, accessible crop and trim controls, in-memory queue tools and local recipes, Strict Fit, SRT subtitle burn-in, guarded Fast Trim, clearer phase progress, and journaled recovery for signed portable updates.",
