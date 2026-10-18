@@ -20,6 +20,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
+#[cfg(windows)]
+use tauri::Manager;
 
 const RUNTIME_LOCK: &str = include_str!("../../optional-interpolation-runtime.json");
 const RUNTIME_HELPER: &[u8] = include_bytes!("../../optional-interpolation/install_runtime.py");
@@ -31,6 +33,11 @@ const MAX_RUNTIME_FILES: usize = 150_000;
 const CACHE_HEADROOM: u64 = 1024 * 1024 * 1024;
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const RUNTIME_NAMESPACE_MARKER: &str = "VFL_OPTIONAL_RUNTIME_STORE.json";
+const RUNTIME_NAMESPACE_BYTES: &[u8] = b"{\"schema\":1,\"app\":\"com.setmaster.video.for.lazies\",\"kind\":\"optional-runtime-store\"}\n";
+const RUNTIME_NAMESPACE_ERROR: &str =
+    "The optional runtime folder is unrecognized or unavailable. Existing files were preserved.";
+const RUNTIME_PATH_ERROR: &str = "The local data path is too long for optional interpolation. A shorter Windows user profile path is required.";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -135,6 +142,7 @@ struct Store {
     models: PathBuf,
     runtimes: PathBuf,
     caches: PathBuf,
+    artifacts: PathBuf,
     bundles: Vec<PathBuf>,
 }
 
@@ -410,8 +418,163 @@ fn store_at(locations: Locations) -> Result<Store, String> {
         models: root.join("optional-models"),
         runtimes: root.join("optional-runtimes"),
         caches: root.join("optional-cache"),
+        artifacts: root.join("optional-runtimes/artifacts"),
         bundles: locations.bundles,
     })
+}
+
+fn store(app: &AppHandle) -> Result<Store, String> {
+    let store = store_at(interpolation_components::locations(app)?)?;
+    #[cfg(windows)]
+    {
+        let mut store = store;
+        store.runtimes = app
+            .path()
+            .local_data_dir()
+            .map_err(|_| "The local optional runtime folder is unavailable.".to_string())?
+            .join("vflr");
+        Ok(store)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(store)
+    }
+}
+
+fn check_windows_path(path: &Path, limit: usize) -> Result<(), String> {
+    #[cfg(windows)]
+    let length = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().count()
+    };
+    #[cfg(not(windows))]
+    let length = path
+        .to_str()
+        .ok_or(RUNTIME_PATH_ERROR)?
+        .encode_utf16()
+        .count();
+    if length > limit {
+        return Err(RUNTIME_PATH_ERROR.into());
+    }
+    Ok(())
+}
+
+fn admit_runtime_root(path: &Path) -> Result<(), String> {
+    if cfg!(windows) {
+        // The pinned Windows inventory's longest relative file is 137 UTF-16
+        // units: 121 + separator + 137 remains below conventional MAX_PATH.
+        check_windows_path(path, 121)?;
+    }
+    Ok(())
+}
+
+fn runtime_target(store: &Store, lock: &RuntimeLock) -> Result<PathBuf, String> {
+    let parent = if cfg!(windows) {
+        store.runtimes.clone()
+    } else {
+        store.runtimes.join(&lock.id)
+    };
+    let target = parent.join(runtime_digest());
+    admit_runtime_root(&target)?;
+    Ok(target)
+}
+
+// Unlike owned_dir, these namespace reads must never create a missing root or
+// ancestor, including when a directory disappears between admission and open.
+fn existing_directory(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        existing_directory(parent)?;
+    }
+    let meta = fs::symlink_metadata(path).map_err(|_| RUNTIME_NAMESPACE_ERROR)?;
+    if !meta.is_dir() || redirected(&meta) {
+        return Err(RUNTIME_NAMESPACE_ERROR.into());
+    }
+    Ok(())
+}
+
+fn runtime_namespace_owned(root: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(RUNTIME_NAMESPACE_ERROR.into()),
+        Ok(_) => {}
+    }
+    existing_directory(root)?;
+    let marker = root.join(RUNTIME_NAMESPACE_MARKER);
+    if regular(&marker).map_err(|_| RUNTIME_NAMESPACE_ERROR)?.len()
+        != RUNTIME_NAMESPACE_BYTES.len() as u64
+    {
+        return Err(RUNTIME_NAMESPACE_ERROR.into());
+    }
+    let mut bytes = Vec::new();
+    File::open(marker)
+        .map_err(|_| RUNTIME_NAMESPACE_ERROR)?
+        .take(RUNTIME_NAMESPACE_BYTES.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| RUNTIME_NAMESPACE_ERROR)?;
+    if bytes.as_slice() != RUNTIME_NAMESPACE_BYTES {
+        return Err(RUNTIME_NAMESPACE_ERROR.into());
+    }
+    Ok(true)
+}
+
+fn clean_failed_namespace_claim(root: &Path, marker_created: bool) {
+    if marker_created {
+        let _ = fs::remove_file(root.join(RUNTIME_NAMESPACE_MARKER));
+    }
+    // Only a tracked self-created root reaches this function. A foreign file
+    // makes rmdir fail and is preserved; never recursively remove the root.
+    let _ = fs::remove_dir(root);
+}
+
+fn claim_runtime_namespace(root: &Path) -> Result<(), String> {
+    if runtime_namespace_owned(root)? {
+        return Ok(());
+    }
+    existing_directory(root.parent().ok_or(RUNTIME_NAMESPACE_ERROR)?)?;
+    match fs::create_dir(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return if runtime_namespace_owned(root)? {
+                Ok(())
+            } else {
+                Err(RUNTIME_NAMESPACE_ERROR.into())
+            };
+        }
+        Err(_) => return Err(RUNTIME_NAMESPACE_ERROR.into()),
+    }
+    let marker = root.join(RUNTIME_NAMESPACE_MARKER);
+    let mut file = match File::options().write(true).create_new(true).open(marker) {
+        Ok(file) => file,
+        Err(_) => {
+            clean_failed_namespace_claim(root, false);
+            return Err(RUNTIME_NAMESPACE_ERROR.into());
+        }
+    };
+    let result = file
+        .write_all(RUNTIME_NAMESPACE_BYTES)
+        .and_then(|_| file.sync_all());
+    drop(file);
+    if result.is_err() {
+        clean_failed_namespace_claim(root, true);
+        return Err(RUNTIME_NAMESPACE_ERROR.into());
+    }
+    Ok(())
+}
+
+fn runtime_store_lease(root: &Path, exclusive: bool) -> Result<Option<File>, String> {
+    if cfg!(windows) {
+        if !runtime_namespace_owned(root)? {
+            return Ok(None);
+        }
+        existing_directory(root)?;
+        let lease = open_store_lock(root, exclusive)?;
+        if !runtime_namespace_owned(root)? {
+            return Err(RUNTIME_NAMESPACE_ERROR.into());
+        }
+        Ok(Some(lease))
+    } else {
+        Ok(Some(lock_store(root, exclusive)?))
+    }
 }
 
 fn owned_dir(path: &Path) -> Result<(), String> {
@@ -456,6 +619,10 @@ fn regular(path: &Path) -> Result<fs::Metadata, String> {
 
 fn lock_store(root: &Path, exclusive: bool) -> Result<File, String> {
     owned_dir(root)?;
+    open_store_lock(root, exclusive)
+}
+
+fn open_store_lock(root: &Path, exclusive: bool) -> Result<File, String> {
     let path = root.join(".components.lock");
     if path
         .try_exists()
@@ -679,6 +846,7 @@ fn runtime_owned(
     verify: bool,
     cancel: &AtomicBool,
 ) -> Result<RuntimePaths, String> {
+    admit_runtime_root(dir)?;
     let digest = runtime_digest();
     let ownership = check_ownership(dir, &expected_ownership("runtime", &lock.id, &digest))?;
     let inventory_path = dir.join(INVENTORY);
@@ -706,6 +874,9 @@ fn runtime_owned(
     let mut total = 0u64;
     for file in &inventory.files {
         safe_relative(&file.path)?;
+        if cfg!(windows) {
+            check_windows_path(&dir.join(&file.path), 259)?;
+        }
         if !allowed.insert(file.path.clone())
             || !folded.insert(runtime_path_key(&file.path))
             || !digest_valid(&file.sha256)
@@ -1441,7 +1612,11 @@ fn admit_storage(store: &Store, required: u64, cancel: &AtomicBool) -> Result<()
         downloaded: store.models.clone(),
         bundles: store.bundles.clone(),
     })?;
-    for root in [&store.models, &store.runtimes, &store.caches] {
+    let mut roots = vec![&store.models, &store.runtimes, &store.caches];
+    if cfg!(windows) {
+        roots.push(&store.artifacts);
+    }
+    for root in roots {
         check_cancel(cancel)?;
         owned_dir(root)?;
         let free = crate::interpolation_media::available_space(&helper, root)?;
@@ -1470,7 +1645,7 @@ fn assemble_runtime(
         .platforms
         .get(platform_key()?)
         .ok_or("The optional runtime is unavailable for this platform.")?;
-    let target = store.runtimes.join(&lock.id).join(runtime_digest());
+    let target = runtime_target(store, lock)?;
     if let Some(paths) = counts.verified_runtime.take() {
         emit(
             progress,
@@ -1486,10 +1661,10 @@ fn assemble_runtime(
         });
     }
     check_cancel(cancel)?;
-    let artifacts = store.runtimes.join("artifacts");
+    let artifacts = &store.artifacts;
     let mut python_archive = None;
     for artifact in std::iter::once(&platform.python).chain(&platform.wheels) {
-        let path = artifact_cache(client, &artifacts, artifact, cancel, |bytes| {
+        let path = artifact_cache(client, artifacts, artifact, cancel, |bytes| {
             emit(
                 progress,
                 "downloading",
@@ -1510,6 +1685,7 @@ fn assemble_runtime(
         .tempdir_in(parent)
         .map_err(|_| "Cannot stage the optional runtime. Check free disk space.")?;
     let root = stage.path().join("runtime");
+    admit_runtime_root(&root)?;
     owned_dir(&root)?;
     emit(
         progress,
@@ -1542,7 +1718,7 @@ fn assemble_runtime(
         .arg("--platform")
         .arg(platform_key()?)
         .arg("--cache")
-        .arg(&artifacts)
+        .arg(artifacts)
         .arg("--root")
         .arg(&root);
     configure_command(&mut command, &store.caches.join("assembly"))?;
@@ -1753,23 +1929,20 @@ fn validate_self_test(output: &[u8], id: &str) -> Result<String, String> {
 }
 
 pub(crate) fn resolve_model(app: &AppHandle, id: &str) -> Result<ResolvedModel, String> {
-    resolve_at(&store_at(interpolation_components::locations(app)?)?, id)
+    resolve_at(&store(app)?, id)
 }
 
 fn resolve_at(store: &Store, id: &str) -> Result<ResolvedModel, String> {
     let (model, digest) = manifest(id)?;
     let lock = runtime_lock()?;
+    let runtime_path = runtime_target(store, &lock)?;
     let model_lease = lock_store(&store.models, false)?;
-    let runtime_lease = lock_store(&store.runtimes, false)?;
+    let runtime_lease = runtime_store_lease(&store.runtimes, false)?
+        .ok_or("Install this optional model to use its shared runtime.")?;
     let scripts = qualified_scripts(store)?;
     let path = model_path(store, &model, &digest);
     model_owned(&path, &model, &digest, true, &AtomicBool::new(false))?;
-    let runtime = runtime_owned(
-        &store.runtimes.join(&lock.id).join(runtime_digest()),
-        &lock,
-        true,
-        &AtomicBool::new(false),
-    )?;
+    let runtime = runtime_owned(&runtime_path, &lock, true, &AtomicBool::new(false))?;
     let mut resolved = resolved(store, &model, &digest, &path, &runtime, &scripts)?;
     resolved._lease = Some(Arc::new(vec![model_lease, runtime_lease]));
     Ok(resolved)
@@ -1795,28 +1968,28 @@ fn status_value(
 }
 
 pub(crate) fn status(app: &AppHandle, id: &str) -> Result<InterpolationStatus, String> {
-    status_at(&store_at(interpolation_components::locations(app)?)?, id)
+    status_at(&store(app)?, id)
 }
 
 fn status_at(store: &Store, id: &str) -> Result<InterpolationStatus, String> {
     let (model, digest) = manifest(id)?;
     let lock = runtime_lock()?;
+    let runtime_path = runtime_target(store, &lock)?;
     let platform = lock
         .platforms
         .get(platform_key()?)
         .ok_or("Optional runtime is unavailable for this platform.")?;
     let model_lease = lock_store(&store.models, false)?;
-    let runtime_lease = lock_store(&store.runtimes, false)?;
+    let runtime_lease = runtime_store_lease(&store.runtimes, false)?;
     let scripts = qualified_scripts(store)?;
     let cancel = AtomicBool::new(false);
     let path = model_path(store, &model, &digest);
     let model_valid = model_owned(&path, &model, &digest, true, &cancel);
-    let runtime = runtime_owned(
-        &store.runtimes.join(&lock.id).join(runtime_digest()),
-        &lock,
-        true,
-        &cancel,
-    );
+    let runtime = if runtime_lease.is_some() {
+        runtime_owned(&runtime_path, &lock, true, &cancel)
+    } else {
+        Err("Install this optional model to use its shared runtime.".into())
+    };
     let total = remaining_download(&model, platform, model_valid.is_ok(), runtime.is_ok());
     let installed = if model_owned(&path, &model, &digest, false, &cancel).is_ok() {
         model
@@ -1831,6 +2004,8 @@ fn status_at(store: &Store, id: &str) -> Result<InterpolationStatus, String> {
     let checked = (|| {
         model_valid?;
         let runtime = runtime?;
+        let runtime_lease =
+            runtime_lease.ok_or("Install this optional model to use its shared runtime.")?;
         let mut resolved = resolved(store, &model, &digest, &path, &runtime, &scripts)?;
         resolved._lease = Some(Arc::new(vec![model_lease, runtime_lease]));
         Ok::<_, String>(resolved)
@@ -1874,7 +2049,7 @@ pub(crate) fn install(
     cancel: &AtomicBool,
     mut progress: impl FnMut(InstallUpdate),
 ) -> Result<InterpolationStatus, String> {
-    let store = store_at(interpolation_components::locations(app)?)?;
+    let store = store(app)?;
     let client = download_client()?;
     install_at(&store, id, cancel, &mut progress, |file| {
         fetch(&client, file).map(|response| Box::new(response) as Box<dyn Read>)
@@ -1890,8 +2065,13 @@ fn install_at(
 ) -> Result<InterpolationStatus, String> {
     let (model, digest) = manifest(id)?;
     let lock = runtime_lock()?;
+    let runtime_path = runtime_target(store, &lock)?;
     let _model_lease = lock_store(&store.models, true)?;
-    let _runtime_lease = lock_store(&store.runtimes, true)?;
+    if cfg!(windows) {
+        claim_runtime_namespace(&store.runtimes)?;
+    }
+    let _runtime_lease =
+        runtime_store_lease(&store.runtimes, true)?.ok_or(RUNTIME_NAMESPACE_ERROR)?;
     let scripts = qualified_scripts(store)?;
     let platform = lock
         .platforms
@@ -1901,13 +2081,7 @@ fn install_at(
     let target = model_path(store, &model, &digest);
     let model_bytes: u64 = model.files.iter().map(|f| f.bytes).sum();
     let model_verified = model_owned(&target, &model, &digest, true, cancel).is_ok();
-    let verified_runtime = runtime_owned(
-        &store.runtimes.join(&lock.id).join(runtime_digest()),
-        &lock,
-        true,
-        cancel,
-    )
-    .ok();
+    let verified_runtime = runtime_owned(&runtime_path, &lock, true, cancel).ok();
     check_cancel(cancel)?;
     admit_storage(
         store,
@@ -2001,21 +2175,17 @@ fn install_at(
 }
 
 pub(crate) fn remove(app: &AppHandle, id: &str) -> Result<InterpolationStatus, String> {
-    remove_at(&store_at(interpolation_components::locations(app)?)?, id)
+    remove_at(&store(app)?, id)
 }
 
 fn remove_at(store: &Store, id: &str) -> Result<InterpolationStatus, String> {
     let (model, digest) = manifest(id)?;
     let lock = runtime_lock()?;
+    let runtime_path = runtime_target(store, &lock)?;
     let _lease = lock_store(&store.models, true)?;
-    let _runtime_lease = lock_store(&store.runtimes, false)?;
-    let retained_runtime_verified = runtime_owned(
-        &store.runtimes.join(&lock.id).join(runtime_digest()),
-        &lock,
-        true,
-        &AtomicBool::new(false),
-    )
-    .is_ok();
+    let _runtime_lease = runtime_store_lease(&store.runtimes, false)?;
+    let retained_runtime_verified = _runtime_lease.is_some()
+        && runtime_owned(&runtime_path, &lock, true, &AtomicBool::new(false)).is_ok();
     let target = model_path(store, &model, &digest);
     if target
         .try_exists()
@@ -2047,6 +2217,198 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Cursor;
+
+    #[test]
+    fn runtime_layout_preserves_archive_model_and_cache_locations() {
+        let locations = Locations {
+            downloaded: PathBuf::from("interpolation/downloaded"),
+            bundles: vec![],
+        };
+        let store = store_at(locations).unwrap();
+        assert_eq!(store.models, Path::new("interpolation/optional-models"));
+        assert_eq!(store.caches, Path::new("interpolation/optional-cache"));
+        assert_eq!(
+            store.artifacts,
+            Path::new("interpolation/optional-runtimes/artifacts")
+        );
+        let lock = runtime_lock().unwrap();
+        let target = runtime_target(&store, &lock).unwrap();
+        let expected_parent = if cfg!(windows) {
+            store.runtimes.clone()
+        } else {
+            store.runtimes.join(&lock.id)
+        };
+        assert_eq!(target, expected_parent.join(runtime_digest()));
+        assert_eq!(target.file_name().unwrap().to_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn windows_path_budget_counts_utf16_and_rejects_before_mutation() {
+        assert!(check_windows_path(Path::new(&"x".repeat(121)), 121).is_ok());
+        assert_eq!(
+            check_windows_path(Path::new(&"x".repeat(122)), 121),
+            Err(RUNTIME_PATH_ERROR.into())
+        );
+        let unicode = format!("{}😀", "x".repeat(119));
+        assert!(check_windows_path(Path::new(&unicode), 121).is_ok());
+        assert!(check_windows_path(Path::new(&format!("{unicode}x")), 121).is_err());
+        assert!(check_windows_path(Path::new(&"x".repeat(259)), 259).is_ok());
+        assert!(check_windows_path(Path::new(&"x".repeat(260)), 259).is_err());
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store {
+            models: temp.path().join("models"),
+            runtimes: temp.path().join("x".repeat(122)),
+            caches: temp.path().join("cache"),
+            artifacts: temp.path().join("artifacts"),
+            bundles: vec![],
+        };
+        let result = runtime_target(&store, &runtime_lock().unwrap());
+        assert_eq!(result.is_err(), cfg!(windows));
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn runtime_namespace_claim_requires_missing_root_and_exact_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("r");
+        assert!(!runtime_namespace_owned(&root).unwrap());
+        assert!(!root.exists());
+        claim_runtime_namespace(&root).unwrap();
+        assert!(runtime_namespace_owned(&root).unwrap());
+        assert_eq!(
+            fs::read(root.join(RUNTIME_NAMESPACE_MARKER)).unwrap(),
+            RUNTIME_NAMESPACE_BYTES
+        );
+        assert!(!root.join(".components.lock").exists());
+        fs::write(root.join("user-note"), b"preserved").unwrap();
+        fs::create_dir(root.join("other-generation")).unwrap();
+        claim_runtime_namespace(&root).unwrap();
+        assert_eq!(fs::read(root.join("user-note")).unwrap(), b"preserved");
+        assert!(root.join("other-generation").is_dir());
+        let held = open_store_lock(&root, true).unwrap();
+        assert!(open_store_lock(&root, false).is_err());
+        drop(held);
+        assert!(runtime_namespace_owned(&root).unwrap());
+    }
+
+    #[test]
+    fn runtime_namespace_refuses_existing_unknown_content_without_stamping() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, marker) in [
+            ("empty", None),
+            ("partial", Some(b"{".as_slice())),
+            ("wrong", Some(b"unrecognized".as_slice())),
+        ] {
+            let root = temp.path().join(name);
+            fs::create_dir(&root).unwrap();
+            if let Some(bytes) = marker {
+                fs::write(root.join(RUNTIME_NAMESPACE_MARKER), bytes).unwrap();
+            }
+            assert_eq!(
+                claim_runtime_namespace(&root),
+                Err(RUNTIME_NAMESPACE_ERROR.into())
+            );
+            assert!(!root.join(".components.lock").exists());
+            match marker {
+                Some(bytes) => assert_eq!(
+                    fs::read(root.join(RUNTIME_NAMESPACE_MARKER)).unwrap(),
+                    bytes
+                ),
+                None => assert_eq!(fs::read_dir(root).unwrap().count(), 0),
+            }
+        }
+        let root = temp.path().join("nonempty");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("user-note"), b"preserved").unwrap();
+        assert!(claim_runtime_namespace(&root).is_err());
+        assert_eq!(fs::read(root.join("user-note")).unwrap(), b"preserved");
+        assert!(!root.join(RUNTIME_NAMESPACE_MARKER).exists());
+        let file = temp.path().join("file");
+        fs::write(&file, b"preserved").unwrap();
+        assert!(claim_runtime_namespace(&file).is_err());
+        assert_eq!(fs::read(file).unwrap(), b"preserved");
+        let oversized = temp.path().join("oversized");
+        fs::create_dir(&oversized).unwrap();
+        let bytes = vec![b'x'; RUNTIME_NAMESPACE_BYTES.len() + 1];
+        fs::write(oversized.join(RUNTIME_NAMESPACE_MARKER), &bytes).unwrap();
+        assert!(claim_runtime_namespace(&oversized).is_err());
+        assert_eq!(
+            fs::read(oversized.join(RUNTIME_NAMESPACE_MARKER)).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn namespace_cleanup_preserves_foreign_entries_and_missing_lease_stays_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("new");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(RUNTIME_NAMESPACE_MARKER), RUNTIME_NAMESPACE_BYTES).unwrap();
+        fs::write(root.join("user-note"), b"preserved").unwrap();
+        clean_failed_namespace_claim(&root, true);
+        assert!(!root.join(RUNTIME_NAMESPACE_MARKER).exists());
+        assert_eq!(fs::read(root.join("user-note")).unwrap(), b"preserved");
+        fs::write(root.join(RUNTIME_NAMESPACE_MARKER), b"foreign").unwrap();
+        clean_failed_namespace_claim(&root, false);
+        assert_eq!(
+            fs::read(root.join(RUNTIME_NAMESPACE_MARKER)).unwrap(),
+            b"foreign"
+        );
+        let missing = temp.path().join("missing");
+        assert!(existing_directory(&missing).is_err());
+        assert!(open_store_lock(&missing, false).is_err());
+        assert!(!missing.exists());
+        #[cfg(windows)]
+        assert!(runtime_store_lease(&missing, false).unwrap().is_none());
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_namespace_refuses_redirected_root_and_marker() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("user-note"), b"preserved").unwrap();
+        let root = temp.path().join("r");
+        symlink(&outside, &root).unwrap();
+        assert!(claim_runtime_namespace(&root).is_err());
+        assert_eq!(fs::read(outside.join("user-note")).unwrap(), b"preserved");
+        assert!(!outside.join(RUNTIME_NAMESPACE_MARKER).exists());
+        let owned = temp.path().join("owned");
+        claim_runtime_namespace(&owned).unwrap();
+        fs::remove_file(owned.join(RUNTIME_NAMESPACE_MARKER)).unwrap();
+        symlink(
+            outside.join("user-note"),
+            owned.join(RUNTIME_NAMESPACE_MARKER),
+        )
+        .unwrap();
+        assert!(runtime_namespace_owned(&owned).is_err());
+        assert!(claim_runtime_namespace(&owned).is_err());
+        assert_eq!(fs::read(outside.join("user-note")).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn global_models_lease_blocks_removal_before_runtime_namespace_mutation() {
+        let temp = tempfile::Builder::new()
+            .prefix("r")
+            .rand_bytes(4)
+            .tempdir()
+            .unwrap();
+        let store = Store {
+            models: temp.path().join("models"),
+            runtimes: temp.path().join("r"),
+            caches: temp.path().join("cache"),
+            artifacts: temp.path().join("old/artifacts"),
+            bundles: vec![],
+        };
+        let held = lock_store(&store.models, false).unwrap();
+        assert!(remove_at(&store, "gmfss-fortuna-union").is_err());
+        assert!(!store.runtimes.exists());
+        assert!(!store.artifacts.exists());
+        drop(held);
+    }
 
     fn fixture_model() -> (Manifest, String) {
         (
@@ -2102,10 +2464,15 @@ mod tests {
 
     #[test]
     fn removal_accounts_for_only_verified_retained_runtime_under_shared_lease() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("r")
+            .rand_bytes(4)
+            .tempdir()
+            .unwrap();
         let store = Store {
             models: temporary.path().join("models"),
-            runtimes: temporary.path().join("runtimes"),
+            runtimes: temporary.path().join("r"),
+            artifacts: temporary.path().join("artifacts"),
             caches: temporary.path().join("cache"),
             bundles: vec![],
         };
@@ -2113,7 +2480,10 @@ mod tests {
         let lock = runtime_lock().unwrap();
         let platform = lock.platforms.get(platform_key().unwrap()).unwrap();
         let target = model_path(&store, &model, &digest);
-        let runtime = store.runtimes.join(&lock.id).join(runtime_digest());
+        let runtime = runtime_target(&store, &lock).unwrap();
+        if cfg!(windows) {
+            claim_runtime_namespace(&store.runtimes).unwrap();
+        }
         let create_owned_partial_model = || {
             owned_dir(&target).unwrap();
             write_ownership(&target, &expected_ownership("model", &model.id, &digest)).unwrap();
@@ -2903,10 +3273,15 @@ mod tests {
             )
             .unwrap();
         }
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("r")
+            .rand_bytes(4)
+            .tempdir()
+            .unwrap();
         let store = Store {
             models: temporary.path().join("optional-models"),
-            runtimes: temporary.path().join("optional-runtimes"),
+            runtimes: temporary.path().join("r"),
+            artifacts: temporary.path().join("optional-runtimes/artifacts"),
             caches: temporary.path().join("optional-cache"),
             bundles: vec![
                 Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2923,7 +3298,10 @@ mod tests {
         assert!(
             crate::interpolation_media::available_space(&native_helper, &store.models).unwrap() > 0
         );
-        let runtime_target = store.runtimes.join(&lock.id).join(runtime_digest());
+        let runtime_target = runtime_target(&store, &lock).unwrap();
+        if cfg!(windows) {
+            claim_runtime_namespace(&store.runtimes).unwrap();
+        }
         owned_dir(&runtime_target).unwrap();
         for directory in &inventory.directories {
             owned_dir(&runtime_target.join(safe_relative(directory).unwrap())).unwrap();
