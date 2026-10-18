@@ -2530,6 +2530,48 @@ mod tests {
 
     #[test]
     fn shared_resolved_leases_hold_both_model_and_runtime_until_last_clone_drops() {
+        const CHILD: &str = "VFL_OPTIONAL_LEASE_TEST_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            // Parallel tests spawn children that briefly inherit flock's open
+            // file description before CLOEXEC runs. Keep the immediate lease
+            // assertions in their own process without concurrent test spawns.
+            let isolated = tempfile::tempdir().unwrap();
+            for directory in ["home", "tmp", "local", "roaming", "cwd"] {
+                fs::create_dir(isolated.path().join(directory)).unwrap();
+            }
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "optional_interpolation_components::tests::shared_resolved_leases_hold_both_model_and_runtime_until_last_clone_drops",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", isolated.path().join("home"))
+                .env("USERPROFILE", isolated.path().join("home"))
+                .env("APPDATA", isolated.path().join("roaming"))
+                .env("LOCALAPPDATA", isolated.path().join("local"))
+                .env("TMPDIR", isolated.path().join("tmp"))
+                .env("TEMP", isolated.path().join("tmp"))
+                .env("TMP", isolated.path().join("tmp"))
+                .current_dir(isolated.path().join("cwd"));
+            #[cfg(windows)]
+            for name in ["SystemRoot", "WINDIR"] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Isolated lease test failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let models = temp.path().join("models");
         let runtimes = temp.path().join("runtimes");
