@@ -12,6 +12,8 @@ import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
 import { UserRecipeDialog, type UserRecipeDialogState } from "./components/UserRecipeDialog";
+import RecordingWorkspace from "./components/RecordingWorkspace";
+import { WorkspaceTabs, type Workspace } from "./components/WorkspaceTabs";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
 import type {
   AppSmokeConfig,
@@ -656,6 +658,8 @@ function formatDimensionDraft(value: number) {
 }
 
 function App() {
+  const [activeWorkspace, setActiveWorkspace] = useState<Workspace>("edit");
+  const activeWorkspaceRef = useRef<Workspace>("edit");
   const [openCards, setOpenCards] = useState<Record<RailCardKey, boolean>>(DEFAULT_OPEN_CARDS);
   const [sampleDurationS, setSampleDurationS] = useState<number>(10);
   const [sampleEstimate, setSampleEstimate] = useState<{
@@ -3366,10 +3370,10 @@ function App() {
     if (!hasTauriRuntime()) return;
 
     const cleanupWindowDrop = bindWindowFileDrop(window, {
-      isDropAllowed: () => !modalOpenRef.current,
+      isDropAllowed: () => activeWorkspaceRef.current === "edit" && !modalOpenRef.current,
       onDragActiveChange: setDragActive,
       onPathsDropped: (paths) => {
-        if (!modalOpenRef.current) void handleDroppedPaths(paths);
+        if (activeWorkspaceRef.current === "edit" && !modalOpenRef.current) void handleDroppedPaths(paths);
       },
     });
 
@@ -3382,7 +3386,7 @@ function App() {
         unlisten = await getCurrentWebviewWindow().onDragDropEvent((event) => {
           const p = event.payload;
           if (p.type === "enter" || p.type === "over") {
-            if (!modalOpenRef.current) {
+            if (activeWorkspaceRef.current === "edit" && !modalOpenRef.current) {
               setDragActive(true);
             }
             return;
@@ -3392,7 +3396,7 @@ function App() {
             return;
           }
           if (p.type !== "drop") return;
-          if (!modalOpenRef.current) void handleDroppedPaths(p.paths);
+          if (activeWorkspaceRef.current === "edit" && !modalOpenRef.current) void handleDroppedPaths(p.paths);
         });
       } catch (e) {
         console.warn("Failed to register drag-drop handler:", e);
@@ -5429,6 +5433,16 @@ function App() {
     setPreviewPlaying(false);
   }
 
+  function changeWorkspace(workspace: Workspace) {
+    if (activeWorkspaceRef.current === workspace) return;
+    // Native drop callbacks can arrive before the next render/effect.
+    activeWorkspaceRef.current = workspace;
+    setDragActive(false);
+    trimDragCleanupRef.current?.();
+    if (workspace !== "edit") pausePreviewPlayback();
+    setActiveWorkspace(workspace);
+  }
+
   function syncPreviewToTime(nextTimeS: number, target: TrimFocusTarget, opts?: { pause?: boolean }) {
     activeTrimTargetRef.current = target;
     setActiveTrimTarget(target);
@@ -5608,7 +5622,7 @@ function App() {
   }
 
   const handleComposeShortcutKeydown = useEffectEvent((event: KeyboardEvent) => {
-    if (!inputPath || modalOpen) return;
+    if (activeWorkspaceRef.current !== "edit" || !inputPath || modalOpen) return;
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
     if (blocksComposeShortcutTarget(event.target)) return;
 
@@ -7263,7 +7277,7 @@ function App() {
 
   return (
     <div className="vfl-app">
-      {dragActive && !modalOpen ? (
+      {activeWorkspace === "edit" && dragActive && !modalOpen ? (
         <div className="vfl-drop-overlay" aria-hidden="true">
           <div className="vfl-drop-overlay-card">
             {updateBusy
@@ -7513,8 +7527,9 @@ function App() {
           <div className="vfl-title">
             <div className="vfl-title-main">Video For Lazies</div>
           </div>
+          <WorkspaceTabs active={activeWorkspace} onChange={changeWorkspace} />
           <div className="vfl-header-utilities">
-            <div className="vfl-header-badges">
+            {activeWorkspace === "edit" ? <div className="vfl-header-badges">
               <div className="vfl-header-badge">{sourceBadgeText}</div>
               <div className="vfl-header-badge">{format.toUpperCase()} export</div>
               {sizeLimitEnabled ? <div className="vfl-header-badge">{sizeLimitMb} MB target</div> : null}
@@ -7524,7 +7539,17 @@ function App() {
                   {activeEditChips.length} active edit{activeEditChips.length === 1 ? "" : "s"}
                 </div>
               ) : null}
-            </div>
+            </div> : (
+              <div className="vfl-header-badge">MP4 recording</div>
+            )}
+            {activeWorkspace === "record" && (attemptUi.isActive || queueRunning) ? (
+              <button type="button" className="vfl-workspace-export-status" onClick={() => {
+                changeWorkspace("edit");
+                document.getElementById("vfl-workspace-tab-edit")?.focus();
+              }}>
+                {queueRunning ? "Queue active" : "Export active"} · View in Edit
+              </button>
+            ) : null}
             <button
               className="vfl-about-button"
               type="button"
@@ -7543,6 +7568,14 @@ function App() {
 
       </header>
 
+      <div
+        id="vfl-workspace-edit"
+        className="vfl-workspace"
+        role="tabpanel"
+        aria-labelledby="vfl-workspace-tab-edit"
+        hidden={activeWorkspace !== "edit"}
+        inert={activeWorkspace !== "edit"}
+      >
       <div className="vfl-split">
         <section className="vfl-pane-left">
               <div className="vfl-preview-section">
@@ -7558,12 +7591,14 @@ function App() {
                           ref={cropperRef}
                           src={videoSrc}
                           rect={cropRect}
-                          onChange={setCropRect}
+                          onChange={(rect) => {
+                            if (activeWorkspaceRef.current === "edit") setCropRect(rect);
+                          }}
                           aspect={aspect}
                           frameAspectRatio={probe.width / probe.height}
                           rotationDeg={rotateDeg}
                           cropEnabled={cropEnabled}
-                          disabled={encodeBusy}
+                          disabled={encodeBusy || activeWorkspace !== "edit"}
                           colorFilter={previewColorFilter}
                           onTimeUpdate={setPreviewTimeS}
                           onPlaybackChange={setPreviewPlaying}
@@ -9318,6 +9353,17 @@ function App() {
           </div>
         </div>
       </footer>
+      </div>
+      <div
+        id="vfl-workspace-record"
+        className="vfl-workspace"
+        role="tabpanel"
+        aria-labelledby="vfl-workspace-tab-record"
+        hidden={activeWorkspace !== "record"}
+        inert={activeWorkspace !== "record"}
+      >
+        <RecordingWorkspace />
+      </div>
     </div>
   );
 }

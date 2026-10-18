@@ -55,6 +55,18 @@ body {
   min-width: 0;
 }
 
+.vfl-workspace {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.vfl-workspace[hidden] {
+  display: none;
+}
+
 .vfl-split {
   flex: 1;
   display: flex;
@@ -110,6 +122,51 @@ body {
   align-items: center;
   gap: 14px;
   padding: 8px 14px;
+}
+
+.vfl-workspace-tabs {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--inset);
+  flex: 0 0 auto;
+}
+
+.vfl-workspace-tabs > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 76px;
+  padding: 4px 10px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.vfl-workspace-tabs > button[aria-selected="true"] {
+  border-color: rgba(var(--accent), 0.35);
+  background: rgba(var(--accent), 0.1);
+  color: var(--accent-strong);
+}
+
+.vfl-workspace-tabs svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.vfl-workspace-export-status {
+  color: var(--accent-strong);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .vfl-title {
