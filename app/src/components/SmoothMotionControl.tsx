@@ -230,8 +230,8 @@ export function SmoothMotionControl({ value, format, frameRateCap, disabled, sta
             const selected = event.currentTarget.value as InterpolationModelId;
             onStatus(null); setProfile(selected); onChange({ ...value, modelId: selected });
           }}>
-            <option value="rife-v4.25">Standard (4.25)</option>
-            <option value="rife-v4.26">Alternative (4.26)</option>
+            <option value="rife-v4.25">RIFE 4.25 (REC)</option>
+            <option value="rife-v4.26">RIFE 4.26</option>
           </select>
         </div>
         <div className="vfl-inline-hint" role="status" aria-live="polite" data-smoke-id="interpolation-status">
