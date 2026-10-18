@@ -211,6 +211,10 @@ def assemble(lock_path, platform, cache, root):
     for item, file in wheel_inputs:
         with zipfile.ZipFile(file) as archive:
             for member in archive.infolist():
+                # ZipInfo normalizes Windows separators and truncates at NUL.
+                # Reject raw aliases before considering the normalized path.
+                if member.orig_filename != member.filename:
+                    fail("Wheel archive path is not canonical")
                 entries += 1
                 if entries > MAX_ENTRIES or member.flag_bits & 1:
                     fail("Wheel entry limit or encryption rule violated")

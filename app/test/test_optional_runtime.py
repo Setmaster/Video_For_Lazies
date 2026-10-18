@@ -32,6 +32,9 @@ class Assembly(unittest.TestCase):
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
             for name, data, mode in entries:
                 entry = zipfile.ZipInfo(name)
+                # Preserve malformed names that ZipInfo would normalize before
+                # writing, so the archive itself exercises the raw-name guard.
+                entry.filename = name
                 entry.external_attr = (mode or stat.S_IFREG | 0o644) << 16
                 entry.compress_type = zipfile.ZIP_DEFLATED
                 z.writestr(entry, data)
@@ -70,7 +73,24 @@ class Assembly(unittest.TestCase):
         self.rejects([('/outside.py', b'x', None)])
 
     def test_backslash(self):
-        self.rejects([('pkg\\escape.py', b'x', None)])
+        for name, mode in [('pkg\\escape.py', None), ('pkg\\directory/', stat.S_IFDIR | 0o755)]:
+            with self.subTest(name=name):
+                self.rejects_raw_name_before_writes(name, mode)
+
+    def test_null_byte_alias(self):
+        for name, mode in [('pkg/x.py\x00alias', None), ('pkg/directory/\x00alias', stat.S_IFDIR | 0o755)]:
+            with self.subTest(name=name):
+                self.rejects_raw_name_before_writes(name, mode)
+
+    def rejects_raw_name_before_writes(self, name, mode):
+        c, r, l, w = self.fixture([('valid/first.py', b'never extracted', None),
+                                   (name, b'' if mode else b'x', mode)])
+        with zipfile.ZipFile(c / (w['sha256'] + '-' + w['filename'])) as archive:
+            self.assertEqual(archive.infolist()[1].orig_filename, name)
+        with self.assertRaises((ValueError, OSError, zipfile.BadZipFile)):
+            helper.assemble(l, 'windows-x86_64', c, r)
+        self.assertEqual(list(r.iterdir()), [r / 'python.exe'])
+        self.assertEqual((r / 'python.exe').read_bytes(), b'inert fixture interpreter; never executed')
 
     def test_drive(self):
         self.rejects([('C:/escape.py', b'x', None)])
