@@ -1,5 +1,6 @@
-//! Reviewed model data is downloaded; executable code always comes from the app.
+//! Native RIFE uses app-shipped code; optional backends use pinned reviewed components.
 //! Admission between installation, removal and exports belongs to lib.rs.
+use crate::optional_interpolation_components;
 use crate::process::ManagedChild;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -67,13 +68,31 @@ pub(crate) struct InstallUpdate {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum ModelExecution {
+    Native,
+    TorchPair {
+        python_path: PathBuf,
+        script_path: PathBuf,
+        source_dir: PathBuf,
+        cache_dir: PathBuf,
+    },
+    TorchSequence {
+        python_path: PathBuf,
+        script_path: PathBuf,
+        source_dir: PathBuf,
+        cache_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ResolvedModel {
+    pub execution: ModelExecution,
     pub worker_path: PathBuf,
     pub model_dir: PathBuf,
     pub model_id: String,
     pub model_digest: String,
     pub worker_digest: String,
-    _lease: Option<Arc<File>>,
+    pub(super) _lease: Option<Arc<Vec<File>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -84,9 +103,9 @@ struct Ownership {
     model_digest: String,
 }
 
-struct Locations {
-    downloaded: PathBuf,
-    bundles: Vec<PathBuf>,
+pub(super) struct Locations {
+    pub(super) downloaded: PathBuf,
+    pub(super) bundles: Vec<PathBuf>,
 }
 
 fn catalog() -> Result<Catalog, String> {
@@ -162,7 +181,7 @@ fn model_digest(model: &Model) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn locations(app: &AppHandle) -> Result<Locations, String> {
+pub(super) fn locations(app: &AppHandle) -> Result<Locations, String> {
     let downloaded = app
         .path()
         .app_local_data_dir()
@@ -190,7 +209,7 @@ fn locations(app: &AppHandle) -> Result<Locations, String> {
     })
 }
 
-fn file_digest(path: &Path) -> Result<String, String> {
+pub(super) fn file_digest(path: &Path) -> Result<String, String> {
     let mut input =
         File::open(path).map_err(|_| "Cannot read the interpolation engine.".to_string())?;
     let mut hash = Sha256::new();
@@ -207,7 +226,7 @@ fn file_digest(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn worker_path(locations: &Locations) -> Result<PathBuf, String> {
+pub(super) fn worker_path(locations: &Locations) -> Result<PathBuf, String> {
     if cfg!(debug_assertions)
         && let Some(path) = std::env::var_os("VFL_INTERPOLATION_WORKER_PATH")
     {
@@ -240,7 +259,7 @@ fn regular_file(path: &Path) -> Result<fs::Metadata, String> {
     Ok(meta)
 }
 
-fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+pub(super) fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         Err("Canceled.".into())
     } else {
@@ -302,6 +321,7 @@ fn resolve_at(
     let worker = worker_path(locations)?;
     Ok((
         ResolvedModel {
+            execution: ModelExecution::Native,
             worker_digest: file_digest(&worker)?,
             worker_path: worker,
             model_dir: dir,
@@ -360,12 +380,15 @@ fn locate_model(
 }
 
 pub(crate) fn resolve_model(app: &AppHandle, model_id: &str) -> Result<ResolvedModel, String> {
+    if optional_interpolation_components::supports(model_id) {
+        return optional_interpolation_components::resolve_model(app, model_id);
+    }
     let catalog = catalog()?;
     let model = selected_model(&catalog, model_id)?;
     let locations = locations(app)?;
     let lease = model_lock(&locations, false)?;
     resolve_at(&locations, &catalog, model).map(|(mut resolved, _)| {
-        resolved._lease = Some(Arc::new(lease));
+        resolved._lease = Some(Arc::new(vec![lease]));
         resolved
     })
 }
@@ -393,6 +416,9 @@ fn make_status(
 }
 
 pub(crate) fn status(app: &AppHandle, model_id: &str) -> Result<InterpolationStatus, String> {
+    if optional_interpolation_components::supports(model_id) {
+        return optional_interpolation_components::status(app, model_id);
+    }
     let catalog = catalog()?;
     let model = selected_model(&catalog, model_id)?;
     let locations = locations(app)?;
@@ -576,7 +602,7 @@ fn self_test(resolved: &ResolvedModel, cancel: &AtomicBool) -> Result<String, St
     Ok(result.device_name)
 }
 
-fn read_bounded(mut input: impl Read) -> Result<Vec<u8>, String> {
+pub(super) fn read_bounded(mut input: impl Read) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut buffer = [0u8; 4096];
     let mut overflow = false;
@@ -749,6 +775,9 @@ pub(crate) fn install(
     cancel: &AtomicBool,
     mut progress: impl FnMut(InstallUpdate),
 ) -> Result<InterpolationStatus, String> {
+    if optional_interpolation_components::supports(model_id) {
+        return optional_interpolation_components::install(app, model_id, cancel, progress);
+    }
     let catalog = catalog()?;
     let model = selected_model(&catalog, model_id)?;
     let locations = locations(app)?;
@@ -817,6 +846,7 @@ fn install_at(
             "Testing the interpolation model.",
         );
         let resolved = ResolvedModel {
+            execution: ModelExecution::Native,
             worker_path: worker.clone(),
             model_dir: target,
             model_id: model.id.clone(),
@@ -891,6 +921,7 @@ fn install_at(
         "Testing the interpolation model.",
     );
     let resolved = ResolvedModel {
+        execution: ModelExecution::Native,
         worker_path: worker.clone(),
         model_dir: staging.path().into(),
         model_id: model.id.clone(),
@@ -1045,6 +1076,9 @@ fn activate(staging: &Path, target: &Path, model: &Model, catalog: &Catalog) -> 
 }
 
 pub(crate) fn remove(app: &AppHandle, model_id: &str) -> Result<InterpolationStatus, String> {
+    if optional_interpolation_components::supports(model_id) {
+        return optional_interpolation_components::remove(app, model_id);
+    }
     let catalog = catalog()?;
     let model = selected_model(&catalog, model_id)?;
     let locations = locations(app)?;

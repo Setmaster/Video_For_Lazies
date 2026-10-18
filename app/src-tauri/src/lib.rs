@@ -12,6 +12,9 @@ mod interpolation_commands;
 mod interpolation_components;
 mod interpolation_media;
 mod interpolation_timeline;
+mod optional_interpolation_components;
+#[cfg(test)]
+mod optional_interpolation_tests;
 mod process;
 pub mod updater;
 mod video;
@@ -400,7 +403,9 @@ fn parse_smoke_config_from_env(
                 .get("VFL_SMOKE_INTERPOLATION_MODEL")
                 .map(String::as_str)
                 .unwrap_or("rife-v4.25");
-            if !matches!(model_id, "rife-v4.25" | "rife-v4.26") {
+            if !matches!(model_id, "rife-v4.25" | "rife-v4.26")
+                && !optional_interpolation_components::supports(model_id)
+            {
                 return Err("VFL_SMOKE_INTERPOLATION_MODEL is not supported.".to_string());
             }
             Ok(video::InterpolationSettings {
@@ -957,6 +962,18 @@ mod tests {
         let interpolation = config.interpolation.unwrap();
         assert_eq!(interpolation.target_fps, 120);
         assert_eq!(interpolation.model_id, "rife-v4.25");
+        for model_id in ["gmfss-fortuna-union", "gimm-vfi-r-p", "ldf-vfi"] {
+            env.insert("VFL_SMOKE_INTERPOLATION_MODEL".into(), model_id.into());
+            assert_eq!(
+                parse_smoke_config_from_env(&env)
+                    .unwrap()
+                    .unwrap()
+                    .interpolation
+                    .unwrap()
+                    .model_id,
+                model_id
+            );
+        }
         env.insert("VFL_SMOKE_INTERPOLATION_FPS".into(), "90".into());
         assert!(parse_smoke_config_from_env(&env).is_err());
         env.insert("VFL_SMOKE_INTERPOLATION_FPS".into(), "60".into());

@@ -8,6 +8,7 @@ import {
   appRoot, interpolationBundleRoot, interpolationNativeRoot, interpolationSidecarDir,
   INTERPOLATION_NATIVE, getInterpolationExecutableName, readInterpolationCatalog,
   getInterpolationSourceDigest, sha256File,
+  optionalInterpolationRoot, optionalInterpolationFiles,
 } from './interpolationBundle.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -120,6 +121,13 @@ async function buildInterpolationBundle({ force = false, jobs = 4, platform = pr
     await fs.mkdir(source);
     for (const item of sourceArchives) await fs.copyFile(item.archive, path.join(source, item.archiveName));
     await fs.cp(interpolationNativeRoot, path.join(source, 'vfl-rife'), { recursive: true });
+    await fs.mkdir(path.join(target, 'optional'));
+    await fs.mkdir(path.join(source, 'vfl-optional'));
+    for (const name of optionalInterpolationFiles) {
+      await fs.copyFile(path.join(optionalInterpolationRoot, name), path.join(target, 'optional', name));
+      await fs.copyFile(path.join(optionalInterpolationRoot, name), path.join(source, 'vfl-optional', name));
+    }
+    await fs.copyFile(path.join(appRoot, 'optional-interpolation-runtime.json'), path.join(source, 'optional-interpolation-runtime.json'));
     await fs.copyFile(path.join(appRoot, 'scripts', 'interpolationBundle.mjs'), path.join(source, 'interpolationBundle.mjs'));
     await fs.copyFile(fileURLToPath(import.meta.url), path.join(source, 'build-interpolation-sidecar.mjs'));
     await fs.copyFile(path.join(appRoot, 'interpolation-models.json'), path.join(target, 'model-catalog.json'));
@@ -142,7 +150,7 @@ async function buildInterpolationBundle({ force = false, jobs = 4, platform = pr
       await fs.copyFile(cached, output);
     }
     await fs.writeFile(path.join(target, 'INTERPOLATION_NOTICES.txt'),
-      `Video For Lazies RIFE sidecar, protocol 1\nNative wrapper: GPL-3.0-or-later; see LICENSE.txt and source/vfl-rife.\nRIFE Warp layer derives from k4yt3x/librife-ncnn-vulkan ${INTERPOLATION_NATIVE.rifeSourceCommit} (MIT), with validation, border and error handling changes documented in its README.\nncnn ${INTERPOLATION_NATIVE.ncnn.commit} (BSD-3-Clause), glslang ${INTERPOLATION_NATIVE.glslang.commit} (see complete multi-party license).\nOriginal model: Practical-RIFE 4.25, linked weights MIT per upstream declaration in licenses/model-license.txt. Converted model catalog/source and file hashes are recorded in model-catalog.json and bundle-provenance.json. This build consumes the published model conversion; it does not regenerate it. See source/vfl-rife/README.md.\nGPU drivers including Vulkan are provided by the operating system/vendor. No CUDA, Python or external OpenMP runtime is bundled.\n`);
+      `Video For Lazies interpolation sidecar, protocol 1\nNative wrapper and optional worker adapters: GPL-3.0-or-later; see LICENSE.txt, source/vfl-rife and source/vfl-optional.\nRIFE Warp layer derives from k4yt3x/librife-ncnn-vulkan ${INTERPOLATION_NATIVE.rifeSourceCommit} (MIT), with validation, border and error handling changes documented in its README.\nncnn ${INTERPOLATION_NATIVE.ncnn.commit} (BSD-3-Clause), glslang ${INTERPOLATION_NATIVE.glslang.commit} (see complete multi-party license).\nOriginal model: Practical-RIFE 4.25, linked weights MIT per upstream declaration in licenses/model-license.txt. Converted model catalog/source and file hashes are recorded in model-catalog.json and bundle-provenance.json. This build consumes the published model conversion; it does not regenerate it. See source/vfl-rife/README.md.\nGPU drivers including Vulkan are provided by the operating system/vendor. Bundled RIFE requires no Python or CUDA setup. Optional GMFSS, GIMM and LDF use separately downloaded, app-local pinned runtimes, sources and weights. Their per-file manifests and runtime lock are included under source/. Downloaded components retain their own licenses and notices; GIMM is noncommercial. No optional model weights or Torch runtime are included in this portable bundle.\n`);
     const provenance = {
       protocol: 1, platform, arch: 'x64', sourceDigest,
       native: INTERPOLATION_NATIVE, modelCatalogVersion: catalog.catalogVersion,

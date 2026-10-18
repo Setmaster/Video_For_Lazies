@@ -34,8 +34,13 @@ impl Rate {
     }
 
     pub fn frame_count(self, duration_ns: u64) -> Result<u64, String> {
-        let divisor = NANOS * u128::from(self.denominator);
-        let count = (u128::from(duration_ns) * u128::from(self.numerator)).div_ceil(divisor);
+        // Scheduling and final setpts both round to nanoseconds. Count only
+        // rounded samples strictly before the retained end, including a tie's
+        // ownership at that end rather than inventing a sub-nanosecond frame.
+        let divisor = 2 * NANOS * u128::from(self.denominator);
+        let count = (u128::from(duration_ns).saturating_mul(2).saturating_sub(1)
+            * u128::from(self.numerator))
+        .div_ceil(divisor);
         let count =
             u64::try_from(count).map_err(|_| "Interpolation frame count overflow.".to_string())?;
         if count == 0 || count > MAX_OUTPUT_FRAMES {
@@ -45,17 +50,21 @@ impl Rate {
     }
 
     pub fn sample_before(self, frame: u64, timestamp_ns: u64) -> bool {
-        u128::from(frame) * NANOS * u128::from(self.denominator)
-            < u128::from(timestamp_ns) * u128::from(self.numerator)
+        self.sample_ns(frame) < u128::from(timestamp_ns)
+    }
+
+    fn sample_ns(self, frame: u64) -> u128 {
+        let numerator = u128::from(frame) * NANOS * u128::from(self.denominator);
+        (numerator + u128::from(self.numerator) / 2) / u128::from(self.numerator)
     }
 
     pub fn alpha(self, frame: u64, left_ns: u64, right_ns: u64) -> Result<f32, String> {
         if right_ns <= left_ns {
             return Err("Decoded video timestamps are not strictly increasing.".into());
         }
-        let sample = u128::from(frame) * NANOS * u128::from(self.denominator);
-        let left = u128::from(left_ns) * u128::from(self.numerator);
-        let span = u128::from(right_ns - left_ns) * u128::from(self.numerator);
+        let sample = self.sample_ns(frame);
+        let left = u128::from(left_ns);
+        let span = u128::from(right_ns - left_ns);
         if sample <= left {
             return Ok(0.0);
         }
@@ -148,7 +157,19 @@ mod tests {
         let rate = Rate::for_playback(60, 1.0).unwrap();
         assert!(rate.frame_count(u64::MAX).is_err());
         assert!(!rate.sample_before(1, 16_666_666));
-        assert!(rate.sample_before(1, 16_666_667));
+        assert!(!rate.sample_before(1, 16_666_667));
+        assert!(rate.sample_before(1, 16_666_668));
         assert_eq!(rate.alpha(1, 16_666_667, 30_000_000).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn decoded_nanosecond_rounding_preserves_source_anchors_cut_and_trim_ownership() {
+        let rate = Rate::for_playback(60, 1.0).unwrap();
+        assert!(!rate.sample_before(4, 66_666_667));
+        assert_eq!(rate.alpha(4, 66_666_667, 100_000_000).unwrap(), 0.0);
+        assert_eq!(rate.frame_count(16_666_667).unwrap(), 1);
+        assert_eq!(rate.frame_count(16_666_668).unwrap(), 2);
+        assert_eq!(rate.frame_count(1).unwrap(), 1);
+        assert!(rate.frame_count(0).is_err());
     }
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { beginInterpolationInstall, bindInterpolationInstall, createInterpolationInstall, interpolationConflict, interpolationInstallActive, interpolationPublicMessage, normalizeInterpolation, reduceInterpolationInstall } from "../src/lib/interpolation.mjs";
+import { INTERPOLATION_MODELS, interpolationModelLabel, beginInterpolationInstall, bindInterpolationInstall, createInterpolationInstall, interpolationConflict, interpolationInstallActive, interpolationPublicMessage, normalizeInterpolation, reduceInterpolationInstall } from "../src/lib/interpolation.mjs";
 import { parsePersistedSettings, serializePersistedSettings } from "../src/lib/settings.mjs";
 import { EXPORT_RECIPES, recipeMatchesSettings } from "../src/lib/exportRecipes.mjs";
 import { createExportQueueState, reduceExportQueue } from "../src/lib/exportQueue.mjs";
@@ -20,6 +20,25 @@ test("saved interpolation intent is an allowlist and old settings default Off", 
   assert.deepEqual(JSON.parse(raw), { interpolation: intent });
   assert.deepEqual(parsePersistedSettings(raw).interpolation, intent);
   assert.doesNotMatch(raw, /private|Path|device/);
+});
+
+test("each optional model survives settings, recipes and queue snapshots", () => {
+  for (const modelId of INTERPOLATION_MODELS) {
+    const interpolation = { targetFps: 60, modelId };
+    assert.deepEqual(parsePersistedSettings(serializePersistedSettings({ interpolation })).interpolation, interpolation);
+    const created = createUserRecipe([], modelId, "Smooth motion", { ...settings(), interpolation }, { id: modelId });
+    assert.equal(created.ok, true);
+    assert.deepEqual(parseUserRecipeStore(serializeUserRecipeStore(created.recipes)).recipes[0].settings.interpolation, interpolation);
+    const queue = reduceExportQueue(createExportQueueState(), { type: "enqueue-prepared", items: [{ request: { ...settings(), interpolation, inputPath: "/input.mp4", outputPath: "/output.mp4" }, durationS: 1 }] });
+    assert.deepEqual(queue.items[0].request.interpolation, interpolation);
+    interpolation.modelId = "untrusted";
+    assert.equal(queue.items[0].request.interpolation.modelId, modelId);
+  }
+});
+
+test("plan summaries identify every model by its actual name", () => {
+  assert.deepEqual(INTERPOLATION_MODELS.map(interpolationModelLabel), ["RIFE 4.25", "RIFE 4.26", "GMFSS Fortuna (Union)", "GIMM-VFI-R-P", "LDF-VFI"]);
+  assert.equal(interpolationModelLabel("toString"), "toString");
 });
 
 test("cap conflicts and MP3 cannot silently discard requested interpolation", () => {

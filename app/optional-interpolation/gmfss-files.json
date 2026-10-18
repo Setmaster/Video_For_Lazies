@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "id": "gmfss-fortuna-union",
+  "label": "GMFSS Fortuna (Union)",
+  "description": "Tuned for anime",
+  "noncommercial": false,
+  "backend": "torch-pair",
+  "files": [
+    {
+      "path": "sources/gmfss_model/FeatureNet.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/FeatureNet.py",
+      "bytes": 842,
+      "sha256": "89ca395657e245daf439f99bfdbb646396733ec2658174fc43df6aae43bff317"
+    },
+    {
+      "path": "sources/gmfss_model/MetricNet.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/MetricNet.py",
+      "bytes": 2863,
+      "sha256": "b254075a16257d819acf417916579f5aae51f52ddd1d821cbb452555dc753984"
+    },
+    {
+      "path": "sources/gmfss_model/FusionNet_u.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/FusionNet_u.py",
+      "bytes": 5820,
+      "sha256": "68386cc06f6d51a89da061b2f638b60eccb2a513ae42701cea89bbe1636a14d2"
+    },
+    {
+      "path": "sources/gmfss_model/IFNet_HDv3.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/IFNet_HDv3.py",
+      "bytes": 3765,
+      "sha256": "3f2c3ffa6dd13295ed8509f05feb694b271c990ea50c8c807939160b95e1d21b"
+    },
+    {
+      "path": "sources/gmfss_model/warplayer.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/warplayer.py",
+      "bytes": 1119,
+      "sha256": "445460161c2a7f44a26959f90c80c5df2f3bc5e9f2cd54f20dd3a679e39552ad"
+    },
+    {
+      "path": "sources/gmfss_model/util.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/util.py",
+      "bytes": 946,
+      "sha256": "3b41891cf39fe00e82abdde5ed5d0ab1ffb1e0cb64078f532a59587034f1f663"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/backbone.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/backbone.py",
+      "bytes": 4330,
+      "sha256": "5f93239c829bd07558225dd0c05ddbeafb3fe2f87c58e378730f73490aee969c"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/geometry.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/geometry.py",
+      "bytes": 3194,
+      "sha256": "5809d961e692c9e6bd5539963f78ee9b152920cf572760c7d9e870b037cf595a"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/gmflow.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/gmflow.py",
+      "bytes": 7093,
+      "sha256": "689f72e9a9a1e4bec1dc8b24046d905391f6d546f74e394c38f105798fdf710d"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/matching.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/matching.py",
+      "bytes": 3520,
+      "sha256": "07a2fab8a339373291915316b7ed3275686920d9fa2a8a2aa32865d485729684"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/position.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/position.py",
+      "bytes": 1956,
+      "sha256": "25a714652ad816e65ba71e96bc34f338eb3e50cfebe4b4dce98c7e440c0ef96c"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/transformer.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/transformer.py",
+      "bytes": 15512,
+      "sha256": "7c9aa7dd6d34b81b951553c9477efc615c56903464fa87ab47ff4752b972eb32"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/trident_conv.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/trident_conv.py",
+      "bytes": 3189,
+      "sha256": "f999f8509285957673baaa5da45d64ab0d6212a5e0c8943463834e95ae148be8"
+    },
+    {
+      "path": "sources/gmfss_model/gmflow/utils.py",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/gmflow/utils.py",
+      "bytes": 3092,
+      "sha256": "fb430e806eee6f1fa43c973257b3aaaf61a3989d537398353a5ca8a5476a7caf"
+    },
+    {
+      "path": "sources/gmfss_model/softsplat_torch.py",
+      "url": "https://raw.githubusercontent.com/98mxr/GMFSS_Fortuna/0fb7ac1dc292e2615217110dd9d82557845fb919/model/softsplat_torch.py",
+      "bytes": 5744,
+      "sha256": "9255f930a3564e64bb1a9b170c46e3a31fe9e6edac516a85b649f3443a0b6697"
+    },
+    {
+      "path": "models/flownet.pkl",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/models/flownet.pkl",
+      "bytes": 18916681,
+      "sha256": "31fa34960d6326f231c35db9070728419dbad78b463567601dfb6b34049789ef"
+    },
+    {
+      "path": "models/feat_union.pkl",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/models/feat_union.pkl",
+      "bytes": 3259059,
+      "sha256": "3de9e046c68b8cdedaba7490c7b33d50bca69f4b2e8932b23b28836f5c2d81f9"
+    },
+    {
+      "path": "models/metric_union.pkl",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/models/metric_union.pkl",
+      "bytes": 484523,
+      "sha256": "b4fe92d9fb0d18cca98989f28733a45b9fbf0c3a23e1a9d8a19f4df42680e519"
+    },
+    {
+      "path": "models/fusionnet_union.pkl",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/models/fusionnet_union.pkl",
+      "bytes": 31423429,
+      "sha256": "6098e143f239aedcac854267df251ff6945a10d8ca14e0b1ac9afe5f51c36474"
+    },
+    {
+      "path": "models/rife.pkl",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/vsgmfss_fortuna/models/rife.pkl",
+      "bytes": 21261539,
+      "sha256": "a222360fa1b3e794d2d5236a3b8513f4c9c09960b0742733546888930f383e56"
+    },
+    {
+      "path": "sources/gmfss_model/LICENSE.HolyWu.txt",
+      "url": "https://raw.githubusercontent.com/HolyWu/vs-gmfss_fortuna/f4f990a456678942beb7bcbca3fd5645d139ebe4/LICENSE",
+      "bytes": 1063,
+      "sha256": "ebc4b7ac7fd58d4d29f78a37902a963df99e739a220183e814d540464d1e3cff"
+    },
+    {
+      "path": "sources/gmfss_model/LICENSE.Fortuna.txt",
+      "url": "https://raw.githubusercontent.com/98mxr/GMFSS_Fortuna/0fb7ac1dc292e2615217110dd9d82557845fb919/LICENSE",
+      "bytes": 1062,
+      "sha256": "8fe4311e45253322850be74659f5b45feb4b09e22da363939a2969728bfa7d9d"
+    },
+    {
+      "path": "sources/gmfss_model/LICENSE.GMFlow.txt",
+      "url": "https://raw.githubusercontent.com/haofeixu/gmflow/b5123431164d01ec14526a1c3d22218aecb62024/LICENSE",
+      "bytes": 11340,
+      "sha256": "6746d3bb707775716932ce5df0de252a03b00ff6d4206aee9a63f9f0f4042775"
+    }
+  ],
+  "provenance": {
+    "architectureRepository": "HolyWu/vs-gmfss_fortuna",
+    "architectureCommit": "f4f990a456678942beb7bcbca3fd5645d139ebe4",
+    "softsplatRepository": "98mxr/GMFSS_Fortuna",
+    "softsplatCommit": "0fb7ac1dc292e2615217110dd9d82557845fb919",
+    "variant": "Union, original committed HolyWu checkpoint; later AnimeRun fine-tune identity is not claimed"
+  },
+  "licenseNotes": [
+    "HolyWu and 98mxr root source licenses are MIT; include both complete license texts.",
+    "GMFlow-derived modules retain Apache-2.0 provenance; include GMFlow Apache license and notices.",
+    "Chosen files exclude the CuPy softsplat implementation and the separate sniklaus/softmax-splatting implementation.",
+    "No explicit noncommercial restriction was found for the selected source and committed weights. The original Google Drive archives have not been independently inspected for terms.",
+    "Pinned model/runtime bytes must be verified before imports or checkpoint loading. Package runtime redistribution terms are tracked separately."
+  ]
+}

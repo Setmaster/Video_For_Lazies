@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "id": "gimm-vfi-r-p",
+  "label": "GIMM-VFI-R-P",
+  "description": "Perceptually tuned motion",
+  "noncommercial": true,
+  "backend": "torch-pair",
+  "files": [
+    {
+      "path": "sources/gimmvfi/generalizable_INR/gimmvfi_r.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/gimmvfi_r.py",
+      "bytes": 17989,
+      "sha256": "c677245baaba247ea8017c5d25fd6c472d90c638c4115edf8e12d4bfaccc9ab2"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/modules/coord_sampler.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/modules/coord_sampler.py",
+      "bytes": 3200,
+      "sha256": "e8110a024d807f97c61b04a6a8ecfaa03e3b78a0fdea510969b7aecc1daf8347"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/modules/hyponet.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/modules/hyponet.py",
+      "bytes": 7388,
+      "sha256": "2854ada7f95d83507f4ba51bea24476166748436c7e3fc2074e0c1304ed17e70"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/modules/fi_components.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/modules/fi_components.py",
+      "bytes": 10978,
+      "sha256": "dac5c59e55208c7ecff0c42174f1f73c9125cc53ac0e92f4e815ce127e87c5b3"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/modules/fi_utils.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/modules/fi_utils.py",
+      "bytes": 2460,
+      "sha256": "e7329e4de89cbea0c4bc9134fde5ebce5f7c64cd34dcb48cae08c6078c2c399a"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/modules/utils.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/modules/utils.py",
+      "bytes": 2407,
+      "sha256": "890d23ff91d0ef523f6414c30acf3a995bd184338f4448f21c39779d5e9b91e1"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/modules/layers.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/modules/layers.py",
+      "bytes": 1021,
+      "sha256": "03b84709af4ca3687c408c917070a15ada43072fe0cabe60db31e48165a2992d"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/raft/raft.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/raft/raft.py",
+      "bytes": 5335,
+      "sha256": "6016d9f74f096b4f6f191d9d75599919179b66697f4d3a5cbb44c3229919feeb"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/raft/update.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/raft/update.py",
+      "bytes": 5437,
+      "sha256": "de0964a489fb96c1a2e401551ca106056b6e8748d3798d610b26e5e1d8987c39"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/raft/extractor.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/raft/extractor.py",
+      "bytes": 9845,
+      "sha256": "00ab27d368d1c266c812913b340b0b793fba7781bb53d127ac00f6cbb19b67e1"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/raft/corr.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/raft/corr.py",
+      "bytes": 6278,
+      "sha256": "d9a9368e4d010cc3b5c6c22a7aff6ba62dcfd3e12b009ae2247c526e3489a62e"
+    },
+    {
+      "path": "sources/gimmvfi/generalizable_INR/raft/utils/utils.py",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/gimmvfi/generalizable_INR/raft/utils/utils.py",
+      "bytes": 2619,
+      "sha256": "eddced877ae0f4e5bc80caedff987a01e65071070c3ea2b79e982a3e2a2c02b7"
+    },
+    {
+      "path": "models/gimmvfi_r_arb_lpips_fp32.safetensors",
+      "url": "https://huggingface.co/Kijai/GIMM-VFI_safetensors/resolve/c1089661cf9ac6dcc32fa375ff698f06b3412aff/gimmvfi_r_arb_lpips_fp32.safetensors",
+      "bytes": 79204556,
+      "sha256": "897b892e7ee481f2e5c09e59661b645abbd6c9aba9c0c01346bbe31aa569e277"
+    },
+    {
+      "path": "models/raft-things_fp32.safetensors",
+      "url": "https://huggingface.co/Kijai/GIMM-VFI_safetensors/resolve/c1089661cf9ac6dcc32fa375ff698f06b3412aff/raft-things_fp32.safetensors",
+      "bytes": 21062368,
+      "sha256": "ba7cb7781f9f67030e2f6acc4151ac8701b633d93d39e8d61991f2b472a0e45a"
+    },
+    {
+      "path": "licenses/GIMM-S-Lab.txt",
+      "url": "https://raw.githubusercontent.com/kijai/ComfyUI-GIMM-VFI/4c9a3123762af85e7c796e41737da0b70c75d72d/LICENSE",
+      "bytes": 1678,
+      "sha256": "17373c8fa4c0b89ae826fe2d40cd8ab895a4c2b1d9da64477fccf646c9a26c4d"
+    },
+    {
+      "path": "licenses/AMT-CC-BY-NC-4.0.txt",
+      "url": "https://raw.githubusercontent.com/MCG-NKU/AMT/70f988fbfc0d3d458beba1ee49caf876e57968fe/LICENSE",
+      "bytes": 18208,
+      "sha256": "5230fe1253ad281313dc26275637dc24e7455c5fd2a6113382fcf8fe007bf1ff"
+    },
+    {
+      "path": "licenses/RAFT-BSD-3-Clause.txt",
+      "url": "https://raw.githubusercontent.com/princeton-vl/RAFT/2888e15a51fa41140771d3f498ed8023cff098d1/LICENSE",
+      "bytes": 1512,
+      "sha256": "399af7e243d625e8dea2b3f81fec676ea19bacf7d9ce8cfd4ce15530d8a66173"
+    }
+  ],
+  "provenance": {
+    "sourceRepository": "https://github.com/kijai/ComfyUI-GIMM-VFI",
+    "sourceCommit": "4c9a3123762af85e7c796e41737da0b70c75d72d",
+    "modelRepository": "https://huggingface.co/Kijai/GIMM-VFI_safetensors",
+    "modelRevision": "c1089661cf9ac6dcc32fa375ff698f06b3412aff",
+    "sourcePatches": "gimm.py validates the 12-file source closure, removes optional CUDA/SciPy/OmegaConf paths, binds warp grids to the selected device, and handles zero-flow normalization. No upstream package initializer or softsplat implementation is loaded. Bilinear forward accumulation is independent standard-Torch code."
+  },
+  "licenseNotes": [
+    "Model source and safetensors are published under S-Lab License 1.0 for noncommercial redistribution/use. Commercial use requires permission from contributors.",
+    "Preserve S-Lab, AMT CC-BY-NC-4.0 and RAFT BSD-3-Clause notices and retained source copyright/attribution.",
+    "The academic-only softmax-splatting implementation is excluded; the adapter uses independently written bilinear scatter accumulation.",
+    "Runtime dependencies have separate notices supplied by the runtime pack."
+  ]
+}

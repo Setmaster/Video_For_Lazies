@@ -1,5 +1,7 @@
 //! Persistent RGB8 inference with one decoded-presentation clock and lossless replay.
-use crate::interpolation_components::ResolvedModel;
+mod sequence;
+
+use crate::interpolation_components::{ModelExecution, ResolvedModel};
 use crate::interpolation_timeline::{Rate, is_scene_cut};
 use crate::process::{self, ManagedChild, ProcessGroup};
 use crate::video::{EncodeRequest, VideoProbe};
@@ -207,6 +209,47 @@ fn command(program: &Path) -> Command {
     command
 }
 
+fn inference_command(model: &ResolvedModel, gpu: &str) -> Result<Command, String> {
+    match &model.execution {
+        ModelExecution::Native => {
+            let mut cmd = command(&model.worker_path);
+            cmd.arg("--model")
+                .arg(&model.model_dir)
+                .args(["--gpu", gpu]);
+            Ok(cmd)
+        }
+        ModelExecution::TorchPair {
+            python_path,
+            script_path,
+            source_dir,
+            cache_dir,
+        }
+        | ModelExecution::TorchSequence {
+            python_path,
+            script_path,
+            source_dir,
+            cache_dir,
+        } => {
+            let mut cmd = command(python_path);
+            crate::optional_interpolation_components::configure_command(&mut cmd, cache_dir)?;
+            cmd.env_remove("PYTHONHOME")
+                .env_remove("PYTHONPATH")
+                .args(["-I", "-B"])
+                .arg(script_path)
+                .arg("--model-id")
+                .arg(&model.model_id)
+                .arg("--model")
+                .arg(&model.model_dir)
+                .arg("--sources")
+                .arg(source_dir)
+                .arg("--cache")
+                .arg(cache_dir)
+                .args(["--gpu", gpu]);
+            Ok(cmd)
+        }
+    }
+}
+
 pub(crate) fn available_space(worker: &Path, path: &Path) -> Result<u64, String> {
     let mut cmd = command(worker);
     cmd.arg("--available-space").arg(path);
@@ -296,6 +339,201 @@ fn read_picture<R: Read>(pipe: &mut R, frame: &mut [u8]) -> Result<(), String> {
     pipe.read_exact(frame).map_err(|_| "Frame decoding or native interpolation ended before a complete RGB picture. No output was published.".into())
 }
 
+struct ColorDescription {
+    matrix: &'static str,
+    range: &'static str,
+    color_tags: Vec<(String, String)>,
+}
+
+impl ColorDescription {
+    fn from_probe(probe: &VideoProbe) -> Self {
+        let matrix = match probe.color_space.as_deref() {
+            Some("bt709") => "bt709",
+            Some("bt2020nc" | "bt2020_ncl") => "bt2020",
+            Some("smpte240m") => "smpte240m",
+            _ => "bt601",
+        };
+        let range = if matches!(probe.color_range.as_deref(), Some("pc" | "jpeg")) {
+            "pc"
+        } else {
+            "tv"
+        };
+        let color_tags = [
+            ("-color_primaries", &probe.color_primaries),
+            ("-color_trc", &probe.color_transfer),
+            ("-colorspace", &probe.color_space),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| {
+            value
+                .as_ref()
+                .map(|value| (name.to_string(), value.clone()))
+        })
+        .collect();
+        Self {
+            matrix,
+            range,
+            color_tags,
+        }
+    }
+}
+
+fn decoder_command(
+    ffmpeg: &str,
+    source: &Path,
+    probe: &VideoProbe,
+    start_s: f64,
+    end_s: f64,
+    matrix: &str,
+) -> Command {
+    let mut decoder_command = command(Path::new(ffmpeg));
+    let start_ns = (start_s * 1_000_000_000.0).round() as u64;
+    let trim = format!(
+        "trim=start={start_s:.9}:end={end_s:.9},settb=expr=1/1000000000,setpts=PTS-{start_ns},scale=in_color_matrix={matrix}:in_range=auto:out_range=pc,format=rgb24,showinfo"
+    );
+    decoder_command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-nostdin",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-i",
+        ])
+        .arg(source)
+        .args([
+            "-map",
+            &format!("0:{}", probe.video_stream_index),
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &trim,
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "rawvideo",
+            "-threads",
+            "1",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]);
+    decoder_command
+}
+
+fn assembler_command(ffmpeg: &str, probe: &VideoProbe, rate: Rate, path: &Path) -> Command {
+    let mut assembler_command = command(Path::new(ffmpeg));
+    assembler_command
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgb24",
+            "-video_size",
+            &format!("{}x{}", probe.width, probe.height),
+            "-framerate",
+            &rate.ffmpeg(),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "gbrp",
+            "-color_range",
+            "pc",
+            "-threads",
+            "1",
+        ])
+        .arg(path);
+    assembler_command
+}
+
+fn scratch_size(directory: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in
+        fs::read_dir(directory).map_err(|_| "Could not inspect interpolation scratch storage.")?
+    {
+        let entry = entry.map_err(|_| "Could not inspect interpolation scratch storage.")?;
+        let metadata = entry
+            .file_type()
+            .map_err(|_| "Could not inspect interpolation scratch storage.")?;
+        if !metadata.is_file() || metadata.is_symlink() {
+            return Err("Interpolation scratch storage contains an unexpected entry.".into());
+        }
+        total = total
+            .checked_add(
+                entry
+                    .metadata()
+                    .map_err(|_| "Could not inspect interpolation scratch storage.")?
+                    .len(),
+            )
+            .ok_or("Interpolation scratch size overflow.")?;
+    }
+    Ok(total)
+}
+
+fn send_timing(
+    sender: &mpsc::SyncSender<Result<(u64, u64), String>>,
+    stop: &AtomicBool,
+    mut message: Result<(u64, u64), String>,
+) -> bool {
+    while !stop.load(Ordering::Relaxed) {
+        match sender.try_send(message) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(mpsc::TrySendError::Full(value)) => message = value,
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+fn spawn_timing_reader<R: Read + Send + 'static>(
+    pipe: R,
+    sender: mpsc::SyncSender<Result<(u64, u64), String>>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let message = match reader.by_ref().take(16 * 1024).read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if line.len() >= 16 * 1024 => {
+                    Some(Err("Decoder returned an oversized timing record.".into()))
+                }
+                Ok(_) if line.contains(" i:T") || line.contains(" i:B") => Some(Err(
+                    "Interlaced video must be deinterlaced before AI interpolation.".into(),
+                )),
+                Ok(_) => parse_showinfo(&line).map(Ok),
+                Err(_) => Some(Err("Decoder timing stream failed.".into())),
+            };
+            if let Some(message) = message {
+                let failed = message.is_err();
+                if !send_timing(&sender, &stop, message) || failed {
+                    break;
+                }
+            }
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare(
     ffmpeg: &str,
@@ -348,6 +586,30 @@ pub(crate) fn prepare(
         return Err("There is not enough free scratch space for interpolation and encoder headroom. Trim the clip or free storage and retry.".into());
     }
     let quota = MAX_SCRATCH_BYTES.min(free.saturating_sub(FREE_HEADROOM * 2));
+    if matches!(model.execution, ModelExecution::TorchSequence { .. }) {
+        return sequence::prepare(
+            sequence::Job {
+                ffmpeg,
+                source,
+                probe,
+                request,
+                model,
+                cancel,
+                group,
+                identity,
+                start_s,
+                end_s,
+                duration_ns,
+                rate,
+                count,
+                frame_bytes,
+                directory,
+                path,
+                quota,
+            },
+            &mut progress,
+        );
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
     let clock = Instant::now();
@@ -358,7 +620,6 @@ pub(crate) fn prepare(
         let last = last_progress.clone();
         let group = group.clone();
         let cancel = cancel.clone();
-        let path = path.clone();
         let worker_path = model.worker_path.clone();
         let scratch = directory.path().to_path_buf();
         std::thread::spawn(move || {
@@ -369,7 +630,7 @@ pub(crate) fn prepare(
             let mut last_space_check = Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 let idle = clock.elapsed().as_millis() as u64 - last.load(Ordering::Relaxed);
-                let too_large = fs::metadata(&path).is_ok_and(|file| file.len() > quota);
+                let too_large = scratch_size(&scratch).map_or(true, |size| size > quota);
                 let low_space = if last_space_check.elapsed() >= Duration::from_secs(1) {
                     last_space_check = Instant::now();
                     available_space(&worker_path, &scratch)
@@ -399,65 +660,12 @@ pub(crate) fn prepare(
 
     // showinfo is immediately before raw encoding: every admitted RGB frame
     // and its exact PTS come from the same graph, avoiding a separate timing scan.
-    let mut decoder_command = command(Path::new(ffmpeg));
-    let matrix = match probe.color_space.as_deref() {
-        Some("bt709") => "bt709",
-        Some("bt2020nc" | "bt2020_ncl") => "bt2020",
-        Some("smpte240m") => "smpte240m",
-        _ => "bt601",
-    };
-    let range = if matches!(probe.color_range.as_deref(), Some("pc" | "jpeg")) {
-        "pc"
-    } else {
-        "tv"
-    };
-    let color_tags = [
-        ("-color_primaries", &probe.color_primaries),
-        ("-color_trc", &probe.color_transfer),
-        ("-colorspace", &probe.color_space),
-    ]
-    .into_iter()
-    .filter_map(|(name, value)| {
-        value
-            .as_ref()
-            .map(|value| (name.to_string(), value.clone()))
-    })
-    .collect();
-    let start_ns = (start_s * 1_000_000_000.0).round() as u64;
-    let trim = format!(
-        "trim=start={start_s:.9}:end={end_s:.9},settb=expr=1/1000000000,setpts=PTS-{start_ns},scale=in_color_matrix={matrix}:in_range=auto:out_range=pc,format=rgb24,showinfo"
-    );
-    decoder_command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "info",
-            "-nostdin",
-            "-threads",
-            "1",
-            "-filter_threads",
-            "1",
-            "-i",
-        ])
-        .arg(source)
-        .args([
-            "-map",
-            &format!("0:{}", probe.video_stream_index),
-            "-an",
-            "-sn",
-            "-dn",
-            "-vf",
-            &trim,
-            "-fps_mode",
-            "passthrough",
-            "-c:v",
-            "rawvideo",
-            "-threads",
-            "1",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ]);
+    let ColorDescription {
+        matrix,
+        range,
+        color_tags,
+    } = ColorDescription::from_probe(probe);
+    let decoder_command = decoder_command(ffmpeg, source, probe, start_s, end_s, matrix);
     let mut decoder = ManagedChild::spawn(decoder_command)
         .map_err(|_| "Could not start interpolation decoder.".to_string())?;
     let mut decoded = decoder
@@ -469,58 +677,23 @@ pub(crate) fn prepare(
         .take()
         .ok_or("Missing decoder timing stream.")?;
     let (sender, receiver) = mpsc::sync_channel::<Result<(u64, u64), String>>(4);
-    guard.readers.push(std::thread::spawn(move || {
-        let mut reader = BufReader::new(decoder_errors);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            // BufRead::read_line could allocate arbitrary metadata. Limit each
-            // log record and reject overflow before reading the next frame.
-            let read = reader.by_ref().take(16 * 1024).read_line(&mut line);
-            match read {
-                Ok(0) => break,
-                Ok(_) if line.len() >= 16 * 1024 => {
-                    let _ = sender.send(Err("Decoder returned an oversized timing record.".into()));
-                    break;
-                }
-                Ok(_) if line.contains(" i:T") || line.contains(" i:B") => {
-                    let _ = sender.send(Err(
-                        "Interlaced video must be deinterlaced before AI interpolation.".into(),
-                    ));
-                    break;
-                }
-                Ok(_) => {
-                    if let Some(frame) = parse_showinfo(&line)
-                        && sender.send(Ok(frame)).is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = sender.send(Err("Decoder timing stream failed.".into()));
-                    break;
-                }
-            }
-        }
-    }));
+    guard.readers.push(spawn_timing_reader(
+        decoder_errors,
+        sender,
+        guard.stop.clone(),
+    ));
 
     let gpu = crate::interpolation_components::gpu_choice();
     if gpu != "auto" && gpu != "-1" && gpu.parse::<u32>().is_err() {
         return Err("Invalid interpolation GPU override.".into());
     }
-    let mut worker_command = command(&model.worker_path);
-    worker_command
-        .arg("--stream")
-        .arg("--model")
-        .arg(&model.model_dir)
-        .args([
-            "--width",
-            &probe.width.to_string(),
-            "--height",
-            &probe.height.to_string(),
-            "--gpu",
-            &gpu,
-        ]);
+    let mut worker_command = inference_command(model, &gpu)?;
+    worker_command.arg("--stream").args([
+        "--width",
+        &probe.width.to_string(),
+        "--height",
+        &probe.height.to_string(),
+    ]);
     let mut worker = ManagedChild::spawn_with_stdin(worker_command)
         .map_err(|_| "Could not start native frame interpolation.".to_string())?;
     let mut worker_input = worker
@@ -537,40 +710,7 @@ pub(crate) fn prepare(
             .take()
             .ok_or("Missing native interpolation diagnostics.")?,
     ));
-    let mut assembler_command = command(Path::new(ffmpeg));
-    assembler_command
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-threads",
-            "1",
-            "-filter_threads",
-            "1",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "rgb24",
-            "-video_size",
-            &format!("{}x{}", probe.width, probe.height),
-            "-framerate",
-            &rate.ffmpeg(),
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            "ffv1",
-            "-level",
-            "3",
-            "-pix_fmt",
-            "gbrp",
-            "-color_range",
-            "pc",
-            "-threads",
-            "1",
-        ])
-        .arg(&path);
+    let assembler_command = assembler_command(ffmpeg, probe, rate, &path);
     let mut assembler = ManagedChild::spawn_with_stdin(assembler_command)
         .map_err(|_| "Could not start lossless interpolation storage.".to_string())?;
     let mut assembled = assembler
@@ -767,6 +907,60 @@ pub(crate) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optional_python_disables_bytecode_before_worker_imports() {
+        let directory = tempfile::tempdir().unwrap();
+        for sequence in [false, true] {
+            let python_path = directory.path().join("python");
+            let script_path = directory.path().join("worker.py");
+            let source_dir = directory.path().join("sources");
+            let cache_dir = directory
+                .path()
+                .join(if sequence { "sequence" } else { "pair" });
+            let execution = if sequence {
+                ModelExecution::TorchSequence {
+                    python_path: python_path.clone(),
+                    script_path: script_path.clone(),
+                    source_dir,
+                    cache_dir,
+                }
+            } else {
+                ModelExecution::TorchPair {
+                    python_path: python_path.clone(),
+                    script_path: script_path.clone(),
+                    source_dir,
+                    cache_dir,
+                }
+            };
+            let model = ResolvedModel {
+                execution,
+                worker_path: directory.path().join("storage-helper"),
+                model_dir: directory.path().join("models"),
+                model_id: if sequence {
+                    "ldf-vfi"
+                } else {
+                    "gmfss-fortuna-union"
+                }
+                .into(),
+                model_digest: String::new(),
+                worker_digest: String::new(),
+                _lease: None,
+            };
+            let command = inference_command(&model, "auto").unwrap();
+            assert_eq!(command.get_program(), python_path.as_os_str());
+            let arguments: Vec<_> = command.get_args().collect();
+            // Isolated mode ignores PYTHONDONTWRITEBYTECODE. -B must precede
+            // the script so even its earliest stdlib imports cannot mutate
+            // the hash-verified portable runtime.
+            assert_eq!(arguments[0], "-I");
+            assert_eq!(arguments[1], "-B");
+            assert_eq!(arguments[2], script_path.as_os_str());
+            assert!(command.get_envs().any(|(name, value)| {
+                name == "PYTHONDONTWRITEBYTECODE" && value == Some(std::ffi::OsStr::new("1"))
+            }));
+        }
+    }
+
     #[test]
     #[ignore = "requires the built native sidecar, catalog models and FFmpeg; use VFL_INTERPOLATION_GPU=-1 for CPU"]
     fn native_prepared_video_preserves_cadence_audio_and_persistent_inference() {
@@ -978,6 +1172,33 @@ mod tests {
     fn incomplete_rgb_is_rejected() {
         assert!(read_picture(&mut &b"abc"[..], &mut [0u8; 6]).is_err());
     }
+    #[test]
+    fn timing_producer_can_stop_while_the_bounded_receiver_remains_alive() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender.send(Ok((0, 0))).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let producer = std::thread::spawn(move || send_timing(&sender, &stopping, Ok((1, 1))));
+        std::thread::sleep(Duration::from_millis(15));
+        stop.store(true, Ordering::Relaxed);
+        assert!(!producer.join().unwrap());
+    }
+
+    #[test]
+    fn scratch_size_counts_raw_active_and_prepared_files_together() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, size) in [
+            ("decoded.rgb", 12),
+            ("active-sequence.rgb", 7),
+            ("prepared.mkv", 5),
+        ] {
+            fs::write(directory.path().join(name), vec![0; size]).unwrap();
+        }
+        assert_eq!(scratch_size(directory.path()).unwrap(), 24);
+        fs::create_dir(directory.path().join("unexpected")).unwrap();
+        assert!(scratch_size(directory.path()).is_err());
+    }
+
     #[test]
     fn changed_source_is_rejected() {
         let file = tempfile::NamedTempFile::new().unwrap();

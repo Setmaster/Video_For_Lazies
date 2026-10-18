@@ -3,9 +3,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { InterpolationSettings, InterpolationOperationId, InterpolationStatus, InterpolationInstallProgress, InterpolationModelId, OutputFormat } from "../lib/types";
 import { beginInterpolationInstall, bindInterpolationInstall, createInterpolationInstall, interpolationConflict, interpolationInstallActive, interpolationPublicMessage, reduceInterpolationInstall, type InterpolationInstallState } from "../lib/interpolation";
+import { InterpolationModelPicker, type InterpolationModelOption } from "./InterpolationModelPicker";
+
+const MODEL_OPTIONS = [
+  { id: "rife-v4.25", label: "RIFE 4.25", description: "Balanced motion for most videos" },
+  { id: "rife-v4.26", label: "RIFE 4.26", description: "Another option for different motion" },
+  { id: "gmfss-fortuna-union", label: "GMFSS Fortuna (Union)", description: "Tuned for anime" },
+  { id: "gimm-vfi-r-p", label: "GIMM-VFI-R-P", description: "Perceptually tuned motion", noncommercial: true },
+  { id: "ldf-vfi", label: "LDF-VFI", description: "Detailed motion across longer sequences" },
+] as const satisfies readonly InterpolationModelOption<InterpolationModelId>[];
 
 function bytes(value: number) {
-  return `${(Math.max(0, value) / 1_000_000).toFixed(1)} MB`;
+  const amount = Math.max(0, value);
+  return amount >= 1_000_000_000 ? `${(amount / 1_000_000_000).toFixed(1)} GB` : `${(amount / 1_000_000).toFixed(1)} MB`;
 }
 
 export function SmoothMotionControl({ value, format, frameRateCap, disabled, startupReady, onChange, onRemoveCap, onStatus, onBusy }: {
@@ -224,16 +234,12 @@ export function SmoothMotionControl({ value, format, frameRateCap, disabled, sta
           {([60, 120] as const).map((fps) => <button type="button" key={fps} className={value.targetFps === fps ? "active" : ""} aria-pressed={value.targetFps === fps} disabled={disabled || !startupReady || busy || checking || format === "mp3"}
             onClick={() => { setTarget(fps); onChange({ ...value, targetFps: fps }); }}>{fps} fps</button>)}
         </div>
-        <div className="vfl-field">
-          <label htmlFor="vfl-smooth-motion-model">Motion model</label>
-          <select id="vfl-smooth-motion-model" value={modelId} disabled={disabled || !startupReady || busy || checking || format === "mp3"} onChange={(event) => {
-            const selected = event.currentTarget.value as InterpolationModelId;
+        <InterpolationModelPicker id="vfl-smooth-motion-model" value={modelId} options={MODEL_OPTIONS}
+          disabled={disabled || !startupReady || busy || checking || format === "mp3"} onChange={(selected) => {
             onStatus(null); setProfile(selected); onChange({ ...value, modelId: selected });
-          }}>
-            <option value="rife-v4.25">RIFE 4.25 (REC)</option>
-            <option value="rife-v4.26">RIFE 4.26</option>
-          </select>
-        </div>
+          }} />
+        {!modelId.startsWith("rife-") ? <div className="vfl-inline-hint">Requires an NVIDIA GPU and a current driver. The first download includes a shared runtime.</div> : null}
+        {modelId === "ldf-vfi" ? <div className="vfl-inline-hint">LDF needs BF16 support, more GPU memory, and compatible constant frame timing.</div> : null}
         <div className="vfl-inline-hint" role="status" aria-live="polite" data-smoke-id="interpolation-status">
           {checking ? "Checking Smooth motion..." : busy ? phaseText : status?.state === "ready" ? `Ready${status.bundled ? ". Included with the app." : ". Available offline."}` : status?.message || "Check or install frame interpolation before exporting."}
         </div>

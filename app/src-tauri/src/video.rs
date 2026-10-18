@@ -4348,7 +4348,10 @@ fn validate_interpolation_request(
         return Ok(());
     };
     if !matches!(settings.target_fps, 60 | 120)
-        || !matches!(settings.model_id.as_str(), "rife-v4.25" | "rife-v4.26")
+        || !matches!(
+            settings.model_id.as_str(),
+            "rife-v4.25" | "rife-v4.26" | "gmfss-fortuna-union" | "gimm-vfi-r-p" | "ldf-vfi"
+        )
     {
         return Err("Choose a supported AI model and a 60 or 120 fps target.".into());
     }

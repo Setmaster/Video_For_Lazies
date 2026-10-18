@@ -7,7 +7,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { confirm as confirmDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { SmoothMotionControl } from "./components/SmoothMotionControl";
-import { normalizeInterpolation, interpolationConflict } from "./lib/interpolation";
+import { normalizeInterpolation, interpolationConflict, interpolationModelLabel } from "./lib/interpolation";
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
@@ -8782,7 +8782,7 @@ function App() {
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Frame rate</div>
-                      <div className="vfl-summary-value">{interpolation ? `Smooth motion: ${interpolation.targetFps} fps (${interpolation.modelId === "rife-v4.25" ? "Standard" : "Alternative"})` : advancedFrameRateSummary}</div>
+                      <div className="vfl-summary-value">{interpolation ? `Smooth motion: ${interpolation.targetFps} fps (${interpolationModelLabel(interpolation.modelId)})` : advancedFrameRateSummary}</div>
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Audio bitrate</div>

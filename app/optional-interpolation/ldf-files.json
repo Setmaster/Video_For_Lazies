@@ -1,0 +1,214 @@
+{
+  "schemaVersion": 1,
+  "id": "ldf-vfi",
+  "label": "LDF-VFI",
+  "description": "Detailed motion across longer sequences",
+  "noncommercial": false,
+  "backend": "torch-sequence",
+  "files": [
+    {
+      "path": "sources/training/models/transformer_wan.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/models/transformer_wan.py",
+      "bytes": 36343,
+      "sha256": "939d7a8b5e363253069af047a24b4b3aaa382cde1d185cf23cc2e204200689ed"
+    },
+    {
+      "path": "sources/training/models/precond.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/models/precond.py",
+      "bytes": 30196,
+      "sha256": "1fee74ed8a63d53e1eb28026d26629f3c1da38abf6d20ade4f1a5610da579db9"
+    },
+    {
+      "path": "sources/training/models/utils.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/models/utils.py",
+      "bytes": 7846,
+      "sha256": "f416bd78dac46e79da47dcea8a6fd7043436fc26043c055c945722a02808748f"
+    },
+    {
+      "path": "sources/training/models/vae2_1.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/models/vae2_1.py",
+      "bytes": 23162,
+      "sha256": "89282600cf33ffcfd152ac9c6b22638bd9b14992d5dab8cf071e8da76d8f5e74"
+    },
+    {
+      "path": "sources/training/models/vae2_1_cond.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/models/vae2_1_cond.py",
+      "bytes": 27516,
+      "sha256": "060e36c14fe15f39fa82d29bed1a31244bb8ca883d6b659056776d798b558429"
+    },
+    {
+      "path": "sources/training/models/vae2_1_cond_v2.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/models/vae2_1_cond_v2.py",
+      "bytes": 32468,
+      "sha256": "e274eb05939ea0d93658944a054d45dfb67950ca577e48300d6b733f24a000fb"
+    },
+    {
+      "path": "sources/training/models/msk_encoder.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/models/msk_encoder.py",
+      "bytes": 1246,
+      "sha256": "70bbee447229e3de597b7474304c82b420122a1843470d6233669506a83070dd"
+    },
+    {
+      "path": "sources/training/distributed/util.py",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/training/distributed/util.py",
+      "bytes": 1522,
+      "sha256": "d05528a019d43b09764237699ae7de315f3117974705d72f8e3484d53d5edc89"
+    },
+    {
+      "path": "sources/LICENSE",
+      "url": "https://raw.githubusercontent.com/xypeng9903/LDF-VFI/61b34d2379df8a313e8e4cb467cc2f74c52b45d7/LICENSE",
+      "bytes": 11356,
+      "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+    },
+    {
+      "path": "models/transformer/config.json",
+      "url": "https://huggingface.co/onecat-ai/LDF-VFI/resolve/87816885edfe4dba20190aea399b40181239824f/transformer/config.json",
+      "bytes": 534,
+      "sha256": "0e07d9356f0ef4ef227c8436d722d2fa0766a8ea75e26beb44220fbeba5e3172"
+    },
+    {
+      "path": "models/README.md",
+      "url": "https://huggingface.co/onecat-ai/LDF-VFI/resolve/87816885edfe4dba20190aea399b40181239824f/README.md",
+      "bytes": 2605,
+      "sha256": "b9bd33329e3fef7098d55a36f2e2d931654b139a39704522b528b6e89f404d75"
+    },
+    {
+      "path": "models/transformer/diffusion_pytorch_model.safetensors",
+      "url": "https://huggingface.co/onecat-ai/LDF-VFI/resolve/87816885edfe4dba20190aea399b40181239824f/transformer/diffusion_pytorch_model.safetensors",
+      "bytes": 5641946552,
+      "sha256": "73b82c245d9985f5311b0bb4568cba63bca0304ec83a26f17e57a89604174d0f"
+    },
+    {
+      "path": "models/Wan2.1_VAE_cond_v2.pth",
+      "url": "https://huggingface.co/onecat-ai/LDF-VFI/resolve/87816885edfe4dba20190aea399b40181239824f/Wan2.1_VAE_cond_v2.pth",
+      "bytes": 801028218,
+      "sha256": "96fcd7f89998868a681b715d030eac99420335421785fccc581c2541303b9515"
+    },
+    {
+      "path": "sources/third-party-notices/flashvsr-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/OpenImagingLab/FlashVSR/74cddfa3320211f899dfe3cb4c7779743c487e54/LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "sources/third-party-notices/wan2.2-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/Wan-Video/Wan2.2/388807310646ed5f318a99f8e8d9ad28c5b65373/LICENSE.txt",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "sources/third-party-notices/wan2.1-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/Wan-Video/Wan2.1/9737cba9c1c3c4d04b33fcad41c111989865d315/LICENSE.txt",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "sources/third-party-notices/diffusers-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/huggingface/diffusers/375ec930863ee74d0a0d5209f5627a5c89c752c2/LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  ],
+  "provenance": {
+    "sourceRepository": "https://github.com/xypeng9903/LDF-VFI",
+    "sourceCommit": "61b34d2379df8a313e8e4cb467cc2f74c52b45d7",
+    "modelRepository": "https://huggingface.co/onecat-ai/LDF-VFI",
+    "modelRevision": "87816885edfe4dba20190aea399b40181239824f",
+    "ancestryInventory": [
+      {
+        "id": "flashvsr",
+        "repository": "OpenImagingLab/FlashVSR",
+        "commit": "74cddfa3320211f899dfe3cb4c7779743c487e54",
+        "licensePath": "LICENSE",
+        "scope": "training/models/utils.py",
+        "evidence": "Exact ancestor URL declared in the pinned LDF source header.",
+        "licenseFile": "sources/third-party-notices/flashvsr-LICENSE.txt",
+        "license": "Apache-2.0",
+        "noticeFilesFound": [],
+        "noticeInventoryUrl": "https://api.github.com/repos/OpenImagingLab/FlashVSR/git/trees/74cddfa3320211f899dfe3cb4c7779743c487e54?recursive=1"
+      },
+      {
+        "id": "wan2.2",
+        "repository": "Wan-Video/Wan2.2",
+        "commit": "388807310646ed5f318a99f8e8d9ad28c5b65373",
+        "licensePath": "LICENSE.txt",
+        "scope": "training/distributed/util.py",
+        "evidence": "Exact ancestor URL and Alibaba Wan copyright declared in the pinned LDF source header.",
+        "licenseFile": "sources/third-party-notices/wan2.2-LICENSE.txt",
+        "license": "Apache-2.0",
+        "noticeFilesFound": [],
+        "noticeInventoryUrl": "https://api.github.com/repos/Wan-Video/Wan2.2/git/trees/388807310646ed5f318a99f8e8d9ad28c5b65373?recursive=1"
+      },
+      {
+        "id": "wan2.1",
+        "repository": "Wan-Video/Wan2.1",
+        "commit": "9737cba9c1c3c4d04b33fcad41c111989865d315",
+        "licensePath": "LICENSE.txt",
+        "scope": "training/models/vae2_1.py, vae2_1_cond.py, vae2_1_cond_v2.py",
+        "evidence": "VAE headers retain Alibaba Wan authors and LDF identifies Wan2.1. Exact upstream VAE revision is not declared by LDF; this pin freezes official license inventory, not an exact code-origin assertion.",
+        "licenseFile": "sources/third-party-notices/wan2.1-LICENSE.txt",
+        "license": "Apache-2.0",
+        "noticeFilesFound": [],
+        "noticeInventoryUrl": "https://api.github.com/repos/Wan-Video/Wan2.1/git/trees/9737cba9c1c3c4d04b33fcad41c111989865d315?recursive=1"
+      },
+      {
+        "id": "diffusers",
+        "repository": "huggingface/diffusers",
+        "commit": "375ec930863ee74d0a0d5209f5627a5c89c752c2",
+        "licensePath": "LICENSE",
+        "scope": "training/models/transformer_wan.py",
+        "evidence": "Source retains Wan Team and Hugging Face copyright plus Apache-2.0 header. Inventory pin is diffusers v0.33.1, the model config/runtime dependency version; it is not an exact code-origin assertion.",
+        "licenseFile": "sources/third-party-notices/diffusers-LICENSE.txt",
+        "license": "Apache-2.0",
+        "noticeFilesFound": [],
+        "noticeInventoryUrl": "https://api.github.com/repos/huggingface/diffusers/git/trees/375ec930863ee74d0a0d5209f5627a5c89c752c2?recursive=1"
+      }
+    ]
+  },
+  "licenses": [
+    {
+      "id": "Apache-2.0",
+      "scope": "source and published model weights",
+      "files": [
+        "sources/LICENSE",
+        "models/README.md"
+      ]
+    },
+    {
+      "id": "Apache-2.0",
+      "upstream": "flashvsr",
+      "scope": "training/models/utils.py",
+      "files": [
+        "sources/third-party-notices/flashvsr-LICENSE.txt"
+      ],
+      "attribution": "Original copyright and modification notices are retained in the immutable LDF source files."
+    },
+    {
+      "id": "Apache-2.0",
+      "upstream": "wan2.2",
+      "scope": "training/distributed/util.py",
+      "files": [
+        "sources/third-party-notices/wan2.2-LICENSE.txt"
+      ],
+      "attribution": "Original copyright and modification notices are retained in the immutable LDF source files."
+    },
+    {
+      "id": "Apache-2.0",
+      "upstream": "wan2.1",
+      "scope": "training/models/vae2_1.py, vae2_1_cond.py, vae2_1_cond_v2.py",
+      "files": [
+        "sources/third-party-notices/wan2.1-LICENSE.txt"
+      ],
+      "attribution": "Original copyright and modification notices are retained in the immutable LDF source files."
+    },
+    {
+      "id": "Apache-2.0",
+      "upstream": "diffusers",
+      "scope": "training/models/transformer_wan.py",
+      "files": [
+        "sources/third-party-notices/diffusers-LICENSE.txt"
+      ],
+      "attribution": "Original copyright and modification notices are retained in the immutable LDF source files."
+    }
+  ]
+}

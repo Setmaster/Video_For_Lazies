@@ -1,5 +1,13 @@
-export const INTERPOLATION_MODELS = Object.freeze(["rife-v4.25", "rife-v4.26"]);
+export const INTERPOLATION_MODELS = Object.freeze(["rife-v4.25", "rife-v4.26", "gmfss-fortuna-union", "gimm-vfi-r-p", "ldf-vfi"]);
 export const INTERPOLATION_TARGETS = Object.freeze([60, 120]);
+
+const MODEL_LABELS = Object.freeze({
+  "rife-v4.25": "RIFE 4.25", "rife-v4.26": "RIFE 4.26",
+  "gmfss-fortuna-union": "GMFSS Fortuna (Union)", "gimm-vfi-r-p": "GIMM-VFI-R-P", "ldf-vfi": "LDF-VFI",
+});
+export function interpolationModelLabel(modelId) {
+  return Object.hasOwn(MODEL_LABELS, modelId) ? MODEL_LABELS[modelId] : modelId;
+}
 
 /** Rebuild only reusable intent; never persist paths, device names or install state. */
 export function normalizeInterpolation(value) {

@@ -23,7 +23,7 @@ The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports 
 - Crop by drawing over the preview, editing labelled source-pixel fields, or running crop detection. Quarter-turn rotation keeps the preview, pointer mapping, and source crop coordinates aligned.
 - Resize by original dimensions, max edge, or custom dimensions; rotate, reverse, create a forward-then-reverse loop, change playback speed, and adjust brightness, contrast, and saturation.
 - Apply a frame-rate cap to the post-speed frame rate. The current plan reports when the cap changes the output.
-- Enable **Smooth motion** for local AI frame interpolation at 60 or 120 fps. Portable builds include the native worker and Standard model; the Alternative model installs with one button, without Python or CUDA setup.
+- Enable **Smooth motion** for local AI frame interpolation at 60 or 120 fps. RIFE 4.25 is included; additional models install with one button, without manual Python or CUDA setup.
 - Burn one validated UTF-8 `.srt` file into MP4 or WebM using source-timeline timing and a fixed bottom-centered style. Subtitles force video re-encoding; inline HTML/ASS styling and positioning overrides are rejected.
 - Save the current preview frame as PNG when the source has standard 8-bit SDR color and square pixels.
 
@@ -112,7 +112,11 @@ For security vulnerabilities, use [private vulnerability reporting](https://gith
 
 Turn on **Smooth motion**, choose 60 or 120 fps, and export MP4 or WebM. The ordinary preview shows your source; **Export exact sample** in Advanced runs the interpolation pipeline for a short output you can inspect first. The setting is saved in recipes and queue snapshots.
 
-The Standard RIFE 4.25 model is included in the portable folder. Select Alternative RIFE 4.26 and click **Install frame interpolation** to download it. Downloads show progress and support cancellation and retry. The app verifies model sizes and SHA256 hashes and runs a local inference test before activating a download. Video frames stay on your device. A hardware Vulkan GPU and its vendor driver are required; unsupported devices show an explanation instead of silently using the CPU.
+RIFE 4.25 is included in the portable folder. Select RIFE 4.26, GMFSS Fortuna (Union), GIMM-VFI-R-P or LDF-VFI and click **Install frame interpolation** to download it. Hover or focus a model in the menu for a short description. GIMM's tooltip includes a red **noncommercial** marker; its upstream license restricts use.
+
+RIFE uses a hardware Vulkan GPU and its vendor driver. GMFSS, GIMM and LDF require an NVIDIA GPU with a current driver. Their first installation also downloads a shared, app-local Python/Torch runtime, approximately 3 GB on Windows or 4.3 GB on Linux, with no manual Python, CUDA toolkit or compiler setup. LDF adds approximately 6.4 GB of model data, needs BF16 support and substantially more GPU memory, and requires compatible constant frame timing. The other optional models have smaller model downloads. Installed models work offline; removing one keeps the shared runtime for the others.
+
+Downloads show progress and support cancellation and retry. The app verifies source, model and runtime sizes and SHA256 hashes and runs a local inference test before activating a download. Video frames stay on your device. Unsupported devices and incompatible model timing show an explanation instead of silently switching models or using the CPU.
 
 Interpolation currently accepts supported 8-bit SDR video with known frame timing. The app rejects incompatible media before export. A frame-rate cap below the chosen target must be removed or raised. Generated frames are cached once per export and reused by size-target attempts; allow temporary disk space for the lossless video cache. Interpolation can take substantially longer than an ordinary export, especially at high resolutions. Inspect a sample for artifacts around cuts, fine details and fast motion.
 
@@ -148,7 +152,7 @@ cd app
 npm run portable
 ```
 
-This writes `release/Video_For_Lazies/` with the app executable, update helper, bundled `ffmpeg-sidecar/`, `interpolation-sidecar/` worker and Standard model, capability contract, payload manifest, embedded subtitle support, and required project/legal files. Keep the whole folder together. The portable command performs the platform build; Windows also runs its baseline packaged-window startup check.
+This writes `release/Video_For_Lazies/` with the app executable, update helper, bundled `ffmpeg-sidecar/`, `interpolation-sidecar/` worker and RIFE 4.25 model, capability contract, payload manifest, embedded subtitle support, and required project/legal files. Keep the whole folder together. The portable command performs the platform build; Windows also runs its baseline packaged-window startup check.
 
 To create and fully verify a release archive:
 

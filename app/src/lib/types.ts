@@ -97,7 +97,7 @@ export interface ResizeSettings {
   heightPx?: number | null;
 }
 
-export type InterpolationModelId = "rife-v4.25" | "rife-v4.26";
+export type InterpolationModelId = "rife-v4.25" | "rife-v4.26" | "gmfss-fortuna-union" | "gimm-vfi-r-p" | "ldf-vfi";
 export interface InterpolationSettings {
   targetFps: 60 | 120;
   modelId: InterpolationModelId;

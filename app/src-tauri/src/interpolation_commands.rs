@@ -48,7 +48,9 @@ impl InterpolationInstaller {
 }
 
 fn validate_model_id(model_id: &str) -> Result<(), String> {
-    if matches!(model_id, "rife-v4.25" | "rife-v4.26") {
+    if matches!(model_id, "rife-v4.25" | "rife-v4.26")
+        || crate::optional_interpolation_components::supports(model_id)
+    {
         Ok(())
     } else {
         Err("Choose a supported interpolation model.".into())

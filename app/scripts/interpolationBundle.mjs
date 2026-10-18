@@ -7,6 +7,11 @@ export const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 export const interpolationSidecarResourceTarget = 'interpolation-sidecar';
 export const interpolationBundleRoot = path.join(appRoot, '.interpolation-bundle');
 export const interpolationNativeRoot = path.join(appRoot, 'native', 'interpolation');
+export const optionalInterpolationRoot = path.join(appRoot, 'optional-interpolation');
+export const optionalInterpolationFiles = Object.freeze([
+  'worker.py', 'gmfss.py', 'gimm.py', 'ldf.py', 'install_runtime.py',
+  'gmfss-files.json', 'gimm-files.json', 'ldf-files.json',
+]);
 export const interpolationSidecarDir = path.join(interpolationBundleRoot, 'current', interpolationSidecarResourceTarget);
 export const tauriInterpolationResourceSource = '../.interpolation-bundle/current/interpolation-sidecar';
 export const INTERPOLATION_NATIVE = Object.freeze({
@@ -50,6 +55,11 @@ export async function getInterpolationSourceDigest() {
     }
   }
   await add(interpolationNativeRoot);
+  for (const name of optionalInterpolationFiles) {
+    hash.update(`optional/${name}`);
+    hash.update(await fs.readFile(path.join(optionalInterpolationRoot, name)));
+  }
+  hash.update(await fs.readFile(path.join(appRoot, 'optional-interpolation-runtime.json')));
   hash.update(await fs.readFile(fileURLToPath(import.meta.url)));
   hash.update(await fs.readFile(path.join(appRoot, 'scripts', 'build-interpolation-sidecar.mjs')));
   hash.update(await fs.readFile(path.join(appRoot, 'interpolation-models.json')));

@@ -1,6 +1,7 @@
 import type { InterpolationSettings, InterpolationOperationId, InterpolationInstallProgress, InterpolationModelId, OutputFormat } from "./types";
 export const INTERPOLATION_MODELS: readonly InterpolationModelId[];
 export const INTERPOLATION_TARGETS: readonly (60 | 120)[];
+export function interpolationModelLabel(modelId: InterpolationModelId): string;
 export function normalizeInterpolation(value: unknown): InterpolationSettings | null;
 export function interpolationConflict(value: unknown, format: OutputFormat, cap: number | string | null | undefined): string | null;
 export interface InterpolationInstallState {
