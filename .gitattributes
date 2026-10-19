@@ -4,3 +4,4 @@ app/interpolation-models.json text eol=lf
 app/native/interpolation/** text eol=lf
 app/optional-interpolation/** text eol=lf
 app/optional-interpolation-runtime.json text eol=lf
+app/src-tauri/src/updater/fixtures/** -text
