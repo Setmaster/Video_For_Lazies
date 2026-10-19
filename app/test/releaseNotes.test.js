@@ -68,3 +68,10 @@ test("release notes renderer describes the first release without a fake range", 
 test("manual release notes are trimmed before rendering", () => {
   assert.equal(normalizeManualNotes("\n  summary\n"), "summary");
 });
+
+test("Windows-only release notes claim only Windows build and artifact proof", () => {
+  const notes = renderReleaseNotes({ version: "2.6.0", commits: [], targetLabels: ["win-x64"] });
+  assert.match(notes, /Video_For_Lazies-v2\.6\.0-win-x64\.zip/);
+  assert.match(notes, /builds and verifies Windows x64 portable archives/);
+  assert.doesNotMatch(notes, /Linux|both platforms|linux-x64/);
+});

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "releases": {
+    "2.6.0": {
+      "targets": ["windows-x64"],
+      "makeLatest": false
+    }
+  }
+}

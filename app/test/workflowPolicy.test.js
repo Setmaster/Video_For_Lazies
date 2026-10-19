@@ -72,6 +72,18 @@ test("release docs require exact-SHA CI and portable artifacts by release class"
   assert.match(appReadme, /Tag-triggered runs (?:intentionally|conservatively) create a draft prerelease/);
 });
 
+test("tag and manual release builds derive platforms and latest status from version policy", async () => {
+  const release = await readRepoFile(".github/workflows/portable-artifacts.yml");
+  assert.match(release, /REQUESTED_VERSION:.*github\.event\.inputs\.version \|\| github\.ref_name/);
+  assert.match(release, /run: node scripts\/releasePolicy\.mjs "\$REQUESTED_VERSION"/);
+  assert.match(release, /matrix:.*fromJSON\(needs\.policy\.outputs\.matrix\)/);
+  assert.match(release, /needs: \[policy, portable\]/);
+  assert.match(release, /prepare-release-assets\.mjs[^\n]*--targets "\$RELEASE_TARGETS"/);
+  assert.match(release, /generate-release-notes\.mjs[^\n]*--targets "\$RELEASE_TARGETS"/);
+  assert.match(release, /MAKE_LATEST:.*needs\.policy\.outputs\.make_latest/);
+  assert.match(release, /if \[\[ "\$MAKE_LATEST" == "false" \]\]; then\s*args\+=\(--latest=false\)/);
+});
+
 test("release docs describe updater trust, recovery, and current package proof", async () => {
   const docs = await readRepoFile("docs/release.md");
 

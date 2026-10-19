@@ -38,7 +38,15 @@ git push origin main v1.2.3
 
 For release-candidate checks before approval, run the manual workflow from the development branch with `build_only=true`. This verifies and retains private artifacts without creating a GitHub Release. For an owner-approved draft release, explicitly use `build_only=false` and leave `draft=true` until review is complete.
 
-Pushing a release tag intentionally creates a draft prerelease. Tag events do not have the manual `draft` or `prerelease` inputs, and the release step defaults missing values to `true` so assets can be reviewed before public promotion. After the tag workflow succeeds and the draft assets pass verification, explicitly publish the release as stable and latest.
+Pushing a release tag intentionally creates a draft prerelease. Tag events do not have the manual `draft` or `prerelease` inputs, and the release step defaults missing values to `true` so assets can be reviewed before public promotion. After the tag workflow succeeds and the draft assets pass verification, explicitly publish the release as stable, applying the version policy’s Latest setting.
+
+## Platform scope
+
+`app/release-policy.json` records version-specific platform exceptions. Unlisted versions build the normal Windows/Linux pair. v2.6.0 builds Windows x64 only and must remain **stable but non-latest**. The workflow resolves this policy from the exact candidate before selecting its matrix, staging assets and creating the draft. Do not override its platform list or promote a Windows-only release to GitHub Latest.
+
+Released apps use one shared `releases/latest/download` manifest with a single version for all payloads. A missing platform is an update-check error, and a v2.5.0 Linux payload cannot be relabeled v2.6.0. Keep v2.5.0 Latest and its assets unchanged. Windows v2.6.0 is a manual download into a new portable folder; older Windows apps will not offer it automatically. Its updater remains on the shared channel for a future compatible release.
+
+For a platform exception, apply the gates below to its declared platforms. Exact-SHA source CI remains required, including Linux-hosted source checks; this does not qualify or publish a new Linux app. Independently verify the existing Latest release and update metadata are unchanged before and after publication. A future full release must restore the complete platform pair and qualify Linux separately.
 
 ## Release Gate Policy
 
@@ -46,13 +54,13 @@ The blocking gate for every stable release is:
 
 1. Local checks pass on `dev`.
 2. CI passes on `dev` for the exact commit that will be released.
-3. The manual `Portable Release` workflow passes with `build_only=true` for that exact `dev` commit, including Windows and Linux portable artifacts.
+3. The manual `Portable Release` workflow passes with `build_only=true` for that exact `dev` commit, including every platform declared by the version policy.
 4. `dev` fast-forwards into `main`, and CI passes on the same `main` commit unless the narrowly scoped patch-only setup-stall exception below applies.
 5. The release tag workflow passes and creates the reviewable draft prerelease.
 6. Draft assets are downloaded and verified against `SHA256SUMS.txt`, the update manifest hashes and signature, and any targeted runtime smoke needed for the change.
-7. The verified draft is explicitly published as stable and latest, then the latest release endpoint and update channel are checked.
+7. The verified draft is explicitly published as stable with the policy’s Latest setting, then the release endpoint and shared update channel are checked.
 
-The `Portable Release` workflow is the final artifact gate because it rebuilds and verifies both Windows x64 and Linux x64 portable artifacts before publication. It does not replace an exact-SHA `main` CI result when that result is a hard gate.
+The `Portable Release` workflow is the final artifact gate because it rebuilds and verifies the declared native portable artifacts before publication. It does not replace an exact-SHA `main` CI result when that result is a hard gate.
 
 Exact-SHA `main` CI is a hard gate for every `MAJOR` or `MINOR` release and for any release that changes update checks, signing, manifests, payload validation, staging, apply behavior, rollback, or recovery. A runner-setup or dependency-installation stall does not satisfy this gate and cannot use the setup-stall exception. Rerun `main` CI until the exact release SHA completes successfully.
 
@@ -95,7 +103,7 @@ The `Portable Release` GitHub Actions workflow builds verified x64 artifacts for
 - `linux-x64`
 - `win-x64`
 
-It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds and verifies both portable zips on every run. Manual dispatch defaults to `build_only=true`, which uploads private artifacts with 30-day retention and skips the release job. Tag pushes, or an explicit manual `build_only=false`, continue through release notes, the combined `SHA256SUMS.txt`, updater-manifest signing, and GitHub Release creation. Tag events have no dispatch inputs, so the release script conservatively defaults them to `draft=true` and `prerelease=true`; stable publication is a separate, explicit step after draft verification.
+It runs on manual dispatch with an explicit version, and on pushed `v*.*.*` tags. The requested version or tag must match the synchronized app metadata. The workflow builds and verifies the portable zips declared by the version policy on every run. Manual dispatch defaults to `build_only=true`, which uploads private artifacts with 30-day retention and skips the release job. Tag pushes, or an explicit manual `build_only=false`, continue through release notes, the combined `SHA256SUMS.txt`, updater-manifest signing, and GitHub Release creation. Tag events have no dispatch inputs, so the release script conservatively defaults them to `draft=true` and `prerelease=true`; stable publication is a separate, explicit step after draft verification.
 
 Manual dispatch inputs:
 
@@ -117,7 +125,7 @@ gh workflow run portable-artifacts.yml --ref dev \
   -f prerelease=true
 ```
 
-This run is expected to finish green after both platform artifacts pass. The release job is skipped and no tag, draft, or public release is created.
+This run is expected to finish green after all declared platform artifacts pass. The release job is skipped and no tag, draft, or public release is created.
 
 Release notes follow this template:
 
@@ -142,18 +150,21 @@ Release notes follow this template:
 
 Recommended stable tag protocol:
 
-1. Require local checks, exact-SHA `dev` CI, and a `build_only=true` Windows/Linux workflow run to pass.
+1. Require local checks, exact-SHA `dev` CI, and a `build_only=true` workflow run for the declared platforms to pass.
 2. Fast-forward `dev` into `main`, push `main`, and require exact-SHA `main` CI to pass.
 3. Create and push the lightweight `vX.Y.Z` tag at that commit.
 4. Wait for the tag-triggered `Portable Release` workflow to finish green and create its draft prerelease.
-5. Download and verify all five draft assets, both archive payloads, the signed update manifest, and generated release notes.
+5. Download and verify all draft assets and declared archive payloads, the signed update manifest, and generated release notes.
 6. Replace the entire generated body with curated, owner-reviewed notes for every major or minor release, and whenever the generated summary does not adequately explain the change. Then publish only the verified draft:
 
 ```bash
+# Normal cross-platform release:
 gh release edit vX.Y.Z --draft=false --prerelease=false --latest
+# Windows-only v2.6.0; preserve v2.5.0 as Latest:
+gh release edit v2.6.0 --draft=false --prerelease=false --latest=false
 ```
 
-7. Confirm `main`, `dev`, and the tag resolve to the same commit, then verify the latest release endpoint and `releases/latest/download` update-manifest assets.
+7. Confirm `main`, `dev`, and the tag resolve to the same commit, then verify the release endpoint, public bytes and `releases/latest/download` update-manifest assets. For v2.6.0, Latest must still identify v2.5.0.
 
 Alternative manual draft protocol for review without a pre-existing tag:
 
@@ -162,7 +173,7 @@ Alternative manual draft protocol for review without a pre-existing tag:
 3. Review commits since that tag with `git log --oneline <previous-tag>..HEAD`, or use `git log --oneline HEAD` for the first release.
 4. Write the curated `release_notes` input using the template above.
 5. Trigger `Portable Release` with `build_only=false` and `draft=true`.
-6. Review the draft release notes, Linux zip, Windows zip, `SHA256SUMS.txt`, `vfl-update-manifest-v1.json`, and `vfl-update-manifest-v1.json.sig`.
+6. Review the draft release notes, every declared platform zip, `SHA256SUMS.txt`, `vfl-update-manifest-v1.json`, and `vfl-update-manifest-v1.json.sig`.
 7. Confirm the draft release is backed by the intended public `vX.Y.Z` tag.
 8. Confirm generated `SOURCE.md` in each zip names the intended release tag and source commit.
 9. Publish the draft only when the owner wants that release visible to the public.
@@ -190,13 +201,13 @@ Windows artifact example:
 release/Video_For_Lazies-vX.Y.Z-win-x64.zip
 ```
 
-GitHub release assets are the Linux zip, the Windows zip, the combined checksum file, the signed updater manifest, and the updater manifest signature. Payload manifest sidecars are intermediate workflow inputs and are intentionally not uploaded as separate release assets.
+GitHub release assets are the declared platform zips, the checksum file, the signed updater manifest, and the updater manifest signature. A normal paired release has five assets; Windows-only v2.6.0 has four. Payload manifest sidecars are intermediate workflow inputs and are intentionally not uploaded as separate release assets.
 
 ## Updater Signing
 
 Portable update checks trust the signed `vfl-update-manifest-v1.json`, not the network transport alone. The manifest binds the release version and tag to each platform archive URL, SHA256, byte size, portable root, and embedded payload-manifest digest. The app verifies the detached manifest signature against its embedded updater public keys before showing an update prompt.
 
-Release assembly requires one complete Linux/Windows artifact pair at one version. Each payload-manifest sidecar must be byte-for-byte identical to the copy embedded in its corresponding zip. Before signing, release staging validates zip integrity, canonical paths, the exact manifest-owned file set, every file hash and size, and Linux file modes. The workflow then verifies the new signature against the same public keys embedded in the shipped app.
+Release assembly normally requires one complete Linux/Windows artifact pair at one version. An explicit platform policy can restrict assembly to Windows only; every selected payload must still match that version and unexpected platforms are rejected. Each payload-manifest sidecar must be byte-for-byte identical to the copy embedded in its corresponding zip. Before signing, release staging validates zip integrity, canonical paths, the exact manifest-owned file set, every file hash and size, and Linux file modes. The workflow then verifies the new signature against the same public keys embedded in the shipped app.
 
 After download, the app verifies the selected archive size and SHA256, validates the embedded payload manifest, and extracts only the signed file set into app-managed staging. Apply is single-owner and no-clobber: a late collision or unknown sibling is preserved rather than silently overwritten or deleted. A durable journal records the staged plan and verified backup digest before replacement. Startup finalizes a successful update; an interrupted or failed replacement uses the journal and verified backup for automatic recovery or rollback. If saved state cannot be trusted, cleanup stops and the staged files and backup remain available for explicit recovery.
 
@@ -240,7 +251,7 @@ Windows builds also require `recording-sidecar/vfl_recording_host.exe` and `reco
 
 Release verification extracts the exact zip that will be uploaded and validates its payload manifest, required legal/source files, bundled FFmpeg capability contract, and a real FFmpeg encode/probe. Packaged app smokes on both platforms cover media-depth safety, strict size fitting and subtitle burn-in, frame-accurate trim and no-clobber refusal, progress/finalization behavior, reset/cancel/drop interactions, and representative MP4/WebM export plans. Linux uses Xvfb when no display is available and also runs the codec-plan matrix. Windows additionally verifies the helper's embedded execution manifest and redirected self-test, the packaged startup surface, and native keyboard-driven preview, trim, crop, dialog, queue, and accessibility behavior.
 
-The release workflow repeats the full test, lint, audit, build, archive, payload, and packaged-runtime chain independently on native Windows and Linux runners. Download the resulting private or draft artifacts and verify them again before publication; a green source build alone is not artifact proof.
+The release workflow repeats the full test, lint, audit, build, archive, payload, and packaged-runtime chain independently on each declared native runner. Download the resulting private or draft artifacts and verify them again before publication; a green source build alone is not artifact proof.
 
 ## Windows Code-Signing Note
 

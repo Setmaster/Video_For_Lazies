@@ -14,6 +14,7 @@ import {
   sha256File,
 } from "./portableRelease.mjs";
 import { normalizeVersionInput } from "./versioning.mjs";
+import { validateReleaseTargets } from "./releasePolicy.mjs";
 import {
   MAX_UPDATE_ARCHIVE_BYTES,
   MAX_UPDATE_ZIP_ENTRIES,
@@ -364,12 +365,13 @@ function parseReleaseFile(fileName, pattern) {
   };
 }
 
-export function selectUpdateReleasePair({ filePaths, version } = {}) {
+export function selectUpdateReleasePair({ filePaths, version, targets = REQUIRED_UPDATE_TARGETS } = {}) {
   if (!Array.isArray(filePaths)) {
     throw new Error("filePaths must be an array.");
   }
 
-  const candidates = new Map(REQUIRED_UPDATE_TARGETS.map((target) => [target, {
+  const selectedTargets = validateReleaseTargets(targets);
+  const candidates = new Map(selectedTargets.map((target) => [target, {
     zips: [],
     payloadSidecars: [],
   }]));
@@ -377,17 +379,23 @@ export function selectUpdateReleasePair({ filePaths, version } = {}) {
     const fileName = path.basename(filePath);
     const zipInfo = parseReleaseFile(fileName, RELEASE_ZIP_PATTERN);
     if (zipInfo) {
+      if (!candidates.has(zipInfo.updateTarget)) {
+        throw new Error(`Unexpected release zip for excluded updater target: ${zipInfo.updateTarget}`);
+      }
       candidates.get(zipInfo.updateTarget).zips.push({ filePath, ...zipInfo });
       continue;
     }
 
     const payloadInfo = parseReleaseFile(fileName, PAYLOAD_SIDECAR_PATTERN);
     if (payloadInfo) {
+      if (!candidates.has(payloadInfo.updateTarget)) {
+        throw new Error(`Unexpected payload manifest for excluded updater target: ${payloadInfo.updateTarget}`);
+      }
       candidates.get(payloadInfo.updateTarget).payloadSidecars.push({ filePath, ...payloadInfo });
     }
   }
 
-  for (const target of REQUIRED_UPDATE_TARGETS) {
+  for (const target of selectedTargets) {
     const targetCandidates = candidates.get(target);
     if (targetCandidates.zips.length === 0) {
       throw new Error(`Missing release zip for updater target: ${target}`);
@@ -407,7 +415,7 @@ export function selectUpdateReleasePair({ filePaths, version } = {}) {
     }
   }
 
-  const selected = Object.fromEntries(REQUIRED_UPDATE_TARGETS.map((target) => {
+  const selected = Object.fromEntries(selectedTargets.map((target) => {
     const targetCandidates = candidates.get(target);
     return [target, {
       zipPath: targetCandidates.zips[0].filePath,
@@ -534,6 +542,7 @@ export async function buildUpdateManifest({
   releaseAssetDir,
   version,
   publishedAt = new Date().toISOString(),
+  targets = REQUIRED_UPDATE_TARGETS,
 } = {}) {
   if (!releaseAssetDir) {
     throw new Error("releaseAssetDir is required.");
@@ -541,11 +550,11 @@ export async function buildUpdateManifest({
 
   const normalizedVersion = normalizeVersionInput(version);
   const files = await walkFiles(releaseAssetDir);
-  const releasePair = selectUpdateReleasePair({ filePaths: files, version: normalizedVersion });
+  const releasePair = selectUpdateReleasePair({ filePaths: files, version: normalizedVersion, targets });
 
   const releaseTag = `v${normalizedVersion}`;
   const artifacts = {};
-  for (const target of REQUIRED_UPDATE_TARGETS) {
+  for (const target of Object.keys(releasePair.artifacts)) {
     const { zipPath, payloadSidecarPath: payloadPath } = releasePair.artifacts[target];
     const zipName = path.basename(zipPath);
     const zipStat = await fs.stat(zipPath);
@@ -597,8 +606,9 @@ export async function writeUpdateManifest({
   releaseAssetDir,
   version,
   publishedAt,
+  targets,
 } = {}) {
-  const manifest = await buildUpdateManifest({ releaseAssetDir, version, publishedAt });
+  const manifest = await buildUpdateManifest({ releaseAssetDir, version, publishedAt, targets });
   const outputPath = path.resolve(releaseAssetDir, UPDATE_MANIFEST_FILE_NAME);
   await fs.writeFile(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return { manifest, outputPath };

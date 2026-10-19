@@ -81,7 +81,7 @@ async function assertSafeReleaseDirectories(inputDir, outputDir) {
   return { canonicalInputDir, canonicalOutputDir };
 }
 
-export async function prepareReleaseAssets({ inputDir, outputDir, version } = {}) {
+export async function prepareReleaseAssets({ inputDir, outputDir, version, targets = REQUIRED_UPDATE_TARGETS } = {}) {
   const resolvedInputDir = path.resolve(repoRoot, inputDir ?? "release");
   const resolvedOutputDir = path.resolve(repoRoot, outputDir ?? "release/release-assets");
   const initialDirectories = await assertSafeReleaseDirectories(
@@ -89,7 +89,7 @@ export async function prepareReleaseAssets({ inputDir, outputDir, version } = {}
     resolvedOutputDir,
   );
   const files = await walkFiles(resolvedInputDir, resolvedOutputDir);
-  const releasePair = selectUpdateReleasePair({ filePaths: files, version });
+  const releasePair = selectUpdateReleasePair({ filePaths: files, version, targets });
 
   const finalDirectories = await assertSafeReleaseDirectories(
     resolvedInputDir,
@@ -107,7 +107,7 @@ export async function prepareReleaseAssets({ inputDir, outputDir, version } = {}
 
   const copiedFiles = [];
   const copiedPayloadSidecars = [];
-  for (const target of REQUIRED_UPDATE_TARGETS) {
+  for (const target of Object.keys(releasePair.artifacts)) {
     const { zipPath: zipFile, payloadSidecarPath } = releasePair.artifacts[target];
     const outputPath = path.resolve(resolvedOutputDir, path.basename(zipFile));
     await fs.copyFile(zipFile, outputPath);
@@ -120,6 +120,7 @@ export async function prepareReleaseAssets({ inputDir, outputDir, version } = {}
   const { outputPath: updateManifestPath } = await writeUpdateManifest({
     releaseAssetDir: resolvedOutputDir,
     version: releasePair.version,
+    targets,
   });
   const checksumLines = [];
   for (const filePath of copiedFiles) {
@@ -139,6 +140,7 @@ async function main() {
     inputDir: options.input,
     outputDir: options.output,
     version: options.version,
+    targets: options.targets?.split(","),
   });
 
   console.log(`Release assets staged in ${result.outputDir}`);

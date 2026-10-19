@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { getPortableTargetLabel } from "./portableRelease.mjs";
 import { normalizeVersionInput } from "./versioning.mjs";
 import { repoRoot } from "./ffmpegBundle.mjs";
+import { DEFAULT_RELEASE_TARGETS, validateReleaseTargets } from "./releasePolicy.mjs";
 
 const CATEGORY_ORDER = [
   "Added",
@@ -124,6 +125,10 @@ export function renderReleaseNotes({
   targetLabels = ["linux-x64", "win-x64"],
 } = {}) {
   const tag = normalizeTag(version);
+  const hasWindows = targetLabels.includes("win-x64");
+  const hasLinux = targetLabels.includes("linux-x64");
+  const platformNames = [hasWindows && "Windows x64", hasLinux && "Linux x64"].filter(Boolean).join(" and ");
+  const platformScope = hasWindows && hasLinux ? "on both platforms" : `on ${platformNames}`;
   const grouped = new Map(CATEGORY_ORDER.map((category) => [category, []]));
 
   for (const commit of commits) {
@@ -166,18 +171,18 @@ export function renderReleaseNotes({
   lines.push("- `vfl-update-manifest-v1.json.sig`", "");
 
   lines.push("## Runtime Notes", "");
-  lines.push("- Windows x64 and Linux x64 portable releases bundle pinned GPL FFmpeg sidecars and include FFmpeg source plus build-provenance archives in the portable payload.");
+  lines.push(`- ${platformNames} portable releases bundle pinned GPL FFmpeg sidecars and include FFmpeg source plus build-provenance archives in the portable payload.`);
   lines.push("- AI Smooth motion bundles its native RIFE worker and Standard model. Hardware Vulkan and supported 8-bit SDR video are required; optional model downloads need no Python or CUDA toolkit setup.");
   lines.push("- Portable updates are accepted only after the app verifies the signed release manifest, archive SHA256 and size, and the embedded payload manifest.");
   lines.push("- Updates use an app-managed staging directory, a durable journal, and a verified backup for automatic recovery or rollback after an interrupted replacement. If saved state cannot be trusted, the app preserves the staged files and backup for explicit recovery.");
-  lines.push("- Windows portable executables are not Authenticode-signed and may trigger SmartScreen or antivirus reputation warnings. Verify the matching entry in `SHA256SUMS.txt` before running.");
-  lines.push("- `VFL_FFMPEG_PATH` and `VFL_FFPROBE_PATH` remain available for custom runtime overrides on both platforms.");
+  if (hasWindows) lines.push("- Windows portable executables are not Authenticode-signed and may trigger SmartScreen or antivirus reputation warnings. Verify the matching entry in `SHA256SUMS.txt` before running.");
+  lines.push(`- \`VFL_FFMPEG_PATH\` and \`VFL_FFPROBE_PATH\` remain available for custom runtime overrides ${platformScope}.`);
   lines.push("");
 
   lines.push("## Verification", "");
-  lines.push("- GitHub Actions builds and verifies Windows x64 and Linux x64 portable archives before creating the release.");
-  lines.push("- Each extracted archive must exactly match its payload manifest, including the file set, SHA256, size, and Linux file modes where applicable.");
-  lines.push("- Packaged smokes verify bundled FFmpeg capabilities, encode/probe behavior, and app export workflows on both platforms; Windows also verifies the update-helper manifest and packaged startup.");
+  lines.push(`- GitHub Actions builds and verifies ${platformNames} portable archives before creating the release.`);
+  lines.push(`- Each extracted archive must exactly match its payload manifest, including the file set, SHA256, size${hasLinux ? ", and Linux file modes where applicable" : ""}.`);
+  lines.push(`- Packaged smokes verify bundled FFmpeg capabilities, encode/probe behavior, and app export workflows ${platformScope}${hasWindows ? "; Windows also verifies the update-helper manifest and packaged startup" : ""}.`);
   lines.push("- The release includes combined SHA256 checksums and a signed update manifest that binds each archive and payload-manifest digest.", "");
 
   return lines.join("\n");
@@ -227,10 +232,10 @@ async function main() {
     explicitPreviousTag: options["previous-tag"] ?? normalizeManualNotes(process.env.VFL_PREVIOUS_TAG),
   });
   const commits = await readCommits(previousTag);
-  const targetLabels = [
-    getPortableTargetLabel({ platform: "linux", arch: "x64" }),
-    getPortableTargetLabel({ platform: "win32", arch: "x64" }),
-  ];
+  const targets = validateReleaseTargets(options.targets?.split(",") ?? DEFAULT_RELEASE_TARGETS);
+  const targetLabels = targets.map((target) => getPortableTargetLabel({
+    platform: target === "windows-x64" ? "win32" : "linux", arch: "x64",
+  }));
 
   const notes = renderReleaseNotes({
     version,

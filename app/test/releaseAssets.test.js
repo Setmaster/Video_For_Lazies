@@ -11,6 +11,7 @@ import {
   generatePayloadManifest,
 } from "../scripts/updateManifests.mjs";
 import { createReleaseZipFixture } from "../test-support/releaseZipFixture.js";
+import { verifyManifestSignature } from "../scripts/verify-update-manifest.mjs";
 
 async function writePortableFixture(root, { platform }) {
   const files = [
@@ -157,6 +158,65 @@ test("prepareReleaseAssets requires both Linux and Windows zips", async () => {
       prepareReleaseAssets({ inputDir, outputDir }),
       /missing release zip.*windows-x64/i,
     );
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("Windows-only release keeps exact payload validation and signs only its Windows metadata", async () => {
+  const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-release-assets-windows-test-"));
+  try {
+    const inputDir = path.resolve(tempRoot, "downloads");
+    const outputDir = path.resolve(tempRoot, "release-assets");
+    const artifacts = await writeReleasePair(inputDir, { version: "2.6.0" });
+    await fs.rm(path.resolve(inputDir, "linux"), { recursive: true });
+    const result = await prepareReleaseAssets({ inputDir, outputDir, version: "2.6.0", targets: ["windows-x64"] });
+    assert.equal(result.files.length, 3);
+    const manifestBytes = await fs.readFile(path.resolve(outputDir, UPDATE_MANIFEST_FILE_NAME));
+    const manifest = JSON.parse(manifestBytes);
+    assert.deepEqual(Object.keys(manifest.artifacts), ["windows-x64"]);
+    assert.equal(manifest.version, "2.6.0");
+    const artifact = manifest.artifacts["windows-x64"];
+    assert.equal(artifact.sha256, sha256(await fs.readFile(artifacts["windows-x64"].zipPath)));
+    assert.equal(artifact.payloadManifest.sha256, sha256(await fs.readFile(artifacts["windows-x64"].sidecarPath)));
+    assert.equal(artifact.url, "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip");
+    assert.doesNotMatch(await fs.readFile(path.resolve(outputDir, "SHA256SUMS.txt"), "utf8"), /linux/);
+
+    // Fresh inert test key proves signatures bind the selected platform list too.
+    const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+    const keyId = crypto.randomBytes(8);
+    const keyBytes = publicKey.export({ format: "der", type: "spki" }).subarray(-32);
+    const publicKeyText = `untrusted comment: test\n${Buffer.concat([Buffer.from("Ed"), keyId, keyBytes]).toString("base64")}`;
+    const digest = crypto.createHash("blake2b512").update(manifestBytes).digest();
+    const signatureText = `untrusted comment: test\n${Buffer.concat([Buffer.from("ED"), keyId, crypto.sign(null, digest, privateKey)]).toString("base64")}`;
+    assert.equal(verifyManifestSignature(manifestBytes, signatureText, [publicKeyText]), true);
+    manifest.artifacts["linux-x64"] = artifact;
+    assert.equal(verifyManifestSignature(Buffer.from(JSON.stringify(manifest)), signatureText, [publicKeyText]), false);
+
+    // Selection cannot weaken embedded manifest checks.
+    await fs.appendFile(artifacts["windows-x64"].sidecarPath, "\n");
+    await assert.rejects(
+      prepareReleaseAssets({ inputDir, outputDir, targets: ["windows-x64"] }),
+      /byte-for-byte.*embedded/i,
+    );
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("Windows-only release rejects Linux archives before replacing staged files", async () => {
+  const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-release-assets-excluded-test-"));
+  try {
+    const inputDir = path.resolve(tempRoot, "downloads");
+    const outputDir = path.resolve(tempRoot, "release-assets");
+    await writeReleasePair(inputDir);
+    await fs.mkdir(outputDir);
+    await fs.writeFile(path.resolve(outputDir, "marker.txt"), "preserve");
+    await assert.rejects(
+      prepareReleaseAssets({ inputDir, outputDir, targets: ["windows-x64"] }),
+      /excluded updater target: linux-x64/,
+    );
+    assert.equal(await fs.readFile(path.resolve(outputDir, "marker.txt"), "utf8"), "preserve");
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }

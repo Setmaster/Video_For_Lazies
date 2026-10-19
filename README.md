@@ -9,8 +9,8 @@ Video For Lazies is a focused desktop app for video jobs that should not require
 The app accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports `mp4`, `webm`, or audio-only `mp3`. It is built with Tauri, React, Rust, and FFmpeg.
 
 <p align="center">
-  <a href="https://github.com/Setmaster/Video_For_Lazies/releases/latest" aria-label="Download the latest Video For Lazies release">
-    <img src="https://img.shields.io/github/v/release/Setmaster/Video_For_Lazies?label=Download&labelColor=06111D&color=35D3B4&style=for-the-badge" alt="Download latest release">
+  <a href="https://github.com/Setmaster/Video_For_Lazies/releases" aria-label="Download Video For Lazies">
+    <img src="https://img.shields.io/badge/Download-portable-35D3B4?labelColor=06111D&style=for-the-badge" alt="Download portable releases">
   </a>
 </p>
 
@@ -63,11 +63,13 @@ It is not a nonlinear editor. There are no multi-track timelines, effects stacks
 
 ## Download
 
-Download the latest stable portable zip from [GitHub Releases](https://github.com/Setmaster/Video_For_Lazies/releases/latest).
+Choose the portable zip for your platform:
 
-- Windows x64: `Video_For_Lazies-vX.Y.Z-win-x64.zip`
-- Linux x64: `Video_For_Lazies-vX.Y.Z-linux-x64.zip`
-- Checksums: `SHA256SUMS.txt`
+- [Windows x64 v2.6.0, with screen recording](https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.6.0): `Video_For_Lazies-v2.6.0-win-x64.zip`
+- [Linux x64 v2.5.0](https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.5.0): `Video_For_Lazies-v2.5.0-linux-x64.zip`
+- Use `SHA256SUMS.txt` from the same release as your zip.
+
+Windows v2.6.0 is a separate manual download. Extract it into a new folder and keep the entire portable folder together. The shared in-app update channel stays on v2.5.0 until a release is ready for both platforms, so older Windows apps will not offer v2.6.0 automatically.
 
 The portable builds bundle pinned FFmpeg and FFprobe sidecars, so end users do not need to install FFmpeg separately for supported Windows and Linux releases.
 

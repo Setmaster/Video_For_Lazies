@@ -42,18 +42,38 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  policy:
+    name: Resolve release platforms
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.policy.outputs.matrix }}
+      targets: ${{ steps.policy.outputs.targets }}
+      make_latest: ${{ steps.policy.outputs.make_latest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Resolve release policy
+        id: policy
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: node scripts/releasePolicy.mjs "$REQUESTED_VERSION"
+        working-directory: app
+
   portable:
     name: Build ${{ matrix.target }}
+    needs: policy
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: linux-x64
-          - os: windows-2022
-            target: win-x64
+      matrix: ${{ fromJSON(needs.policy.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -198,7 +218,7 @@ jobs:
   release:
     name: Create GitHub Release
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.build_only }}
-    needs: portable
+    needs: [policy, portable]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -242,7 +262,9 @@ jobs:
           path: release/downloaded-artifacts
 
       - name: Stage release assets
-        run: node scripts/prepare-release-assets.mjs --input release/downloaded-artifacts --output release/release-assets
+        env:
+          RELEASE_TARGETS: ${{ needs.policy.outputs.targets }}
+        run: node scripts/prepare-release-assets.mjs --input release/downloaded-artifacts --output release/release-assets --targets "$RELEASE_TARGETS"
         working-directory: app
 
       - name: Sign update manifest
@@ -260,7 +282,8 @@ jobs:
         env:
           VFL_RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
           VFL_PREVIOUS_TAG: ${{ github.event.inputs.previous_tag }}
-        run: node scripts/generate-release-notes.mjs --version "${{ steps.version.outputs.version }}" --output release/RELEASE_NOTES.md
+          RELEASE_TARGETS: ${{ needs.policy.outputs.targets }}
+        run: node scripts/generate-release-notes.mjs --version "${{ steps.version.outputs.version }}" --targets "$RELEASE_TARGETS" --output release/RELEASE_NOTES.md
         working-directory: app
 
       - name: Create GitHub Release
@@ -270,6 +293,7 @@ jobs:
           PRERELEASE: ${{ github.event.inputs.prerelease }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
           TARGET_SHA: ${{ steps.version.outputs.target_sha }}
+          MAKE_LATEST: ${{ needs.policy.outputs.make_latest }}
         shell: bash
         run: |
           set -euo pipefail
@@ -301,6 +325,10 @@ jobs:
           fi
           if [[ "${PRERELEASE:-true}" == "true" ]]; then
             args+=(--prerelease)
+          fi
+          # Platform-only stable releases must leave the shared latest channel intact.
+          if [[ "$MAKE_LATEST" == "false" ]]; then
+            args+=(--latest=false)
           fi
 
           gh release create "${args[@]}"
