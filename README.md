@@ -65,11 +65,11 @@ It is not a nonlinear editor. There are no multi-track timelines, effects stacks
 
 Choose the portable zip for your platform:
 
-- [Windows x64 v2.6.0, with screen recording](https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.6.0): `Video_For_Lazies-v2.6.0-win-x64.zip`
+- [Windows x64 v2.6.1, with screen recording and independent updates](https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.6.1): `Video_For_Lazies-v2.6.1-win-x64.zip`
 - [Linux x64 v2.5.0](https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.5.0): `Video_For_Lazies-v2.5.0-linux-x64.zip`
 - Use `SHA256SUMS.txt` from the same release as your zip.
 
-Windows v2.6.0 is a separate manual download. Extract it into a new folder and keep the entire portable folder together. The shared in-app update channel stays on v2.5.0 until a release is ready for both platforms, so older Windows apps will not offer v2.6.0 automatically.
+Windows v2.6.1 introduces independent platform updates: future Windows releases can be offered without waiting for a Linux release. Apps through v2.6.0 need one manual bootstrap download to get this updater. Extract v2.6.1 into a new folder and keep the entire portable folder together. Older apps still use the shared update channel on v2.5.0 and will not offer v2.6.1 automatically. Linux editing remains on v2.5.0; Linux recording is not available yet.
 
 The portable builds bundle pinned FFmpeg and FFprobe sidecars, so end users do not need to install FFmpeg separately for supported Windows and Linux releases.
 

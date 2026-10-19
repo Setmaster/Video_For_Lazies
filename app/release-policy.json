@@ -4,6 +4,10 @@
     "2.6.0": {
       "targets": ["windows-x64"],
       "makeLatest": false
+    },
+    "2.6.1": {
+      "targets": ["windows-x64"],
+      "makeLatest": false
     }
   }
 }
