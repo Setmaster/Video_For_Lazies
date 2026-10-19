@@ -47,6 +47,9 @@ async function writePortableFixture(root, { platform = "linux" } = {}) {
   if (platform === "linux") {
     files.push("Video_For_Lazies.png", "Video_For_Lazies.desktop");
   }
+  if (platform === "win32") {
+    files.push("recording-sidecar/vfl_recording_host.exe", "recording-sidecar/RECORDING_NOTICES.txt");
+  }
 
   for (const relativePath of files) {
     const filePath = path.resolve(root, relativePath);
@@ -162,6 +165,32 @@ test("payload manifest validation rejects extra unowned files", async () => {
       validatePayloadManifest({ portableDir, version: "1.2.3", platform: "linux" }),
       /does not exactly match/,
     );
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("Windows recording helper and notices are hashed, required and owned by the payload", async () => {
+  const tempRoot = await fs.mkdtemp(path.resolve(os.tmpdir(), "vfl-recording-payload-test-"));
+  try {
+    const portableDir = path.resolve(tempRoot, "Video_For_Lazies");
+    await writePortableFixture(portableDir, { platform: "win32" });
+    const { manifest } = await generatePayloadManifest({ portableDir, version: "1.2.3", platform: "win32" });
+    const required = ["recording-sidecar/vfl_recording_host.exe", "recording-sidecar/RECORDING_NOTICES.txt"];
+    for (const relativePath of required) {
+      const entry = manifest.files.find((file) => file.path === relativePath);
+      assert.ok(entry, `${relativePath} must be updater-owned`);
+      assert.equal(entry.sha256, sha256(Buffer.from(relativePath)));
+      const bytes = await fs.readFile(path.resolve(portableDir, relativePath));
+      await fs.writeFile(path.resolve(portableDir, relativePath), Buffer.alloc(bytes.length, 0));
+      await assert.rejects(validatePayloadManifest({ portableDir, version: "1.2.3", platform: "win32" }), /Payload hash mismatch for recording-sidecar/);
+      await fs.writeFile(path.resolve(portableDir, relativePath), bytes);
+      const missing = { ...manifest, files: manifest.files.filter((file) => file.path !== relativePath) };
+      await fs.writeFile(path.resolve(portableDir, PAYLOAD_MANIFEST_FILE_NAME), JSON.stringify(missing));
+      await assert.rejects(validatePayloadManifest({ portableDir, version: "1.2.3", platform: "win32" }), /missing required file: recording-sidecar/);
+      await fs.writeFile(path.resolve(portableDir, PAYLOAD_MANIFEST_FILE_NAME), JSON.stringify(manifest));
+    }
+    await validatePayloadManifest({ portableDir, version: "1.2.3", platform: "win32" });
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }

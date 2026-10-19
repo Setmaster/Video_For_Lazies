@@ -36,6 +36,7 @@ async function writePortableFixture(root, { platform }) {
     "ffmpeg-sidecar/FFMPEG_BUNDLE_NOTICES.txt",
   ];
   if (platform === "linux") files.push("Video_For_Lazies.png", "Video_For_Lazies.desktop");
+  if (platform === "win32") files.push("recording-sidecar/vfl_recording_host.exe", "recording-sidecar/RECORDING_NOTICES.txt");
   for (const relativePath of files) {
     const filePath = path.resolve(root, relativePath);
     await fs.mkdir(path.dirname(filePath), { recursive: true });

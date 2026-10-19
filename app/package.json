@@ -23,7 +23,8 @@
     "preview": "vite preview",
     "portable": "tauri build --no-bundle && npm run build:update-helper && node scripts/make-portable.mjs && npm run smoke:portable",
     "tauri": "tauri",
-    "prepare:interpolation-sidecar": "node scripts/build-interpolation-sidecar.mjs"
+    "prepare:interpolation-sidecar": "node scripts/build-interpolation-sidecar.mjs",
+    "prepare:recording-sidecar": "node scripts/build-recording-sidecar.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

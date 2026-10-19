@@ -16,6 +16,7 @@ mod optional_interpolation_components;
 #[cfg(test)]
 mod optional_interpolation_tests;
 mod process;
+mod recording;
 pub mod updater;
 mod video;
 
@@ -852,13 +853,25 @@ pub fn run() {
         .manage(activity::ActivityCoordinator::startup_pending())
         .manage(interpolation_commands::InterpolationInstaller::default())
         .manage(updater::UpdaterCoordinator::new())
+        .manage(recording::RecordingManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         // Destroyed (not CloseRequested) so the frontend close-confirm can still
         // prevent the close; once the window is really gone, no ffmpeg child may
         // outlive the app.
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            let recorder: State<'_, recording::RecordingManager> = window.app_handle().state();
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && recorder.needs_close_guard()
+            {
+                api.prevent_close();
+                let _ = window.emit("recording-close-requested", ());
+            }
             if matches!(event, tauri::WindowEvent::Destroyed) {
+                recorder.shutdown();
                 let activity: State<'_, activity::ActivityCoordinator> =
                     window.app_handle().state();
                 activity.shutdown();
@@ -891,10 +904,29 @@ pub fn run() {
             updater::finalize_update_startup,
             updater::elevated_update_pending,
             start_encode,
-            cancel_encode
+            cancel_encode,
+            recording::recording_capabilities,
+            recording::recording_sources,
+            recording::recording_audio_devices,
+            recording::recording_select_region,
+            recording::recording_start,
+            recording::recording_stop,
+            recording::recording_close,
+            recording::recording_snapshot,
+            recording::recording_recover,
+            recording::recording_discard_recovery
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let recorder: State<'_, recording::RecordingManager> = app.state();
+                if recorder.needs_close_guard() {
+                    api.prevent_exit();
+                    let _ = app.emit("recording-close-requested", ());
+                }
+            }
+        });
 }
 
 #[cfg(test)]

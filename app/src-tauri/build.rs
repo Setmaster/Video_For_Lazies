@@ -1,6 +1,7 @@
 fn main() {
     ensure_ffmpeg_sidecar_placeholder();
     ensure_interpolation_sidecar_placeholder();
+    ensure_recording_sidecar_placeholder();
     let attributes = configure_windows_binary_manifests();
     tauri_build::try_build(attributes).expect("failed to run the Tauri build script")
 }
@@ -29,6 +30,7 @@ fn configure_windows_binary_manifests() -> tauri_build::Attributes {
     for (binary, file_name) in [
         ("video_for_lazies", "video-for-lazies.manifest"),
         ("vfl-update-helper", "vfl-update-helper.manifest"),
+        ("vfl_recording_host", "vfl-recording-host.manifest"),
     ] {
         let source_path = manifest_dir.join(file_name);
         let linker_path = out_dir.join(file_name);
@@ -50,6 +52,23 @@ fn configure_windows_binary_manifests() -> tauri_build::Attributes {
 
     tauri_build::Attributes::new()
         .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
+}
+
+fn ensure_recording_sidecar_placeholder() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let sidecar = manifest.join("target/recording-sidecar");
+    std::fs::create_dir_all(&sidecar).expect("create recording resource directory");
+    let notice = sidecar.join("RECORDING_NOTICES.txt");
+    if !notice.exists() {
+        std::fs::write(
+            notice,
+            "Recording resources are prepared by npm run prepare:recording-sidecar.\n",
+        )
+        .expect("create recording resource placeholder");
+    }
 }
 
 fn ensure_ffmpeg_sidecar_placeholder() {

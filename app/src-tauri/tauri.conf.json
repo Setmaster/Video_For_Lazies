@@ -4,9 +4,9 @@
   "version": "2.5.0",
   "identifier": "com.setmaster.video.for.lazies",
   "build": {
-    "beforeDevCommand": "npm run prepare:ffmpeg-sidecar && npm run prepare:interpolation-sidecar && npm run dev",
+    "beforeDevCommand": "npm run prepare:ffmpeg-sidecar && npm run prepare:interpolation-sidecar && npm run prepare:recording-sidecar && npm run dev",
     "devUrl": "http://localhost:1422",
-    "beforeBuildCommand": "npm run prepare:ffmpeg-sidecar && npm run prepare:interpolation-sidecar && npm run build",
+    "beforeBuildCommand": "npm run prepare:ffmpeg-sidecar && npm run prepare:interpolation-sidecar && npm run prepare:recording-sidecar && npm run build",
     "frontendDist": "../dist"
   },
   "app": {

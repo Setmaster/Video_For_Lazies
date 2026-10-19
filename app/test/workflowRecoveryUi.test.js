@@ -56,7 +56,7 @@ test("drop, output claims, retry, snapshot, and diagnostics are wired through pr
   assert.match(app, /const handleDroppedPaths = useEffectEvent\(async \(paths: string\[\]\)/);
   assert.match(app, /busy:\s+jobIdRef\.current !== null \|\|\s+pendingEncodeRef\.current !== null \|\|\s+exportQueueStateRef\.current\.autoRun \|\|\s+queuePreparationCountRef\.current > 0 \|\|\s+queueSnapshotApplyingRef\.current/);
   assert.match(app, /queueCapacity: exportQueueRemainingCapacity\(exportQueueStateRef\.current\)/);
-  assert.match(app, /isDropAllowed: \(\) => !modalOpenRef\.current/);
+  assert.match(app, /isDropAllowed: \(\) => activeWorkspaceRef\.current === "edit" && !modalOpenRef\.current/);
   assert.match(app, /exportQueueState\.pathRevision/);
   assert.match(app, /exportQueueClaimsOutputPath\(exportQueueState, outputPath\)/);
   assert.match(app, /That output path is already reserved by an item in the export queue/);

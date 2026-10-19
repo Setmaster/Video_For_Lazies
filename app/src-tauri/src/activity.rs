@@ -20,6 +20,34 @@ pub(crate) struct ActivityLease {
     id: u64,
 }
 
+/// Holds exclusive admission while the native window commits its close. A
+/// failed close reopens admission; ordinary "keep open" never enters shutdown.
+pub(crate) struct CloseGuard {
+    lease: ActivityLease,
+    committed: bool,
+}
+impl CloseGuard {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _active = self
+                .lease
+                .coordinator
+                .active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.lease
+                .coordinator
+                .closing
+                .store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Allocate a positive ID without wrapping or advancing an exhausted counter.
 pub(crate) fn allocate_operation_id(counter: &AtomicU64, maximum: u64) -> Option<u64> {
     let mut current = counter.load(Ordering::Relaxed);
@@ -46,6 +74,15 @@ impl ActivityCoordinator {
 
     pub(crate) fn begin(&self, label: &'static str) -> Result<ActivityLease, String> {
         self.begin_inner(label, false)
+    }
+
+    pub(crate) fn begin_close(&self) -> Result<CloseGuard, String> {
+        let lease = self.begin("app close")?;
+        self.closing.store(true, Ordering::Release);
+        Ok(CloseGuard {
+            lease,
+            committed: false,
+        })
     }
 
     pub(crate) fn begin_startup(&self) -> Result<ActivityLease, String> {
@@ -173,5 +210,19 @@ mod tests {
         assert!(coordinator.begin("model check").is_err());
         drop(startup);
         assert!(coordinator.begin("model check").is_ok());
+    }
+    #[test]
+    fn failed_close_reopens_admission_but_committed_close_stays_closed() {
+        let coordinator = ActivityCoordinator::default();
+        let close = coordinator.begin_close().unwrap();
+        assert!(coordinator.begin("recording").is_err());
+        drop(close);
+        assert!(!coordinator.is_closing());
+        let operation = coordinator.begin("recording").unwrap();
+        assert!(coordinator.begin_close().is_err());
+        drop(operation);
+        coordinator.begin_close().unwrap().commit();
+        assert!(coordinator.is_closing());
+        assert!(coordinator.begin("export").is_err());
     }
 }

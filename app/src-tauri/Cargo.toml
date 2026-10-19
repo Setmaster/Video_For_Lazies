@@ -33,3 +33,24 @@ zip = "9.0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
+
+# Recording APIs stay in a separate executable so missing Windows media
+# components cannot prevent the editor from starting.
+[[bin]]
+name = "vfl_recording_host"
+path = "src/bin/vfl_recording_host.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.61.3", features = [
+  "Foundation", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11",
+  "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage",
+  "Win32_System_WinRT", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture",
+  "Win32_System_Performance", "Win32_System_StationsAndDesktops",
+  "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Direct3D_Fxc",
+  "Win32_Media_MediaFoundation", "Win32_Media_Audio", "Win32_Media_KernelStreaming",
+  "Win32_Media_Multimedia", "Win32_Media_DirectShow", "Win32_Devices_FunctionDiscovery", "Win32_Devices_Display",
+  "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi",
+  "Win32_System_LibraryLoader", "Win32_Security"
+  , "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem"
+] }

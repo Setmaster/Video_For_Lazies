@@ -23,6 +23,8 @@ npm run tauri build
 
 On Windows and Linux x64, the Tauri build runs `npm run prepare:ffmpeg-sidecar` first. Staging verifies the pinned GPL FFmpeg archive and corresponding source/build-recipe archives before copying the runtime, capability contract, licenses, and source material.
 
+Windows also runs `npm run prepare:recording-sidecar` to build the native recording helper using the installed Rust/MSVC toolchain. It is bundled under `recording-sidecar/`; users do not install a separate recording runtime. Linux skips this helper and exposes recording as unavailable.
+
 ## Portable Folder
 
 ```bash
@@ -33,6 +35,7 @@ This writes `release/Video_For_Lazies/` with:
 
 - the app executable and `vfl-update-helper`
 - the platform `ffmpeg-sidecar/` and canonical capability contract
+- `recording-sidecar/` with the native capture helper and notices on Windows
 - the DejaVu Sans subtitle font embedded in the app binary, with its license recorded in generated notices
 - the payload manifest, release-specific `SOURCE.md` and `THIRD_PARTY_NOTICES.md`, and copies of `README.md`, `FFMPEG_BUNDLING.md`, and `LICENSE.txt`
 

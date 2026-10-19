@@ -236,6 +236,9 @@ function expectedRequiredFiles({ platform }) {
   if (platform === "linux") {
     required.push(portableLinuxIconFileName, portableLinuxDesktopFileName);
   }
+  if (platform === "win32") {
+    required.push("recording-sidecar/vfl_recording_host.exe", "recording-sidecar/RECORDING_NOTICES.txt");
+  }
 
   return required;
 }

@@ -1,0 +1,98 @@
+//! Private, bounded stdio protocol. Media APIs are linked only into this helper.
+#[cfg(windows)]
+#[path = "../recording/windows.rs"]
+mod windows;
+
+#[cfg(windows)]
+fn main() {
+    use std::io::{BufRead, Read, Write};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    fn send(mut value: serde_json::Value) {
+        value["protocolVersion"] = serde_json::json!(1);
+        let mut out = std::io::stdout().lock();
+        if serde_json::to_writer(&mut out, &value).is_err()
+            || out.write_all(b"\n").is_err()
+            || out.flush().is_err()
+        {
+            // A missing parent must never leave capture running.
+            std::process::exit(2);
+        }
+    }
+    let mut input = std::io::BufReader::new(std::io::stdin());
+    let mut first = Vec::new();
+    let initial = input.by_ref().take(65_537).read_until(b'\n', &mut first);
+    if initial.is_err() || first.len() > 65_536 || !first.ends_with(b"\n") {
+        send(serde_json::json!({"type":"error","message":"Invalid recording request."}));
+        return;
+    }
+    let request: serde_json::Value = match serde_json::from_slice(&first) {
+        Ok(value) => value,
+        Err(_) => {
+            send(serde_json::json!({"type":"error","message":"Invalid recording request."}));
+            return;
+        }
+    };
+    if request["protocolVersion"] != 1 {
+        send(
+            serde_json::json!({"type":"error","message":"Recording component version mismatch. Restore the complete app folder."}),
+        );
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let cancel = stop.clone();
+    std::thread::spawn(move || {
+        let mut line = Vec::new();
+        // The only further command is stop. EOF also means parent loss.
+        let _ = input.take(128).read_until(b'\n', &mut line);
+        cancel.store(true, Ordering::Release);
+    });
+    let mut no_media = false;
+    let result: Result<serde_json::Value, String> = (|| match request["operation"]
+        .as_str()
+        .unwrap_or("")
+    {
+        "sources" => {
+            if !windows::supports_capture() {
+                return Err("Screen recording requires Windows Graphics Capture support.".into());
+            }
+            serde_json::to_value(windows::enumerate_displays()?).map_err(|e| e.to_string())
+        }
+        "audio-devices" => {
+            serde_json::to_value(windows::audio_devices()?).map_err(|e| e.to_string())
+        }
+        "select-region" => {
+            let id = request["displayId"]
+                .as_str()
+                .ok_or("Choose a display first.")?;
+            serde_json::to_value(windows::select_region(id, stop)?).map_err(|e| e.to_string())
+        }
+        "record" => {
+            let config = serde_json::from_value(request["config"].clone())
+                .map_err(|e| format!("Invalid recording settings: {e}"))?;
+            let outcome = windows::run(config, stop, |progress| {
+                send(serde_json::json!({"type":"progress","value":progress}))
+            })
+            .map_err(|failure| {
+                no_media = failure.no_media;
+                failure.message
+            })?;
+            serde_json::to_value(outcome).map_err(|e| e.to_string())
+        }
+        _ => Err("Unsupported recording operation.".into()),
+    })();
+    match result {
+        Ok(value) => send(serde_json::json!({"type":"result","value":value})),
+        Err(message) => {
+            send(serde_json::json!({"type":"error","message":message,"noMedia":no_media}))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("The recording host is currently available on Windows only.");
+    std::process::exit(1);
+}

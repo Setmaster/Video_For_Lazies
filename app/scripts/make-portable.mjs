@@ -10,6 +10,7 @@ import {
   listPortableCompanionFiles,
 } from "./ffmpegBundle.mjs";
 import { getInterpolationSidecarDir } from "./interpolationBundle.mjs";
+import { recordingSidecarDir } from "./build-recording-sidecar.mjs";
 import { generatePortableDocs } from "./generate-portable-docs.mjs";
 import { copyPortableArtifacts } from "./portableArtifacts.mjs";
 import { getProjectVersion } from "./versioning.mjs";
@@ -55,6 +56,11 @@ async function main() {
         sourcePath: getInterpolationSidecarDir(),
         outputPath: path.resolve(outDir, "interpolation-sidecar"),
       },
+      ...(isWin ? [{
+        name: "recording-sidecar",
+        sourcePath: recordingSidecarDir,
+        outputPath: path.resolve(outDir, "recording-sidecar"),
+      }] : []),
     ],
     companionFiles: [
       ...listPortableCompanionFiles(generatedDocs),

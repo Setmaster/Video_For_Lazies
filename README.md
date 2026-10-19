@@ -108,6 +108,16 @@ For security vulnerabilities, use [private vulnerability reporting](https://gith
 - Bundled MP4 export uses H.264. In Auto mode, a custom FFmpeg without `libx264` can fall back to `mpeg4` when that encoder is available; an explicit H.264 or standard-SDR plan fails closed instead.
 - Process media files you trust. Video For Lazies runs FFmpeg locally as your user, so hostile media exercises the active FFmpeg build.
 
+### Screen recording on Windows
+
+Open the **Record** tab, choose a display, then select **Full screen** or draw an **Area** with the mouse. Choose a local output folder and click **Start recording**. Recording uses a bundled helper, with no OBS or recording-runtime installation. Linux recording is not available yet; editing remains available on both platforms.
+
+System audio and microphone are independent options, both off initially. Choose an available device for each enabled source. Recordings save as H.264 MP4 with AAC when audio is enabled. HDR displays are converted to SDR BT.709; HDR output is not preserved. Odd-sized areas retain every selected pixel and add a black edge for even MP4 dimensions.
+
+Choose 24, 25, 30, 50 or 60 fps, Standard or High quality, a visible cursor, and a 0/3/5-second countdown. High quality uses more disk space. Available resolution and frame rate depend on capture and encoder throughput; the app reports a failure instead of silently reducing either setting.
+
+Use **Stop and save**, the native Stop control, or **Ctrl+Shift+F10** when that shortcut is available. Wait for **Recording saved**, then open the MP4 or choose **Edit video**. Closing during recording offers **Stop and save** or **Keep open**. Interrupted recordings appear under **Unfinished recordings** for recovery; an unfinished ending may be lost. Temporary files can be larger than the saved MP4, especially with audio. Keep extra free space. Existing output files are preserved.
+
 ### Smooth motion
 
 Turn on **Smooth motion**, choose 60 or 120 fps, and export MP4 or WebM. The ordinary preview shows your source; **Export exact sample** in Advanced runs the interpolation pipeline for a short output you can inspect first. The setting is saved in recipes and queue snapshots.

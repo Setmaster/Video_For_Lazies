@@ -169,6 +169,12 @@ if (-not (Test-Path $exePath)) {
 }
 
 $helperManifestVerifier = Join-Path $PSScriptRoot "verify-windows-update-helper-manifest.ps1"
+foreach ($recordingFile in @("vfl_recording_host.exe", "RECORDING_NOTICES.txt")) {
+  $recordingPath = Join-Path $portableRoot "recording-sidecar/$recordingFile"
+  if (-not (Test-Path -LiteralPath $recordingPath -PathType Leaf)) {
+    throw "Portable smoke could not find required recording sidecar file: $recordingFile"
+  }
+}
 & $helperManifestVerifier `
   -HelperPath (Join-Path $portableRoot "vfl-update-helper.exe") `
   -MainAppPath $exePath `
