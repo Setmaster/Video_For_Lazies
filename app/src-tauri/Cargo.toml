@@ -1,5 +1,6 @@
 [package]
 name = "video_for_lazies"
+default-run = "video_for_lazies"
 version = "2.6.0"
 description = "Video For Lazies"
 authors = ["Setmaster"]
