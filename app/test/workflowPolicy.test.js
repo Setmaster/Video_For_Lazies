@@ -81,6 +81,7 @@ test("tag and manual release builds derive platforms and latest status from vers
   assert.match(release, /prepare-release-assets\.mjs[^\n]*--targets "\$RELEASE_TARGETS"/);
   assert.match(release, /generate-release-notes\.mjs[^\n]*--targets "\$RELEASE_TARGETS"/);
   assert.match(release, /MAKE_LATEST:.*needs\.policy\.outputs\.make_latest/);
+  assert.match(release, /name: Check update discovery history headroom\s+run: node scripts\/verify-update-channels\.mjs --inventory-only/);
   assert.match(release, /if \[\[ "\$MAKE_LATEST" == "false" \]\]; then\s*args\+=\(--latest=false\)/);
 });
 

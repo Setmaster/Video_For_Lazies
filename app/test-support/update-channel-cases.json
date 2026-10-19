@@ -1,0 +1,876 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "windows discovers stable non-latest release",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 25,
+          "tag_name": "v2.5.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2501,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2502,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2503,
+              "name": "Video_For_Lazies-v2.5.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/Video_For_Lazies-v2.5.0-win-x64.zip"
+            },
+            {
+              "id": 2504,
+              "name": "Video_For_Lazies-v2.5.0-linux-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/Video_For_Lazies-v2.5.0-linux-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedTag": "v2.6.0"
+    },
+    {
+      "name": "linux ignores newer Windows-only release",
+      "target": "linux-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 25,
+          "tag_name": "v2.5.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2501,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2502,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2503,
+              "name": "Video_For_Lazies-v2.5.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/Video_For_Lazies-v2.5.0-win-x64.zip"
+            },
+            {
+              "id": 2504,
+              "name": "Video_For_Lazies-v2.5.0-linux-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/Video_For_Lazies-v2.5.0-linux-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedTag": "v2.5.0"
+    },
+    {
+      "name": "semantic version ordering ignores API order",
+      "target": "linux-x64",
+      "releases": [
+        {
+          "id": 29,
+          "tag_name": "v2.9.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2901,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.9.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2902,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.9.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2903,
+              "name": "Video_For_Lazies-v2.9.0-linux-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.9.0/Video_For_Lazies-v2.9.0-linux-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 210,
+          "tag_name": "v2.10.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 21001,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.10.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 21002,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.10.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 21003,
+              "name": "Video_For_Lazies-v2.10.0-linux-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.10.0/Video_For_Lazies-v2.10.0-linux-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedTag": "v2.10.0"
+    },
+    {
+      "name": "only canonical stable u64 version tags participate",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 70,
+          "tag_name": "v9.0.0-beta.1",
+          "draft": false,
+          "prerelease": true,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 7001,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 7002,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 7003,
+              "name": "Video_For_Lazies-v9.0.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/Video_For_Lazies-v9.0.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 71,
+          "tag_name": "v8.0.0",
+          "draft": true,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 7101,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 7102,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 7103,
+              "name": "Video_For_Lazies-v9.0.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/Video_For_Lazies-v9.0.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 72,
+          "tag_name": "v07.0.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 7201,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 7202,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 7203,
+              "name": "Video_For_Lazies-v9.0.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/Video_For_Lazies-v9.0.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 73,
+          "tag_name": "v6.0.0+build",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 7301,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 7302,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 7303,
+              "name": "Video_For_Lazies-v9.0.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/Video_For_Lazies-v9.0.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 74,
+          "tag_name": "7.0.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 7401,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 7402,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 7403,
+              "name": "Video_For_Lazies-v9.0.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/Video_For_Lazies-v9.0.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 75,
+          "tag_name": "v18446744073709551616.0.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 7501,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 7502,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 7503,
+              "name": "Video_For_Lazies-v9.0.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v9.0.0/Video_For_Lazies-v9.0.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedTag": "v2.6.0"
+    },
+    {
+      "name": "highest applicable release missing metadata does not fall back",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 27,
+          "tag_name": "v2.7.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2703,
+              "name": "Video_For_Lazies-v2.7.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/Video_For_Lazies-v2.7.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedError": "selected-metadata-missing"
+    },
+    {
+      "name": "selected duplicate manifest is an error",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 27,
+          "tag_name": "v2.7.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2701,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2702,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2703,
+              "name": "Video_For_Lazies-v2.7.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/Video_For_Lazies-v2.7.0-win-x64.zip"
+            },
+            {
+              "id": 11701,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/vfl-update-manifest-v1.json"
+            }
+          ]
+        }
+      ],
+      "expectedError": "selected-metadata-ambiguous"
+    },
+    {
+      "name": "selected duplicate archive is an error",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 27,
+          "tag_name": "v2.7.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2701,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2702,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2703,
+              "name": "Video_For_Lazies-v2.7.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/Video_For_Lazies-v2.7.0-win-x64.zip"
+            },
+            {
+              "id": 11703,
+              "name": "Video_For_Lazies-v2.7.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/Video_For_Lazies-v2.7.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedError": "archive-ambiguous"
+    },
+    {
+      "name": "conflicting records for one release tag fail closed",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 999,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedError": "conflicting-release"
+    },
+    {
+      "name": "identical repeated release is harmless",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedTag": "v2.6.0"
+    },
+    {
+      "name": "missing platform is unavailable",
+      "target": "linux-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedError": "no-platform-release"
+    },
+    {
+      "name": "selected unuploaded archive does not fall back",
+      "target": "windows-x64",
+      "releases": [
+        {
+          "id": 26,
+          "tag_name": "v2.6.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2601,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2602,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2603,
+              "name": "Video_For_Lazies-v2.6.0-win-x64.zip",
+              "state": "uploaded",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip"
+            }
+          ]
+        },
+        {
+          "id": 27,
+          "tag_name": "v2.7.0",
+          "draft": false,
+          "prerelease": false,
+          "published_at": "2026-10-19T00:00:00Z",
+          "assets": [
+            {
+              "id": 2701,
+              "name": "vfl-update-manifest-v1.json",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/vfl-update-manifest-v1.json"
+            },
+            {
+              "id": 2702,
+              "name": "vfl-update-manifest-v1.json.sig",
+              "state": "uploaded",
+              "size": 100,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/vfl-update-manifest-v1.json.sig"
+            },
+            {
+              "id": 2703,
+              "name": "Video_For_Lazies-v2.7.0-win-x64.zip",
+              "state": "starter",
+              "size": 123,
+              "browser_download_url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.7.0/Video_For_Lazies-v2.7.0-win-x64.zip"
+            }
+          ]
+        }
+      ],
+      "expectedError": "archive-invalid"
+    }
+  ]
+}

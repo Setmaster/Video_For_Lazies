@@ -1,0 +1,39 @@
+{
+  "schema": "com.setmaster.video-for-lazies.update-manifest.v1",
+  "appId": "com.setmaster.video-for-lazies",
+  "channel": "stable",
+  "version": "2.5.0",
+  "releaseTag": "v2.5.0",
+  "releaseUrl": "https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.5.0",
+  "publishedAt": "2026-10-18T07:23:12.191Z",
+  "minUpdaterProtocol": 1,
+  "notes": {
+    "title": "Video For Lazies v2.5.0",
+    "summary": "See the GitHub release notes for changes.",
+    "url": "https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.5.0"
+  },
+  "artifacts": {
+    "linux-x64": {
+      "fileName": "Video_For_Lazies-v2.5.0-linux-x64.zip",
+      "url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/Video_For_Lazies-v2.5.0-linux-x64.zip",
+      "sha256": "49a0434e366180bf5bfb5f730664aaf18aa8d5e17ab9a2c8848f214100aa5a70",
+      "sizeBytes": 132401194,
+      "rootDir": "Video_For_Lazies",
+      "payloadManifest": {
+        "path": "Video_For_Lazies/VFL_PAYLOAD_MANIFEST.json",
+        "sha256": "29673db29e85469f1fe3926006e0b45f810dc45b4804e50c28dd59e6b859aecb"
+      }
+    },
+    "windows-x64": {
+      "fileName": "Video_For_Lazies-v2.5.0-win-x64.zip",
+      "url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/Video_For_Lazies-v2.5.0-win-x64.zip",
+      "sha256": "0a2c10fbb23186faf88174ce64f23420ed158dc305264566815a7d7b277d8485",
+      "sizeBytes": 124154909,
+      "rootDir": "Video_For_Lazies",
+      "payloadManifest": {
+        "path": "Video_For_Lazies/VFL_PAYLOAD_MANIFEST.json",
+        "sha256": "69653a23da91433c12c7ce9061a4cdf0aaae420972d5db58b8b320a96bfcd9e3"
+      }
+    }
+  }
+}

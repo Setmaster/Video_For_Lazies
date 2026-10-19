@@ -42,11 +42,34 @@ Pushing a release tag intentionally creates a draft prerelease. Tag events do no
 
 ## Platform scope
 
-`app/release-policy.json` records version-specific platform exceptions. Unlisted versions build the normal Windows/Linux pair. v2.6.0 builds Windows x64 only and must remain **stable but non-latest**. The workflow resolves this policy from the exact candidate before selecting its matrix, staging assets and creating the draft. Do not override its platform list or promote a Windows-only release to GitHub Latest.
+`app/release-policy.json` records version-specific platform exceptions. Unlisted versions build the normal Windows/Linux pair. v2.6.0 builds Windows x64 only and must remain **stable but non-latest**. The workflow resolves this policy from the exact candidate before selecting its matrix, staging assets and creating the draft. Do not override its platform list or promote a platform-only release to GitHub Latest.
 
-Released apps use one shared `releases/latest/download` manifest with a single version for all payloads. A missing platform is an update-check error, and a v2.5.0 Linux payload cannot be relabeled v2.6.0. Keep v2.5.0 Latest and its assets unchanged. Windows v2.6.0 is a manual download into a new portable folder; older Windows apps will not offer it automatically. Its updater remains on the shared channel for a future compatible release.
+Apps through v2.6.0 use one shared `releases/latest/download` manifest with a single version for all payloads. A missing platform is an update-check error, and a v2.5.0 Linux payload cannot be relabeled v2.6.0. Keep v2.5.0 Latest and its assets unchanged. Windows v2.6.0 is a manual download into a new portable folder; older Windows apps will not offer it automatically. Its updater remains on the shared channel for a future compatible release.
 
-For a platform exception, apply the gates below to its declared platforms. Exact-SHA source CI remains required, including Linux-hosted source checks; this does not qualify or publish a new Linux app. Independently verify the existing Latest release and update metadata are unchanged before and after publication. A future full release must restore the complete platform pair and qualify Linux separately.
+For a platform exception, apply the gates below to its declared platforms. Exact-SHA source CI remains required, including Linux-hosted source checks; this does not qualify or publish a new Linux app. Independently verify the existing Latest release and update metadata are unchanged before and after publication. A later Linux-only release must qualify Linux separately; a paired release must qualify both platforms. Target declarations use the same resolver for manual runs and tag events and require no new code for each version.
+
+### Independent platform update discovery
+
+New builds discover stable Windows and Linux updates independently from the existing signed per-release manifests. They read the public GitHub release inventory, select the highest canonical stable `vMAJOR.MINOR.PATCH` release carrying the exact platform ZIP, and then require that release's manifest and signature. GitHub Latest does not select the new platform channels. If the highest applicable release has missing, ambiguous or invalid metadata, the check fails safely instead of falling back to an older release. Signature, version/tag, platform, archive URL/size and payload bindings remain mandatory. No mutable feed, alias tag or post-publication asset rewrite is needed.
+
+Declare a future platform-only release by adding its version to `app/release-policy.json` with `targets: ["windows-x64"]` or `targets: ["linux-x64"]` and `makeLatest: false`. A paired declaration uses both targets; unlisted versions retain the normal paired default. Preserve historical entries. Each publication needs a new globally unique SemVer tag: a missing platform cannot be appended later to an already published release.
+
+Already installed apps need one bootstrap upgrade to a version containing this discovery implementation. That can be a manual portable-folder download or a separately approved future paired bridge release delivered through the old shared Latest route. Subsequent updates use their platform stream automatically. Implementing discovery on `dev` does not distribute it to old binaries, authorize a bridge release, or change v2.5.0/v2.6.0 assets or the legacy Latest selection.
+
+Before a release, run the read-only maintainer check:
+
+```sh
+cd app
+npm run release:channels:verify
+# Inventory and capacity only, also enforced before Portable Release builds:
+npm run release:channels:verify -- --inventory-only
+```
+
+The full command reports the current signed Windows and Linux heads, archive hashes/sizes and signature results as JSON. It uses no authentication and downloads only inventory and signed metadata, without executing the app or downloading archives. The inventory-only command checks history headroom before the build matrix starts.
+
+Discovery is finite: at most ten 100-release pages, 1000 records, 5 MiB per page and 20 MiB aggregate inventory, within a shared 45-second discovery/metadata deadline. Multi-page reads recheck the first page and reject a changed inventory. At or beyond 1000 records, or if more pages remain, checks are unavailable and users need a newer app manually. They must not be described as up to date. The maintainer command and release gate fail readiness starting at 800 records so a signed discovery-index migration can ship before installed clients reach the cap. Keep old releases intact; deleting or hiding history is not a capacity workaround.
+
+Public GitHub API requests share an unauthenticated IP rate limit. Inventory redirects are refused; signed metadata retains normal GitHub CDN redirects. Offline, rate-limited, oversized, malformed or incomplete discovery must preserve the installed app and trusted-version state, provide a retry/manual-download path, and avoid automatic retry loops or fallback to shared Latest. Never embed a GitHub token in the app. Release publication must still be explicitly approved and all gates below still apply.
 
 ## Release Gate Policy
 
@@ -58,7 +81,7 @@ The blocking gate for every stable release is:
 4. `dev` fast-forwards into `main`, and CI passes on the same `main` commit unless the narrowly scoped patch-only setup-stall exception below applies.
 5. The release tag workflow passes and creates the reviewable draft prerelease.
 6. Draft assets are downloaded and verified against `SHA256SUMS.txt`, the update manifest hashes and signature, and any targeted runtime smoke needed for the change.
-7. The verified draft is explicitly published as stable with the policy’s Latest setting, then the release endpoint and shared update channel are checked.
+7. The verified draft is explicitly published as stable with the policy’s Latest setting, then the release endpoint, independent platform discovery and legacy shared update channel are checked.
 
 The `Portable Release` workflow is the final artifact gate because it rebuilds and verifies the declared native portable artifacts before publication. It does not replace an exact-SHA `main` CI result when that result is a hard gate.
 
@@ -164,7 +187,7 @@ gh release edit vX.Y.Z --draft=false --prerelease=false --latest
 gh release edit v2.6.0 --draft=false --prerelease=false --latest=false
 ```
 
-7. Confirm `main`, `dev`, and the tag resolve to the same commit, then verify the release endpoint, public bytes and `releases/latest/download` update-manifest assets. For v2.6.0, Latest must still identify v2.5.0.
+7. Confirm `main`, `dev`, and the tag resolve to the same commit, then verify the release endpoint, public bytes and `releases/latest/download` update-manifest assets. Run `npm run release:channels:verify` and confirm each platform selects its expected signed version. For v2.6.0, Latest must still identify v2.5.0.
 
 Alternative manual draft protocol for review without a pre-existing tag:
 
@@ -207,7 +230,7 @@ GitHub release assets are the declared platform zips, the checksum file, the sig
 
 Portable update checks trust the signed `vfl-update-manifest-v1.json`, not the network transport alone. The manifest binds the release version and tag to each platform archive URL, SHA256, byte size, portable root, and embedded payload-manifest digest. The app verifies the detached manifest signature against its embedded updater public keys before showing an update prompt.
 
-Release assembly normally requires one complete Linux/Windows artifact pair at one version. An explicit platform policy can restrict assembly to Windows only; every selected payload must still match that version and unexpected platforms are rejected. Each payload-manifest sidecar must be byte-for-byte identical to the copy embedded in its corresponding zip. Before signing, release staging validates zip integrity, canonical paths, the exact manifest-owned file set, every file hash and size, and Linux file modes. The workflow then verifies the new signature against the same public keys embedded in the shipped app.
+Release assembly normally requires one complete Linux/Windows artifact pair at one version. An explicit platform policy can restrict assembly to either platform; every selected payload must still match that version and unexpected platforms are rejected. Each payload-manifest sidecar must be byte-for-byte identical to the copy embedded in its corresponding zip. Before signing, release staging validates zip integrity, canonical paths, the exact manifest-owned file set, every file hash and size, and Linux file modes. The workflow then verifies the new signature against the same public keys embedded in the shipped app.
 
 After download, the app verifies the selected archive size and SHA256, validates the embedded payload manifest, and extracts only the signed file set into app-managed staging. Apply is single-owner and no-clobber: a late collision or unknown sibling is preserved rather than silently overwritten or deleted. A durable journal records the staged plan and verified backup digest before replacement. Startup finalizes a successful update; an interrupted or failed replacement uses the journal and verified backup for automatic recovery or rollback. If saved state cannot be trusted, cleanup stops and the staged files and backup remain available for explicit recovery.
 

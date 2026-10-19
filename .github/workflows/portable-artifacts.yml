@@ -66,6 +66,10 @@ jobs:
         run: node scripts/releasePolicy.mjs "$REQUESTED_VERSION"
         working-directory: app
 
+      - name: Check update discovery history headroom
+        run: node scripts/verify-update-channels.mjs --inventory-only
+        working-directory: app
+
   portable:
     name: Build ${{ matrix.target }}
     needs: policy

@@ -1,0 +1,28 @@
+{
+  "schema": "com.setmaster.video-for-lazies.update-manifest.v1",
+  "appId": "com.setmaster.video-for-lazies",
+  "channel": "stable",
+  "version": "2.6.0",
+  "releaseTag": "v2.6.0",
+  "releaseUrl": "https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.6.0",
+  "publishedAt": "2026-10-19T05:20:15.439Z",
+  "minUpdaterProtocol": 1,
+  "notes": {
+    "title": "Video For Lazies v2.6.0",
+    "summary": "See the GitHub release notes for changes.",
+    "url": "https://github.com/Setmaster/Video_For_Lazies/releases/tag/v2.6.0"
+  },
+  "artifacts": {
+    "windows-x64": {
+      "fileName": "Video_For_Lazies-v2.6.0-win-x64.zip",
+      "url": "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.6.0/Video_For_Lazies-v2.6.0-win-x64.zip",
+      "sha256": "a9b4b01d1ab35f174e7999d81f98bd1ae33e2da595d940458a305a610824688e",
+      "sizeBytes": 124751422,
+      "rootDir": "Video_For_Lazies",
+      "payloadManifest": {
+        "path": "Video_For_Lazies/VFL_PAYLOAD_MANIFEST.json",
+        "sha256": "38ffce6098cb9412c9c6dafab48975dd51f8ce7db42e2961efe852a25b06249d"
+      }
+    }
+  }
+}

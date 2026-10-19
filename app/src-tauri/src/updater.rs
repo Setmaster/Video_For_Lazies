@@ -16,6 +16,8 @@ use sha2::{Digest, Sha256};
 use tauri::ipc::{Channel, JavaScriptChannelId};
 use tauri::{AppHandle, Manager, State, Webview};
 
+mod discovery;
+
 const APP_ID: &str = "com.setmaster.video-for-lazies";
 const UPDATE_CHANNEL: &str = "stable";
 const UPDATE_PROTOCOL_VERSION: u64 = 1;
@@ -42,7 +44,6 @@ const TEMP_HELPER_PREFIX: &str = "vfl-apply-";
 const LEGACY_TEMP_HELPER_PREFIX: &str = "vfl-update-helper-";
 const PAYLOAD_MANIFEST_FILE_NAME: &str = "VFL_PAYLOAD_MANIFEST.json";
 const PORTABLE_ROOT_DIR_NAME: &str = "Video_For_Lazies";
-const UPDATE_MANIFEST_URL: &str = "https://github.com/Setmaster/Video_For_Lazies/releases/latest/download/vfl-update-manifest-v1.json";
 const CHECK_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 const SKIP_INTERVAL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_UPDATE_BYTES: u64 = 750 * 1024 * 1024;
@@ -52,6 +53,7 @@ const COPY_RETRIES: usize = 80;
 const COPY_RETRY_DELAY_MS: u64 = 250;
 const PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PARENT_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(test)]
 const METADATA_TIMEOUT: Duration = Duration::from_secs(45);
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(600);
 const PREFS_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -216,7 +218,34 @@ impl UpdatePublicError {
         }
     }
 
-    fn check_failed(_internal: String) -> Self {
+    fn check_failed(internal: String) -> Self {
+        if let Some(seconds) = internal
+            .strip_prefix("Update checks are temporarily limited by GitHub. Try again in ")
+            .and_then(|text| text.strip_suffix(" seconds."))
+            .and_then(|text| text.parse::<u64>().ok())
+            .filter(|seconds| (1..=3600).contains(seconds))
+        {
+            return Self::new(
+                "update-rate-limited",
+                UpdatePhase::Checking,
+                true,
+                "waitAndRetry",
+                &format!(
+                    "GitHub is temporarily limiting update checks. Try again in {seconds} seconds."
+                ),
+            );
+        }
+        if internal
+            == "Update history exceeds this app's discovery limit. Download a newer portable app manually."
+        {
+            return Self::new(
+                "update-discovery-limit",
+                UpdatePhase::Checking,
+                false,
+                "downloadPortable",
+                &internal,
+            );
+        }
         Self::new(
             "update-check-failed",
             UpdatePhase::Checking,
@@ -226,7 +255,14 @@ impl UpdatePublicError {
         )
     }
 
-    fn prepare_failed(_internal: String) -> Self {
+    fn prepare_failed(internal: String) -> Self {
+        let check_error = Self::check_failed(internal);
+        if matches!(
+            check_error.code.as_str(),
+            "update-rate-limited" | "update-discovery-limit"
+        ) {
+            return check_error;
+        }
         Self::new(
             "update-prepare-failed",
             UpdatePhase::Failed,
@@ -1324,16 +1360,19 @@ fn check_for_update_at(
     let bundle = fetch()?;
     let manifest = &bundle.manifest;
     validate_update_manifest(manifest, Some(&prefs))?;
+    // Even an older or equal manifest must belong to this platform before it
+    // can affect reminders or the antirollback floor (including overrides).
+    let target = current_target()?;
+    let selected_artifact = manifest
+        .artifacts
+        .get(target)
+        .ok_or_else(|| "The update manifest does not include this platform.".to_string())?;
+    validate_artifact(target, selected_artifact)?;
     let latest = parse_semver(&manifest.version)?;
     let current = parse_semver(current_version())?;
     let available = latest > current;
     let artifact = if available {
-        let target = current_target()?;
-        let artifact = manifest
-            .artifacts
-            .get(target)
-            .ok_or_else(|| "The update manifest does not include this platform.".to_string())?;
-        validate_artifact(target, artifact)?;
+        let artifact = selected_artifact;
         Some(UpdateArtifactInfo {
             target: target.to_string(),
             file_name: artifact.file_name.clone(),
@@ -1408,13 +1447,29 @@ fn fetch_verified_update_manifest() -> Result<VerifiedManifest, String> {
 fn fetch_verified_update_manifest_with_client(
     client: &reqwest::blocking::Client,
 ) -> Result<VerifiedManifest, String> {
+    let deadline = std::time::Instant::now() + discovery::DISCOVERY_TIMEOUT;
     #[cfg(debug_assertions)]
     if let Some(manifest) = load_digest_bound_debug_manifest()? {
         return Ok(VerifiedManifest { manifest });
     }
 
-    let manifest_url = std::env::var("VFL_UPDATE_MANIFEST_URL")
-        .unwrap_or_else(|_| UPDATE_MANIFEST_URL.to_string());
+    let target = current_target()?;
+    let candidate = if std::env::var_os("VFL_UPDATE_MANIFEST_URL").is_some() {
+        None
+    } else {
+        discovery::check_cooldown()?;
+        Some(discovery::discover(
+            &discovery::client()?,
+            discovery::RELEASES_API,
+            target,
+            deadline,
+        )?)
+    };
+    let manifest_url = match &candidate {
+        Some(candidate) => candidate.manifest_url(),
+        None => std::env::var("VFL_UPDATE_MANIFEST_URL")
+            .map_err(|_| "Invalid explicit update manifest URL.".to_string())?,
+    };
     let signature_url = std::env::var("VFL_UPDATE_SIGNATURE_URL")
         .unwrap_or_else(|_| format!("{manifest_url}{DEFAULT_SIGNATURE_SUFFIX}"));
     let allow_local_http = update_local_http_allowed();
@@ -1422,22 +1477,77 @@ fn fetch_verified_update_manifest_with_client(
     validate_manifest_url(&manifest_url, allow_local_http)?;
     validate_manifest_url(&signature_url, allow_local_http)?;
 
-    let manifest_bytes = download_signed_metadata(client, &manifest_url, &signature_url)?;
+    let manifest_bytes =
+        download_signed_metadata_before(client, &manifest_url, &signature_url, deadline)?;
 
     let manifest: UpdateManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| format!("Update manifest is not valid JSON: {e}"))?;
+    validate_update_manifest(&manifest, None)?;
+    if let Some(candidate) = candidate {
+        validate_discovered_manifest(&manifest, &candidate, target)?;
+    } else if !manifest.artifacts.contains_key(target) {
+        return Err("The update manifest does not include this platform.".to_string());
+    }
+    discovery::remaining(deadline)?;
     Ok(VerifiedManifest { manifest })
 }
 
+fn validate_discovered_manifest(
+    manifest: &UpdateManifest,
+    candidate: &discovery::Candidate,
+    target: &str,
+) -> Result<(), String> {
+    validate_update_manifest(manifest, None)?;
+    if manifest.version != candidate.version.to_string()
+        || manifest.release_tag != candidate.tag()
+        || manifest.release_url != format!("{}/tag/{}", discovery::RELEASES_WEB, candidate.tag())
+    {
+        return Err("The signed update manifest does not match the selected release.".to_string());
+    }
+    let artifact = manifest
+        .artifacts
+        .get(target)
+        .ok_or_else(|| "The signed update manifest does not include this platform.".to_string())?;
+    if artifact.file_name != candidate.archive_name
+        || artifact.url
+            != format!(
+                "{}/download/{}/{}",
+                discovery::RELEASES_WEB,
+                candidate.tag(),
+                candidate.archive_name
+            )
+        || artifact.size_bytes != candidate.archive_size
+    {
+        return Err("The signed update archive does not match the selected release.".to_string());
+    }
+    Ok(())
+}
+
+fn download_signed_metadata_before(
+    client: &reqwest::blocking::Client,
+    manifest_url: &str,
+    signature_url: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    let manifest_bytes = download_bytes_before(client, manifest_url, 5 * 1024 * 1024, deadline)?;
+    let signature_bytes = download_bytes_before(client, signature_url, 1024 * 1024, deadline)?;
+    verify_manifest_signature(&manifest_bytes, &signature_bytes)?;
+    discovery::remaining(deadline)?;
+    Ok(manifest_bytes)
+}
+
+#[cfg(test)]
 fn download_signed_metadata(
     client: &reqwest::blocking::Client,
     manifest_url: &str,
     signature_url: &str,
 ) -> Result<Vec<u8>, String> {
-    let manifest_bytes = download_bytes(client, manifest_url, 5 * 1024 * 1024)?;
-    let signature_bytes = download_bytes(client, signature_url, 1024 * 1024)?;
-    verify_manifest_signature(&manifest_bytes, &signature_bytes)?;
-    Ok(manifest_bytes)
+    download_signed_metadata_before(
+        client,
+        manifest_url,
+        signature_url,
+        std::time::Instant::now() + discovery::DISCOVERY_TIMEOUT,
+    )
 }
 
 #[cfg(debug_assertions)]
@@ -1529,6 +1639,10 @@ fn validate_update_manifest(
     }
 
     let latest = parse_semver(&manifest.version)?;
+    if !latest.pre.is_empty() || !latest.build.is_empty() || manifest.version != latest.to_string()
+    {
+        return Err("Update manifest version is not canonical stable SemVer.".to_string());
+    }
     if manifest.release_tag != format!("v{latest}") {
         return Err("Update manifest release tag does not match its version.".to_string());
     }
@@ -2117,8 +2231,8 @@ fn prepare_apply_journal_with_manifest(
     // Already-shipped v1 updaters write plans without the signed payload
     // digest or journal, then launch the helper from the new payload. Upgrade
     // that one-hop handoff by fetching and verifying the signed manifest again.
-    // If `latest` moved between staging and apply, fail closed and let the next
-    // attempt stage the new latest release.
+    // This lookup is pinned to the staged version, independent of publication
+    // of newer releases for either platform.
     if atomic_path_exists(&update_journal_path(&plan.install_dir))
         || atomic_path_exists(&update_pending_path(&plan.install_dir))
     {
@@ -2127,8 +2241,50 @@ fn prepare_apply_journal_with_manifest(
     if let Some(signed_manifest) = verified_legacy_manifest {
         return migrate_legacy_apply_plan(plan_path, plan, signed_manifest);
     }
-    let signed_bundle = fetch_verified_update_manifest()?;
+    let signed_bundle = fetch_verified_legacy_manifest(plan)?;
     migrate_legacy_apply_plan(plan_path, plan, &signed_bundle.manifest)
+}
+
+fn fetch_verified_legacy_manifest(plan: &UpdateApplyPlan) -> Result<VerifiedManifest, String> {
+    validate_apply_plan(plan)?;
+    #[cfg(debug_assertions)]
+    if let Some(manifest) = load_digest_bound_debug_manifest()? {
+        signed_payload_digest_for_plan(plan, &manifest)?;
+        return Ok(VerifiedManifest { manifest });
+    }
+    fetch_verified_legacy_manifest_with(plan, |url, signature_url, deadline| {
+        download_signed_metadata_before(&update_http_client()?, url, signature_url, deadline)
+    })
+}
+
+fn fetch_verified_legacy_manifest_with(
+    plan: &UpdateApplyPlan,
+    fetch: impl FnOnce(&str, &str, std::time::Instant) -> Result<Vec<u8>, String>,
+) -> Result<VerifiedManifest, String> {
+    validate_apply_plan(plan)?;
+    let version = discovery::stable_version(&format!("v{}", plan.to_version)).ok_or_else(|| {
+        "The legacy update target version is not canonical stable SemVer.".to_string()
+    })?;
+    let url = discovery::manifest_url(&version);
+    let bytes = fetch(
+        &url,
+        &format!("{url}{DEFAULT_SIGNATURE_SUFFIX}"),
+        std::time::Instant::now() + discovery::DISCOVERY_TIMEOUT,
+    )?;
+    let manifest: UpdateManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Invalid legacy signed update manifest: {e}"))?;
+    let candidate = discovery::Candidate {
+        archive_name: discovery::archive_name(&version, &plan.target)?,
+        archive_size: manifest
+            .artifacts
+            .get(&plan.target)
+            .map(|a| a.size_bytes)
+            .unwrap_or(0),
+        version,
+    };
+    validate_discovered_manifest(&manifest, &candidate, &plan.target)?;
+    signed_payload_digest_for_plan(plan, &manifest)?;
+    Ok(VerifiedManifest { manifest })
 }
 
 fn migrate_legacy_apply_plan(
@@ -2154,8 +2310,7 @@ fn signed_payload_digest_for_plan(
     validate_update_manifest(manifest, None)?;
     if manifest.version != plan.to_version {
         return Err(
-            "The signed latest release changed before the legacy update could be applied."
-                .to_string(),
+            "The signed release does not match the staged legacy update version.".to_string(),
         );
     }
     let artifact = manifest
@@ -3996,12 +4151,27 @@ fn update_request(
     client.get(url).timeout(timeout)
 }
 
+#[cfg(test)]
 fn download_bytes(
     client: &reqwest::blocking::Client,
     url: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, String> {
-    let mut response = update_request(client, url, METADATA_TIMEOUT)
+    download_bytes_before(
+        client,
+        url,
+        max_bytes,
+        std::time::Instant::now() + METADATA_TIMEOUT,
+    )
+}
+
+fn download_bytes_before(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    let mut response = update_request(client, url, discovery::remaining(deadline)?)
         .send()
         .map_err(|e| format!("Failed to download update metadata: {e}"))?;
     if !response.status().is_success() {
@@ -4022,6 +4192,7 @@ fn download_bytes(
     if bytes.len() as u64 > max_bytes {
         return Err("Update metadata is larger than expected.".to_string());
     }
+    discovery::remaining(deadline)?;
     Ok(bytes)
 }
 
@@ -5114,6 +5285,230 @@ mod tests {
 "#;
         let signature = b"dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbXpRK3I3V09GMXgxcjdwRTNaZ01iaXVXUzF2VVZoU2N2ajR0a3ZyNjlvNWFCRGJXdmNpYW9WV3BiMW1JSGkrZ01GNXhuWXZEYkV1YXdOQTJkNUczZlVxSHVxYnVEeVFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3ODQyMjQyCWZpbGU6dmZsLXVwZGF0ZS1tYW5pZmVzdC12MS5qc29uCnFMVTBldERQS1JyaWtDUG5DYmp0NDl0QlBxTFpVN0xrVHZqanE2ZklMWldRNWhqZ3pDUzFOamNGaTRGZlA5TG5Wcmd2SnNJMWlqUnBlN1NibFZheUF3PT0K";
         (manifest, signature)
+    }
+
+    fn platform_signed_fixture(version: &str) -> (&'static [u8], &'static [u8]) {
+        match version {
+            "2.5.0" => (
+                include_bytes!("updater/fixtures/v2.5.0.json"),
+                include_bytes!("updater/fixtures/v2.5.0.json.sig"),
+            ),
+            "2.6.0" => (
+                include_bytes!("updater/fixtures/v2.6.0.json"),
+                include_bytes!("updater/fixtures/v2.6.0.json.sig"),
+            ),
+            _ => panic!("unknown public fixture"),
+        }
+    }
+
+    #[test]
+    fn public_platform_fixtures_use_production_keys_and_exact_target_binding() {
+        for (target, version) in [("windows-x64", "2.6.0"), ("linux-x64", "2.5.0")] {
+            let (bytes, signature) = platform_signed_fixture(version);
+            verify_manifest_signature(bytes, signature).unwrap();
+            let manifest: UpdateManifest = serde_json::from_slice(bytes).unwrap();
+            let mut candidate = discovery::Candidate {
+                version: Version::parse(version).unwrap(),
+                archive_name: manifest.artifacts[target].file_name.clone(),
+                archive_size: manifest.artifacts[target].size_bytes,
+            };
+            validate_discovered_manifest(&manifest, &candidate, target).unwrap();
+            candidate.archive_size += 1;
+            assert!(validate_discovered_manifest(&manifest, &candidate, target).is_err());
+            candidate.archive_size -= 1;
+            let mut wrong_tag = manifest.clone();
+            wrong_tag.artifacts.get_mut(target).unwrap().url = format!(
+                "{}/download/v0.0.1/{}",
+                discovery::RELEASES_WEB,
+                candidate.archive_name
+            );
+            assert!(validate_discovered_manifest(&wrong_tag, &candidate, target).is_err());
+            let mut wrong_target = manifest.clone();
+            wrong_target.artifacts.remove(target);
+            assert!(validate_discovered_manifest(&wrong_target, &candidate, target).is_err());
+            let mut prerelease = manifest.clone();
+            prerelease.version = format!("{version}-rc.1");
+            prerelease.release_tag = format!("v{version}-rc.1");
+            assert!(validate_update_manifest(&prerelease, None).is_err());
+        }
+    }
+
+    #[test]
+    fn opposite_platform_manifest_never_changes_preferences_even_when_older_or_equal() {
+        let (temp, _, plan, _) = create_apply_fixture("platform-prefs", "1.1.0", "9.0.0");
+        let path = temp.path().join("prefs.json");
+        update_prefs_at(&path, |prefs| {
+            prefs.remind_later_version = Some("9.0.0".to_string());
+            Ok(())
+        })
+        .unwrap();
+        let original = fs::read(&path).unwrap();
+        for version in ["1.2.3", current_version(), "99.0.0"] {
+            let mut manifest = test_manifest_for_preferences(&plan, version);
+            let artifact = manifest
+                .artifacts
+                .remove(current_target().unwrap())
+                .unwrap();
+            let other = if current_target().unwrap() == "linux-x64" {
+                "windows-x64"
+            } else {
+                "linux-x64"
+            };
+            manifest.artifacts.insert(other.to_string(), artifact);
+            assert!(
+                check_for_update_at(&path, true, || Ok(VerifiedManifest { manifest })).is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn selected_signature_failure_does_not_fall_back_or_mutate_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        update_prefs_at(&path, |prefs| {
+            prefs.highest_trusted_version = Some("1.0.0".to_string());
+            Ok(())
+        })
+        .unwrap();
+        let original = fs::read(&path).unwrap();
+        let (manifest, _) = platform_signed_fixture("2.6.0");
+        let (_, wrong_signature) = platform_signed_fixture("2.5.0");
+        let (url, server) = serve_http_fixture(vec![
+            fixture_http_response(manifest, ""),
+            fixture_http_response(wrong_signature, ""),
+        ]);
+        let result = check_for_update_at(&path, true, || {
+            let bytes = download_signed_metadata_before(
+                &update_http_client()?,
+                &format!("{url}/manifest"),
+                &format!("{url}/manifest.sig"),
+                std::time::Instant::now() + discovery::DISCOVERY_TIMEOUT,
+            )?;
+            Ok(VerifiedManifest {
+                manifest: serde_json::from_slice(&bytes).unwrap(),
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn selected_metadata_pair_shares_one_deadline_including_body_reads() {
+        use std::net::TcpListener;
+        let (manifest, signature) = platform_signed_fixture("2.6.0");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            for (delay, body) in [(20, manifest), (500, signature)] {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 8192);
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                std::thread::sleep(Duration::from_millis(delay));
+                let _ = socket.write_all(body);
+            }
+        });
+        let result = download_signed_metadata_before(
+            &update_http_client().unwrap(),
+            &format!("{base}/manifest"),
+            &format!("{base}/manifest.sig"),
+            std::time::Instant::now() + Duration::from_millis(300),
+        );
+        assert!(
+            result.is_err(),
+            "body read received a fresh per-request deadline"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_lookup_fetches_only_the_exact_plan_tag_with_current_keys() {
+        let (_temp, _, plan, _) = create_apply_fixture("legacy-tag", "1.9.1", "2.5.0");
+        let (manifest, signature) = platform_signed_fixture("2.5.0");
+        let (url, server) = serve_http_fixture(vec![
+            fixture_http_response(manifest, ""),
+            fixture_http_response(signature, ""),
+        ]);
+        let verified = fetch_verified_legacy_manifest_with(&plan, |canonical, canonical_sig, deadline| {
+            assert_eq!(canonical, "https://github.com/Setmaster/Video_For_Lazies/releases/download/v2.5.0/vfl-update-manifest-v1.json");
+            assert_eq!(canonical_sig, format!("{canonical}.sig"));
+            download_signed_metadata_before(&update_http_client()?, &format!("{url}/manifest"), &format!("{url}/manifest.sig"), deadline)
+        }).unwrap();
+        assert_eq!(verified.manifest.version, "2.5.0");
+        assert_eq!(server.join().unwrap().len(), 2);
+        let mut bad = plan.clone();
+        bad.to_version = "2.5.0+alias".to_string();
+        assert!(
+            fetch_verified_legacy_manifest_with(&bad, |_, _, _| panic!(
+                "noncanonical plan made a request"
+            ))
+            .is_err()
+        );
+        let mut wrong = verified.manifest;
+        wrong.version = "2.6.0".to_string();
+        wrong.release_tag = "v2.6.0".to_string();
+        assert!(signed_payload_digest_for_plan(&plan, &wrong).is_err());
+    }
+
+    #[test]
+    #[ignore = "explicit read-only public network qualification, no preferences or install"]
+    fn public_platform_channel_discovery_read_only() {
+        for (target, expected) in [("windows-x64", "2.6.0"), ("linux-x64", "2.5.0")] {
+            let deadline = std::time::Instant::now() + discovery::DISCOVERY_TIMEOUT;
+            let candidate = discovery::discover(
+                &discovery::client().unwrap(),
+                discovery::RELEASES_API,
+                target,
+                deadline,
+            )
+            .unwrap();
+            let url = candidate.manifest_url();
+            let bytes = download_signed_metadata_before(
+                &update_http_client().unwrap(),
+                &url,
+                &format!("{url}.sig"),
+                deadline,
+            )
+            .unwrap();
+            let manifest: UpdateManifest = serde_json::from_slice(&bytes).unwrap();
+            validate_discovered_manifest(&manifest, &candidate, target).unwrap();
+            assert_eq!(manifest.version, expected);
+            println!(
+                "target={target} version={} tag={} metadataSha256={} archiveSha256={} bytes={}",
+                manifest.version,
+                manifest.release_tag,
+                sha256_bytes(&bytes),
+                manifest.artifacts[target].sha256,
+                manifest.artifacts[target].size_bytes
+            );
+        }
     }
 
     #[test]

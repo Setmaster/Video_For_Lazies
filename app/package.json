@@ -17,6 +17,7 @@
     "release:notes": "node scripts/generate-release-notes.mjs",
     "release:assets": "node scripts/prepare-release-assets.mjs",
     "release:manifest:sign": "node scripts/sign-update-manifest.mjs",
+    "release:channels:verify": "node scripts/verify-update-channels.mjs",
     "version:check": "node scripts/check-version.mjs",
     "version:set": "node scripts/set-version.mjs",
     "test": "node --test",
