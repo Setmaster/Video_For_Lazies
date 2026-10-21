@@ -139,6 +139,16 @@ fn command_no_window(bin: &str) -> Command {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoProbe {
+    pub source_identity: String,
+    pub audio_tracks: Vec<AudioTrackDescriptor>,
+    pub audio_tracks_truncated: bool,
+    #[serde(skip)]
+    pub(crate) preview_original_safe: bool,
+    #[serde(skip)]
+    pub(crate) audio_start_s: Option<f64>,
+    #[serde(skip)]
+    pub(crate) audio_end_s: Option<f64>,
+
     pub duration_s: f64,
     /// Selected video's first timestamp on FFmpeg's default input timeline.
     #[serde(skip)]
@@ -183,6 +193,18 @@ pub struct VideoProbe {
     pub audio_sample_format: Option<String>,
     pub decoded_video_bytes_per_pixel: Option<f64>,
     pub decoded_audio_bytes_per_sample: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrackDescriptor {
+    pub stream_index: u32,
+    pub codec: Option<String>,
+    pub channels: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub title: Option<String>,
+    pub language: Option<String>,
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -321,6 +343,10 @@ pub struct InterpolationSettings {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeRequest {
+    #[serde(default)]
+    pub audio_stream_index: Option<u32>,
+    #[serde(default)]
+    pub audio_source_identity: Option<String>,
     #[serde(default)]
     pub interpolation: Option<InterpolationSettings>,
     pub input_path: String,
@@ -1541,7 +1567,7 @@ fn resolve_binary_path(
     fallback.to_string()
 }
 
-fn default_ffmpeg() -> String {
+pub(crate) fn default_ffmpeg() -> String {
     resolve_binary_path(
         trimmed_env_var("VFL_FFMPEG_PATH"),
         bundled_sidecar_candidate(
@@ -1593,17 +1619,34 @@ fn run_command_output_with_timeout(
     // blocks forever and would be misreported as a timeout.
     fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
         reader: Option<R>,
+        limit: usize,
+        control: process::ProcessControl,
     ) -> Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>> {
         reader.map(|mut r| {
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                r.read_to_end(&mut buf)?;
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = r.read(&mut chunk)?;
+                    if n == 0 {
+                        break;
+                    }
+                    if buf.len().saturating_add(n) > limit {
+                        let _ = control.kill();
+                        return Err(std::io::Error::other(
+                            "Process inspection output exceeded its byte limit.",
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
                 Ok(buf)
             })
         })
     }
-    let mut stdout_reader = spawn_pipe_reader(child.stdout.take());
-    let mut stderr_reader = spawn_pipe_reader(child.stderr.take());
+    let mut stdout_reader =
+        spawn_pipe_reader(child.stdout.take(), 8 * 1024 * 1024, child.control.clone());
+    let mut stderr_reader =
+        spawn_pipe_reader(child.stderr.take(), 64 * 1024, child.control.clone());
     let join_pipe = |handle: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>| {
         handle.take().map_or_else(
             || Ok(Vec::new()),
@@ -1983,6 +2026,7 @@ fn create_temp_output(output_path: &Path, job_id: u64, label: &str) -> Result<Te
 }
 
 fn publish_output_file(temp_path: TempPath, output_path: &Path) -> Result<(), String> {
+    crate::media_source::verify_active()?;
     temp_path.persist_noclobber(output_path).map_err(|error| {
         if output_path.exists() {
             "Output file already exists. Choose a new filename.".to_string()
@@ -2320,6 +2364,11 @@ fn require_ffmpeg_feature(
         "This FFmpeg build cannot provide {name}; missing {}.",
         missing.join(", ")
     ))
+}
+
+pub(crate) fn require_recording_audio() -> Result<(), String> {
+    let runtime = cached_ffmpeg_capabilities(&default_ffmpeg())?;
+    require_ffmpeg_feature("recordingAudio", &ffmpeg_capability_contract()?, &runtime)
 }
 
 fn filter_names_from_graph(graph: Option<&str>) -> HashSet<String> {
@@ -4435,6 +4484,123 @@ fn select_primary_audio_stream(streams: &[FFProbeStream]) -> Option<&FFProbeStre
         })
 }
 
+fn bounded_tag(value: Option<&str>, limit: usize) -> Option<String> {
+    value
+        .map(|v| {
+            let mut result = String::new();
+            for c in v.chars().filter(|c| !c.is_control()) {
+                if result.len() + c.len_utf8() > limit {
+                    break;
+                }
+                result.push(c);
+            }
+            result
+        })
+        .filter(|v| !v.is_empty())
+}
+fn audio_catalog(
+    streams: &[FFProbeStream],
+    selected: Option<u32>,
+) -> (Vec<AudioTrackDescriptor>, bool) {
+    let primary = select_primary_audio_stream(streams).and_then(|s| s.index);
+    let mut audio: Vec<_> = streams
+        .iter()
+        .filter(|s| s.codec_type.as_deref() == Some("audio") && s.index.is_some())
+        .collect();
+    audio.sort_by_key(|s| {
+        (
+            Some(s.index.unwrap()) != selected,
+            Some(s.index.unwrap()) != primary,
+            s.index.unwrap(),
+        )
+    });
+    let truncated = audio.len() > 64;
+    audio.truncate(64);
+    audio.sort_by_key(|s| s.index);
+    (
+        audio
+            .into_iter()
+            .map(|s| AudioTrackDescriptor {
+                stream_index: s.index.unwrap(),
+                codec: bounded_tag(s.codec_name.as_deref(), 64),
+                channels: s.channels,
+                sample_rate: s.sample_rate.as_deref().and_then(|v| v.parse().ok()),
+                title: bounded_tag(
+                    ffprobe_tag_value(&s.tags, "title")
+                        .or_else(|| ffprobe_tag_value(&s.tags, "handler_name")),
+                    128,
+                ),
+                language: bounded_tag(ffprobe_tag_value(&s.tags, "language"), 32),
+                is_default: s.disposition.default != 0,
+            })
+            .collect(),
+        truncated,
+    )
+}
+fn original_preview_safe(
+    parsed: &FFProbeOutput,
+    video: &FFProbeStream,
+    audio: Option<&FFProbeStream>,
+) -> bool {
+    let Some(audio) = audio else { return false };
+    let audios: Vec<_> = parsed
+        .streams
+        .iter()
+        .filter(|s| s.codec_type.as_deref() == Some("audio"))
+        .collect();
+    // Preserve the existing browser decode/error path for an unambiguous sole
+    // audio stream; this does not claim new codec support.
+    if audios.len() == 1 {
+        return audios[0].index == audio.index;
+    }
+    let formats = parsed.format.format_name.as_deref().unwrap_or("");
+    let is_mp4 = formats
+        .split(',')
+        .any(|s| matches!(s, "mov" | "mp4" | "m4a"));
+    let compatible_mp4 = is_mp4
+        && video.codec_name.as_deref() == Some("h264")
+        && video.pix_fmt.as_deref() == Some("yuv420p")
+        && audios
+            .iter()
+            .all(|a| a.codec_name.as_deref() == Some("aac"));
+    if !compatible_mp4 {
+        return false;
+    }
+    // Strict recorder layout: a single first video, contiguous audio roles,
+    // 48 kHz stereo AAC and exactly one default Mixed followed by unique stems.
+    if video.index != Some(0)
+        || parsed.streams.len() != audios.len() + 1
+        || !(2..=3).contains(&audios.len())
+    {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    for (n, a) in audios.iter().enumerate() {
+        let role = ffprobe_tag_value(&a.tags, "title")
+            .or_else(|| ffprobe_tag_value(&a.tags, "handler_name"));
+        if a.index != Some(n as u32 + 1)
+            || a.sample_rate.as_deref() != Some("48000")
+            || a.channels != Some(2)
+            || (a.disposition.default != 0) != (n == 0)
+        {
+            return false;
+        }
+        let Some(role) = role else { return false };
+        if n == 0 {
+            if role != "Mixed" {
+                return false;
+            }
+        } else if !matches!(role, "System audio" | "Application audio" | "Microphone")
+            || (n == 2 && role != "Microphone")
+            || (audios.len() == 3 && n == 1 && role == "Microphone")
+            || !seen.insert(role)
+        {
+            return false;
+        }
+    }
+    audio.index == audios[0].index
+}
+
 fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
     match value {
         serde_json::Value::Number(n) => n.as_f64(),
@@ -4895,7 +5061,22 @@ fn oriented_display_aspect_ratio(
 }
 
 pub fn probe_video(path: String) -> Result<VideoProbe, String> {
-    let video_path = PathBuf::from(path);
+    probe_video_selected(path, None, None)
+}
+
+pub fn probe_video_selected(
+    path: String,
+    audio_stream_index: Option<u32>,
+    audio_source_identity: Option<String>,
+) -> Result<VideoProbe, String> {
+    if audio_stream_index.is_some() && audio_source_identity.is_none() {
+        return Err(
+            "An explicit audio track requires its source identity. Reload the source.".into(),
+        );
+    }
+    let identity = crate::media_source::SourceIdentity::capture(Path::new(&path))?;
+    identity.verify_expected(audio_source_identity.as_deref())?;
+    let video_path = identity.path().to_path_buf();
     if !video_path.exists() {
         return Err(format!("File not found: {}", video_path.display()));
     }
@@ -4909,6 +5090,8 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     let mut cmd = command_no_window(&ffprobe_bin);
     cmd.arg("-v")
         .arg("error")
+        .arg("-protocol_whitelist")
+        .arg("file,pipe")
         .arg("-print_format")
         .arg("json")
         .arg("-show_streams")
@@ -4929,7 +5112,10 @@ pub fn probe_video(path: String) -> Result<VideoProbe, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_probe_output_with_pixel_formats(&stdout, Some(&pixel_formats))
+    let mut probe = parse_probe_output_selected(&stdout, Some(&pixel_formats), audio_stream_index)?;
+    identity.verify(&video_path)?;
+    probe.source_identity = identity.fingerprint().to_string();
+    Ok(probe)
 }
 
 fn aligns_retained_av_interval(request: &EncodeRequest, probe: &VideoProbe) -> bool {
@@ -5042,21 +5228,42 @@ fn probe_nut_timeline_duration(
 }
 
 #[cfg(test)]
-fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
+pub(crate) fn parse_probe_output(stdout: &str) -> Result<VideoProbe, String> {
     parse_probe_output_with_pixel_formats(stdout, None)
 }
 
+#[cfg(test)]
 fn parse_probe_output_with_pixel_formats(
     stdout: &str,
     pixel_formats: Option<&HashMap<String, PixelFormatDescriptor>>,
 ) -> Result<VideoProbe, String> {
+    parse_probe_output_selected(stdout, pixel_formats, None)
+}
+fn parse_probe_output_selected(
+    stdout: &str,
+    pixel_formats: Option<&HashMap<String, PixelFormatDescriptor>>,
+    audio_index: Option<u32>,
+) -> Result<VideoProbe, String> {
     let parsed: FFProbeOutput =
         serde_json::from_str(stdout).map_err(|e| format!("ffprobe returned invalid JSON: {e}"))?;
+    let mut indices = HashSet::new();
+    for stream in &parsed.streams {
+        if let Some(index) = stream.index
+            && !indices.insert(index)
+        {
+            return Err("Ambiguous duplicate stream index (ffprobe).".into());
+        }
+    }
 
     let selected_video = select_primary_video_stream(&parsed.streams).ok_or_else(|| {
         "Could not find a usable non-attached video stream (ffprobe).".to_string()
     })?;
-    let selected_audio = select_primary_audio_stream(&parsed.streams);
+    let selected_audio = if let Some(index) = audio_index {
+        Some(parsed.streams.iter().find(|s|s.index==Some(index) && s.codec_type.as_deref()==Some("audio"))
+            .ok_or("The selected audio track is missing or is not audio. Reload and select it again.")?)
+    } else {
+        select_primary_audio_stream(&parsed.streams)
+    };
 
     let parse_time = |value: Option<&str>| {
         value
@@ -5242,7 +5449,18 @@ fn parse_probe_output_with_pixel_formats(
         .map(|start| (start - input_origin).max(0.0))
         .unwrap_or(0.0);
 
+    let (audio_tracks, audio_tracks_truncated) = audio_catalog(&parsed.streams, audio_stream_index);
+    let preview_original_safe = original_preview_safe(&parsed, selected_video, selected_audio);
+    let audio_end_s = selected_audio.and_then(selected_end);
+    let audio_start_s = selected_audio
+        .map(|s| parse_time(s.start_time.as_deref()).unwrap_or(input_origin) - input_origin);
     Ok(VideoProbe {
+        source_identity: String::new(),
+        audio_tracks,
+        audio_tracks_truncated,
+        preview_original_safe,
+        audio_start_s,
+        audio_end_s,
         duration_s,
         video_start_s,
         video_end_s,
@@ -6121,6 +6339,7 @@ fn run_ffmpeg_with_progress(
     child_slot: &ProcessGroup,
     prepared_video: Option<&PreparedVideo>,
 ) -> Result<(), String> {
+    crate::media_source::verify_active()?;
     let mut progress = progress;
     let mut limits = limits;
     let rewritten_args;
@@ -6715,13 +6934,16 @@ pub fn run_encode_job(
         .map_err(|error| format!("Failed to resolve input file: {error}"))?;
     let input_str = input_path.to_string_lossy().to_string();
 
-    let source_identity = request
-        .interpolation
-        .as_ref()
-        .map(|_| interpolation_media::SourceIdentity::capture(&input_path))
-        .transpose()?;
+    let identity = Arc::new(crate::media_source::SourceIdentity::capture(&input_path)?);
+    identity.verify_expected(request.audio_source_identity.as_deref())?;
+    let _source_scope = crate::media_source::SourceScope::enter(identity.clone());
+    let source_identity = identity;
     let mut ffmpeg_bin = default_ffmpeg();
-    let mut probe = probe_video(input_path.to_string_lossy().to_string())?;
+    let mut probe = probe_video_selected(
+        input_path.to_string_lossy().to_string(),
+        request.audio_stream_index,
+        request.audio_source_identity.clone(),
+    )?;
     prepare_temporal_probe(&request, &input_path, &mut probe)?;
     let runtime_capabilities = cached_ffmpeg_capabilities(&ffmpeg_bin)?;
     let capability_contract = ffmpeg_capability_contract()?;
@@ -6796,9 +7018,7 @@ pub fn run_encode_job(
     } else {
         None
     };
-    if let Some(identity) = &source_identity {
-        identity.verify(&input_path)?;
-    }
+    source_identity.verify(&input_path)?;
     let prepared_video = if let Some(model) = &resolved_model {
         emit_progress_payload(
             Some(window),
@@ -6850,9 +7070,7 @@ pub fn run_encode_job(
                 error
             }
         })?;
-        if let Some(identity) = &source_identity {
-            identity.verify(&input_path)?;
-        }
+        source_identity.verify(&input_path)?;
         prepared.video_stream_index = probe.video_stream_index;
         prepared.format_mp4 = request.format == OutputFormat::Mp4;
         Some(prepared)
@@ -7888,6 +8106,10 @@ pub fn run_encode_job(
 }
 
 #[cfg(test)]
+#[path = "video_audio_tests.rs"]
+mod selected_audio_tests;
+
+#[cfg(test)]
 #[path = "video_media_tests.rs"]
 mod media_integration_tests;
 
@@ -7897,6 +8119,8 @@ mod tests {
 
     pub(super) fn base_request() -> EncodeRequest {
         EncodeRequest {
+            audio_stream_index: None,
+            audio_source_identity: None,
             interpolation: None,
             input_path: "in.mp4".to_string(),
             output_path: "out.mp4".to_string(),
@@ -8219,6 +8443,12 @@ mod tests {
 
     fn probe_10s_1920x1080_audio() -> VideoProbe {
         VideoProbe {
+            source_identity: String::new(),
+            audio_tracks: Vec::new(),
+            audio_tracks_truncated: false,
+            preview_original_safe: false,
+            audio_start_s: Some(0.0),
+            audio_end_s: Some(10.0),
             duration_s: 10.0,
             video_start_s: 0.0,
             video_end_s: None,

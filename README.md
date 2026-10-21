@@ -116,7 +116,11 @@ Open the **Record** tab and choose **Full screen**, draw an **Area** with the mo
 
 Click **Preview** to view the selected source without saving a recording or opening audio devices. Leaving Record stops standalone preview; an active recording continues until stopped. Window capture supports ordinary windows and windowed or borderless games through Windows capture. Protected or exclusive full-screen content may be unavailable. Preview follows window resizing; resizing during recording stops and saves the footage already captured.
 
-System audio and microphone are independent options, both off initially. Choose an available device for each enabled source. Recordings save as H.264 MP4 with AAC when audio is enabled. HDR displays are converted to SDR BT.709; HDR output is not preserved. Odd-sized areas retain every selected pixel and add a black edge for even MP4 dimensions.
+Audio is off initially. Choose **System output** or one **Application**, and optionally enable **Microphone**. Application audio captures the selected process and its children; a browser process may include several tabs. The audio application and recorded window are independent choices. Unsupported application capture reports a reason instead of falling back to system audio.
+
+Adjust volume and mute while recording, with separate input and mixed-output meters. Muting keeps the selected device active; disabling a source requires stopping the recording. Optional microphone **Noise reduction** is applied when saving, so live meters show audio before that processing. MP4 audio includes a default **Mixed** playback track and separate tracks for each enabled source. In **Edit**, choose the audio track to preview and export; queued exports retain that choice.
+
+Recordings save as H.264 MP4 with AAC when audio is enabled. HDR displays are converted to SDR BT.709; HDR output is not preserved. Odd-sized areas retain every selected pixel and add a black edge for even MP4 dimensions.
 
 Choose 24, 25, 30, 50 or 60 fps, Standard or High quality, a visible cursor, and a 0/3/5-second countdown. High quality uses more disk space. Available resolution and frame rate depend on capture and encoder throughput; the app reports a failure instead of silently reducing either setting.
 

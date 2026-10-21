@@ -35,8 +35,7 @@ pub struct Config {
     pub region: Region,
     pub fps: u32,
     pub show_cursor: bool,
-    pub system_audio_device_id: Option<String>,
-    pub microphone_device_id: Option<String>,
+    pub audio: audio_types::NativeAudioConfig,
     pub quality: String,
     pub spool_path: PathBuf,
     #[serde(default)]
@@ -51,6 +50,7 @@ pub struct Progress {
     pub encoder: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<serde_json::Value>,
+    pub audio: Option<audio_types::AudioStatus>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +63,8 @@ pub struct Outcome {
     pub max_video_lag_ms: u64,
     pub max_steady_video_lag_ms: u64,
     pub interruption: Option<String>,
+    pub audio: Option<audio_types::AudioStatus>,
+    pub audio_frames: u64,
 }
 
 pub struct RunError {
@@ -72,7 +74,21 @@ pub struct RunError {
 }
 
 #[path = "windows_audio.rs"]
+#[allow(dead_code)]
 mod audio;
+#[path = "windows_audio_apps.rs"]
+pub mod audio_apps;
+#[path = "audio_envelope.rs"]
+#[allow(dead_code)]
+mod audio_envelope;
+#[path = "audio_mixer.rs"]
+#[allow(dead_code)]
+mod audio_mixer;
+#[path = "windows_audio_pipeline.rs"]
+pub mod audio_pipeline;
+#[path = "audio_types.rs"]
+#[allow(dead_code)]
+pub mod audio_types;
 #[path = "windows_ffmpeg.rs"]
 mod ffmpeg;
 #[path = "windows_gpu.rs"]
@@ -86,6 +102,15 @@ pub fn supports_capture() -> bool {
         return false;
     };
     ::windows::Graphics::Capture::GraphicsCaptureSession::IsSupported().unwrap_or(false)
+}
+pub fn audio_applications(
+    excluded_pid: u32,
+) -> Result<audio_types::AudioApplicationListing, String> {
+    let _com = ComApartment::new()?;
+    audio_apps::enumerate_applications(excluded_pid)
+}
+pub fn audio_capability() -> Result<Option<String>, String> {
+    audio_apps::capability()
 }
 pub fn audio_devices() -> Result<Vec<AudioDevice>, String> {
     let _com = ComApartment::new()?;
@@ -749,7 +774,6 @@ struct MfWriter {
     sink: IMFMediaSink,
     stream: IMFByteStream,
     video: u32,
-    audio: Option<u32>,
     encoder: String,
     spool_path: PathBuf,
 }
@@ -773,20 +797,6 @@ impl MfWriter {
             video.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
             video.SetUINT32(&MF_MT_MPEG2_PROFILE, 77)?;
             video.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, config.fps * 2)?;
-            let has_audio =
-                config.system_audio_device_id.is_some() || config.microphone_device_id.is_some();
-            let audio = if has_audio {
-                let a = MFCreateMediaType()?;
-                a.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-                a.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
-                a.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
-                a.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
-                a.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-                a.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?;
-                Some(a)
-            } else {
-                None
-            };
             let pathname = HSTRING::from(config.spool_path.as_os_str());
             let stream = MFCreateFile(
                 MF_ACCESSMODE_READWRITE,
@@ -794,13 +804,12 @@ impl MfWriter {
                 MF_FILEFLAGS_NONE,
                 PCWSTR(pathname.as_ptr()),
             )?;
-            let sink = MFCreateFMPEG4MediaSink(&stream, &video, audio.as_ref())?;
+            let sink = MFCreateFMPEG4MediaSink(&stream, &video, None)?;
             let mut writer = Self {
                 writer: None,
                 sink,
                 stream,
                 video: 0,
-                audio: None,
                 encoder: String::new(),
                 spool_path: config.spool_path.clone(),
             };
@@ -823,20 +832,6 @@ impl MfWriter {
             input.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
             input.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
             sw.SetInputMediaType(writer.video, &input, None)?;
-            if has_audio {
-                let index = 1;
-                let a = MFCreateMediaType()?;
-                a.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-                a.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
-                a.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
-                a.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
-                a.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-                a.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
-                a.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192_000)?;
-                a.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-                sw.SetInputMediaType(index, &a, None)?;
-                writer.audio = Some(index)
-            }
             sw.BeginWriting()?;
             writer.encoder = encoder_description(&sw, writer.video);
             writer.writer = Some(sw);
@@ -904,7 +899,6 @@ enum WriterBackend {
 struct Writer {
     backend: WriterBackend,
     video: u32,
-    audio: Option<u32>,
     encoder: String,
     spool_path: PathBuf,
 }
@@ -913,7 +907,6 @@ impl Writer {
         match MfWriter::new(config) {
             Ok(writer) => Ok(Self {
                 video: writer.video,
-                audio: writer.audio,
                 encoder: writer.encoder.clone(),
                 spool_path: config.spool_path.clone(),
                 backend: WriterBackend::MediaFoundation(writer),
@@ -932,22 +925,11 @@ impl Writer {
                 Ok(Self {
                     backend: WriterBackend::Ffmpeg(writer),
                     video: 0,
-                    audio: (config.system_audio_device_id.is_some()
-                        || config.microphone_device_id.is_some())
-                    .then_some(1),
                     encoder: "FFmpeg libx264 (software)".into(),
                     spool_path: config.spool_path.clone(),
                 })
             }
             Err(error) => Err(error.to_string()),
-        }
-    }
-    fn sample(&mut self, index: u32, bytes: &[u8], pts: i64, duration: i64) -> Result<(), String> {
-        match &mut self.backend {
-            WriterBackend::MediaFoundation(writer) => writer
-                .sample(index, bytes, pts, duration)
-                .map_err(|e| e.to_string()),
-            WriterBackend::Ffmpeg(writer) => writer.sample(index, bytes, pts),
         }
     }
     fn video_sample(&mut self, frame: Arc<Vec<u8>>, pts: i64, duration: i64) -> Result<(), String> {
@@ -974,11 +956,6 @@ impl Writer {
     }
     fn bytes_written(&self) -> u64 {
         file_size(&self.spool_path)
-            + if matches!(self.backend, WriterBackend::Ffmpeg(_)) && self.audio.is_some() {
-                file_size(&self.spool_path.with_file_name("capture.pcm"))
-            } else {
-                0
-            }
     }
 }
 
@@ -1253,10 +1230,21 @@ pub fn run(
     stop: Arc<AtomicBool>,
     progress: impl Fn(Progress) + Send + 'static,
     preview_control: Arc<preview_control::Controls>,
+    audio_control: Arc<audio_pipeline::Controls>,
 ) -> Result<Outcome, RunError> {
     let mut no_media = true;
-    run_inner(config, stop, progress, &mut no_media, preview_control)
-        .map_err(|message| RunError { message, no_media })
+    let result = run_inner(
+        config,
+        stop,
+        progress,
+        &mut no_media,
+        preview_control,
+        audio_control.clone(),
+    );
+    if let Err(message) = &result {
+        audio_control.finish(Some(message.clone()));
+    }
+    result.map_err(|message| RunError { message, no_media })
 }
 
 fn run_inner(
@@ -1265,7 +1253,9 @@ fn run_inner(
     progress: impl Fn(Progress) + Send + 'static,
     no_media: &mut bool,
     preview_control: Arc<preview_control::Controls>,
+    audio_control: Arc<audio_pipeline::Controls>,
 ) -> Result<Outcome, String> {
+    config.audio.validate()?;
     let _dpi = PhysicalDpi::new();
     let _com = ComApartment::new()?;
     if !supports_capture() {
@@ -1305,11 +1295,16 @@ fn run_inner(
         MediaRuntime::new().map_err(|e| format!("Windows Media Foundation unavailable: {e}"))?;
     let capture = Capture::new(&display, r, config.show_cursor, &native)
         .map_err(|e| format!("Screen capture initialization: {e}"))?;
-    let mut writer = Writer::new(&config)
-        .map_err(|e| format!("H.264/AAC fragmented MP4 initialization: {e}"))?;
-    let mut audio = audio::AudioCapture::start(
-        config.system_audio_device_id.as_deref(),
-        config.microphone_device_id.as_deref(),
+    let mut writer =
+        Writer::new(&config).map_err(|e| format!("H.264 fragmented MP4 initialization: {e}"))?;
+    let mut audio = audio_pipeline::Pipeline::start(
+        &config.audio,
+        config
+            .spool_path
+            .parent()
+            .ok_or("Invalid recording directory")?,
+        audio_control.clone(),
+        &stop,
     )?;
     let _hud = ui::StopHud::start(stop.clone())?;
     capture
@@ -1342,7 +1337,6 @@ fn run_inner(
     let mut max_video_lag = 0i64;
     let mut max_steady_video_lag = 0i64;
     let mut cadence = CadenceGuard::new(config.fps);
-    let mut audio_frames = 0u64;
     let mut last_report = Instant::now();
     let mut last_health = Instant::now();
     let mut interruption = None;
@@ -1403,29 +1397,40 @@ fn run_inner(
                 last_written_frame = Some(frames.latest_time);
             }
             if next_video == 1 {
+                audio_control.ready();
                 progress(Progress {
                     ready: true,
                     elapsed_ms: 0,
-                    bytes_written: writer.bytes_written(),
+                    bytes_written: writer.bytes_written() + audio.bytes(),
                     encoder: writer.encoder.clone(),
                     preview: preview_control.notice(),
+                    audio: audio_control.snapshot(),
                 });
             }
         }
-        audio.poll()?;
-        if let Some(index) = writer.audio {
-            let available = ((elapsed - 1_000_000).max(0) as u64 * 48_000) / 10_000_000;
-            while audio_frames + 480 <= available {
-                write_audio(&mut writer, &mut audio, index, zero, &mut audio_frames, 480)?;
-            }
+        if let Err(error) = audio.poll() {
+            validate_stop(*no_media, elapsed, next_video, config.fps)?;
+            interruption = Some(error);
+            break audio_control.cutoff().unwrap_or(now).min(now);
         }
-        if last_report.elapsed() >= Duration::from_millis(250) {
+        let available = ((elapsed - 1_000_000).max(0) as u64 * 48_000) / 10_000_000;
+        while audio.frames + 480 <= available && !stop.load(Ordering::Acquire) {
+            audio.render(zero, 480, &stop, false)?;
+        }
+        if last_report.elapsed()
+            >= Duration::from_millis(if config.audio.role_mask() != 0 {
+                100
+            } else {
+                250
+            })
+        {
             progress(Progress {
                 ready: true,
                 elapsed_ms: (elapsed / 10_000) as u64,
-                bytes_written: writer.bytes_written(),
+                bytes_written: writer.bytes_written() + audio.bytes(),
                 encoder: writer.encoder.clone(),
                 preview: preview_control.notice(),
+                audio: audio_control.snapshot(),
             });
             last_report = Instant::now()
         }
@@ -1455,14 +1460,18 @@ fn run_inner(
         }
         std::thread::sleep(Duration::from_millis(1));
     };
+    let total = ((cutoff - zero).max(0) as u64 * 48_000) / 10_000_000;
+    audio_control.freeze(total);
     capture
         .session
         .Close()
         .map_err(|e| format!("Stop capture: {e}"))?;
     // Shared-mode packets are delivered after their sampling interval. Drain the bounded tail.
     std::thread::sleep(Duration::from_millis(100));
-    audio.poll()?;
-    audio.stop()?;
+    if let Err(error) = audio.stop() {
+        interruption.get_or_insert(error);
+        let _ = audio.stop();
+    }
     // Stop fixes one common cutoff. Do not acquire any post-cutoff image.
     // Fill still-missing CFR slots with the last known image at or before
     // each slot, including a previously queued future image only when due.
@@ -1484,32 +1493,27 @@ fn run_inner(
             last_written_frame = Some(frames.latest_time);
         }
     }
-    if let Some(index) = writer.audio {
-        let total = ((cutoff - zero).max(0) as u64 * 48_000) / 10_000_000;
-        while audio_frames < total {
-            let chunk = (total - audio_frames).min(480) as u32;
-            write_audio(
-                &mut writer,
-                &mut audio,
-                index,
-                zero,
-                &mut audio_frames,
-                chunk,
-            )?;
-        }
+    while audio.frames < total {
+        let chunk = (total - audio.frames).min(480) as u32;
+        audio.render(zero, chunk, &stop, true)?;
     }
+    audio.release_capture();
+    audio.finish()?;
+    audio_control.finish(interruption.clone());
     writer
         .finish()
         .map_err(|e| format!("Finalize recording; partial file retained: {e}"))?;
     Ok(Outcome {
         elapsed_ms: ((cutoff - zero).max(0) / 10_000) as u64,
-        bytes_written: writer.bytes_written(),
+        bytes_written: writer.bytes_written() + audio.bytes(),
         encoder: writer.encoder.clone(),
         video_frames: next_video,
         distinct_frames,
         max_video_lag_ms: (max_video_lag / 10_000) as u64,
         max_steady_video_lag_ms: (max_steady_video_lag / 10_000) as u64,
         interruption,
+        audio: audio_control.snapshot(),
+        audio_frames: audio.frames,
     })
 }
 
@@ -1596,24 +1600,6 @@ impl VideoFrames {
 fn file_size(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
-fn write_audio(
-    writer: &mut Writer,
-    audio: &mut audio::AudioCapture,
-    index: u32,
-    zero: i64,
-    frames: &mut u64,
-    count: u32,
-) -> Result<(), String> {
-    let pts = (*frames as i128 * 10_000_000 / 48_000) as i64;
-    let pcm = audio.mix_into(zero + pts, count)?;
-    let bytes = unsafe { std::slice::from_raw_parts(pcm.as_ptr().cast::<u8>(), pcm.len() * 2) };
-    writer
-        .sample(index, bytes, pts, count as i64 * 10_000_000 / 48_000)
-        .map_err(|e| format!("Encode audio: {e}"))?;
-    *frames += count as u64;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

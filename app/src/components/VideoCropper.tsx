@@ -14,6 +14,8 @@ export type VideoCropperHandle = {
   pause: () => boolean;
   togglePlayback: () => Promise<boolean>;
   seekTo: (timeS: number) => void;
+  getPlaybackState: () => { timeS: number; playing: boolean };
+  unload: () => void;
 };
 
 type AspectMode = { locked: boolean; ratio: number | null };
@@ -212,6 +214,8 @@ function getContentRectPx(
 
 export const VideoCropper = forwardRef<VideoCropperHandle, {
   src: string;
+  sourceToken?: string;
+  timelineOffsetS?: number;
   rect: NormalizedRect;
   onChange: (r: NormalizedRect) => void;
   aspect: AspectMode;
@@ -222,9 +226,12 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   colorFilter?: string | null;
   onTimeUpdate?: (t: number) => void;
   onPlaybackChange?: (playing: boolean) => void;
-  onSourceReadyChange?: (ready: boolean) => void;
+  onSourceReadyChange?: (ready: boolean, sourceToken?: string) => void;
+  onSourceError?: (sourceToken: string) => void;
 }>(function VideoCropper({
   src,
+  sourceToken = src,
+  timelineOffsetS = 0,
   rect,
   onChange,
   aspect,
@@ -236,6 +243,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   onTimeUpdate,
   onPlaybackChange,
   onSourceReadyChange,
+  onSourceError,
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -516,21 +524,22 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     const v = videoRef.current;
     if (!v) return;
     const reportSize = () => setVideoSize({ w: v.videoWidth, h: v.videoHeight });
-    const reportReady = () => onSourceReadyChange?.(v.readyState >= 1 && v.videoWidth > 0 && v.videoHeight > 0);
+    const reportReady = () => onSourceReadyChange?.(v.readyState >= 1 && v.videoWidth > 0 && v.videoHeight > 0, sourceToken);
     const onLoaded = () => {
       reportSize();
       reportReady();
     };
-    const onReset = () => onSourceReadyChange?.(false);
+    const onReset = () => onSourceReadyChange?.(false, sourceToken);
+    const onError = () => { onReset(); if (src) onSourceError?.(sourceToken); };
 
     v.addEventListener("loadedmetadata", onLoaded);
     v.addEventListener("loadeddata", onLoaded);
     v.addEventListener("canplay", reportReady);
     v.addEventListener("emptied", onReset);
-    v.addEventListener("error", onReset);
-    if (src) {
-      v.load();
-    }
+    v.addEventListener("error", onError);
+    if (src) v.src = src;
+    else v.removeAttribute("src");
+    v.load();
     onLoaded();
 
     return () => {
@@ -538,17 +547,18 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
       v.removeEventListener("loadeddata", onLoaded);
       v.removeEventListener("canplay", reportReady);
       v.removeEventListener("emptied", onReset);
-      v.removeEventListener("error", onReset);
+      v.removeEventListener("error", onError);
+      v.pause(); v.removeAttribute("src"); v.load();
       onReset();
     };
-  }, [src, onSourceReadyChange]);
+  }, [src, sourceToken, onSourceReadyChange, onSourceError]);
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
     if (!onTimeUpdate) return;
 
-    const report = () => onTimeUpdate(v.currentTime || 0);
+    const report = () => onTimeUpdate(Math.max(0, (v.currentTime || 0) - timelineOffsetS));
     v.addEventListener("timeupdate", report);
     v.addEventListener("seeked", report);
     v.addEventListener("loadedmetadata", report);
@@ -559,7 +569,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
       v.removeEventListener("seeked", report);
       v.removeEventListener("loadedmetadata", report);
     };
-  }, [src, onTimeUpdate]);
+  }, [src, sourceToken, timelineOffsetS, onTimeUpdate]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -620,10 +630,19 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
       const v = videoRef.current;
       if (!v) return;
       const duration = Number.isFinite(v.duration) ? v.duration : Number.POSITIVE_INFINITY;
-      v.currentTime = clamp(timeS, 0, duration);
-      onTimeUpdate?.(v.currentTime || 0);
+      v.currentTime = clamp(timeS + timelineOffsetS, 0, duration);
+      onTimeUpdate?.(Math.max(0, (v.currentTime || 0) - timelineOffsetS));
     },
-  }), [onTimeUpdate]);
+    getPlaybackState() {
+      const v = videoRef.current;
+      return { timeS: Math.max(0, (v?.currentTime || 0) - timelineOffsetS), playing: !!v && !v.paused && !v.ended };
+    },
+    unload() {
+      const v = videoRef.current;
+      if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
+      onSourceReadyChange?.(false, sourceToken);
+    },
+  }), [onTimeUpdate, onSourceReadyChange, sourceToken, timelineOffsetS]);
 
   const handleStyle = (corner: "nw" | "ne" | "sw" | "se") => {
     const x = corner.includes("w") ? rectPx.left : rectPx.left + rectPx.width;
@@ -656,8 +675,9 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
         <div className="vfl-video-surface" style={videoSurfaceStyle}>
           <video
             className="vfl-video"
+            data-source-token={sourceToken}
+            data-timeline-offset={timelineOffsetS}
             ref={videoRef}
-            src={src}
             aria-label={`Video preview, rotated ${normalizedRotation} degrees`}
             style={colorFilter ? { filter: colorFilter } : undefined}
             preload="auto"

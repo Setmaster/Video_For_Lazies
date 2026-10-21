@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { AudioApplication, AudioStatus, RecordingAudioConfig } from "./recordingAudioTypes";
 import { acceptRecordingSnapshot, isRecordingActive } from "./recordingState";
 
 export type RecordingPhase = "idle" | "preparing" | "countdown" | "starting" | "recording" | "stopping" | "finalizing" | "completed" | "recoverable" | "failed";
@@ -14,11 +15,12 @@ export type RecordingSnapshot = {
   outputPath: string | null;
   message: string | null;
   config: RecordingConfig | null;
+  audio: AudioStatus | null;
   resolvedGeometry: { width: number; height: number } | null;
   selectionRequestId: string | null;
   recoveries: RecordingRecovery[];
 };
-export type RecordingCapabilities = { available: boolean; reason: string | null; defaultOutputDirectory: string | null };
+export type RecordingCapabilities = { available: boolean; reason: string | null; defaultOutputDirectory: string | null; audio: { application: { available: boolean; reason: string | null }; microphoneSuppression: { available: boolean; reason: string | null } } };
 export type RecordingSource = { id: string; name: string; x: number; y: number; width: number; height: number };
 export type RecordingRegion = { displayId: string; x: number; y: number; width: number; height: number };
 export type CaptureSource = (RecordingRegion & { kind: "region" }) | { kind: "window"; windowId: string };
@@ -34,15 +36,14 @@ export type RecordingConfig = {
   quality: "standard" | "high";
   countdownSeconds: number;
   showCursor: boolean;
-  systemAudioDeviceId: string | null;
-  microphoneDeviceId: string | null;
+  audio: RecordingAudioConfig;
   outputDirectory: string;
 };
 export type RecordingStateChange = (snapshot: RecordingSnapshot, busy: boolean) => void;
 
 const INITIAL_SNAPSHOT: RecordingSnapshot = {
   sessionId: null, sequence: -1, phase: "idle", elapsedMs: 0, bytesWritten: 0,
-  countdownRemaining: null, outputPath: null, message: null, config: null, resolvedGeometry: null, selectionRequestId: null, recoveries: [],
+  countdownRemaining: null, outputPath: null, message: null, config: null, audio: null, resolvedGeometry: null, selectionRequestId: null, recoveries: [],
 };
 
 function errorText(error: unknown) {
@@ -55,6 +56,8 @@ export function useRecording(onStateChange?: RecordingStateChange) {
   const [sources, setSources] = useState<RecordingSource[]>([]);
   const [windows, setWindows] = useState<RecordingWindow[]>([]);
   const [windowsTruncated, setWindowsTruncated] = useState(false);
+  const [applications, setApplications] = useState<AudioApplication[]>([]);
+  const [applicationsTruncated, setApplicationsTruncated] = useState(false);
   const [audioDevices, setAudioDevices] = useState<RecordingAudioDevice[]>([]);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -125,20 +128,25 @@ export function useRecording(onStateChange?: RecordingStateChange) {
     if (!mounted.current) return;
     setCapabilities(available);
     if (available.available) {
-      const [displays, devices, targets] = await Promise.all([
+      const [displays, devices, targets, apps] = await Promise.all([
         invoke<RecordingSource[]>("recording_sources"),
         invoke<RecordingAudioDevice[]>("recording_audio_devices"),
         invoke<{ windows: RecordingWindow[]; truncated: boolean }>("recording_windows"),
+        invoke<{ applications: AudioApplication[]; truncated: boolean }>("recording_audio_applications"),
       ]);
       if (mounted.current) {
         setSources(displays);
         setAudioDevices(devices);
         setWindows(targets.windows);
         setWindowsTruncated(targets.truncated);
+        setApplications(apps.applications);
+        setApplicationsTruncated(apps.truncated);
       }
     } else {
       setSources([]);
       setAudioDevices([]);
+      setApplications([]);
+      setApplicationsTruncated(false);
       setWindows([]);
       setWindowsTruncated(false);
     }
@@ -173,7 +181,7 @@ export function useRecording(onStateChange?: RecordingStateChange) {
   }), [accept, refreshSnapshot, run]);
 
   return {
-    snapshot, capabilities, sources, windows, windowsTruncated, audioDevices, pending, error, statusError, connected,
+    snapshot, capabilities, sources, windows, windowsTruncated, audioDevices, applications, applicationsTruncated, pending, error, statusError, connected,
     active: isRecordingActive(snapshot.phase), selecting: snapshot.selectionRequestId !== null,
     run, command, refreshDevices, refreshSnapshot,
   };

@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State, Window};
 
 mod activity;
+mod audio_preview;
 mod command_dispatch;
 mod interpolation_commands;
 mod interpolation_components;
 mod interpolation_media;
 mod interpolation_timeline;
+mod media_source;
 mod optional_interpolation_components;
 #[cfg(test)]
 mod optional_interpolation_tests;
@@ -610,8 +612,15 @@ fn merge_smoke_optional_fields(existing: Option<&AppSmokeStatus>, next: &mut App
 }
 
 #[tauri::command]
-async fn probe_video(path: String) -> Result<video::VideoProbe, String> {
-    command_dispatch::media(move || video::probe_video(path)).await
+async fn probe_video(
+    path: String,
+    audio_stream_index: Option<u32>,
+    audio_source_identity: Option<String>,
+) -> Result<video::VideoProbe, String> {
+    command_dispatch::media(move || {
+        video::probe_video_selected(path, audio_stream_index, audio_source_identity)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -848,9 +857,13 @@ pub fn run() {
         updater::set_elevated_recovery_run(true);
     }
 
-    tauri::Builder::default()
+    let activity = activity::ActivityCoordinator::startup_pending();
+    let audio_previews = audio_preview::AudioPreviewManager::new(activity.clone());
+
+    let exit_code = tauri::Builder::default()
         .manage(JobManager::new())
-        .manage(activity::ActivityCoordinator::startup_pending())
+        .manage(activity)
+        .manage(audio_previews.clone())
         .manage(interpolation_commands::InterpolationInstaller::default())
         .manage(updater::UpdaterCoordinator::new())
         .manage(recording::RecordingManager::default())
@@ -864,13 +877,23 @@ pub fn run() {
                 return;
             }
             let recorder: State<'_, recording::RecordingManager> = window.app_handle().state();
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event
-                && recorder.needs_close_guard()
-            {
-                api.prevent_close();
-                let _ = window.emit("recording-close-requested", ());
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if recorder.needs_close_guard() {
+                    api.prevent_close();
+                    let _ = window.emit("recording-close-requested", ());
+                } else {
+                    let previews: State<'_, audio_preview::AudioPreviewManager> =
+                        window.app_handle().state();
+                    if previews.needs_close_guard() {
+                        api.prevent_close();
+                        let _ = window.emit("audio-preview-close-requested", ());
+                    }
+                }
             }
             if matches!(event, tauri::WindowEvent::Destroyed) {
+                let previews: State<'_, audio_preview::AudioPreviewManager> =
+                    window.app_handle().state();
+                previews.signal_shutdown();
                 recorder.shutdown();
                 let activity: State<'_, activity::ActivityCoordinator> =
                     window.app_handle().state();
@@ -885,6 +908,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             probe_video,
+            audio_preview::prepare_audio_preview,
+            audio_preview::cancel_audio_preview,
+            audio_preview::release_audio_preview,
             detect_crop,
             suggest_output_path,
             suggest_output_paths,
@@ -913,6 +939,9 @@ pub fn run() {
             recording::preview_manager::recording_preview_frame,
             recording::preview_manager::recording_preview_stop,
             recording::recording_audio_devices,
+            recording::audio_manager::recording_audio_applications,
+            recording::audio_manager::recording_audio_snapshot,
+            recording::audio_manager::recording_audio_set_levels,
             recording::recording_select_region,
             recording::recording_start,
             recording::recording_stop,
@@ -923,15 +952,29 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        .run_return(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 let recorder: State<'_, recording::RecordingManager> = app.state();
                 if recorder.needs_close_guard() {
                     api.prevent_exit();
                     let _ = app.emit("recording-close-requested", ());
+                } else if code.is_none() {
+                    // A verified updater's programmatic exit is already
+                    // approved. Its preview files settle after the loop.
+                    let previews: State<'_, audio_preview::AudioPreviewManager> = app.state();
+                    if previews.needs_close_guard() {
+                        api.prevent_exit();
+                        let _ = app.emit("audio-preview-close-requested", ());
+                    }
                 }
             }
         });
+    // Join preview workers after the event loop has released its window. The
+    // Destroyed hook only signals cancellation so it never waits on a worker.
+    if let Err(error) = audio_previews.shutdown() {
+        eprintln!("Audio preview cleanup failed: {error}");
+    }
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]

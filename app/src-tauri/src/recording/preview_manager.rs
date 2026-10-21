@@ -572,6 +572,7 @@ pub(crate) fn recording_preview_start(
             None,
             |_| {},
             Some(tap),
+            None,
         );
         preview.finish(&app, &owner, result);
     }).is_err() {

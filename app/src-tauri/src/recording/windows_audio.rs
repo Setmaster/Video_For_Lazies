@@ -98,6 +98,8 @@ struct Endpoint {
     timeline: timeline::Timeline,
     running: bool,
     label: &'static str,
+    role: usize,
+    process: Option<super::audio_apps::ProcessGuard>,
 }
 
 impl Endpoint {
@@ -131,6 +133,14 @@ impl Endpoint {
         }
         let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
             .map_err(|error| audio_error(&format!("{label}: activate endpoint"), error))?;
+        Self::initialize(client, flow, label, None)
+    }
+    fn initialize(
+        client: IAudioClient,
+        flow: EDataFlow,
+        label: &'static str,
+        process: Option<super::audio_apps::ProcessGuard>,
+    ) -> Result<Self, String> {
         // The system audio engine handles native channel layout/sample-rate conversion.
         // The timeline below then corrects device-clock drift against shared QPC.
         let format = WAVEFORMATEX {
@@ -168,10 +178,15 @@ impl Endpoint {
             timeline: timeline::Timeline::new(flow == eRender),
             running: false,
             label,
+            role: if flow == eRender { 0 } else { 1 },
+            process,
         })
     }
 
     fn start(&mut self) -> Result<(), String> {
+        if let Some(process) = &self.process {
+            process.verify()?;
+        }
         unsafe { self.client.Start() }
             .map_err(|error| audio_error(&format!("{}: start capture", self.label), error))?;
         self.running = true;
@@ -179,6 +194,9 @@ impl Endpoint {
     }
 
     fn poll(&mut self) -> Result<(), String> {
+        if let Some(process) = &self.process {
+            process.verify()?;
+        }
         // One second of endpoint buffering, with a finite drain bound even if a
         // broken device keeps producing packets. All failures terminate capture.
         for _ in 0..256 {
@@ -298,13 +316,79 @@ impl AudioCapture {
         Ok(capture)
     }
 
-    pub fn poll(&mut self) -> Result<(), String> {
-        if !self.stopped {
-            for endpoint in &mut self.endpoints {
-                endpoint.poll()?;
+    pub fn start_native(
+        render: &super::audio_types::NativeRender,
+        mic_id: Option<&str>,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self, String> {
+        use super::audio_types::NativeRender;
+        let mut capture = Self {
+            endpoints: Vec::new(),
+            stopped: false,
+            _thread: PhantomData,
+        };
+        match render {
+            NativeRender::Off => {}
+            NativeRender::System { device_id } => {
+                capture
+                    .endpoints
+                    .push(Endpoint::open(&enumerator()?, device_id, eRender)?)
+            }
+            NativeRender::Application { identity } => {
+                let activated = super::audio_apps::activate(identity, stop)?;
+                capture.endpoints.push(Endpoint::initialize(
+                    activated.client,
+                    eRender,
+                    "Application audio",
+                    Some(activated.guard),
+                )?);
             }
         }
-        Ok(())
+        if let Some(id) = mic_id {
+            capture
+                .endpoints
+                .push(Endpoint::open(&enumerator()?, id, eCapture)?);
+        }
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Audio preparation was cancelled.".into());
+        }
+        for endpoint in &mut capture.endpoints {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("Audio preparation was cancelled before starting an endpoint.".into());
+            }
+            endpoint.start()?;
+        }
+        Ok(capture)
+    }
+    /// Render each source exactly once, without irreversible pre-mix clipping.
+    pub fn render_sources(
+        &mut self,
+        start: i64,
+        frames: u32,
+    ) -> Result<[Vec<[f32; 2]>; 2], String> {
+        if frames > 480 {
+            return Err("Audio source block exceeds10ms.".into());
+        }
+        let mut blocks = [
+            vec![[0.; 2]; frames as usize],
+            vec![[0.; 2]; frames as usize],
+        ];
+        for endpoint in &mut self.endpoints {
+            endpoint.timeline.mix(start, &mut blocks[endpoint.role]);
+        }
+        Ok(blocks)
+    }
+
+    pub fn poll(&mut self) -> Result<(), String> {
+        let mut failure = None;
+        if !self.stopped {
+            for endpoint in &mut self.endpoints {
+                if let Err(error) = endpoint.poll() {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Exact interleaved stereo 48 kHz PCM. Render at least 100 ms behind
@@ -323,6 +407,12 @@ impl AudioCapture {
             .into_iter()
             .flat_map(|frame| frame.map(timeline::pcm))
             .collect())
+    }
+
+    /// Release all COM clients after the final copied timeline samples are written.
+    pub fn release(&mut self) {
+        self.endpoints.clear();
+        self.stopped = true;
     }
 
     /// Stop clients before final timeline rendering; keeps already copied audio.

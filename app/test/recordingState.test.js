@@ -4,7 +4,7 @@ import { acceptRecordingSnapshot, formatRecordingDuration, isRecordingActive, is
 
 function snapshot(sequence, phase = "idle", overrides = {}) {
   return { sessionId: phase === "idle" ? null : "session-a", sequence, phase,
-    elapsedMs: 0, bytesWritten: 0, countdownRemaining: null, outputPath: null, message: null, config: null, resolvedGeometry: null, selectionRequestId: null, recoveries: [], ...overrides };
+    elapsedMs: 0, bytesWritten: 0, countdownRemaining: null, outputPath: null, message: null, config: null, audio: null, resolvedGeometry: null, selectionRequestId: null, recoveries: [], ...overrides };
 }
 
 test("late start and poll replies cannot roll back stop/finalization", () => {

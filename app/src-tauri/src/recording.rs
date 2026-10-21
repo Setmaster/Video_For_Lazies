@@ -22,12 +22,23 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow as Window};
 
 const PROTOCOL_LIMIT: u64 = 65_536;
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 const RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
+// The writer and checked reader are shared with the separate native helper.
+#[allow(dead_code)]
+mod audio_envelope;
+mod audio_finalize;
+pub(crate) mod audio_manager;
+#[allow(dead_code)]
+mod audio_mixer;
+mod audio_suppression;
+#[allow(dead_code)]
+mod audio_types;
 #[allow(dead_code)]
 mod preview;
 pub(crate) mod preview_manager;
+use audio_types::{AudioStatus, Microphone, RecordingAudioConfig, RenderAudio, Suppression};
 mod source;
 #[cfg(test)]
 use source::Region;
@@ -42,11 +53,40 @@ pub(crate) struct RecordingConfig {
     quality: String,
     countdown_seconds: u32,
     show_cursor: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio: Option<RecordingAudioConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     system_audio_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     microphone_device_id: Option<String>,
     output_directory: String,
 }
 
+impl RecordingConfig {
+    fn public_snapshot_config(&self) -> Self {
+        let mut config = self.clone();
+        config.audio = Some(self.audio_config());
+        config.system_audio_device_id = None;
+        config.microphone_device_id = None;
+        config
+    }
+
+    fn audio_config(&self) -> RecordingAudioConfig {
+        self.audio.clone().unwrap_or_else(|| RecordingAudioConfig {
+            render: self
+                .system_audio_device_id
+                .as_ref()
+                .map_or(RenderAudio::Off, |id| RenderAudio::System {
+                    device_id: id.clone(),
+                }),
+            microphone: self.microphone_device_id.as_ref().map(|id| Microphone {
+                device_id: id.clone(),
+                suppression: Suppression::Off,
+            }),
+            ..RecordingAudioConfig::default()
+        })
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Recovery {
@@ -70,6 +110,16 @@ pub(crate) struct Snapshot {
     config: Option<RecordingConfig>,
     selection_request_id: Option<String>,
     resolved_geometry: Option<Geometry>,
+    audio: Option<AudioStatus>,
+}
+
+impl Snapshot {
+    fn set_recovery_source(&mut self, journal: &Journal) {
+        self.session_id = Some(journal.session_id.clone());
+        self.config = Some(journal.config.public_snapshot_config());
+        // Recovery finalizes retained media; it has no live audio-meter session.
+        self.audio = None;
+    }
 }
 
 impl Default for Snapshot {
@@ -87,6 +137,7 @@ impl Default for Snapshot {
             config: None,
             selection_request_id: None,
             resolved_geometry: None,
+            audio: None,
         }
     }
 }
@@ -117,6 +168,7 @@ pub(crate) struct RecordingManager {
     inner: Arc<Mutex<Inner>>,
     startup_load: Arc<Mutex<()>>,
     preview: Arc<preview_manager::PreviewManager>,
+    audio: Arc<audio_manager::AudioManager>,
 }
 
 impl RecordingManager {
@@ -273,7 +325,15 @@ fn helper_call(
     timeout: Option<Duration>,
     progress: impl FnMut(&Value),
 ) -> Result<Value, String> {
-    helper_call_stream(app, request, stop, timeout, progress, None)
+    helper_call_stream(app, request, stop, timeout, progress, None, None)
+}
+fn control_line(value: &Value) -> Result<Vec<u8>, String> {
+    let mut bytes = serde_json::to_vec(value).map_err(error)?;
+    if bytes.len() >= audio_types::CONTROL_BYTES {
+        return Err("Recording control exceeded its 512-byte wire limit.".into());
+    }
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 fn helper_call_stream(
     app: &AppHandle,
@@ -282,6 +342,7 @@ fn helper_call_stream(
     timeout: Option<Duration>,
     mut progress: impl FnMut(&Value),
     tap: Option<preview_manager::Tap>,
+    audio: Option<audio_manager::Tap>,
 ) -> Result<Value, String> {
     let path = helper_path(app)?;
     regular_ancestors(&path)?;
@@ -295,14 +356,17 @@ fn helper_call_stream(
         .stdin
         .take()
         .ok_or("Recording control pipe is unavailable.")?;
-    request["protocolVersion"] = json!(2);
+    request["protocolVersion"] = json!(3);
     serde_json::to_writer(&mut input, &request).map_err(error)?;
     input
         .write_all(b"\n")
         .and_then(|_| input.flush())
         .map_err(error)?;
-    let (control_send, control_receive) = mpsc::sync_channel::<Value>(1);
+    let (control_send, control_receive) =
+        mpsc::sync_channel::<Value>(audio_types::CONTROL_CAPACITY + 1);
     let input_stop = stop.clone();
+    let control_error = Arc::new(Mutex::new(None::<String>));
+    let writer_error = control_error.clone();
     let input_writer = std::thread::spawn(move || {
         loop {
             if input_stop.load(Ordering::Acquire) {
@@ -311,9 +375,15 @@ fn helper_call_stream(
             }
             match control_receive.recv_timeout(Duration::from_millis(50)) {
                 Ok(value) => {
-                    if serde_json::to_writer(&mut input, &value).is_err()
-                        || input.write_all(b"\n").and_then(|_| input.flush()).is_err()
-                    {
+                    let result = control_line(&value).and_then(|line| {
+                        input
+                            .write_all(&line)
+                            .and_then(|_| input.flush())
+                            .map_err(error)
+                    });
+                    if let Err(error) = result {
+                        *writer_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                        input_stop.store(true, Ordering::Release);
                         break;
                     }
                 }
@@ -389,6 +459,7 @@ fn helper_call_stream(
     let mut stopping = None;
     let recording = request["operation"] == "record" || request["operation"] == "preview";
     let mut last_preview_control = Instant::now() - Duration::from_secs(1);
+    let mut last_audio_control = Instant::now() - Duration::from_secs(1);
     let mut ready = false;
     let mut watchdog_interrupted = false;
     let result = loop {
@@ -398,6 +469,14 @@ fn helper_call_stream(
             last_preview_control = Instant::now();
             if let Some(tap) = &tap {
                 let _ = control_send.try_send(tap.control());
+            }
+        }
+        if !stop.load(Ordering::Acquire)
+            && last_audio_control.elapsed() >= Duration::from_millis(40)
+        {
+            last_audio_control = Instant::now();
+            if let Some(audio) = &audio {
+                audio.control(&control_send, &stop);
             }
         }
         if stop.load(Ordering::Acquire) && stopping.is_none() {
@@ -420,11 +499,17 @@ fn helper_call_stream(
         }
         match receive.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(message)) => {
-                if message["protocolVersion"] != 2 {
+                if message["protocolVersion"] != 3 {
                     break Err("Recording component version mismatch.".into());
                 }
                 match message["type"].as_str() {
                     Some("progress") => {
+                        if let Some(audio) = &audio
+                            && let Err(e) = audio.progress(&message["value"])
+                        {
+                            progress(&json!({"interruption":e}));
+                            stop.store(true, Ordering::Release);
+                        }
                         if let Some(tap) = &tap {
                             tap.progress(&message["value"]);
                         }
@@ -433,6 +518,11 @@ fn helper_call_stream(
                         progress(&message["value"]);
                     }
                     Some("result") => {
+                        if let Some(audio) = &audio
+                            && let Err(e) = audio.progress(&message["value"])
+                        {
+                            break Err(e);
+                        }
                         if watchdog_interrupted {
                             progress(
                                 &json!({"interruption":"Recording stopped because Windows stopped responding. The saved clip may be shorter than expected."}),
@@ -441,6 +531,11 @@ fn helper_call_stream(
                         break Ok(message["value"].clone());
                     }
                     Some("error") => {
+                        if let Some(audio) = &audio
+                            && let Err(e) = audio.progress(&message)
+                        {
+                            break Err(e);
+                        }
                         if message["noMedia"] == true {
                             progress(&json!({"noMedia":true}));
                         }
@@ -460,6 +555,13 @@ fn helper_call_stream(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
+    if let Some(reason) = control_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        progress(&json!({"interruption":reason}));
+    }
     if let Some(reason) = preview_error
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -493,6 +595,7 @@ pub(crate) struct Capabilities {
     available: bool,
     reason: Option<String>,
     default_output_directory: Option<String>,
+    audio: Value,
 }
 #[tauri::command]
 pub(crate) async fn recording_capabilities(
@@ -514,10 +617,13 @@ pub(crate) async fn recording_capabilities(
             Some(Duration::from_secs(10)),
             |_| {},
         );
+        let application=helper_call(&app,json!({"operation":"audio-capabilities"}),Arc::new(AtomicBool::new(false)),Some(Duration::from_secs(10)),|_|{}).map(|v|v["application"].clone()).unwrap_or_else(|reason|json!({"available":false,"reason":reason}));
+        let suppression=video::require_recording_audio().err();
         Ok(Capabilities {
             available: check.is_ok(),
             reason: check.err(),
             default_output_directory: default,
+            audio:json!({"application":application,"microphoneSuppression":{"available":suppression.is_none(),"reason":suppression}}),
         })
     })
     .await
@@ -630,6 +736,8 @@ struct Journal {
     published_hash: Option<String>,
     #[serde(default)]
     candidate_directory: Option<PathBuf>,
+    #[serde(default)]
+    audio_capture: Option<audio_finalize::AudioJournal>,
 }
 
 fn registry(app: &AppHandle) -> Result<PathBuf, String> {
@@ -664,7 +772,11 @@ fn regular_ancestors(path: &Path) -> Result<(), String> {
 fn write_journal(app: &AppHandle, journal: &Journal) -> Result<(), String> {
     let root = registry(app)?;
     let mut file = tempfile::NamedTempFile::new_in(&root).map_err(error)?;
-    serde_json::to_writer(&mut file, journal).map_err(error)?;
+    let bytes = serde_json::to_vec(journal).map_err(error)?;
+    if bytes.len() > PROTOCOL_LIMIT as usize {
+        return Err("Recording recovery metadata exceeds its byte limit.".into());
+    }
+    file.write_all(&bytes).map_err(error)?;
     file.as_file().sync_all().map_err(error)?;
     file.persist(root.join(format!("{}.json", journal.session_id)))
         .map_err(error)?;
@@ -682,8 +794,8 @@ fn read_journal(app: &AppHandle, id: &str) -> Result<Journal, String> {
     }
     let j: Journal =
         serde_json::from_reader(fs::File::open(path).map_err(error)?).map_err(error)?;
-    if j.version != JOURNAL_VERSION
-        || j.session_id != id
+    validate_journal_audio(&j)?;
+    if j.session_id != id
         || j.directory.file_name().and_then(|s| s.to_str()) != Some(&format!(".vfl-recording-{id}"))
     {
         return Err("Invalid recovery journal ownership.".into());
@@ -697,7 +809,7 @@ fn read_journal(app: &AppHandle, id: &str) -> Result<Journal, String> {
     }
     let owner: Value =
         serde_json::from_reader(fs::File::open(marker).map_err(error)?).map_err(error)?;
-    if owner != json!({"version":JOURNAL_VERSION,"sessionId":id}) {
+    if owner != json!({"version":j.version,"sessionId":id}) {
         return Err("Recording directory ownership differs.".into());
     }
     let source_root = fs::canonicalize(&j.config.output_directory).map_err(error)?;
@@ -718,11 +830,29 @@ fn read_journal(app: &AppHandle, id: &str) -> Result<Journal, String> {
         {
             return Err("Invalid recovery staging directory.".into());
         }
-        validate_marker(stage, id)?;
+        validate_marker(stage, id, j.version)?;
     }
     Ok(j)
 }
-fn validate_marker(directory: &Path, id: &str) -> Result<(), String> {
+fn validate_journal_audio(j: &Journal) -> Result<(), String> {
+    match j.version {
+        1 if j.config.audio.is_none() && j.audio_capture.is_none() => Ok(()),
+        2 if j.config.audio.is_some()
+            && j.config.system_audio_device_id.is_none()
+            && j.config.microphone_device_id.is_none() =>
+        {
+            let config = j.config.audio_config();
+            config.validate()?;
+            match (&j.audio_capture, config.enabled()) {
+                (Some(audio), true) => audio.validate(&config),
+                (None, false) => Ok(()),
+                _ => Err("Invalid recording audio ownership.".into()),
+            }
+        }
+        _ => Err("The recording audio recovery version is unsupported or inconsistent.".into()),
+    }
+}
+fn validate_marker(directory: &Path, id: &str, version: u32) -> Result<(), String> {
     regular_ancestors(directory)?;
     let marker = directory.join("owner.json");
     regular_ancestors(&marker)?;
@@ -732,7 +862,7 @@ fn validate_marker(directory: &Path, id: &str) -> Result<(), String> {
     }
     let owner: Value =
         serde_json::from_reader(fs::File::open(marker).map_err(error)?).map_err(error)?;
-    if owner != json!({"version":JOURNAL_VERSION,"sessionId":id}) {
+    if owner != json!({"version":version,"sessionId":id}) {
         return Err("Recording ownership marker differs.".into());
     }
     Ok(())
@@ -774,6 +904,7 @@ fn validate_config(config: &RecordingConfig) -> Result<(), String> {
         return Err("Unsupported recording settings.".into());
     }
     config.source.validate()?;
+    config.audio_config().validate()?;
     if config.output_directory.is_empty() {
         return Err("Choose an output folder.".into());
     }
@@ -814,6 +945,7 @@ fn create_journal(
         .map_err(error)?;
     session_lock.try_lock().map_err(error)?;
     let destination = destination_root.join(format!("Recording-{id}.mp4"));
+    let audio_capture = audio_finalize::AudioJournal::new(&config.audio_config());
     let j = Journal {
         version: JOURNAL_VERSION,
         session_id: id.into(),
@@ -831,6 +963,7 @@ fn create_journal(
         published_size: None,
         published_hash: None,
         candidate_directory: None,
+        audio_capture,
     };
     if let Err(e) = write_journal(app, &j) {
         let _ = fs::remove_dir(&j.directory);
@@ -955,9 +1088,12 @@ pub(crate) async fn recording_start(
     app: AppHandle,
     state: State<'_, RecordingManager>,
     activity: State<'_, ActivityCoordinator>,
-    config: RecordingConfig,
+    mut config: RecordingConfig,
 ) -> Result<Snapshot, String> {
     main_window(&window)?;
+    config.audio = Some(config.audio_config());
+    config.system_audio_device_id = None;
+    config.microphone_device_id = None;
     validate_config(&config)?;
     helper_path(&app)?;
     let (id, stop, snapshot) = {
@@ -1043,6 +1179,11 @@ fn run_session(
 ) {
     let mut cancelled_before_capture = false;
     let result = (|| {
+        let audio_config = config.audio_config();
+        if audio_config.enabled() {
+            video::require_recording_audio()?;
+        }
+        let native_audio = manager.audio.prepare(&id, &audio_config)?;
         let native = manager.preview.native_source(&config.source)?;
         let resolved = helper_call(
             &app,
@@ -1055,7 +1196,7 @@ fn run_session(
             serde_json::from_value(resolved["geometry"].clone()).map_err(error)?;
         geometry.validate()?;
         manager.update(&app, &id, |s| s.resolved_geometry = Some(geometry));
-        let (journal, session_lock) = create_journal(&app, &id, config.clone(), geometry)?;
+        let (mut journal, session_lock) = create_journal(&app, &id, config.clone(), geometry)?;
         let mut no_media = false;
         let result = (|| {
             let deadline = Instant::now() + Duration::from_secs(config.countdown_seconds as u64);
@@ -1078,7 +1219,7 @@ fn run_session(
                 s.countdown_remaining = None;
             });
             let spool = journal.directory.join("capture.mp4");
-            let host = json!({"region":resolved["region"],"source":native,"fps":config.fps,"showCursor":config.show_cursor,"quality":config.quality,"systemAudioDeviceId":config.system_audio_device_id,"microphoneDeviceId":config.microphone_device_id,"spoolPath":spool,"ffmpegPath":bundled_media(&app,"ffmpeg")?});
+            let host = json!({"region":resolved["region"],"source":native,"fps":config.fps,"showCursor":config.show_cursor,"quality":config.quality,"audio":native_audio,"spoolPath":spool,"ffmpegPath":bundled_media(&app,"ffmpeg")?});
             let mut last_space = Instant::now();
             let mut space_error = None;
             let outcome = helper_call_stream(
@@ -1095,6 +1236,7 @@ fn run_session(
                         if progress["ready"].as_bool().unwrap_or(false) && s.phase == "starting" {
                             s.phase = "recording".into();
                         }
+                        s.audio = manager.audio.snapshot(Some(&id));
                         s.elapsed_ms = progress["elapsedMs"].as_u64().unwrap_or(s.elapsed_ms);
                         s.bytes_written =
                             progress["bytesWritten"].as_u64().unwrap_or(s.bytes_written);
@@ -1112,7 +1254,16 @@ fn run_session(
                     app: app.clone(),
                     owner: id.clone(),
                 }),
+                Some(audio_manager::Tap {
+                    manager: manager.audio.clone(),
+                    app: app.clone(),
+                    owner: id.clone(),
+                }),
             )?;
+            if let Some(audio) = &mut journal.audio_capture {
+                audio.samples = outcome["audioFrames"].as_u64();
+                write_journal(&app, &journal)?;
+            }
             if let Some(reason) = outcome["interruption"].as_str() {
                 space_error = Some(reason.into());
             }
@@ -1123,7 +1274,10 @@ fn run_session(
                 s.bytes_written = outcome["bytesWritten"].as_u64().unwrap_or(s.bytes_written);
                 s.message = space_error;
             });
-            let path = finalize(&app, &journal, None)?;
+            let (path, warning) = finalize(&app, &journal, None)?;
+            if let Some(warning) = warning {
+                manager.update(&app, &id, |s| s.message = Some(warning));
+            }
             Ok(path)
         })();
         if result.is_err() && (no_media || !journal.directory.join("capture.mp4").exists()) {
@@ -1134,12 +1288,14 @@ fn run_session(
         drop(session_lock);
         result
     })();
+    manager.audio.finish(&app, &id);
     manager.preview.finish_recording(&app, &id);
     // Release exclusive admission before exposing the terminal state.
     drop(lease);
     let recoveries = find_recoveries(&app).unwrap_or_default();
     manager.update_recoveries(&app, &id, recoveries, |s| {
         s.countdown_remaining = None;
+        s.audio = manager.audio.snapshot(Some(&id));
         match result {
             Ok(path) => {
                 s.phase = "completed".into();
@@ -1288,11 +1444,11 @@ fn finalize(
     app: &AppHandle,
     journal: &Journal,
     output_directory: Option<String>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Option<String>), String> {
     let mut j = journal.clone();
     if publication_matches(&j) {
         let _ = cleanup(app, &j);
-        return Ok(j.destination);
+        return Ok((j.destination, None));
     }
     let destination = if let Some(output) = output_directory {
         let dir = fs::canonicalize(output).map_err(error)?;
@@ -1307,7 +1463,7 @@ fn finalize(
             .ok_or("Invalid output folder.")?
             .join(format!(".vfl-recording-{}-recovery", j.session_id));
         if stage.exists() {
-            validate_marker(&stage, &j.session_id)?;
+            validate_marker(&stage, &j.session_id, j.version)?;
         } else {
             fs::create_dir(&stage).map_err(error)?;
             let mut owner = fs::OpenOptions::new()
@@ -1317,7 +1473,7 @@ fn finalize(
                 .map_err(error)?;
             serde_json::to_writer(
                 &mut owner,
-                &json!({"version":JOURNAL_VERSION,"sessionId":j.session_id}),
+                &json!({"version":j.version,"sessionId":j.session_id}),
             )
             .map_err(error)?;
             owner.sync_all().map_err(error)?;
@@ -1336,11 +1492,53 @@ fn finalize(
     if bytes == 0 {
         return Err("The recording contains no recoverable video.".into());
     }
+    let audio_plan = if j.version == 2 {
+        audio_finalize::prepare(app, &j, &spool)?
+    } else {
+        None
+    };
     if candidate.exists()
-        && validate_candidate(&candidate, &j.config, journal_geometry(&j)?).is_err()
+        && (validate_candidate(&candidate, &j.config, journal_geometry(&j)?).is_err()
+            || audio_plan.as_ref().is_some_and(|plan| {
+                audio_finalize::validate_tracks(app, &candidate, plan).is_err()
+            }))
     {
         regular_ancestors(&candidate)?;
         fs::remove_file(&candidate).map_err(error)?;
+    }
+    if !candidate.exists() && j.version == 2 {
+        let (command, required, timeout) = if let Some(plan) = &audio_plan {
+            let (required, timeout) = plan.budget(bytes);
+            (
+                plan.command(&bundled_media(app, "ffmpeg")?, &spool, &candidate),
+                required,
+                timeout,
+            )
+        } else {
+            let mut command = Command::new(bundled_media(app, "ffmpeg")?);
+            command
+                .args(["-hide_banner", "-v", "error", "-n", "-i"])
+                .arg(&spool)
+                .args([
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "copy",
+                    "-an",
+                    "-map_metadata",
+                    "-1",
+                    "-movflags",
+                    "+faststart",
+                ])
+                .arg(&candidate);
+            let (required, timeout) = remux_budget(bytes, 0);
+            (command, required, timeout)
+        };
+        ensure_local_space(&candidate_root, required)?;
+        if let Err(e) = run_media(command, timeout) {
+            let _ = fs::remove_file(&candidate);
+            return Err(e);
+        }
     }
     if !candidate.exists() {
         let mut pcm_bytes = 0;
@@ -1400,6 +1598,9 @@ fn finalize(
         }
     }
     validate_candidate(&candidate, &j.config, journal_geometry(&j)?)?;
+    if let Some(plan) = &audio_plan {
+        audio_finalize::validate_tracks(app, &candidate, plan)?;
+    }
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1419,7 +1620,7 @@ fn finalize(
             // Publication is irreversible success. A cleanup error must never
             // hide the saved MP4 or offer it as unsaved footage.
             let _ = cleanup(app, &j);
-            Ok(destination)
+            Ok((destination,audio_plan.as_ref().filter(|p|p.recovered_prefix).map(|_|"Saved the complete common audio/video prefix. The interrupted tail may be missing.".into())))
         }
         Err(e) => {
             let detail = e;
@@ -1476,8 +1677,7 @@ fn validate_candidate(
         || !probe
             .frame_rate
             .is_some_and(|fps| (fps - f64::from(config.fps)).abs() < 0.05)
-        || probe.has_audio
-            != (config.system_audio_device_id.is_some() || config.microphone_device_id.is_some())
+        || probe.has_audio != config.audio_config().enabled()
         || probe.has_audio && probe.audio_codec.as_deref() != Some("aac")
     {
         return Err(
@@ -1514,6 +1714,7 @@ pub(crate) async fn recording_close(
     window: Window,
     state: State<'_, RecordingManager>,
     activity: State<'_, ActivityCoordinator>,
+    audio_preview: State<'_, crate::audio_preview::AudioPreviewManager>,
     session_id: Option<String>,
 ) -> Result<(), String> {
     main_window(&window)?;
@@ -1523,6 +1724,10 @@ pub(crate) async fn recording_close(
             .await
             .map_err(error)??,
     );
+    let proxies = audio_preview.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || proxies.cancel_all())
+        .await
+        .map_err(error)??;
     let i = state
         .inner
         .lock()
@@ -1536,39 +1741,70 @@ pub(crate) async fn recording_close(
     close.commit();
     Ok(())
 }
+fn cleanup_inventory(directory: &Path, names: &[&str]) -> Result<(), String> {
+    regular_ancestors(directory)?;
+    for entry in fs::read_dir(directory).map_err(error)? {
+        let entry = entry.map_err(error)?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| names.contains(&name))
+        {
+            return Err(
+                "The recording folder contains unowned files. Its files have been kept.".into(),
+            );
+        }
+        regular_ancestors(&entry.path())?;
+        if !entry.metadata().map_err(error)?.is_file() {
+            return Err(
+                "An owned recording file is not a regular file. Its files have been kept.".into(),
+            );
+        }
+    }
+    Ok(())
+}
+fn remove_cleanup_files(directory: &Path, names: &[&str]) -> Result<(), String> {
+    for name in names {
+        let path = directory.join(name);
+        if path.exists() {
+            regular_ancestors(&path)?;
+            fs::remove_file(path).map_err(error)?;
+        }
+    }
+    fs::remove_dir(directory).map_err(error)
+}
+fn cleanup_session_files(j: &Journal) -> Result<(), String> {
+    validate_journal_audio(j)?;
+    validate_marker(&j.directory, &j.session_id, j.version)?;
+    let mut names = vec!["capture.mp4", "candidate.mp4", "owner.json", "session.lock"];
+    if j.version == 1 {
+        names.push("capture.pcm");
+    } else if let Some(audio) = &j.audio_capture {
+        names.extend(audio.owned_files(&j.config.audio_config())?);
+    }
+    // Preflight both inventories before deleting even their ownership markers.
+    // Unknown siblings are preserved with the journal still usable for inspection.
+    cleanup_inventory(&j.directory, &names)?;
+    let stage_names = ["candidate.mp4", "owner.json"];
+    let stage = j
+        .candidate_directory
+        .as_ref()
+        .filter(|stage| stage.exists());
+    if let Some(stage) = stage {
+        validate_marker(stage, &j.session_id, j.version)?;
+        cleanup_inventory(stage, &stage_names)?;
+    }
+    if let Some(stage) = stage {
+        remove_cleanup_files(stage, &stage_names)?;
+    }
+    remove_cleanup_files(&j.directory, &names)
+}
 fn cleanup(app: &AppHandle, j: &Journal) -> Result<(), String> {
-    if let Some(stage) = &j.candidate_directory
-        && stage.exists()
-    {
-        validate_marker(stage, &j.session_id)?;
-        for name in ["candidate.mp4", "owner.json"] {
-            let path = stage.join(name);
-            if path.exists() {
-                regular_ancestors(&path)?;
-                fs::remove_file(path).map_err(error)?;
-            }
-        }
-        fs::remove_dir(stage).map_err(error)?;
-    }
-    regular_ancestors(&j.directory)?;
-    for name in [
-        "capture.mp4",
-        "capture.pcm",
-        "candidate.mp4",
-        "owner.json",
-        "session.lock",
-    ] {
-        let file = j.directory.join(name);
-        if file.exists() {
-            regular_ancestors(&file)?;
-            fs::remove_file(file).map_err(error)?;
-        }
-    }
-    // Never recursively delete or remove unrelated files.
-    fs::remove_dir(&j.directory).map_err(error)?;
+    cleanup_session_files(j)?;
     fs::remove_file(registry(app)?.join(format!("{}.json", j.session_id))).map_err(error)?;
     Ok(())
 }
+
 #[tauri::command]
 pub(crate) fn recording_recover(
     window: Window,
@@ -1591,8 +1827,7 @@ pub(crate) fn recording_recover(
         if active(&i.snapshot.phase) {
             return Err("Wait for the active recording.".into());
         }
-        i.snapshot.session_id = Some(session_id.clone());
-        i.snapshot.config = Some(j.config.clone());
+        i.snapshot.set_recovery_source(&j);
         i.snapshot.phase = "finalizing".into();
         i.snapshot.message = None;
         i.snapshot.output_path = None;
@@ -1605,7 +1840,8 @@ pub(crate) fn recording_recover(
         drop(lease);
         let recoveries = find_recoveries(&app).unwrap_or_default();
         manager.update_recoveries(&app, &session_id, recoveries, |s| match result {
-            Ok(path) => {
+            Ok((path, warning)) => {
+                s.message = warning;
                 s.phase = "completed".into();
                 s.output_path = Some(path.to_string_lossy().into_owned());
             }
@@ -1657,6 +1893,7 @@ mod tests {
             quality: "standard".into(),
             countdown_seconds: 3,
             show_cursor: true,
+            audio: None,
             system_audio_device_id: None,
             microphone_device_id: None,
             output_directory: "out".into(),
@@ -1682,6 +1919,90 @@ mod tests {
         c = config();
         c.countdown_seconds = 100;
         assert!(validate_config(&c).is_err());
+    }
+    #[test]
+    fn legacy_recovery_public_snapshot_normalizes_audio_without_changing_journal() {
+        for system in [false, true] {
+            for microphone in [false, true] {
+                let mut legacy = config();
+                legacy.system_audio_device_id = system.then(|| "legacy-system".into());
+                legacy.microphone_device_id = microphone.then(|| "legacy-mic".into());
+                let journal = Journal {
+                    version: 1,
+                    session_id: "legacy-snapshot".into(),
+                    created_at: "0".into(),
+                    directory: PathBuf::from("legacy-session"),
+                    destination: PathBuf::from("legacy-output.mp4"),
+                    config: legacy,
+                    resolved_geometry: None,
+                    published_size: None,
+                    published_hash: None,
+                    candidate_directory: None,
+                    audio_capture: None,
+                };
+                let original = serde_json::to_vec(&journal).unwrap();
+                assert!(journal.config.audio.is_none());
+                for phase in ["finalizing", "completed", "recoverable"] {
+                    let stale_meter = audio_types::AudioMeter {
+                        state: "active".into(),
+                        peak: 0.3,
+                        rms: 0.2,
+                        ..Default::default()
+                    };
+                    let mut snapshot = Snapshot {
+                        session_id: Some("old-session".into()),
+                        phase: phase.into(),
+                        output_path: (phase == "completed").then(|| "legacy-output.mp4".into()),
+                        audio: Some(AudioStatus {
+                            session_id: "old-session".into(),
+                            source_generation: "old-audio".into(),
+                            sequence: 10,
+                            accepted_command_sequence: 1,
+                            applied_command_sequence: 1,
+                            applied_at_sample: "480".into(),
+                            rejected_command_sequence: None,
+                            render_level: Default::default(),
+                            microphone_level: Default::default(),
+                            render: stale_meter.clone(),
+                            microphone: stale_meter.clone(),
+                            mixed: stale_meter,
+                            message: None,
+                        }),
+                        ..Snapshot::default()
+                    };
+                    snapshot.set_recovery_source(&journal);
+                    let public = serde_json::to_value(snapshot).unwrap();
+                    assert_eq!(public["sessionId"], "legacy-snapshot");
+                    assert!(public["audio"].is_null());
+                    let audio = &public["config"]["audio"];
+                    assert_eq!(
+                        audio["render"],
+                        if system {
+                            json!({"kind":"system", "deviceId":"legacy-system"})
+                        } else {
+                            json!({"kind":"off"})
+                        }
+                    );
+                    assert_eq!(
+                        audio["microphone"],
+                        if microphone {
+                            json!({"deviceId":"legacy-mic", "suppression":"off"})
+                        } else {
+                            json!(null)
+                        }
+                    );
+                    for level in ["renderLevel", "microphoneLevel"] {
+                        assert_eq!(audio[level], json!({"gain":1.0, "muted":false}));
+                    }
+                    assert!(public["config"].get("systemAudioDeviceId").is_none());
+                    assert!(public["config"].get("microphoneDeviceId").is_none());
+                    assert_eq!(serde_json::to_vec(&journal).unwrap(), original);
+                    assert_eq!(journal.version, 1);
+                    assert!(journal.audio_capture.is_none());
+                    println!("legacy-recovery-public-snapshot:{public}");
+                }
+            }
+        }
     }
     #[test]
     fn physical_regions_handle_negative_origins_and_overflow() {
@@ -1842,6 +2163,7 @@ mod tests {
             published_size: Some(4),
             published_hash: Some(file_digest(&path).unwrap()),
             candidate_directory: None,
+            audio_capture: None,
         };
         assert!(publication_matches(&j));
         fs::write(&path, b"else").unwrap();
@@ -1895,10 +2217,123 @@ mod tests {
             serde_json::to_vec(&json!({"version":1,"sessionId":"abc"})).unwrap(),
         )
         .unwrap();
-        assert!(validate_marker(dir.path(), "abc").is_ok());
-        assert!(validate_marker(dir.path(), "def").is_err());
+        assert!(validate_marker(dir.path(), "abc", 1).is_ok());
+        assert!(validate_marker(dir.path(), "def", 1).is_err());
         fs::write(path, b"invalid").unwrap();
-        assert!(validate_marker(dir.path(), "abc").is_err());
+        assert!(validate_marker(dir.path(), "abc", 1).is_err());
+    }
+    #[test]
+    fn cleanup_preserves_unknown_siblings_and_removes_only_version_declared_files() {
+        use audio_types::{Microphone, RecordingAudioConfig, RenderAudio, Suppression};
+        for mode in ["legacy", "render", "microphone-off", "microphone-save"] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join(".vfl-recording-abc");
+            let stage = root.path().join(".vfl-recording-abc-recovery");
+            fs::create_dir(&directory).unwrap();
+            fs::create_dir(&stage).unwrap();
+            let mut config = config();
+            if mode != "legacy" {
+                config.audio = Some(RecordingAudioConfig {
+                    render: if mode == "render" {
+                        RenderAudio::System {
+                            device_id: "default".into(),
+                        }
+                    } else {
+                        RenderAudio::Off
+                    },
+                    microphone: (mode != "render").then(|| Microphone {
+                        device_id: "default".into(),
+                        suppression: if mode == "microphone-save" {
+                            Suppression::Save
+                        } else {
+                            Suppression::Off
+                        },
+                    }),
+                    ..Default::default()
+                });
+            }
+            let journal = Journal {
+                version: if mode == "legacy" { 1 } else { 2 },
+                session_id: "abc".into(),
+                created_at: "0".into(),
+                directory: directory.clone(),
+                destination: root.path().join("Recording-abc.mp4"),
+                audio_capture: audio_finalize::AudioJournal::new(&config.audio_config()),
+                config,
+                resolved_geometry: None,
+                published_size: None,
+                published_hash: None,
+                candidate_directory: Some(stage.clone()),
+            };
+            let marker =
+                serde_json::to_vec(&json!({"version":journal.version,"sessionId":"abc"})).unwrap();
+            let mut owned = vec!["capture.mp4", "candidate.mp4", "session.lock"];
+            let mut unknown = vec!["unrelated.bin"];
+            if mode == "legacy" {
+                owned.push("capture.pcm");
+                unknown.extend([
+                    "render.f32le",
+                    "microphone.f32le",
+                    audio_envelope::FILE_NAME,
+                ]);
+            } else {
+                owned.extend(
+                    journal
+                        .audio_capture
+                        .as_ref()
+                        .unwrap()
+                        .owned_files(&journal.config.audio_config())
+                        .unwrap(),
+                );
+                unknown.push("capture.pcm");
+                unknown.push(if mode == "render" {
+                    "microphone.f32le"
+                } else {
+                    "render.f32le"
+                });
+                if mode != "microphone-save" {
+                    unknown.extend(["microphone-processed.f32le", "microphone-processed.partial"]);
+                }
+            }
+            for name in owned.iter().chain(&unknown) {
+                fs::write(directory.join(name), name.as_bytes()).unwrap();
+            }
+            fs::write(directory.join("owner.json"), &marker).unwrap();
+            fs::write(stage.join("owner.json"), &marker).unwrap();
+            fs::write(stage.join("candidate.mp4"), b"stage candidate").unwrap();
+            assert!(cleanup_session_files(&journal).is_err(), "{mode}");
+            for name in owned.iter().chain(&unknown) {
+                assert_eq!(
+                    fs::read(directory.join(name)).unwrap(),
+                    name.as_bytes(),
+                    "{mode}/{name}"
+                );
+            }
+            assert_eq!(fs::read(directory.join("owner.json")).unwrap(), marker);
+            assert_eq!(
+                fs::read(stage.join("candidate.mp4")).unwrap(),
+                b"stage candidate"
+            );
+            for name in &unknown {
+                fs::remove_file(directory.join(name)).unwrap();
+            }
+            // An alternate stage unknown must also prevent session deletion.
+            fs::write(stage.join("unrelated.bin"), b"stage unknown").unwrap();
+            assert!(cleanup_session_files(&journal).is_err());
+            assert_eq!(
+                fs::read(directory.join("capture.mp4")).unwrap(),
+                b"capture.mp4"
+            );
+            assert_eq!(
+                fs::read(stage.join("unrelated.bin")).unwrap(),
+                b"stage unknown"
+            );
+            assert_eq!(fs::read(stage.join("owner.json")).unwrap(), marker);
+            fs::remove_file(stage.join("unrelated.bin")).unwrap();
+            cleanup_session_files(&journal).unwrap();
+            assert!(!directory.exists());
+            assert!(!stage.exists());
+        }
     }
     #[test]
     fn only_bundled_and_exact_dev_origins_can_control_capture() {
@@ -1930,5 +2365,44 @@ mod tests {
             remux_budget(1000, hour_pcm + 3),
             remux_budget(1000, hour_pcm)
         );
+    }
+    #[test]
+    fn recovery_audio_versions_never_silently_reinterpret_legacy_stems() {
+        let mut journal = Journal {
+            version: 1,
+            session_id: "abc".into(),
+            created_at: "0".into(),
+            directory: PathBuf::new(),
+            destination: PathBuf::new(),
+            config: config(),
+            resolved_geometry: None,
+            published_size: None,
+            published_hash: None,
+            candidate_directory: None,
+            audio_capture: None,
+        };
+        journal.config.system_audio_device_id = Some("default".into());
+        assert!(validate_journal_audio(&journal).is_ok());
+        journal.version = 2;
+        assert!(validate_journal_audio(&journal).is_err());
+        journal.config.audio = Some(journal.config.audio_config()); // explicit legacy values cannot coexist with v2
+        assert!(validate_journal_audio(&journal).is_err());
+        journal.config.system_audio_device_id = None;
+        assert!(validate_journal_audio(&journal).is_err());
+        journal.audio_capture = audio_finalize::AudioJournal::new(&journal.config.audio_config());
+        assert!(validate_journal_audio(&journal).is_ok());
+        assert!(serde_json::to_vec(&journal).unwrap().len() < PROTOCOL_LIMIT as usize);
+        journal.version = 1;
+        assert!(validate_journal_audio(&journal).is_err());
+    }
+    #[test]
+    fn control_writer_enforces_the_actual512_byte_line_including_newline() {
+        assert_eq!(
+            control_line(&json!({"x":"a".repeat(503)})).unwrap().len(),
+            512
+        );
+        assert!(control_line(&json!({"x":"a".repeat(504)})).is_err());
+        let escaped = control_line(&json!({"x":"a\nb"})).unwrap();
+        assert_eq!(escaped.iter().filter(|b| **b == b'\n').count(), 1);
     }
 }

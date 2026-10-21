@@ -69,6 +69,11 @@ const shippedContractExpectation = {
       encoders: ["ffv1", "rawvideo"],
       filters: ["format", "settb", "showinfo"],
     },
+    recordingAudio: {
+      releaseRequired: true,
+      encoders: ["aac"],
+      filters: ["aeval", "afftdn", "aformat", "amix", "apad", "asetpts", "asplit", "atrim"],
+    },
   },
 };
 

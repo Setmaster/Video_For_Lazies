@@ -36,7 +36,15 @@ export interface StreamDispositions {
   multilayer?: boolean;
 }
 
+export interface AudioTrackDescriptor {
+  streamIndex: number; codec: string | null; channels: number | null; sampleRate: number | null;
+  title: string | null; language: string | null; isDefault: boolean;
+}
+
 export interface VideoProbe {
+  sourceIdentity: string;
+  audioTracks: AudioTrackDescriptor[];
+  audioTracksTruncated: boolean;
   durationS: number;
   width: number;
   height: number;
@@ -122,6 +130,8 @@ export interface InterpolationInstallProgress {
 }
 
 export interface EncodeRequest {
+  audioStreamIndex?: number | null;
+  audioSourceIdentity?: string | null;
   inputPath: string;
   outputPath: string;
   format: OutputFormat;

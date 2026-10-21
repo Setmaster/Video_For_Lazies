@@ -226,3 +226,10 @@
   background: #000;
 }
 .vfl-record-stage.has-preview .vfl-record-empty { width: 100%; max-width: 520px; }
+
+.vfl-audio-source-controls { display: grid; gap: 8px; padding: 10px 0; }
+.vfl-audio-level-label, .vfl-audio-meter-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.vfl-audio-level-label output { font-variant-numeric: tabular-nums; }
+.vfl-audio-meter-row meter { flex: 1; width: 0; min-width: 64px; height: 10px; }
+.vfl-audio-meter-row span { flex: 1; font-size: 11px; }
+.vfl-audio-source-controls input[type="range"] { width: 100%; }

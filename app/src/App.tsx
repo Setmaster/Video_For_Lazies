@@ -12,6 +12,8 @@ import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
 import { UserRecipeDialog, type UserRecipeDialogState } from "./components/UserRecipeDialog";
+import { useAudioTrackPreview } from "./lib/audioTrackPreview";
+import { audioTrackLabel } from "./lib/audioTrackState";
 import RecordingWorkspace from "./components/RecordingWorkspace";
 import type { RecordingSnapshot } from "./lib/recording";
 import { WorkspaceTabs, type Workspace } from "./components/WorkspaceTabs";
@@ -670,8 +672,21 @@ function App() {
     previewAdmissionBusyRef.current = busy;
     setPreviewAdmissionBusy(busy);
   }, []);
+  const [audioTrackWorkBusy, setAudioTrackWorkBusy] = useState(false);
+  const audioTrackWorkBusyRef = useRef(false);
+  const audioWorkParts = useRef({ probe: false, preview: false });
+  const setAudioWork = useCallback((part: "probe" | "preview", busy: boolean) => {
+    audioWorkParts.current[part] = busy;
+    audioTrackWorkBusyRef.current = audioWorkParts.current.probe || audioWorkParts.current.preview;
+    setAudioTrackWorkBusy(audioTrackWorkBusyRef.current);
+  }, []);
+  const handleAudioPreviewAdmission = useCallback((busy: boolean) => setAudioWork("preview", busy), [setAudioWork]);
+  const audioPreviewControllerRef = useRef<ReturnType<typeof useAudioTrackPreview> | null>(null);
   const recordingSnapshotRef = useRef<RecordingSnapshot | null>(null);
   const recordingClosePendingRef = useRef(false);
+  const recordingCloseHandlerRef = useRef<(() => Promise<void>) | null>(null);
+  const [ordinaryClosing, setOrdinaryClosing] = useState(false);
+  const ordinaryClosingRef = useRef(false);
   const handleRecordingStateChange = useCallback((snapshot: RecordingSnapshot, busy: boolean) => {
     recordingSnapshotRef.current = snapshot;
     setRecordingSnapshot(snapshot);
@@ -714,6 +729,15 @@ function App() {
   const [customHeightPx, setCustomHeightPx] = useState("");
   const [outputAspectLocked, setOutputAspectLocked] = useState(true);
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [audioSelection, setAudioSelection] = useState<{ audioStreamIndex: number | null; audioSourceIdentity: string | null }>({ audioStreamIndex: null, audioSourceIdentity: null });
+  const audioSelectionRef = useRef({ path: "", ...audioSelection });
+  const [audioProbePending, setAudioProbePending] = useState(false);
+  const [probeRevision, setProbeRevision] = useState(0);
+  const audioProbeGeneration = useRef(0), probedInputPath = useRef("");
+  const markAudioProbePending = useCallback((pending: boolean) => {
+    if (pending) setAudioWork("probe", true);
+    setAudioProbePending(pending);
+  }, [setAudioWork]);
   const [strictFit, setStrictFit] = useState(false);
   const [subtitlePath, setSubtitlePath] = useState("");
   const [subtitleInspection, setSubtitleInspection] = useState<SubtitleInspection | null>(null);
@@ -1267,53 +1291,49 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const handle = await getCurrentWindow().onCloseRequested(async (event) => {
-          // Rust synchronously holds native close; one shared event below owns
-          // confirmation and waits until the recording is saved.
-          if (recordingBusyRef.current) { event.preventDefault(); return; }
-          const queuedCount = summarizeExportQueue(exportQueueStateRef.current).queued;
-          const encoding = jobIdRef.current !== null || pendingEncodeRef.current !== null;
-          const preparing = queuePreparationCountRef.current > 0;
-          const updating = updateBusyRef.current;
-          const installing = interpolationInstallingRef.current;
-          if (!encoding && queuedCount === 0 && !preparing && !updating && !installing) return;
-
-          const unfinished = [
-            encoding ? "an export is still running" : null,
-            queuedCount > 0
-              ? `${queuedCount} queued export${queuedCount === 1 ? " has" : "s have"} not started`
-              : null,
-            preparing ? "selected queue files are still being prepared" : null,
-            updating ? "an update is still being prepared" : null,
-            installing ? "Smooth motion is still being checked or installed" : null,
-          ].filter((part): part is string => Boolean(part));
-          const summary = `${unfinished.join(", and ")}.`;
-          const ok = await confirmDialog(`${summary} Close anyway?`, {
-            title: "Video For Lazies",
-            kind: "warning",
-          });
-          if (!ok) event.preventDefault();
-        });
-        if (cancelled) handle();
-        else unlisten = handle;
-      } catch {
-        // Not running inside a Tauri window.
-      }
-    })();
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
+    let disposed = false, unlistenWindow: (() => void) | undefined, unlistenPreview: (() => void) | undefined;
+    let inFlight: Promise<void> | null = null;
+    const actualRecording = () => recordingBusyRef.current || !!recordingSnapshotRef.current?.selectionRequestId ||
+      !!recordingSnapshotRef.current && ["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(recordingSnapshotRef.current.phase);
+    const close = () => {
+      if (inFlight) return inFlight;
+      let destroyed = false;
+      inFlight = (async () => {
+        if (actualRecording()) return;
+        const queuedCount = summarizeExportQueue(exportQueueStateRef.current).queued;
+        const unfinished = [
+          jobIdRef.current !== null || pendingEncodeRef.current !== null ? "an export is still running" : null,
+          queuedCount > 0 ? `${queuedCount} queued export${queuedCount === 1 ? " has" : "s have"} not started` : null,
+          queuePreparationCountRef.current > 0 ? "selected queue files are still being prepared" : null,
+          updateBusyRef.current ? "an update is still being prepared" : null,
+          interpolationInstallingRef.current ? "Smooth motion is still being checked or installed" : null,
+        ].filter(Boolean);
+        if (unfinished.length && !await confirmDialog(`${unfinished.join(", and ")}. Close anyway?`, { title: "Video For Lazies", kind: "warning" })) return;
+        if (disposed) return;
+        // Keep open never enters this committed-close lane. All new claims
+        // are blocked synchronously while exact media cleanup is awaited.
+        ordinaryClosingRef.current = true; setOrdinaryClosing(true);
+        if (actualRecording()) { await recordingCloseHandlerRef.current?.(); return; }
+        if (audioPreviewControllerRef.current && !await audioPreviewControllerRef.current.close()) throw new Error("Audio preview cleanup is not confirmed. Retry cleanup before closing.");
+        if (disposed) return;
+        if (actualRecording()) { await recordingCloseHandlerRef.current?.(); return; }
+        await getCurrentWindow().destroy();
+        destroyed = true;
+      })().catch(failure => { if (!disposed) setStatus(`Could not close safely: ${String(failure)}`); }).finally(() => {
+        if (!destroyed) { ordinaryClosingRef.current = false; if (!disposed) setOrdinaryClosing(false); }
+        inFlight = null;
+      });
+      return inFlight;
     };
+    void getCurrentWindow().onCloseRequested(async event => { event.preventDefault(); await close(); }).then(handle => { if (disposed) handle(); else unlistenWindow = handle; }).catch(() => {});
+    void listen("audio-preview-close-requested", () => { void close(); }).then(handle => { if (disposed) handle(); else unlistenPreview = handle; }).catch(() => {});
+    return () => { disposed = true; unlistenWindow?.(); unlistenPreview?.(); };
   }, []);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listen("recording-close-requested", async () => {
+    const closeRecording = async () => {
       if (recordingClosePendingRef.current) return;
       recordingClosePendingRef.current = true;
       try {
@@ -1329,6 +1349,7 @@ function App() {
           const next = await invoke<RecordingSnapshot>("recording_snapshot");
           if (!next.selectionRequestId && !["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(next.phase)) {
             if (next.phase === "completed" || next.phase === "idle" || (next.phase === "failed" && next.recoveries.length === 0)) {
+              if (audioPreviewControllerRef.current && !await audioPreviewControllerRef.current.close()) throw new Error("Audio preview cleanup is not confirmed.");
               await invoke("recording_close", { sessionId: next.sessionId });
             } else {
               changeWorkspace("record");
@@ -1341,8 +1362,10 @@ function App() {
       } catch (error) {
         setStatus(`Could not close safely: ${String(error)}`);
       } finally { recordingClosePendingRef.current = false; }
-    }).then((handle) => { if (disposed) handle(); else unlisten = handle; }).catch(() => {});
-    return () => { disposed = true; unlisten?.(); };
+    };
+    recordingCloseHandlerRef.current = closeRecording;
+    void listen("recording-close-requested", closeRecording).then((handle) => { if (disposed) handle(); else unlisten = handle; }).catch(() => {});
+    return () => { disposed = true; unlisten?.(); if (recordingCloseHandlerRef.current === closeRecording) recordingCloseHandlerRef.current = null; };
   }, []);
 
   useEffect(() => {
@@ -1505,6 +1528,7 @@ function App() {
   }
 
   function applyNewInput(path: string, nextFormat: OutputFormat) {
+    if (ordinaryClosingRef.current) return;
     if (
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
@@ -1522,7 +1546,14 @@ function App() {
     }
 
     if (nextFormat !== formatRef.current) setFormat(nextFormat);
+    audioPreviewControllerRef.current?.resetIntent();
+    void audioPreviewControllerRef.current?.stop(false);
+    audioProbeGeneration.current += 1;
+    audioSelectionRef.current = { path, audioStreamIndex: null, audioSourceIdentity: null };
+    setAudioSelection({ audioStreamIndex: null, audioSourceIdentity: null });
+    markAudioProbePending(true);
     setInputPath(path);
+    setProbeRevision(value => value + 1);
     setStatus("Probing…");
   }
 
@@ -2985,7 +3016,10 @@ function App() {
     externalSubtitleBlockingReason ??
     exactSampleAutoVideoCodecBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting an exact sample." : null);
-  const exportBlockingReason = exactExportPlanBlockingReason;
+  const audioTrackTrimBlockingReason = audioSelection.audioStreamIndex !== null && probe &&
+    (Number(trimStart || 0) >= probe.durationS || trimEnd.trim() !== "" && Number(trimEnd) > probe.durationS)
+    ? "The selected audio track changes the source interval. Adjust the trim before exporting." : null;
+  const exportBlockingReason = audioTrackTrimBlockingReason ?? exactExportPlanBlockingReason;
   const colorHandlingSummary = format === "mp3"
     ? "Video color is not included in MP3 output"
     : colorSource.kind === "standard"
@@ -3126,7 +3160,7 @@ function App() {
     cropDetecting ||
     frameSaving ||
     updateBusy;
-  const encodeBusy = exportWorkBusy || interpolationInstalling || recordingBusy || previewAdmissionBusy;
+  const encodeBusy = exportWorkBusy || interpolationInstalling || recordingBusy || previewAdmissionBusy || audioTrackWorkBusy || ordinaryClosing;
   const lastExportIsCurrentOutcome =
     latestAttempt.kind === "succeeded" || latestAttempt.kind === "target-missed";
   const latestAttemptOutputPath =
@@ -3181,7 +3215,7 @@ function App() {
   ]);
 
   const exportReady = Boolean(inputPath && outputPath && probe && !exportBlockingReason);
-  const sampleExportReady = Boolean(inputPath && outputPath && probe && !exactSamplePlanBlockingReason);
+  const sampleExportReady = Boolean(inputPath && outputPath && probe && !exactSamplePlanBlockingReason && !audioTrackTrimBlockingReason);
   const planHeroReady =
     exportReady && !attemptUi.isActive && !attemptUi.isFailure && !attemptUi.isCancelled && !attemptUi.isTargetMissed;
   const queueCounts = useMemo(() => summarizeExportQueue(exportQueueState), [exportQueueState]);
@@ -3471,10 +3505,45 @@ function App() {
     };
   }, []);
 
-  const videoSrc = useMemo(() => {
-    if (!inputPath || !previewReady) return "";
-    return convertFileSrc(inputPath);
-  }, [inputPath, previewReady]);
+  const unloadAudioPreview = useCallback(() => {
+    const playback = cropperRef.current?.getPlaybackState() || { timeS: 0, playing: false };
+    cropperRef.current?.unload();
+    setPreviewMediaReady(false);
+    return playback;
+  }, []);
+  const restoreAudioPreview = useCallback((playback: { timeS: number; playing: boolean }) => {
+    if (activeWorkspaceRef.current !== "edit") return;
+    cropperRef.current?.seekTo(playback.timeS);
+    if (playback.playing) void cropperRef.current?.play();
+  }, []);
+  const audioPreview = useAudioTrackPreview({ visible: activeWorkspace === "edit" && !ordinaryClosing, enabled: previewReady && !audioProbePending && probedInputPath.current === inputPath,
+    path: inputPath, probe, unload: unloadAudioPreview, restore: restoreAudioPreview, onAdmissionBusyChange: handleAudioPreviewAdmission });
+  audioPreviewControllerRef.current = audioPreview;
+  useEffect(() => {
+    // Keep probe admission through the prepare handoff, before its effect can
+    // submit native work. No render/microtask gap may claim a queue item.
+    if (!audioProbePending && (activeWorkspace !== "edit" || !probe?.hasAudio || audioPreview.pending || audioPreview.asset || audioPreview.error || audioPreview.cancelled)) setAudioWork("probe", false);
+  }, [audioProbePending, activeWorkspace, probe, audioPreview.pending, audioPreview.asset, audioPreview.error, audioPreview.cancelled, setAudioWork]);
+  const handlePreviewSourceReady = useCallback((ready: boolean, token?: string) => {
+    const controller = audioPreviewControllerRef.current;
+    if (!controller || token !== controller.sourceToken) return;
+    setPreviewMediaReady(ready);
+    if (ready) controller.ready(token);
+  }, []);
+  const handlePreviewSourceError = useCallback((token: string) => audioPreviewControllerRef.current?.playbackError(token), []);
+  const videoSrc = audioPreview.path && previewReady ? convertFileSrc(audioPreview.path) : "";
+  function selectAudioTrack(value: string) {
+    if (ordinaryClosingRef.current) return;
+    if (!probe || !probe.sourceIdentity || jobIdRef.current !== null || pendingEncodeRef.current || exportQueueStateRef.current.autoRun) return;
+    const index = value === "auto" ? null : Number(value);
+    if (index !== null && !probe.audioTracks.some(track => track.streamIndex === index)) { setStatus("Selected audio track is unavailable."); return; }
+    audioPreview.resetIntent();
+    void audioPreview.stop(true);
+    audioProbeGeneration.current += 1;
+    audioSelectionRef.current = { path: inputPath, audioStreamIndex: index, audioSourceIdentity: probe.sourceIdentity };
+    setAudioSelection({ audioStreamIndex: index, audioSourceIdentity: probe.sourceIdentity });
+    markAudioProbePending(true); setProbeRevision(value => value + 1);
+  }
 
   useEffect(() => {
     if (!hasTauriRuntime()) return;
@@ -3535,17 +3604,29 @@ function App() {
 
   useEffect(() => {
     let stop = false;
+    const generation = ++audioProbeGeneration.current;
+    const selection = audioSelectionRef.current.path === inputPath ? audioSelectionRef.current : { audioStreamIndex: null, audioSourceIdentity: null };
+    const sameSource = probedInputPath.current === inputPath;
     async function run() {
       if (!inputPath) {
         setProbe(null);
+        markAudioProbePending(false);
+        setAudioWork("probe", false);
         setProbeError(null);
         setCropDetectHint(null);
         return;
       }
+      markAudioProbePending(true);
       setProbeError(null);
       try {
-        const p = await invoke<VideoProbe>("probe_video", { path: inputPath });
-        if (stop) return;
+        const p = await invoke<VideoProbe>("probe_video", { path: inputPath, audioStreamIndex: selection.audioStreamIndex, audioSourceIdentity: selection.audioSourceIdentity });
+        if (stop || generation !== audioProbeGeneration.current) return;
+        probedInputPath.current = inputPath;
+        // Auto still binds this clip's fresh identity; only settings-only
+        // templates deliberately omit it. A replaced file cannot silently
+        // change preview/export audio between probes.
+        audioSelectionRef.current = { path: inputPath, audioStreamIndex: selection.audioStreamIndex, audioSourceIdentity: p.sourceIdentity };
+        setAudioSelection({ audioStreamIndex: selection.audioStreamIndex, audioSourceIdentity: p.sourceIdentity });
         setProbe(p);
         const pendingSnapshot = pendingQueueSnapshotRef.current;
         const preservesAppliedSnapshot =
@@ -3568,7 +3649,7 @@ function App() {
         if (!p.hasAudio && formatRef.current === "mp3") {
           setFormat("mp4");
         }
-        if (!preservesAppliedSnapshot) {
+        if (!preservesAppliedSnapshot && !sameSource) {
           setCropRect({ x: 0, y: 0, w: 1, h: 1 });
         }
         setCropDetectHint(null);
@@ -3576,21 +3657,23 @@ function App() {
           setStatus("Ready.");
         }
       } catch (e) {
-        if (stop) return;
+        if (stop || generation !== audioProbeGeneration.current) return;
         if (pendingQueueSnapshotRef.current?.inputPath === inputPath) {
           pendingQueueSnapshotRef.current = null;
         }
         const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "Failed to probe video.";
         setProbe(null);
         setProbeError(msg);
-        setStatus("Probe failed.");
+        setStatus("Probe failed. Reload or reselect the source audio track.");
+      } finally {
+        if (!stop && generation === audioProbeGeneration.current) markAudioProbePending(false);
       }
     }
     run();
     return () => {
       stop = true;
     };
-  }, [inputPath]);
+  }, [inputPath, probeRevision, markAudioProbePending, setAudioWork]);
 
   useEffect(() => {
     if (!smokeConfig) return;
@@ -4492,12 +4575,15 @@ function App() {
       perturbFirstFrame: format === "mp3" ? false : perturbFirstFrame,
       loopVideo: false,
       strictFit: requestStrictFit,
+      audioStreamIndex: null,
+      audioSourceIdentity: null,
       // Same-settings batches intentionally exclude clip-scoped subtitles.
       subtitlePath: null,
     };
   }
 
   function buildRequest(): EncodeRequest {
+    if (audioTrackTrimBlockingReason) throw new Error(audioTrackTrimBlockingReason);
     if (interpolationBlockingReason) throw new Error(interpolationBlockingReason);
     if (!inputPath) throw new Error("Pick an input file first.");
     if (!outputPath) throw new Error("Pick an output path first.");
@@ -4548,6 +4634,8 @@ function App() {
       title: title.trim() ? title.trim() : null,
       sizeLimitMb: size,
       audioEnabled: audioEnabled,
+      audioStreamIndex: audioSelection.audioStreamIndex,
+      audioSourceIdentity: audioSelection.audioSourceIdentity,
       normalizeAudio,
       stripMetadata,
       colorPolicy,
@@ -4719,6 +4807,12 @@ function App() {
     const crop = request.crop ?? null;
     const color = request.color ?? null;
 
+    audioProbeGeneration.current += 1;
+    audioSelectionRef.current = { path: request.inputPath, audioStreamIndex: request.audioStreamIndex ?? null, audioSourceIdentity: request.audioSourceIdentity ?? sourceProbe.sourceIdentity };
+    setAudioSelection({ audioStreamIndex: request.audioStreamIndex ?? null, audioSourceIdentity: request.audioSourceIdentity ?? sourceProbe.sourceIdentity });
+    probedInputPath.current = request.inputPath;
+    audioPreviewControllerRef.current?.resetIntent();
+    void audioPreviewControllerRef.current?.stop(true);
     setFormat(request.format);
     setTitle(request.title ?? "");
     setSizeLimitMb(request.sizeLimitMb > 0 ? String(request.sizeLimitMb) : "");
@@ -4876,7 +4970,7 @@ function App() {
         }
         const requestFingerprint = JSON.stringify(item.request);
         const [sourceProbe, nextOutputPath, inspectedSubtitle] = await Promise.all([
-          invoke<VideoProbe>("probe_video", { path: item.inputPath }),
+          invoke<VideoProbe>("probe_video", { path: item.inputPath, audioStreamIndex: item.request.audioStreamIndex ?? null, audioSourceIdentity: item.request.audioSourceIdentity ?? null }),
           suggestedOutputForInput(item.inputPath, item.format, claimedOutputPathsForPreparation()),
           item.request.subtitlePath
             ? invoke<SubtitleInspection>("inspect_srt", { path: item.request.subtitlePath })
@@ -5049,7 +5143,7 @@ function App() {
   }
 
   async function startNextQueuedItem() {
-    if (recordingBusyRef.current || previewAdmissionBusyRef.current) return;
+    if (recordingBusyRef.current || previewAdmissionBusyRef.current || audioTrackWorkBusyRef.current || ordinaryClosingRef.current) return;
     if (!encodeEventsReadyRef.current) {
       dispatchExportQueue({ type: "stop-auto-run" });
       setStatus(
@@ -5112,6 +5206,8 @@ function App() {
   }
 
   function runQueue() {
+    if (ordinaryClosingRef.current) return;
+    if (audioTrackWorkBusyRef.current) { setStatus("Wait for audio selection and preview cleanup before running the queue."); return; }
     if (previewAdmissionBusyRef.current) {
       setStatus("Wait for preview to stop before running the export queue.");
       return;
@@ -5202,6 +5298,8 @@ function App() {
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
     reportAsSmokeResult?: boolean;
   }): Promise<StartEncodeResult> {
+    if (ordinaryClosingRef.current) return { ok: false, message: "The app is closing." };
+    if (audioTrackWorkBusyRef.current) return { ok: false, message: "Wait for audio selection and preview cleanup before exporting." };
     if (previewAdmissionBusyRef.current) return { ok: false, message: "Wait for preview to stop before starting an export." };
     if (recordingBusyRef.current) return { ok: false, message: "Stop and save the recording before starting an export." };
     if (!updateStartupReady) return { ok: false, message: "Wait for the app startup check to finish." };
@@ -5512,7 +5610,7 @@ function App() {
     activeWorkspaceRef.current = workspace;
     setDragActive(false);
     trimDragCleanupRef.current?.();
-    if (workspace !== "edit") pausePreviewPlayback();
+    if (workspace !== "edit") { pausePreviewPlayback(); void audioPreviewControllerRef.current?.stop(false); }
     setActiveWorkspace(workspace);
   }
 
@@ -7667,11 +7765,16 @@ function App() {
                   ) : !previewReady ? (
                     <div className="vfl-muted" role="status" aria-live="polite" aria-atomic="true">Loading preview…</div>
                   ) : (
-                    <div className="vfl-preview-layout">
+                    <div className="vfl-preview-layout" data-audio-preview-kind={audioPreview.asset?.kind || ""} data-audio-preview-id={audioPreview.asset?.proxyId || ""} data-audio-preview-request={audioPreview.asset?.requestId || ""}>
+                      {audioProbePending || audioPreview.pending ? <div id="vfl-audio-preview-pending" className="vfl-inline-hint" role="status">Preparing selected audio track… <button type="button" onClick={() => void audioPreview.cancel()}>Cancel preview</button></div> : null}
+                      {!audioProbePending && !audioPreview.pending && !audioPreview.asset && !audioPreview.error && probe.hasAudio && <div className="vfl-inline-hint">Audio preview is off. <button type="button" onClick={audioPreview.retry}>Prepare audio preview</button></div>}
+                      {audioPreview.error && <div id="vfl-audio-preview-error" className="vfl-error" role="alert">{audioPreview.error} <button type="button" onClick={audioPreview.retry}>Retry audio preview</button></div>}
                       <div className="vfl-cropper-wrap">
                         <VideoCropper
                           ref={cropperRef}
                           src={videoSrc}
+                          sourceToken={audioPreview.sourceToken}
+                          timelineOffsetS={audioPreview.timelineOffsetS}
                           rect={cropRect}
                           onChange={(rect) => {
                             if (activeWorkspaceRef.current === "edit") setCropRect(rect);
@@ -7684,7 +7787,8 @@ function App() {
                           colorFilter={previewColorFilter}
                           onTimeUpdate={setPreviewTimeS}
                           onPlaybackChange={setPreviewPlaying}
-                          onSourceReadyChange={setPreviewMediaReady}
+                          onSourceReadyChange={handlePreviewSourceReady}
+                          onSourceError={handlePreviewSourceError}
                         />
                       </div>
 
@@ -7871,7 +7975,7 @@ function App() {
                         and crop tools live here.
                       </div>
                       <div className="vfl-actions">
-                        <button className="primary" onClick={pickInput} disabled={encodeBusy}>
+                        <button className="primary" onClick={pickInput} disabled={exportWorkBusy || interpolationInstalling || recordingBusy || previewAdmissionBusy || ordinaryClosing}>
                           Browse…
                         </button>
                       </div>
@@ -7925,7 +8029,7 @@ function App() {
               <label htmlFor="vfl-input-path">Input</label>
               <input id="vfl-input-path" value={inputPath} placeholder="Pick a video…" readOnly />
               <div className="vfl-file-actions">
-                <button className={!inputPath ? "primary" : ""} onClick={pickInput} disabled={encodeBusy}>
+                <button className={!inputPath ? "primary" : ""} onClick={pickInput} disabled={exportWorkBusy || interpolationInstalling || recordingBusy || previewAdmissionBusy || ordinaryClosing}>
                   Browse…
                 </button>
               </div>
@@ -8100,6 +8204,11 @@ function App() {
               </div>
               <div className="vfl-field">
                 <div className="vfl-field-label">Audio</div>
+                {probe?.hasAudio && <><label htmlFor="vfl-audio-track">Audio track</label><select id="vfl-audio-track" value={audioSelection.audioStreamIndex === null ? "auto" : String(audioSelection.audioStreamIndex)}
+                  disabled={attemptUi.isActive || queueRunning || queueSnapshotApplying || recordingBusy || audioProbePending} onChange={event => selectAudioTrack(event.currentTarget.value)}>
+                  <option value="auto">Default track</option>
+                  {probe.audioTracks.map(track => <option key={track.streamIndex} value={String(track.streamIndex)}>{audioTrackLabel(track)}</option>)}
+                </select><div id="vfl-audio-track-hint" className="vfl-inline-hint">Preview and export use this track. Export includes only the selected audio track; the original keeps all tracks.{probe.audioTracksTruncated ? " Track list limited; the selected and default tracks are included." : ""}</div></>}
                 <label className="vfl-check vfl-check-card">
                   <input
                     type="checkbox"
@@ -9255,6 +9364,7 @@ function App() {
                         {outcome?.outputSizeBytes ? ` • ${formatByteSize(outcome.outputSizeBytes)}` : ""}
                       </div>
                       <div className="vfl-queue-item-meta">{queuedTrimSummary}</div>
+                      <div className="vfl-queue-item-meta">Audio: {item.request.audioStreamIndex == null ? "Default track" : `stream ${item.request.audioStreamIndex}`}{item.request.audioEnabled || item.format === "mp3" ? "" : " · excluded from export"}</div>
                       {actualOutputPath && actualOutputPath !== item.outputPath ? (
                         <div className="vfl-queue-item-meta">Actual result: {actualOutputPath}</div>
                       ) : null}
@@ -9445,8 +9555,8 @@ function App() {
         inert={activeWorkspace !== "record"}
       >
         <RecordingWorkspace
-          visible={activeWorkspace === "record"}
-          busy={exportWorkBusy || interpolationInstalling}
+          visible={activeWorkspace === "record" && !ordinaryClosing}
+          busy={exportWorkBusy || interpolationInstalling || audioTrackWorkBusy || ordinaryClosing}
           onRecordingStateChange={handleRecordingStateChange}
           onPreviewAdmissionBusyChange={handlePreviewAdmissionBusyChange}
           onEditVideo={async (path) => {

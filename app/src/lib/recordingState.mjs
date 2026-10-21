@@ -1,3 +1,4 @@
+import { isAudioStatus, isRecordingAudioConfig } from "./recordingAudioState.mjs";
 const activePhases = new Set(["preparing", "countdown", "starting", "recording", "stopping", "finalizing"]);
 const phases = new Set(["idle", ...activePhases, "completed", "recoverable", "failed"]);
 
@@ -38,6 +39,7 @@ export function acceptRecordingSnapshot(current, incoming) {
       (incoming.sessionId !== null && typeof incoming.sessionId !== "string") ||
       (incoming.outputPath !== null && typeof incoming.outputPath !== "string") ||
       (incoming.message !== null && typeof incoming.message !== "string") ||
+      (incoming.audio !== null && !isAudioStatus(incoming.audio)) ||
       (incoming.resolvedGeometry !== null && (!incoming.resolvedGeometry ||
         ![incoming.resolvedGeometry.width, incoming.resolvedGeometry.height].every(Number.isSafeInteger) ||
         incoming.resolvedGeometry.width < 16 || incoming.resolvedGeometry.height < 16 ||
@@ -47,8 +49,7 @@ export function acceptRecordingSnapshot(current, incoming) {
         typeof incoming.config.requestId !== "string" || !isCaptureSource(incoming.config.source) ||
         ![24, 25, 30, 50, 60].includes(incoming.config.fps) || !["standard", "high"].includes(incoming.config.quality) ||
         ![0, 3, 5].includes(incoming.config.countdownSeconds) || typeof incoming.config.showCursor !== "boolean" ||
-        (incoming.config.systemAudioDeviceId !== null && typeof incoming.config.systemAudioDeviceId !== "string") ||
-        (incoming.config.microphoneDeviceId !== null && typeof incoming.config.microphoneDeviceId !== "string") ||
+        !isRecordingAudioConfig(incoming.config.audio) ||
         typeof incoming.config.outputDirectory !== "string")) ||
       (incoming.countdownRemaining !== null && (!Number.isSafeInteger(incoming.countdownRemaining) || incoming.countdownRemaining < 0)) ||
       incoming.recoveries.some((recovery) => !recovery || typeof recovery.sessionId !== "string" || !recovery.sessionId || typeof recovery.createdAt !== "string" || typeof recovery.message !== "string") ||

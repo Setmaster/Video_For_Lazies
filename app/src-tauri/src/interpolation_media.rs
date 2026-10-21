@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const MAX_SCRATCH_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -35,44 +35,7 @@ pub struct InterpolationDiagnostics {
     pub scratch_bytes: u64,
 }
 
-#[derive(Debug)]
-pub(crate) struct SourceIdentity {
-    len: u64,
-    modified: SystemTime,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-}
-impl SourceIdentity {
-    pub fn capture(path: &Path) -> Result<Self, String> {
-        let metadata = fs::metadata(path)
-            .map_err(|_| "Could not inspect interpolation source.".to_string())?;
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        Ok(Self {
-            len: metadata.len(),
-            modified: metadata
-                .modified()
-                .map_err(|_| "Source modification time is unavailable.".to_string())?,
-            #[cfg(unix)]
-            dev: metadata.dev(),
-            #[cfg(unix)]
-            ino: metadata.ino(),
-        })
-    }
-    pub fn verify(&self, path: &Path) -> Result<(), String> {
-        let current = Self::capture(path)?;
-        let changed = current.len != self.len || current.modified != self.modified;
-        #[cfg(unix)]
-        let changed = changed || current.dev != self.dev || current.ino != self.ino;
-        if changed {
-            Err("The source changed during interpolation. Restore the source or load it again before exporting.".into())
-        } else {
-            Ok(())
-        }
-    }
-}
+pub(crate) use crate::media_source::SourceIdentity;
 
 pub(crate) struct PreparedVideo {
     _directory: TempDir,
@@ -1200,12 +1163,77 @@ mod tests {
     }
 
     #[test]
+    fn rewriting_video_does_not_replace_explicit_selected_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.mp4");
+        fs::write(&source, b"inert source identity").unwrap();
+        let identity = SourceIdentity::capture(&source).unwrap();
+        // Source and scratch have different owners, as in the production path.
+        // The held Windows source handle must close before its source directory.
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("prepared.mkv");
+        let prepared = PreparedVideo {
+            _directory: scratch,
+            path,
+            source,
+            identity,
+            start_s: 0.0,
+            rate: Rate::for_playback(60, 1.0).unwrap(),
+            diagnostics: InterpolationDiagnostics {
+                target_fps: 60,
+                model_id: "fixture".into(),
+                model_digest: String::new(),
+                worker_digest: String::new(),
+                input_frames: 30,
+                output_frames: 60,
+                inferred_frames: 30,
+                held_frames: 0,
+                cut_pairs: 0,
+                scratch_bytes: 0,
+            },
+            output_budget: 1024,
+            video_stream_index: 0,
+            format_mp4: true,
+            loop_video: false,
+            worker_path: PathBuf::new(),
+            matrix: "bt709".into(),
+            range: "tv".into(),
+            color_tags: Vec::new(),
+        };
+        let args = [
+            "-i",
+            "source.mp4",
+            "-map",
+            "0:0",
+            "-map",
+            "0:9",
+            "-c:v",
+            "libx264",
+            "out.mp4",
+        ]
+        .map(str::to_owned);
+        let rewritten = prepared.rewrite_args(&args, 0, true);
+        assert!(rewritten.windows(2).any(|p| p == ["-map", "1:0"]));
+        assert!(rewritten.windows(2).any(|p| p == ["-map", "0:9"]));
+        assert!(!rewritten.windows(2).any(|p| p == ["-map", "0:1"]));
+    }
+
+    #[test]
     fn changed_source_is_rejected() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(file.path(), b"first").unwrap();
-        let identity = SourceIdentity::capture(file.path()).unwrap();
-        identity.verify(file.path()).unwrap();
-        fs::write(file.path(), b"different-length").unwrap();
-        assert!(identity.verify(file.path()).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.mp4");
+        fs::write(&path, b"first").unwrap();
+        let identity = SourceIdentity::capture(&path).unwrap();
+        identity.verify(&path).unwrap();
+        #[cfg(unix)]
+        {
+            fs::write(&path, b"different-length").unwrap();
+            assert!(identity.verify(&path).is_err());
+        }
+        #[cfg(windows)]
+        {
+            assert!(fs::write(&path, b"different-length").is_err());
+            identity.verify(&path).unwrap();
+        }
     }
 }

@@ -1,5 +1,8 @@
 //! Private, bounded stdio protocol. Media APIs are linked only into this helper.
 #[cfg(windows)]
+#[path = "../recording/host_protocol.rs"]
+mod host_protocol;
+#[cfg(windows)]
 #[path = "../recording/windows.rs"]
 mod windows;
 
@@ -11,7 +14,7 @@ fn main() {
         atomic::{AtomicBool, Ordering},
     };
     fn send(mut value: serde_json::Value) {
-        value["protocolVersion"] = serde_json::json!(2);
+        value["protocolVersion"] = serde_json::json!(3);
         let mut out = std::io::stdout().lock();
         if serde_json::to_writer(&mut out, &value).is_err()
             || out.write_all(b"\n").is_err()
@@ -35,7 +38,7 @@ fn main() {
             return;
         }
     };
-    if request["protocolVersion"] != 2 {
+    if request["protocolVersion"] != 3 {
         send(
             serde_json::json!({"type":"error","message":"Recording component version mismatch. Restore the complete app folder."}),
         );
@@ -45,6 +48,8 @@ fn main() {
     let cancel = stop.clone();
     let preview = Arc::new(windows::preview_control::Controls::default());
     let controls = preview.clone();
+    let audio = Arc::new(windows::audio_pipeline::Controls::default());
+    let audio_input = audio.clone();
     std::thread::spawn(move || {
         loop {
             let mut line = Vec::new();
@@ -71,12 +76,25 @@ fn main() {
                     }
                 }
                 Some("preview-off") => controls.off(),
+                Some("audio-levels") => {
+                    let Ok(levels) = serde_json::from_value(value["value"].clone()) else {
+                        break;
+                    };
+                    let _ = audio_input.submit(levels);
+                }
                 _ => break,
             }
         }
         controls.off();
         cancel.store(true, Ordering::Release);
     });
+    let reporter = match host_protocol::Reporter::new() {
+        Ok(r) => r,
+        Err(message) => {
+            send(serde_json::json!({"type":"error","message":message}));
+            return;
+        }
+    };
     let mut no_media = false;
     let result: Result<serde_json::Value, String> = (|| match request["operation"]
         .as_str()
@@ -87,6 +105,14 @@ fn main() {
                 return Err("Screen recording requires Windows Graphics Capture support.".into());
             }
             serde_json::to_value(windows::enumerate_displays()?).map_err(|e| e.to_string())
+        }
+        "audio-applications" => serde_json::to_value(windows::audio_applications(
+            request["excludedPid"].as_u64().unwrap_or(0) as u32,
+        )?)
+        .map_err(|e| e.to_string()),
+        "audio-capabilities" => {
+            let reason = windows::audio_capability()?;
+            Ok(serde_json::json!({"application":{"available":reason.is_none(),"reason":reason}}))
         }
         "windows" => serde_json::to_value(windows::enumerate_windows(
             request["excludedPid"].as_u64().unwrap_or(0) as u32,
@@ -109,7 +135,7 @@ fn main() {
                 request["showCursor"].as_bool().unwrap_or(true),
                 stop,
                 preview,
-                |value| send(serde_json::json!({"type":"progress","value":value})),
+                |value| reporter.progress(value),
             )
         }
         "audio-devices" => {
@@ -124,11 +150,13 @@ fn main() {
         "record" => {
             let config = serde_json::from_value(request["config"].clone())
                 .map_err(|e| format!("Invalid recording settings: {e}"))?;
+            let progress_reporter = reporter.clone();
             let outcome = windows::run(
                 config,
                 stop,
-                |progress| send(serde_json::json!({"type":"progress","value":progress})),
+                move |progress| progress_reporter.progress(serde_json::to_value(progress).unwrap()),
                 preview,
+                audio.clone(),
             )
             .map_err(|failure| {
                 no_media = failure.no_media;
@@ -139,9 +167,9 @@ fn main() {
         _ => Err("Unsupported recording operation.".into()),
     })();
     match result {
-        Ok(value) => send(serde_json::json!({"type":"result","value":value})),
+        Ok(value) => reporter.finish(serde_json::json!({"type":"result","value":value})),
         Err(message) => {
-            send(serde_json::json!({"type":"error","message":message,"noMedia":no_media}))
+            reporter.finish(serde_json::json!({"type":"error","message":message,"noMedia":no_media,"audio":audio.snapshot()}))
         }
     }
 }

@@ -2,7 +2,6 @@
 //! NV12 samples; it never opens a screen or audio device.
 use super::Config;
 use std::{
-    fs::{File, OpenOptions},
     io::{Read, Write},
     os::windows::process::CommandExt,
     process::{Child, Command, Stdio},
@@ -20,8 +19,6 @@ pub(super) struct Writer {
     worker: Option<JoinHandle<Result<(), String>>>,
     diagnostics: Arc<Mutex<Vec<u8>>>,
     stderr_thread: Option<JoinHandle<()>>,
-    pcm: Option<File>,
-    audio_samples: u64,
     video_frames: u64,
     fps: u32,
     video_bytes: usize,
@@ -32,19 +29,6 @@ impl Writer {
         let ffmpeg = config.ffmpeg_path.as_ref().ok_or("The recording encoder cannot handle this resolution and the bundled fallback is unavailable. Restore the complete app folder.")?;
         let width = (config.region.width + 1) & !1;
         let height = (config.region.height + 1) & !1;
-        let has_audio =
-            config.system_audio_device_id.is_some() || config.microphone_device_id.is_some();
-        let pcm = if has_audio {
-            Some(
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(config.spool_path.with_file_name("capture.pcm"))
-                    .map_err(|e| format!("Prepare common-clock audio spool: {e}"))?,
-            )
-        } else {
-            None
-        };
         let mut child = Command::new(ffmpeg)
             .args([
                 "-hide_banner",
@@ -150,8 +134,6 @@ impl Writer {
             worker: Some(worker),
             diagnostics,
             stderr_thread: Some(stderr_thread),
-            pcm,
-            audio_samples: 0,
             video_frames: 0,
             fps: config.fps,
             video_bytes: (width as usize * height as usize * 3 / 2),
@@ -171,25 +153,6 @@ impl Writer {
             })
             .unwrap_or_default();
         format!("{context}. {detail}").trim().to_string()
-    }
-    pub(super) fn sample(&mut self, index: u32, bytes: &[u8], pts: i64) -> Result<(), String> {
-        if index == 1 {
-            let expected = (self.audio_samples as i128 * 10_000_000 / 48_000) as i64;
-            if pts != expected || !bytes.len().is_multiple_of(4) {
-                return Err("Common-clock PCM audio sample order is invalid".into());
-            }
-            self.pcm
-                .as_mut()
-                .ok_or("Unexpected fallback audio stream")?
-                .write_all(bytes)
-                .map_err(|e| format!("Write common-clock audio spool: {e}"))?;
-            self.audio_samples += (bytes.len() / 4) as u64;
-            return Ok(());
-        }
-        if index != 0 {
-            return Err("Unexpected fallback video stream".into());
-        }
-        self.video_sample(Arc::new(bytes.to_vec()), pts)
     }
     pub(super) fn video_sample(&mut self, frame: Arc<Vec<u8>>, pts: i64) -> Result<(), String> {
         let expected_pts = (self.video_frames as i128 * 10_000_000 / i128::from(self.fps)) as i64;
@@ -253,11 +216,6 @@ impl Writer {
         }
         if !status.success() {
             return Err(self.error("The H.264 fallback could not finalize the recording"));
-        }
-        if let Some(pcm) = &mut self.pcm {
-            pcm.flush()
-                .and_then(|_| pcm.sync_all())
-                .map_err(|e| format!("Synchronize common-clock audio spool: {e}"))?;
         }
         self.finished = true;
         Ok(())

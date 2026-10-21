@@ -7,6 +7,10 @@ import type { CaptureSource, RecordingConfig, RecordingPhase, RecordingRegion, R
 import { captureSourceKey, formatRecordingDuration, isRecordingRegionWithinDisplay, recordingSourceProblem, recordingWindowProblem } from "../lib/recordingState";
 import { useRecordingPreview } from "../lib/recordingPreview";
 import type { PreviewHandoff } from "../lib/recordingPreview";
+import RecordingAudioControls from "./RecordingAudioControls";
+import { useRecordingAudio } from "../lib/recordingAudio";
+import { DEFAULT_AUDIO } from "../lib/recordingAudioState";
+import type { RecordingAudioConfig } from "../lib/recordingAudioTypes";
 import RecordingPreview from "./RecordingPreview";
 import "./RecordingWorkspace.css";
 
@@ -27,17 +31,14 @@ const phaseTitles: Record<RecordingPhase, string> = {
 
 export default function RecordingWorkspace({ visible, busy = false, onRecordingStateChange, onPreviewAdmissionBusyChange, onEditVideo }: Props) {
   const recorder = useRecording(onRecordingStateChange);
-  const { snapshot, capabilities, sources, windows, windowsTruncated, audioDevices, pending, active } = recorder;
+  const { snapshot, capabilities, sources, windows, windowsTruncated, audioDevices, applications, applicationsTruncated, pending, active } = recorder;
   const [captureMode, setCaptureMode] = useState<"area" | "display" | "window">("area");
   const [displayId, setDisplayId] = useState("");
   const [windowId, setWindowId] = useState("");
   const resumePreview = useRef<PreviewHandoff | null>(null);
   const [region, setRegion] = useState<RecordingRegion | null>(null);
   const [regionDisplayGeometry, setRegionDisplayGeometry] = useState("");
-  const [systemAudio, setSystemAudio] = useState(false);
-  const [microphone, setMicrophone] = useState(false);
-  const [systemAudioId, setSystemAudioId] = useState("");
-  const [microphoneId, setMicrophoneId] = useState("");
+  const [audioConfig, setAudioConfig] = useState<RecordingAudioConfig>(() => structuredClone(DEFAULT_AUDIO));
   const [showCursor, setShowCursor] = useState(true);
   const [quality, setQuality] = useState<"standard" | "high">("standard");
   const [frameRate, setFrameRate] = useState("30");
@@ -59,8 +60,9 @@ export default function RecordingWorkspace({ visible, busy = false, onRecordingS
   const selectedSource = sourceProblem ? null : candidateSource;
   const systems = audioDevices.filter((device) => device.kind === "system");
   const microphones = audioDevices.filter((device) => device.kind === "microphone");
-  const audioReady = (!systemAudio || systems.some((device) => device.id === systemAudioId)) &&
-    (!microphone || microphones.some((device) => device.id === microphoneId));
+  const audioReady = (audioConfig.render.kind === "off" || audioConfig.render.kind === "system" && systems.some(device => device.id === (audioConfig.render.kind === "system" ? audioConfig.render.deviceId : "")) ||
+    audioConfig.render.kind === "application" && capabilities?.audio.application.available && applications.some(app => app.id === (audioConfig.render.kind === "application" ? audioConfig.render.applicationId : "") && app.available)) &&
+    (!audioConfig.microphone || microphones.some(device => device.id === audioConfig.microphone?.deviceId) && (audioConfig.microphone.suppression === "off" || capabilities?.audio.microphoneSuppression.available));
   const disabled = busy || active || recorder.selecting || pending !== null || !capabilities?.available;
   const preview = useRecordingPreview({ visible, source: active && snapshot.config ? snapshot.config.source : selectedSource,
     showCursor: active && snapshot.config ? snapshot.config.showCursor : showCursor, recordingPhase: snapshot.phase, recordingSessionId: snapshot.sessionId,
@@ -76,13 +78,14 @@ export default function RecordingWorkspace({ visible, busy = false, onRecordingS
     : active || snapshot.phase !== "idle" ? phaseTitles[snapshot.phase]
     : selectedSource ? "Ready to record" : isWindow ? "Choose a window or game" : isArea ? "No area selected" : "Choose a display";
 
+  const mixer = useRecordingAudio({ visible, sessionId: snapshot.sessionId, phase: pending === "recording_stop" ? "stopping" : snapshot.phase, audio: snapshot.audio,
+    config: active && snapshot.config ? snapshot.config.audio : audioConfig,
+    onOverflow: () => { if (snapshot.sessionId) void recorder.command("recording_stop", { sessionId: snapshot.sessionId }); } });
+
   useEffect(() => {
     if (!displayId && sources.length) setDisplayId(sources[0].id);
   }, [displayId, sources]);
-  useEffect(() => {
-    if (!systemAudioId && systems.length) setSystemAudioId(systems[0].id);
-    if (!microphoneId && microphones.length) setMicrophoneId(microphones[0].id);
-  }, [systemAudioId, microphoneId, systems, microphones]);
+
   useEffect(() => {
     if (capabilities?.defaultOutputDirectory) setOutputDirectory((current) => current || capabilities.defaultOutputDirectory || "");
   }, [capabilities]);
@@ -101,8 +104,7 @@ export default function RecordingWorkspace({ visible, busy = false, onRecordingS
       setDisplayId(source.displayId); setRegion(source); setRegionDisplayGeometry(geometry);
       setCaptureMode(restoredDisplay && source.x === restoredDisplay.x && source.y === restoredDisplay.y && source.width === restoredDisplay.width && source.height === restoredDisplay.height ? "display" : "area");
     }
-    setSystemAudio(config.systemAudioDeviceId !== null); setMicrophone(config.microphoneDeviceId !== null);
-    setSystemAudioId(config.systemAudioDeviceId || ""); setMicrophoneId(config.microphoneDeviceId || "");
+    setAudioConfig(config.audio);
     setShowCursor(config.showCursor); setQuality(config.quality); setFrameRate(String(config.fps));
     setCountdown(String(config.countdownSeconds)); setOutputDirectory(config.outputDirectory);
   }, [active, snapshot, sources]);
@@ -154,8 +156,7 @@ export default function RecordingWorkspace({ visible, busy = false, onRecordingS
     const config: RecordingConfig = {
       requestId: crypto.randomUUID(), source: selectedSource, fps: Number(frameRate), quality,
       countdownSeconds: Number(countdown), showCursor,
-      systemAudioDeviceId: systemAudio ? systemAudioId : null,
-      microphoneDeviceId: microphone ? microphoneId : null, outputDirectory,
+      audio: audioConfig, outputDirectory,
     };
     startedRequest.current = config.requestId;
     const intent = preview.detachForRecording();
@@ -232,7 +233,7 @@ export default function RecordingWorkspace({ visible, busy = false, onRecordingS
               <h3 aria-live="polite">{statusTitle}</h3>
               {snapshot.phase === "countdown" && <div className="vfl-record-countdown" role="timer" aria-live="polite" aria-atomic="true" aria-label="Seconds until recording">{snapshot.countdownRemaining ?? "…"}</div>}
               {active && snapshot.phase !== "countdown" && <div className="vfl-record-timer" role="timer" aria-label="Recording duration">{formatRecordingDuration(snapshot.elapsedMs)}</div>}
-              {active && snapshot.config && <p>{snapshot.resolvedGeometry ? `${snapshot.resolvedGeometry.width} × ${snapshot.resolvedGeometry.height} pixels · ` : ""}{snapshot.config.fps} fps<br />{snapshot.config.systemAudioDeviceId ? "System audio on" : "System audio off"} · {snapshot.config.microphoneDeviceId ? "Microphone on" : "Microphone off"}</p>}
+              {active && snapshot.config && <p>{snapshot.resolvedGeometry ? `${snapshot.resolvedGeometry.width} × ${snapshot.resolvedGeometry.height} pixels · ` : ""}{snapshot.config.fps} fps<br />{snapshot.config.audio.render.kind === "off" ? "Render audio off" : snapshot.config.audio.render.kind === "application" ? "Application audio" : "System output"} · {snapshot.config.audio.microphone ? "Microphone on" : "Microphone off"}</p>}
               {!active && !savedPath && <p>{selectedSource ? selectedSource.kind === "region" ? `${selectedSource.width} × ${selectedSource.height} pixels · ${frameRate} fps` : `Selected window · ${frameRate} fps` : isWindow ? "Select one window above. Other windows are not captured." : isArea ? "Select a region within one display." : "Select one full display above."}</p>}
               {!active && candidateSource && sourceProblem && <p className="vfl-record-source-hint">{sourceProblem}</p>}
               {selectedSource?.kind === "region" && (selectedSource.width % 2 !== 0 || selectedSource.height % 2 !== 0) && <p className="vfl-record-source-hint">Your exact area is captured. MP4 adds a black edge to make the output dimensions even.</p>}
@@ -257,23 +258,9 @@ export default function RecordingWorkspace({ visible, busy = false, onRecordingS
         </section>
 
         <aside className="vfl-rail" aria-label="Recording settings">
-          <section className="vfl-card is-open" aria-labelledby="vfl-record-audio-title">
-            <div className="vfl-record-card-head"><h2 id="vfl-record-audio-title" className="vfl-card-title">Audio</h2></div>
-            <div className="vfl-card-body">
-              <label className="vfl-check vfl-check-card"><input type="checkbox" checked={systemAudio} disabled={disabled || (!systemAudio && systems.length === 0)} onChange={(event) => setSystemAudio(event.currentTarget.checked)} /><span>System audio</span></label>
-              {systemAudio && <div className="vfl-field"><label htmlFor="vfl-record-system-device">System audio device</label><select id="vfl-record-system-device" value={systemAudioId} disabled={disabled} onChange={(event) => setSystemAudioId(event.currentTarget.value)}>
-                {!systems.some((device) => device.id === systemAudioId) && <option value={systemAudioId}>Selected device unavailable</option>}
-                {systems.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
-              </select></div>}
-              <label className="vfl-check vfl-check-card"><input type="checkbox" checked={microphone} disabled={disabled || (!microphone && microphones.length === 0)} onChange={(event) => setMicrophone(event.currentTarget.checked)} /><span>Microphone</span></label>
-              {microphone && <div className="vfl-field"><label htmlFor="vfl-record-microphone-device">Microphone device</label><select id="vfl-record-microphone-device" value={microphoneId} disabled={disabled} onChange={(event) => setMicrophoneId(event.currentTarget.value)}>
-                {!microphones.some((device) => device.id === microphoneId) && <option value={microphoneId}>Selected device unavailable</option>}
-                {microphones.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
-              </select></div>}
-              <div className="vfl-inline-hint">Microphone is off by default. Audio starts only when you record.</div>
-              {capabilities?.available && (!systems.length || !microphones.length) && <div className="vfl-inline-hint">{!systems.length ? "No system audio device found. " : ""}{!microphones.length ? "No microphone found." : ""}</div>}
-            </div>
-          </section>
+          <RecordingAudioControls config={active && snapshot.config ? snapshot.config.audio : audioConfig} setConfig={setAudioConfig}
+            devices={audioDevices} applications={applications} truncated={applicationsTruncated} capabilities={capabilities}
+            locked={disabled} recording={active} mixer={mixer} />
           <section className="vfl-card is-open" aria-labelledby="vfl-record-video-title">
             <div className="vfl-record-card-head"><h2 id="vfl-record-video-title" className="vfl-card-title">Video</h2></div>
             <div className="vfl-card-body">
