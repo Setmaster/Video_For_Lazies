@@ -664,6 +664,12 @@ function App() {
   const [recordingBusy, setRecordingBusy] = useState(false);
   const [recordingSnapshot, setRecordingSnapshot] = useState<RecordingSnapshot | null>(null);
   const recordingBusyRef = useRef(false);
+  const [previewAdmissionBusy, setPreviewAdmissionBusy] = useState(false);
+  const previewAdmissionBusyRef = useRef(false);
+  const handlePreviewAdmissionBusyChange = useCallback((busy: boolean) => {
+    previewAdmissionBusyRef.current = busy;
+    setPreviewAdmissionBusy(busy);
+  }, []);
   const recordingSnapshotRef = useRef<RecordingSnapshot | null>(null);
   const recordingClosePendingRef = useRef(false);
   const handleRecordingStateChange = useCallback((snapshot: RecordingSnapshot, busy: boolean) => {
@@ -3120,7 +3126,7 @@ function App() {
     cropDetecting ||
     frameSaving ||
     updateBusy;
-  const encodeBusy = exportWorkBusy || interpolationInstalling || recordingBusy;
+  const encodeBusy = exportWorkBusy || interpolationInstalling || recordingBusy || previewAdmissionBusy;
   const lastExportIsCurrentOutcome =
     latestAttempt.kind === "succeeded" || latestAttempt.kind === "target-missed";
   const latestAttemptOutputPath =
@@ -5043,7 +5049,7 @@ function App() {
   }
 
   async function startNextQueuedItem() {
-    if (recordingBusyRef.current) return;
+    if (recordingBusyRef.current || previewAdmissionBusyRef.current) return;
     if (!encodeEventsReadyRef.current) {
       dispatchExportQueue({ type: "stop-auto-run" });
       setStatus(
@@ -5106,6 +5112,10 @@ function App() {
   }
 
   function runQueue() {
+    if (previewAdmissionBusyRef.current) {
+      setStatus("Wait for preview to stop before running the export queue.");
+      return;
+    }
     if (recordingBusyRef.current) {
       setStatus("Stop and save the recording before running the export queue.");
       return;
@@ -5192,6 +5202,7 @@ function App() {
     sample?: { outputDurationS: number; fullDurationS: number | null } | null;
     reportAsSmokeResult?: boolean;
   }): Promise<StartEncodeResult> {
+    if (previewAdmissionBusyRef.current) return { ok: false, message: "Wait for preview to stop before starting an export." };
     if (recordingBusyRef.current) return { ok: false, message: "Stop and save the recording before starting an export." };
     if (!updateStartupReady) return { ok: false, message: "Wait for the app startup check to finish." };
     if (interpolationInstallingRef.current) {
@@ -9434,8 +9445,10 @@ function App() {
         inert={activeWorkspace !== "record"}
       >
         <RecordingWorkspace
+          visible={activeWorkspace === "record"}
           busy={exportWorkBusy || interpolationInstalling}
           onRecordingStateChange={handleRecordingStateChange}
+          onPreviewAdmissionBusyChange={handlePreviewAdmissionBusyChange}
           onEditVideo={async (path) => {
             if (recordingSnapshotRef.current && ["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(recordingSnapshotRef.current.phase)) return;
             if (inputPathRef.current && queuePathIdentity(inputPathRef.current) !== queuePathIdentity(path)) {

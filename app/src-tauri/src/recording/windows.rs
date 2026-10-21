@@ -8,16 +8,18 @@ use std::{
     },
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Display {
-    pub id: String,
-    pub name: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
+#[path = "preview.rs"]
+#[allow(dead_code)]
+mod preview;
+#[path = "windows_preview.rs"]
+pub mod preview_control;
+#[path = "source.rs"]
+#[allow(dead_code)] // Shared main-process source DTOs are intentionally unused here.
+pub mod source;
+#[path = "windows_sources.rs"]
+mod sources;
+pub use source::{Display, Geometry, NativeSource, Region};
+pub use sources::enumerate_windows;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioDevice {
@@ -27,16 +29,9 @@ pub struct AudioDevice {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Region {
-    pub display_id: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Config {
+    #[serde(default)]
+    pub source: Option<NativeSource>,
     pub region: Region,
     pub fps: u32,
     pub show_cursor: bool,
@@ -54,6 +49,8 @@ pub struct Progress {
     pub elapsed_ms: u64,
     pub bytes_written: u64,
     pub encoder: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<serde_json::Value>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +62,7 @@ pub struct Outcome {
     pub distinct_frames: u64,
     pub max_video_lag_ms: u64,
     pub max_steady_video_lag_ms: u64,
+    pub interruption: Option<String>,
 }
 
 pub struct RunError {
@@ -295,17 +293,61 @@ struct Capture {
     monitor: HMONITOR,
     display_id: String,
     color_space: DXGI_COLOR_SPACE_TYPE,
+    window: Option<source::WindowIdentity>,
+}
+#[derive(Clone)]
+struct CaptureDomain {
+    monitor: HMONITOR,
+    display_id: String,
+    color_space: DXGI_COLOR_SPACE_TYPE,
+    white: f32,
+}
+impl CaptureDomain {
+    fn matches(&self, other: &Self) -> bool {
+        self.monitor == other.monitor
+            && self.display_id == other.display_id
+            && same_color_state(self.color_space, self.white, other.color_space, other.white)
+    }
 }
 impl Capture {
-    fn new(display: &Display, region: &Region, cursor: bool) -> ::windows::core::Result<Self> {
+    fn domain(&self) -> CaptureDomain {
+        CaptureDomain {
+            monitor: self.monitor,
+            display_id: self.display_id.clone(),
+            color_space: self.color_space,
+            white: self.white,
+        }
+    }
+    fn verify_domain(&self, initial: &CaptureDomain) -> Result<(), String> {
+        if !initial.matches(&self.domain()) {
+            return Err("The window display or color state changed. Select it again.".into());
+        }
+        self.verify_color()
+    }
+    fn new(
+        display: &Display,
+        region: &Region,
+        cursor: bool,
+        source: &NativeSource,
+    ) -> ::windows::core::Result<Self> {
         unsafe {
-            let monitor = MonitorFromPoint(
-                POINT {
-                    x: display.x + 1,
-                    y: display.y + 1,
-                },
-                MONITOR_DEFAULTTONULL,
-            );
+            let window = match source {
+                NativeSource::Window { identity } => Some(identity.clone()),
+                _ => None,
+            };
+            let monitor = if let Some(identity) = &window {
+                sources::validate_window(identity)
+                    .map_err(capture_error)?
+                    .monitor
+            } else {
+                MonitorFromPoint(
+                    POINT {
+                        x: display.x + 1,
+                        y: display.y + 1,
+                    },
+                    MONITOR_DEFAULTTONULL,
+                )
+            };
             if monitor.0.is_null() {
                 return Err(::windows::core::Error::new(
                     ::windows::core::HRESULT(0x80070057u32 as i32),
@@ -314,21 +356,34 @@ impl Capture {
             }
             // FP16 scRGB retains HDR values until the explicit SDR tone map below.
             let (color_space, white) = monitor_color(monitor, &display.id)?;
-            let hdr = color_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-            if capture_buffer_bytes(display, region, hdr) > 512 * 1024 * 1024 {
-                return Err(::windows::core::Error::new(
-                    ::windows::core::HRESULT(0x8007000eu32 as i32),
-                    "This recording area requires more than 512 MiB of capture buffers; choose a smaller area or display",
-                ));
-            }
+            let hdr = window.is_some() || color_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
             let interop: IGraphicsCaptureItemInterop =
                 ::windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-            let item: GraphicsCaptureItem = interop.CreateForMonitor(monitor)?;
+            let item: GraphicsCaptureItem = if let Some(identity) = &window {
+                let state = sources::validate_window(identity).map_err(capture_error)?;
+                let item = interop.CreateForWindow(state.hwnd)?;
+                sources::validate_window(identity).map_err(capture_error)?;
+                item
+            } else {
+                interop.CreateForMonitor(monitor)?
+            };
             let size = item.Size()?;
-            if size.Width != display.width as i32 || size.Height != display.height as i32 {
-                return Err(::windows::core::Error::new(
-                    ::windows::core::HRESULT(0x80070057u32 as i32),
-                    "Display geometry changed; select it again",
+            let expected = if window.is_some() {
+                (region.width as i32, region.height as i32)
+            } else {
+                (display.width as i32, display.height as i32)
+            };
+            if (size.Width, size.Height) != expected {
+                return Err(capture_error("Source geometry changed; select it again"));
+            }
+            let buffers = Display {
+                width: size.Width as u32,
+                height: size.Height as u32,
+                ..display.clone()
+            };
+            if capture_buffer_bytes(&buffers, region, hdr) > 512 * 1024 * 1024 {
+                return Err(capture_error(
+                    "This source needs more than512MiB of controlled capture buffers",
                 ));
             }
             let (mut device, mut context) = (None, None);
@@ -375,8 +430,16 @@ impl Capture {
                             message,
                         )
                     })?;
-            let left = (region.x - display.x) as u32;
-            let top = (region.y - display.y) as u32;
+            let left = if window.is_some() {
+                0
+            } else {
+                (region.x - display.x) as u32
+            };
+            let top = if window.is_some() {
+                0
+            } else {
+                (region.y - display.y) as u32
+            };
             Ok(Self {
                 device,
                 pool,
@@ -399,10 +462,17 @@ impl Capture {
                 monitor,
                 display_id: display.id.clone(),
                 color_space,
+                window,
             })
         }
     }
     fn verify_color(&self) -> Result<(), String> {
+        if let Some(identity) = &self.window {
+            let state = sources::validate_window(identity)?;
+            if state.monitor != self.monitor || state.display.id != self.display_id {
+                return Err("The window moved to another display; select it again. The partial recording will be saved.".into());
+            }
+        }
         let (space, white) = monitor_color(self.monitor, &self.display_id)
             .map_err(|e| format!("Display color state: {e}"))?;
         let initial_white = self.white;
@@ -414,17 +484,11 @@ impl Capture {
         }
         Ok(())
     }
-    fn frame(&self) -> Result<Option<(i64, Vec<u8>)>, String> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err("Recording display was closed or disconnected".into());
-        }
-        unsafe {
-            self.device
-                .GetDeviceRemovedReason()
-                .map_err(|e| format!("Graphics device lost: {e}"))?;
-        }
+    fn take_frame(
+        &self,
+    ) -> Result<Option<::windows::Graphics::Capture::Direct3D11CaptureFrame>, String> {
         // The pool owns at most two frames. All immediate-context work stays on this thread.
-        let frame = unsafe {
+        unsafe {
             let mut raw = ptr::null_mut();
             (::windows::core::Interface::vtable(&self.pool).TryGetNextFrame)(
                 self.pool.as_raw(),
@@ -434,15 +498,43 @@ impl Capture {
             .map_err(|e| format!("Capture frame pool: {e}"))?;
             if raw.is_null() {
                 return Ok(None);
-            };
-            ::windows::Graphics::Capture::Direct3D11CaptureFrame::from_raw(raw)
+            }
+            Ok(Some(
+                ::windows::Graphics::Capture::Direct3D11CaptureFrame::from_raw(raw),
+            ))
+        }
+    }
+    fn frame(&self) -> Result<Option<(i64, Vec<u8>)>, String> {
+        self.frame_inner(false)
+    }
+    fn latest_frame(&self) -> Result<Option<(i64, Vec<u8>)>, String> {
+        self.frame_inner(true)
+    }
+    fn frame_inner(&self, latest: bool) -> Result<Option<(i64, Vec<u8>)>, String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err("Recording source was closed or disconnected".into());
+        }
+        unsafe {
+            self.device
+                .GetDeviceRemovedReason()
+                .map_err(|e| format!("Graphics device lost: {e}"))?;
+        }
+        let Some(mut frame) = self.take_frame()? else {
+            return Ok(None);
         };
+        // Standalone preview samples at5Hz. Drain at most the second queued
+        // pool frame, releasing the older one without any GPU conversion/readback.
+        // The recording path takes exactly one frame as before.
+        if latest && let Some(newer) = self.take_frame()? {
+            let _ = frame.Close();
+            frame = newer;
+        }
         let result = (|| -> ::windows::core::Result<(i64, Vec<u8>)> {
             let size = frame.ContentSize()?;
             if size.Width != self.monitor_width || size.Height != self.monitor_height {
                 return Err(::windows::core::Error::new(
                     ::windows::core::HRESULT(0x80070057u32 as i32),
-                    "Display size changed during recording",
+                    "Source size changed during recording; the partial recording will be saved",
                 ));
             }
             let timestamp = frame.SystemRelativeTime()?.Duration;
@@ -947,22 +1039,232 @@ fn encoder_description(writer: &IMFSinkWriter, index: u32) -> String {
 }
 
 /// Runs only inside the supervised native recorder host, never on the Tauri thread.
+fn capture_error(message: impl AsRef<str>) -> ::windows::core::Error {
+    ::windows::core::Error::new(
+        ::windows::core::HRESULT(0x80004005u32 as i32),
+        message.as_ref(),
+    )
+}
+fn allocate_preview_sequence(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            old.checked_add(1)
+                .filter(|value| *value <= 9_007_199_254_740_991)
+        })
+        .ok()
+        .map(|old| old + 1)
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedCapture {
+    pub display: Display,
+    pub region: Region,
+    pub geometry: Geometry,
+}
+pub fn resolve_source(source: NativeSource) -> Result<ResolvedCapture, String> {
+    let _dpi = PhysicalDpi::new();
+    let _com = ComApartment::new()?;
+    match source {
+        NativeSource::Region(region) => {
+            Geometry {
+                width: region.width,
+                height: region.height,
+            }
+            .validate()?;
+            let display = enumerate_displays()?
+                .into_iter()
+                .find(|display| display.id == region.display_id)
+                .ok_or("The selected display is no longer connected.")?;
+            if region.x < display.x
+                || region.y < display.y
+                || i64::from(region.x) + i64::from(region.width)
+                    > i64::from(display.x) + i64::from(display.width)
+                || i64::from(region.y) + i64::from(region.height)
+                    > i64::from(display.y) + i64::from(display.height)
+            {
+                return Err("The selected area must fit the selected display.".into());
+            }
+            Ok(ResolvedCapture {
+                geometry: Geometry {
+                    width: region.width,
+                    height: region.height,
+                },
+                region,
+                display,
+            })
+        }
+        NativeSource::Window { identity } => {
+            let state = sources::validate_window(&identity)?;
+            let interop: IGraphicsCaptureItemInterop =
+                ::windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                    .map_err(|e| format!("Window capture requires Windows10 1903 or later: {e}"))?;
+            let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(state.hwnd) }
+                .map_err(|e| format!("Windows cannot capture this window: {e}"))?;
+            sources::validate_window(&identity)?;
+            let size = item
+                .Size()
+                .map_err(|e| format!("Window capture geometry: {e}"))?;
+            let geometry = Geometry {
+                width: size.Width.max(0) as u32,
+                height: size.Height.max(0) as u32,
+            };
+            geometry.validate()?;
+            let display = state.display;
+            let region = Region {
+                display_id: display.id.clone(),
+                x: display.x,
+                y: display.y,
+                width: geometry.width,
+                height: geometry.height,
+            };
+            Ok(ResolvedCapture {
+                display,
+                region,
+                geometry,
+            })
+        }
+    }
+}
+#[derive(Default)]
+struct PreviewSampling {
+    next: Option<Instant>,
+}
+impl PreviewSampling {
+    fn due(&mut self, now: Instant) -> bool {
+        if self.next.is_some_and(|next| now < next) {
+            return false;
+        }
+        // Schedule from actual sampling time: late scheduling never causes
+        // a burst of expensive conversions to catch up missed preview slots.
+        self.next = Some(now + Duration::from_millis(200));
+        true
+    }
+}
+pub fn run_preview(
+    source: NativeSource,
+    cursor: bool,
+    stop: Arc<AtomicBool>,
+    control: Arc<preview_control::Controls>,
+    progress: impl Fn(serde_json::Value),
+) -> Result<serde_json::Value, String> {
+    let _dpi = PhysicalDpi::new();
+    let _com = ComApartment::new()?;
+    if !supports_capture() {
+        return Err("Windows Graphics Capture is unavailable.".into());
+    }
+    interactive_desktop()?;
+    let mut resolved = resolve_source(source.clone())?;
+    control.geometry(resolved.geometry);
+    let mut emitter = preview_control::Emitter::new(control.clone())?;
+    let mut capture = Capture::new(&resolved.display, &resolved.region, cursor, &source)
+        .map_err(|e| format!("Preview capture initialization: {e}"))?;
+    if stop.load(Ordering::Acquire) || control.current().is_none() {
+        return Ok(serde_json::json!({"previewStopped":true}));
+    }
+    capture
+        .session
+        .StartCapture()
+        .map_err(|e| format!("Start preview: {e}"))?;
+    let initial_domain = capture.domain();
+    let mut ready = false;
+    let mut first_deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_report = Instant::now() - Duration::from_secs(1);
+    let mut last_health = Instant::now();
+    let mut resize_window = Instant::now();
+    let mut resizes = 0;
+    let mut sampling = PreviewSampling::default();
+    loop {
+        if stop.load(Ordering::Acquire) || control.current().is_none() {
+            break;
+        }
+        if sampling.due(Instant::now()) {
+            match capture.latest_frame() {
+                Ok(Some((time, image))) => {
+                    ready = true;
+                    emitter.offer(time, &image, resolved.geometry);
+                }
+                Ok(None) => {
+                    if !ready && Instant::now() > first_deadline {
+                        return Err(
+                            "Windows did not provide a preview frame for this source.".into()
+                        );
+                    }
+                }
+                Err(error)
+                    if matches!(source, NativeSource::Window { .. })
+                        && error.contains("Source size changed") =>
+                {
+                    if resize_window.elapsed() > Duration::from_secs(5) {
+                        resize_window = Instant::now();
+                        resizes = 0;
+                    }
+                    resizes += 1;
+                    if resizes > 10 {
+                        return Err(
+                            "The window is resizing too quickly. Resume preview after resizing."
+                                .into(),
+                        );
+                    }
+                    // Resize must not establish a fresh color/monitor domain and
+                    // erase a concurrent movement or HDR transition.
+                    capture.verify_domain(&initial_domain)?;
+                    control.resized(resolved.geometry);
+                    progress(serde_json::json!({"ready":ready,"preview":control.notice()}));
+                    drop(capture);
+                    resolved = resolve_source(source.clone())?;
+                    control.geometry(resolved.geometry);
+                    capture = Capture::new(&resolved.display, &resolved.region, cursor, &source)
+                        .map_err(|e| format!("Reconfigure preview: {e}"))?;
+                    capture.verify_domain(&initial_domain)?;
+                    if stop.load(Ordering::Acquire) || control.current().is_none() {
+                        break;
+                    }
+                    capture
+                        .session
+                        .StartCapture()
+                        .map_err(|e| format!("Restart preview: {e}"))?;
+                    ready = false;
+                    first_deadline = Instant::now() + Duration::from_secs(2);
+                    progress(serde_json::json!({"ready":false,"preview":control.notice()}));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if last_report.elapsed() >= Duration::from_millis(200) {
+            progress(serde_json::json!({"ready":ready,"preview":control.notice()}));
+            last_report = Instant::now();
+        }
+        if last_health.elapsed() >= Duration::from_millis(200) {
+            interactive_desktop()?;
+            capture.verify_color()?;
+            last_health = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    control.off();
+    progress(serde_json::json!({"ready":ready,"preview":control.notice()}));
+    drop(capture);
+    Ok(serde_json::json!({"previewStopped":true}))
+}
+
 /// Stop fixes a single QPC endpoint; errors retain every byte of the owned spool.
 pub fn run(
     config: Config,
     stop: Arc<AtomicBool>,
     progress: impl Fn(Progress) + Send + 'static,
+    preview_control: Arc<preview_control::Controls>,
 ) -> Result<Outcome, RunError> {
     let mut no_media = true;
-    run_inner(config, stop, progress, &mut no_media)
+    run_inner(config, stop, progress, &mut no_media, preview_control)
         .map_err(|message| RunError { message, no_media })
 }
 
 fn run_inner(
-    config: Config,
+    mut config: Config,
     stop: Arc<AtomicBool>,
     progress: impl Fn(Progress) + Send + 'static,
     no_media: &mut bool,
+    preview_control: Arc<preview_control::Controls>,
 ) -> Result<Outcome, String> {
     let _dpi = PhysicalDpi::new();
     let _com = ComApartment::new()?;
@@ -975,24 +1277,22 @@ fn run_inner(
     {
         return Err("Unsupported recording frame rate or quality".into());
     }
-    let display = enumerate_displays()?
-        .into_iter()
-        .find(|d| d.id == config.region.display_id)
-        .ok_or("Selected display is no longer connected")?;
-    let r = &config.region;
-    if r.width < 16
-        || r.height < 16
-        || r.width > 7680
-        || r.height > 4320
-        || r.x < display.x
-        || r.y < display.y
-        || r.x as i64 + r.width as i64 > display.x as i64 + display.width as i64
-        || r.y as i64 + r.height as i64 > display.y as i64 + display.height as i64
+    let native = config
+        .source
+        .clone()
+        .unwrap_or_else(|| NativeSource::Region(config.region.clone()));
+    let resolved = resolve_source(native.clone())?;
+    if resolved.geometry.width != config.region.width
+        || resolved.geometry.height != config.region.height
     {
-        return Err(
-            "Recording area must fit one display and be between 16×16 and 7680×4320".into(),
-        );
+        return Err("The source resized before recording began. Select it again.".into());
     }
+    config.region = resolved.region;
+    let display = resolved.display;
+    let r = &config.region;
+    let geometry = resolved.geometry;
+    preview_control.geometry(geometry);
+    let mut preview_emitter = preview_control::Emitter::new(preview_control.clone())?;
     if !config.spool_path.is_absolute() || config.spool_path.exists() {
         return Err(
             "A fresh absolute spool path is required; existing files are never replaced".into(),
@@ -1003,7 +1303,7 @@ fn run_inner(
     }
     let _mf =
         MediaRuntime::new().map_err(|e| format!("Windows Media Foundation unavailable: {e}"))?;
-    let capture = Capture::new(&display, r, config.show_cursor)
+    let capture = Capture::new(&display, r, config.show_cursor, &native)
         .map_err(|e| format!("Screen capture initialization: {e}"))?;
     let mut writer = Writer::new(&config)
         .map_err(|e| format!("H.264/AAC fragmented MP4 initialization: {e}"))?;
@@ -1030,6 +1330,7 @@ fn run_inner(
         };
         std::thread::sleep(Duration::from_millis(3))
     };
+    preview_emitter.offer(zero, &first, geometry);
     let mut frames = VideoFrames {
         latest: Arc::new(first),
         latest_time: zero,
@@ -1044,6 +1345,7 @@ fn run_inner(
     let mut audio_frames = 0u64;
     let mut last_report = Instant::now();
     let mut last_health = Instant::now();
+    let mut interruption = None;
     let cutoff = loop {
         let now = qpc100ns().map_err(|e| format!("Recording clock: {e}"))?;
         let elapsed = (now - zero).max(0);
@@ -1067,12 +1369,20 @@ fn run_inner(
         // is pending. Together with Arc sharing to the pipe worker, this caps
         // retained CPU buffers at three. Never substitute a future image into
         // an earlier CFR slot when a capture/encoder loop is late.
-        if frames.pending.is_none()
-            && let Some((time, image)) = capture.frame()?
-            && time >= zero
-            && time <= now + 100_000
-        {
-            frames.push(time, image, slot);
+        if frames.pending.is_none() {
+            match capture.frame() {
+                Ok(Some((time, image))) if time >= zero && time <= now + 100_000 => {
+                    preview_emitter.offer(time, &image, geometry);
+                    frames.push(time, image, slot);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    validate_stop(*no_media, elapsed, next_video, config.fps)?;
+                    interruption = Some(error);
+                    preview_control.off();
+                    break now;
+                }
+            }
         }
         let due = (elapsed as u64 * config.fps as u64) / 10_000_000;
         if next_video <= due {
@@ -1098,6 +1408,7 @@ fn run_inner(
                     elapsed_ms: 0,
                     bytes_written: writer.bytes_written(),
                     encoder: writer.encoder.clone(),
+                    preview: preview_control.notice(),
                 });
             }
         }
@@ -1114,12 +1425,17 @@ fn run_inner(
                 elapsed_ms: (elapsed / 10_000) as u64,
                 bytes_written: writer.bytes_written(),
                 encoder: writer.encoder.clone(),
+                preview: preview_control.notice(),
             });
             last_report = Instant::now()
         }
         if last_health.elapsed() >= Duration::from_millis(500) {
-            interactive_desktop()?;
-            capture.verify_color()?;
+            if let Err(error) = interactive_desktop().and_then(|_| capture.verify_color()) {
+                validate_stop(*no_media, elapsed, next_video, config.fps)?;
+                interruption = Some(error);
+                preview_control.off();
+                break now;
+            }
             let current = enumerate_displays()?
                 .into_iter()
                 .find(|d| d.id == display.id);
@@ -1129,7 +1445,11 @@ fn run_inner(
                     && d.width == display.width
                     && d.height == display.height
             }) {
-                return Err("Display topology changed; the partial recording was retained".into());
+                validate_stop(*no_media, elapsed, next_video, config.fps)?;
+                interruption =
+                    Some("Display topology changed; the partial recording was saved.".into());
+                preview_control.off();
+                break now;
             };
             last_health = Instant::now()
         }
@@ -1189,6 +1509,7 @@ fn run_inner(
         distinct_frames,
         max_video_lag_ms: (max_video_lag / 10_000) as u64,
         max_steady_video_lag_ms: (max_steady_video_lag / 10_000) as u64,
+        interruption,
     })
 }
 
@@ -1296,6 +1617,42 @@ fn write_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_sampling_is_five_hz_without_catch_up_bursts() {
+        let mut sampling = PreviewSampling::default();
+        let start = Instant::now();
+        assert!(sampling.due(start));
+        for millis in [1, 5, 100, 199] {
+            assert!(!sampling.due(start + Duration::from_millis(millis)));
+        }
+        assert!(sampling.due(start + Duration::from_millis(200)));
+        assert!(sampling.due(start + Duration::from_millis(1100)));
+        assert!(!sampling.due(start + Duration::from_millis(1101)));
+        assert!(!sampling.due(start + Duration::from_millis(1299)));
+        assert!(sampling.due(start + Duration::from_millis(1300)));
+    }
+    #[test]
+    fn resize_cannot_adopt_another_display_or_color_domain() {
+        let initial = CaptureDomain {
+            monitor: HMONITOR(std::ptr::dangling_mut()),
+            display_id: "display-a".into(),
+            color_space: DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+            white: 2.5,
+        };
+        assert!(initial.matches(&initial.clone()));
+        let mut changed = initial.clone();
+        changed.monitor = HMONITOR(std::ptr::without_provenance_mut(2));
+        assert!(!initial.matches(&changed));
+        changed = initial.clone();
+        changed.display_id = "display-b".into();
+        assert!(!initial.matches(&changed));
+        changed = initial.clone();
+        changed.white = 3.0;
+        assert!(!initial.matches(&changed));
+        changed = initial.clone();
+        changed.color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        assert!(!initial.matches(&changed));
+    }
     #[test]
     fn scheduler_stalls_of_100_and_200_ms_recover_without_changing_the_epoch() {
         for stall in [1_000_000, 2_000_000] {

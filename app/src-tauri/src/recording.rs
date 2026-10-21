@@ -1,5 +1,6 @@
 //! Recording owns its native process, activity lease and recovery files through
-//! publication. The webview receives status, never video frames or PCM.
+//! publication. A separate leased lane delivers only bounded preview thumbnails;
+//! full capture frames and PCM remain in the native helper.
 use crate::{
     activity::{ActivityCoordinator, ActivityLease},
     process, video,
@@ -24,21 +25,19 @@ const PROTOCOL_LIMIT: u64 = 65_536;
 const JOURNAL_VERSION: u32 = 1;
 const RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Region {
-    pub display_id: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
+#[allow(dead_code)]
+mod preview;
+pub(crate) mod preview_manager;
+mod source;
+#[cfg(test)]
+use source::Region;
+pub(crate) use source::{Geometry, Source};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecordingConfig {
     request_id: String,
-    source: Region,
+    source: Source,
     fps: u32,
     quality: String,
     countdown_seconds: u32,
@@ -70,6 +69,7 @@ pub(crate) struct Snapshot {
     recoveries: Vec<Recovery>,
     config: Option<RecordingConfig>,
     selection_request_id: Option<String>,
+    resolved_geometry: Option<Geometry>,
 }
 
 impl Default for Snapshot {
@@ -86,6 +86,7 @@ impl Default for Snapshot {
             recoveries: vec![],
             config: None,
             selection_request_id: None,
+            resolved_geometry: None,
         }
     }
 }
@@ -115,6 +116,7 @@ impl Inner {
 pub(crate) struct RecordingManager {
     inner: Arc<Mutex<Inner>>,
     startup_load: Arc<Mutex<()>>,
+    preview: Arc<preview_manager::PreviewManager>,
 }
 
 impl RecordingManager {
@@ -130,6 +132,8 @@ impl RecordingManager {
         if let Some((_, stop)) = &i.selecting {
             stop.store(true, Ordering::Release);
         }
+        drop(i);
+        self.preview.shutdown();
     }
     fn snapshot(&self) -> Snapshot {
         self.inner
@@ -264,10 +268,20 @@ fn helper_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// A bounded protocol and a watchdog sit outside the native media call stack.
 fn helper_call(
     app: &AppHandle,
+    request: Value,
+    stop: Arc<AtomicBool>,
+    timeout: Option<Duration>,
+    progress: impl FnMut(&Value),
+) -> Result<Value, String> {
+    helper_call_stream(app, request, stop, timeout, progress, None)
+}
+fn helper_call_stream(
+    app: &AppHandle,
     mut request: Value,
     stop: Arc<AtomicBool>,
     timeout: Option<Duration>,
     mut progress: impl FnMut(&Value),
+    tap: Option<preview_manager::Tap>,
 ) -> Result<Value, String> {
     let path = helper_path(app)?;
     regular_ancestors(&path)?;
@@ -281,12 +295,33 @@ fn helper_call(
         .stdin
         .take()
         .ok_or("Recording control pipe is unavailable.")?;
-    request["protocolVersion"] = json!(1);
+    request["protocolVersion"] = json!(2);
     serde_json::to_writer(&mut input, &request).map_err(error)?;
     input
         .write_all(b"\n")
         .and_then(|_| input.flush())
         .map_err(error)?;
+    let (control_send, control_receive) = mpsc::sync_channel::<Value>(1);
+    let input_stop = stop.clone();
+    let input_writer = std::thread::spawn(move || {
+        loop {
+            if input_stop.load(Ordering::Acquire) {
+                let _ = input.write_all(b"stop\n").and_then(|_| input.flush());
+                break;
+            }
+            match control_receive.recv_timeout(Duration::from_millis(50)) {
+                Ok(value) => {
+                    if serde_json::to_writer(&mut input, &value).is_err()
+                        || input.write_all(b"\n").and_then(|_| input.flush()).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
     let output = child
         .stdout
         .take()
@@ -295,12 +330,31 @@ fn helper_call(
         .stderr
         .take()
         .ok_or("Recording error pipe is unavailable.")?;
+    let stream_tap = tap.clone();
+    let stream_stop = stop.clone();
+    let preview_error = Arc::new(Mutex::new(None::<String>));
+    let read_error = preview_error.clone();
     let errors = std::thread::spawn(move || {
         let mut reader = stderr;
-        let mut tail = [0_u8; 4096];
-        while let Ok(n) = reader.read(&mut tail) {
-            if n == 0 {
-                break;
+        if let Some(tap) = stream_tap {
+            loop {
+                match preview::read_frame(&mut reader) {
+                    Ok(Some(frame)) => tap.accept(frame),
+                    Ok(None) => break,
+                    Err(error) => {
+                        tap.fail(&error);
+                        *read_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                        stream_stop.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        } else {
+            let mut tail = [0_u8; 4096];
+            while let Ok(n) = reader.read(&mut tail) {
+                if n == 0 {
+                    break;
+                }
             }
         }
     });
@@ -333,12 +387,20 @@ fn helper_call(
     let started = Instant::now();
     let mut last_progress = started;
     let mut stopping = None;
-    let recording = request["operation"] == "record";
+    let recording = request["operation"] == "record" || request["operation"] == "preview";
+    let mut last_preview_control = Instant::now() - Duration::from_secs(1);
     let mut ready = false;
     let mut watchdog_interrupted = false;
     let result = loop {
+        if !stop.load(Ordering::Acquire)
+            && last_preview_control.elapsed() >= Duration::from_millis(400)
+        {
+            last_preview_control = Instant::now();
+            if let Some(tap) = &tap {
+                let _ = control_send.try_send(tap.control());
+            }
+        }
         if stop.load(Ordering::Acquire) && stopping.is_none() {
-            let _ = input.write_all(b"stop\n").and_then(|_| input.flush());
             stopping = Some(Instant::now());
         }
         if stopping.is_some_and(|at: Instant| at.elapsed() > Duration::from_secs(20)) {
@@ -358,11 +420,14 @@ fn helper_call(
         }
         match receive.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(message)) => {
-                if message["protocolVersion"] != 1 {
+                if message["protocolVersion"] != 2 {
                     break Err("Recording component version mismatch.".into());
                 }
                 match message["type"].as_str() {
                     Some("progress") => {
+                        if let Some(tap) = &tap {
+                            tap.progress(&message["value"]);
+                        }
                         ready |= message["value"]["ready"].as_bool().unwrap_or(false);
                         last_progress = Instant::now();
                         progress(&message["value"]);
@@ -395,7 +460,14 @@ fn helper_call(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
-    drop(input);
+    if let Some(reason) = preview_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        progress(&json!({"interruption":reason}));
+    }
+    drop(control_send);
     if result.is_err() {
         let _ = child.control.kill();
     }
@@ -408,6 +480,7 @@ fn helper_call(
     drop(receive);
     let _ = reader.join();
     let _ = errors.join();
+    let _ = input_writer.join();
     if result.is_ok() && !exited.is_some_and(|status| status.success()) {
         return Err("Recording helper did not exit successfully.".into());
     }
@@ -493,7 +566,7 @@ pub(crate) async fn recording_select_region(
     if request_id.is_empty() || request_id.len() > 100 {
         return Err("Invalid selection request.".into());
     }
-    let lease = activity.begin("screen selection")?;
+    let activity = activity.inner().clone();
     let manager = state.inner().clone();
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -501,19 +574,30 @@ pub(crate) async fn recording_select_region(
             .inner
             .lock()
             .map_err(|_| "Recording is unavailable.")?;
+        if active(&i.snapshot.phase) || i.selecting.is_some() {
+            return Err("A recording operation is already active.".into());
+        }
         i.selecting = Some((request_id.clone(), stop.clone()));
         i.snapshot.selection_request_id = Some(request_id.clone());
         i.snapshot.sequence += 1;
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
-        let result = helper_call(
-            &app,
-            json!({"operation":"select-region","displayId":display_id}),
-            stop,
-            Some(Duration::from_secs(180)),
-            |_| {},
-        );
+        let result = (|| {
+            let _lease = match manager.preview.stop_wait(true)? {
+                Some(lease) => lease,
+                None => activity.begin("screen selection")?,
+            };
+            if stop.load(Ordering::Acquire) {
+                return Err("Area selection was cancelled.".into());
+            }
+            helper_call(
+                &app,
+                json!({"operation":"select-region","displayId":display_id}),
+                stop,
+                Some(Duration::from_secs(180)),
+                |_| {},
+            )
+        })();
         let mut i = manager.inner.lock().unwrap_or_else(|e| e.into_inner());
         if i.selecting
             .as_ref()
@@ -538,6 +622,8 @@ struct Journal {
     directory: PathBuf,
     destination: PathBuf,
     config: RecordingConfig,
+    #[serde(default)]
+    resolved_geometry: Option<Geometry>,
     #[serde(default)]
     published_size: Option<u64>,
     #[serde(default)]
@@ -687,11 +773,7 @@ fn validate_config(config: &RecordingConfig) -> Result<(), String> {
     {
         return Err("Unsupported recording settings.".into());
     }
-    let r = &config.source;
-    if r.width < 16 || r.height < 16 || r.width > 7680 || r.height > 4320 || r.display_id.is_empty()
-    {
-        return Err("Choose an area between 16 pixels and 7680 × 4320.".into());
-    }
+    config.source.validate()?;
     if config.output_directory.is_empty() {
         return Err("Choose an output folder.".into());
     }
@@ -701,6 +783,7 @@ fn create_journal(
     app: &AppHandle,
     id: &str,
     config: RecordingConfig,
+    geometry: Geometry,
 ) -> Result<(Journal, fs::File), String> {
     validate_config(&config)?;
     let destination_root = fs::canonicalize(&config.output_directory)
@@ -744,6 +827,7 @@ fn create_journal(
         directory,
         destination,
         config,
+        resolved_geometry: Some(geometry),
         published_size: None,
         published_hash: None,
         candidate_directory: None,
@@ -866,7 +950,7 @@ pub(crate) async fn recording_snapshot(
 }
 
 #[tauri::command]
-pub(crate) fn recording_start(
+pub(crate) async fn recording_start(
     window: Window,
     app: AppHandle,
     state: State<'_, RecordingManager>,
@@ -876,39 +960,60 @@ pub(crate) fn recording_start(
     main_window(&window)?;
     validate_config(&config)?;
     helper_path(&app)?;
-    let mut i = state
-        .inner
-        .lock()
-        .map_err(|_| "Recording is unavailable.")?;
-    if i.request_id.as_deref() == Some(&config.request_id) {
-        return Ok(i.snapshot.clone());
-    }
-    if active(&i.snapshot.phase) || i.selecting.is_some() {
-        return Err("A recording operation is already active.".into());
-    }
-    let lease = activity.begin("recording")?;
-    let id = format!(
-        "{:x}-{:x}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(error)?
-            .as_nanos(),
-        std::process::id()
-    );
-    let stop = Arc::new(AtomicBool::new(false));
-    i.snapshot = Snapshot {
-        session_id: Some(id.clone()),
-        sequence: i.snapshot.sequence + 1,
-        phase: "preparing".into(),
-        recoveries: i.snapshot.recoveries.clone(),
-        config: Some(config.clone()),
-        ..Snapshot::default()
+    let (id, stop, snapshot) = {
+        let mut i = state
+            .inner
+            .lock()
+            .map_err(|_| "Recording is unavailable.")?;
+        if i.request_id.as_deref() == Some(&config.request_id) {
+            return Ok(i.snapshot.clone());
+        }
+        if active(&i.snapshot.phase) || i.selecting.is_some() {
+            return Err("A recording operation is already active.".into());
+        }
+
+        let id = format!(
+            "{:x}-{:x}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(error)?
+                .as_nanos(),
+            std::process::id()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        i.snapshot = Snapshot {
+            session_id: Some(id.clone()),
+            sequence: i.snapshot.sequence + 1,
+            phase: "preparing".into(),
+            recoveries: i.snapshot.recoveries.clone(),
+            config: Some(config.clone()),
+            ..Snapshot::default()
+        };
+        i.stop = Some(stop.clone());
+        i.request_id = Some(config.request_id.clone());
+        let snapshot = i.snapshot.clone();
+        (id, stop, snapshot)
     };
-    i.stop = Some(stop.clone());
-    i.request_id = Some(config.request_id.clone());
-    let snapshot = i.snapshot.clone();
-    drop(i);
     let manager = state.inner().clone();
+    let activity = activity.inner().clone();
+    let preview = manager.preview.clone();
+    let transfer = tauri::async_runtime::spawn_blocking(move || preview.stop_wait(true))
+        .await
+        .map_err(error)?;
+    let lease = match transfer.and_then(|lease| match lease {
+        Some(lease) => Ok(lease),
+        None => activity.begin("recording"),
+    }) {
+        Ok(lease) => lease,
+        Err(error) => {
+            manager.update(&app, &id, |s| {
+                s.phase = "failed".into();
+                s.message = Some(error.clone());
+            });
+            return Err(error);
+        }
+    };
+    manager.preview.recording_owner(&id);
     let failed_manager = manager.clone();
     let failed_app = app.clone();
     let failed_id = id.clone();
@@ -916,6 +1021,9 @@ pub(crate) fn recording_start(
         .name("recording-session".into())
         .spawn(move || run_session(app, manager, id, config, stop, lease))
     {
+        failed_manager
+            .preview
+            .finish_recording(&failed_app, &failed_id);
         failed_manager.update(&failed_app, &failed_id, |s| {
             s.phase = "failed".into();
             s.message = Some(format!("Cannot start recorder: {e}"));
@@ -935,20 +1043,19 @@ fn run_session(
 ) {
     let mut cancelled_before_capture = false;
     let result = (|| {
-        // Re-resolve the display and audio endpoints immediately before arming.
-        let sources = helper_call(
+        let native = manager.preview.native_source(&config.source)?;
+        let resolved = helper_call(
             &app,
-            json!({"operation":"sources"}),
+            json!({"operation":"resolve-source","source":native}),
             stop.clone(),
             Some(Duration::from_secs(10)),
             |_| {},
         )?;
-        let display = sources
-            .as_array()
-            .and_then(|list| list.iter().find(|d| d["id"] == config.source.display_id))
-            .ok_or("The selected display is no longer connected. Select it again.")?;
-        validate_bounds(&config.source, display)?;
-        let (journal, session_lock) = create_journal(&app, &id, config.clone())?;
+        let geometry: Geometry =
+            serde_json::from_value(resolved["geometry"].clone()).map_err(error)?;
+        geometry.validate()?;
+        manager.update(&app, &id, |s| s.resolved_geometry = Some(geometry));
+        let (journal, session_lock) = create_journal(&app, &id, config.clone(), geometry)?;
         let mut no_media = false;
         let result = (|| {
             let deadline = Instant::now() + Duration::from_secs(config.countdown_seconds as u64);
@@ -971,10 +1078,10 @@ fn run_session(
                 s.countdown_remaining = None;
             });
             let spool = journal.directory.join("capture.mp4");
-            let host = json!({"region":config.source,"fps":config.fps,"showCursor":config.show_cursor,"quality":config.quality,"systemAudioDeviceId":config.system_audio_device_id,"microphoneDeviceId":config.microphone_device_id,"spoolPath":spool,"ffmpegPath":bundled_media(&app,"ffmpeg")?});
+            let host = json!({"region":resolved["region"],"source":native,"fps":config.fps,"showCursor":config.show_cursor,"quality":config.quality,"systemAudioDeviceId":config.system_audio_device_id,"microphoneDeviceId":config.microphone_device_id,"spoolPath":spool,"ffmpegPath":bundled_media(&app,"ffmpeg")?});
             let mut last_space = Instant::now();
             let mut space_error = None;
-            let outcome = helper_call(
+            let outcome = helper_call_stream(
                 &app,
                 json!({"operation":"record","config":host}),
                 stop.clone(),
@@ -1000,7 +1107,16 @@ fn run_session(
                         }
                     }
                 },
+                Some(preview_manager::Tap {
+                    manager: manager.preview.clone(),
+                    app: app.clone(),
+                    owner: id.clone(),
+                }),
             )?;
+            if let Some(reason) = outcome["interruption"].as_str() {
+                space_error = Some(reason.into());
+            }
+
             manager.update(&app, &id, |s| {
                 s.phase = "finalizing".into();
                 s.elapsed_ms = outcome["elapsedMs"].as_u64().unwrap_or(s.elapsed_ms);
@@ -1018,6 +1134,7 @@ fn run_session(
         drop(session_lock);
         result
     })();
+    manager.preview.finish_recording(&app, &id);
     // Release exclusive admission before exposing the terminal state.
     drop(lease);
     let recoveries = find_recoveries(&app).unwrap_or_default();
@@ -1049,6 +1166,7 @@ fn run_session(
         i.stop = None;
     }
 }
+#[cfg(test)]
 fn validate_bounds(region: &Region, display: &Value) -> Result<(), String> {
     let x = display["x"]
         .as_i64()
@@ -1218,7 +1336,9 @@ fn finalize(
     if bytes == 0 {
         return Err("The recording contains no recoverable video.".into());
     }
-    if candidate.exists() && validate_candidate(&candidate, &j.config).is_err() {
+    if candidate.exists()
+        && validate_candidate(&candidate, &j.config, journal_geometry(&j)?).is_err()
+    {
         regular_ancestors(&candidate)?;
         fs::remove_file(&candidate).map_err(error)?;
     }
@@ -1279,7 +1399,7 @@ fn finalize(
             return Err(e);
         }
     }
-    validate_candidate(&candidate, &j.config)?;
+    validate_candidate(&candidate, &j.config, journal_geometry(&j)?)?;
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1327,12 +1447,30 @@ fn remux_budget(video_bytes: u64, pcm_bytes: u64) -> (u64, Duration) {
     (reserve, Duration::from_secs(timeout))
 }
 
-fn validate_candidate(candidate: &Path, config: &RecordingConfig) -> Result<(), String> {
+fn journal_geometry(j: &Journal) -> Result<Geometry, String> {
+    let geometry = j
+        .resolved_geometry
+        .or(match &j.config.source {
+            Source::Region(region) => Some(Geometry {
+                width: region.width,
+                height: region.height,
+            }),
+            Source::Window { .. } => None,
+        })
+        .ok_or("Recording recovery is missing its native source geometry.")?;
+    geometry.validate()?;
+    Ok(geometry)
+}
+fn validate_candidate(
+    candidate: &Path,
+    config: &RecordingConfig,
+    geometry: Geometry,
+) -> Result<(), String> {
     regular_ancestors(candidate)?;
     let probe = video::probe_video(candidate.to_string_lossy().into_owned())?;
     if probe.video_codec.as_deref() != Some("h264")
-        || probe.width != (config.source.width + 1) & !1
-        || probe.height != (config.source.height + 1) & !1
+        || probe.width != (geometry.width + 1) & !1
+        || probe.height != (geometry.height + 1) & !1
         || !probe.duration_s.is_finite()
         || probe.duration_s <= 0.
         || !probe
@@ -1372,13 +1510,19 @@ fn publish_candidate(candidate: &Path, destination: &Path) -> Result<(), String>
 }
 
 #[tauri::command]
-pub(crate) fn recording_close(
+pub(crate) async fn recording_close(
     window: Window,
     state: State<'_, RecordingManager>,
     activity: State<'_, ActivityCoordinator>,
     session_id: Option<String>,
 ) -> Result<(), String> {
     main_window(&window)?;
+    let preview = state.preview.clone();
+    drop(
+        tauri::async_runtime::spawn_blocking(move || preview.stop_wait(false))
+            .await
+            .map_err(error)??,
+    );
     let i = state
         .inner
         .lock()
@@ -1502,13 +1646,13 @@ mod tests {
     fn config() -> RecordingConfig {
         RecordingConfig {
             request_id: "test".into(),
-            source: Region {
+            source: Source::Region(Region {
                 display_id: "display1".into(),
                 x: -1920,
                 y: 0,
                 width: 640,
                 height: 480,
-            },
+            }),
             fps: 30,
             quality: "standard".into(),
             countdown_seconds: 3,
@@ -1527,9 +1671,13 @@ mod tests {
             assert!(validate_config(&c).is_err());
         }
         c = config();
-        c.source.width = 641;
+        if let Source::Region(region) = &mut c.source {
+            region.width = 641;
+        }
         assert!(validate_config(&c).is_ok());
-        c.source.width = 7681;
+        if let Source::Region(region) = &mut c.source {
+            region.width = 7681;
+        }
         assert!(validate_config(&c).is_err());
         c = config();
         c.countdown_seconds = 100;
@@ -1538,7 +1686,9 @@ mod tests {
     #[test]
     fn physical_regions_handle_negative_origins_and_overflow() {
         let d = json!({"x":-1920,"y":0,"width":1920,"height":1080});
-        let mut r = config().source;
+        let Source::Region(mut r) = config().source else {
+            panic!("region fixture");
+        };
         assert!(validate_bounds(&r, &d).is_ok());
         r.x = -1921;
         assert!(validate_bounds(&r, &d).is_err());
@@ -1688,6 +1838,7 @@ mod tests {
             directory: dir.path().to_path_buf(),
             destination: path.clone(),
             config: config(),
+            resolved_geometry: None,
             published_size: Some(4),
             published_hash: Some(file_digest(&path).unwrap()),
             candidate_directory: None,

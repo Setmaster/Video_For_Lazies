@@ -5,6 +5,31 @@ export function isRecordingActive(phase) {
   return activePhases.has(phase);
 }
 
+export function isCaptureSource(source) {
+  if (!source || typeof source !== "object") return false;
+  const identifier = (value) => typeof value === "string" && value.length > 0 && value.length <= 256;
+  if (source.kind === "window") return identifier(source.windowId);
+  return source.kind === "region" && identifier(source.displayId) &&
+    [source.x, source.y, source.width, source.height].every(Number.isSafeInteger) &&
+    source.width >= 16 && source.height >= 16 && source.width <= 7680 && source.height <= 4320;
+}
+
+export function captureSourceKey(source) {
+  if (!isCaptureSource(source)) return "";
+  return source.kind === "window" ? JSON.stringify(["window", source.windowId])
+    : JSON.stringify(["region", source.displayId, source.x, source.y, source.width, source.height]);
+}
+
+export function recordingWindowProblem(windowId, windows) {
+  if (!windowId) return "Choose a window or game to continue.";
+  const target = windows.find((window) => window.id === windowId);
+  if (!target) return "The selected window is unavailable. Refresh and select it again.";
+  if (target.protection === "excluded") return "This window excludes screen capture. Choose another window.";
+  if (!target.available) return target.reason || "This window cannot be captured. Choose another window.";
+  if (target.method !== "wgc-window") return "This window's capture method is unsupported.";
+  return null;
+}
+
 export function acceptRecordingSnapshot(current, incoming) {
   if (!incoming || !Number.isSafeInteger(incoming.sequence) || incoming.sequence < 0 ||
       !phases.has(incoming.phase) || !Array.isArray(incoming.recoveries) ||
@@ -13,12 +38,13 @@ export function acceptRecordingSnapshot(current, incoming) {
       (incoming.sessionId !== null && typeof incoming.sessionId !== "string") ||
       (incoming.outputPath !== null && typeof incoming.outputPath !== "string") ||
       (incoming.message !== null && typeof incoming.message !== "string") ||
+      (incoming.resolvedGeometry !== null && (!incoming.resolvedGeometry ||
+        ![incoming.resolvedGeometry.width, incoming.resolvedGeometry.height].every(Number.isSafeInteger) ||
+        incoming.resolvedGeometry.width < 16 || incoming.resolvedGeometry.height < 16 ||
+        incoming.resolvedGeometry.width > 7680 || incoming.resolvedGeometry.height > 4320)) ||
       (incoming.selectionRequestId !== null && (typeof incoming.selectionRequestId !== "string" || !incoming.selectionRequestId)) ||
       (incoming.config !== null && (typeof incoming.config !== "object" || !incoming.config ||
-        typeof incoming.config.requestId !== "string" || !incoming.config.source ||
-        typeof incoming.config.source.displayId !== "string" ||
-        ![incoming.config.source.x, incoming.config.source.y, incoming.config.source.width, incoming.config.source.height].every(Number.isSafeInteger) ||
-        incoming.config.source.width <= 0 || incoming.config.source.height <= 0 ||
+        typeof incoming.config.requestId !== "string" || !isCaptureSource(incoming.config.source) ||
         ![24, 25, 30, 50, 60].includes(incoming.config.fps) || !["standard", "high"].includes(incoming.config.quality) ||
         ![0, 3, 5].includes(incoming.config.countdownSeconds) || typeof incoming.config.showCursor !== "boolean" ||
         (incoming.config.systemAudioDeviceId !== null && typeof incoming.config.systemAudioDeviceId !== "string") ||

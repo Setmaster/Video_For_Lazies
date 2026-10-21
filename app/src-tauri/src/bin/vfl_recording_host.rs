@@ -11,7 +11,7 @@ fn main() {
         atomic::{AtomicBool, Ordering},
     };
     fn send(mut value: serde_json::Value) {
-        value["protocolVersion"] = serde_json::json!(1);
+        value["protocolVersion"] = serde_json::json!(2);
         let mut out = std::io::stdout().lock();
         if serde_json::to_writer(&mut out, &value).is_err()
             || out.write_all(b"\n").is_err()
@@ -35,7 +35,7 @@ fn main() {
             return;
         }
     };
-    if request["protocolVersion"] != 1 {
+    if request["protocolVersion"] != 2 {
         send(
             serde_json::json!({"type":"error","message":"Recording component version mismatch. Restore the complete app folder."}),
         );
@@ -43,10 +43,38 @@ fn main() {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let cancel = stop.clone();
+    let preview = Arc::new(windows::preview_control::Controls::default());
+    let controls = preview.clone();
     std::thread::spawn(move || {
-        let mut line = Vec::new();
-        // The only further command is stop. EOF also means parent loss.
-        let _ = input.take(128).read_until(b'\n', &mut line);
+        loop {
+            let mut line = Vec::new();
+            let result = input.by_ref().take(513).read_until(b'\n', &mut line);
+            if result.is_err()
+                || line.is_empty()
+                || line.len() > 512
+                || !line.ends_with(b"\n")
+                || line == b"stop\n"
+            {
+                break;
+            }
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                break;
+            };
+            match value["operation"].as_str() {
+                Some("preview-renew") => {
+                    if let (Some(id), Some(epoch)) =
+                        (value["previewId"].as_str(), value["configEpoch"].as_u64())
+                    {
+                        controls.renew(id, epoch, value["leaseMs"].as_u64().unwrap_or(3000));
+                    } else {
+                        break;
+                    }
+                }
+                Some("preview-off") => controls.off(),
+                _ => break,
+            }
+        }
+        controls.off();
         cancel.store(true, Ordering::Release);
     });
     let mut no_media = false;
@@ -60,6 +88,30 @@ fn main() {
             }
             serde_json::to_value(windows::enumerate_displays()?).map_err(|e| e.to_string())
         }
+        "windows" => serde_json::to_value(windows::enumerate_windows(
+            request["excludedPid"].as_u64().unwrap_or(0) as u32,
+        )?)
+        .map_err(|e| e.to_string()),
+        "resolve-source" => {
+            let source = serde_json::from_value(request["source"].clone())
+                .map_err(|_| "Invalid capture source.")?;
+            serde_json::to_value(windows::resolve_source(source)?).map_err(|e| e.to_string())
+        }
+        "preview" => {
+            let source = serde_json::from_value(request["source"].clone())
+                .map_err(|_| "Invalid preview source.")?;
+            let id = request["previewId"]
+                .as_str()
+                .ok_or("Invalid preview identity.")?;
+            preview.renew(id, 1, 3000);
+            windows::run_preview(
+                source,
+                request["showCursor"].as_bool().unwrap_or(true),
+                stop,
+                preview,
+                |value| send(serde_json::json!({"type":"progress","value":value})),
+            )
+        }
         "audio-devices" => {
             serde_json::to_value(windows::audio_devices()?).map_err(|e| e.to_string())
         }
@@ -72,9 +124,12 @@ fn main() {
         "record" => {
             let config = serde_json::from_value(request["config"].clone())
                 .map_err(|e| format!("Invalid recording settings: {e}"))?;
-            let outcome = windows::run(config, stop, |progress| {
-                send(serde_json::json!({"type":"progress","value":progress}))
-            })
+            let outcome = windows::run(
+                config,
+                stop,
+                |progress| send(serde_json::json!({"type":"progress","value":progress})),
+                preview,
+            )
             .map_err(|failure| {
                 no_media = failure.no_media;
                 failure.message

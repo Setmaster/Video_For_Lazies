@@ -112,7 +112,9 @@ For security vulnerabilities, use [private vulnerability reporting](https://gith
 
 ### Screen recording on Windows
 
-Open the **Record** tab, choose a display, then select **Full screen** or draw an **Area** with the mouse. Choose a local output folder and click **Start recording**. Recording uses a bundled helper, with no OBS or recording-runtime installation. Linux recording is not available yet; editing remains available on both platforms.
+Open the **Record** tab and choose **Full screen**, draw an **Area** with the mouse, or select **Window or game** and choose a window. Choose a local output folder and click **Start recording**. Recording uses a bundled helper, with no OBS or recording-runtime installation. Linux recording is not available yet; editing remains available on both platforms.
+
+Click **Preview** to view the selected source without saving a recording or opening audio devices. Leaving Record stops standalone preview; an active recording continues until stopped. Window capture supports ordinary windows and windowed or borderless games through Windows capture. Protected or exclusive full-screen content may be unavailable. Preview follows window resizing; resizing during recording stops and saves the footage already captured.
 
 System audio and microphone are independent options, both off initially. Choose an available device for each enabled source. Recordings save as H.264 MP4 with AAC when audio is enabled. HDR displays are converted to SDR BT.709; HDR output is not preserved. Odd-sized areas retain every selected pixel and add a black edge for even MP4 dimensions.
 

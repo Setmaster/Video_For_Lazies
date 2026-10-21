@@ -14,16 +14,22 @@ export type RecordingSnapshot = {
   outputPath: string | null;
   message: string | null;
   config: RecordingConfig | null;
+  resolvedGeometry: { width: number; height: number } | null;
   selectionRequestId: string | null;
   recoveries: RecordingRecovery[];
 };
 export type RecordingCapabilities = { available: boolean; reason: string | null; defaultOutputDirectory: string | null };
 export type RecordingSource = { id: string; name: string; x: number; y: number; width: number; height: number };
 export type RecordingRegion = { displayId: string; x: number; y: number; width: number; height: number };
+export type CaptureSource = (RecordingRegion & { kind: "region" }) | { kind: "window"; windowId: string };
+export type RecordingWindow = {
+  id: string; name: string; processName: string; width: number; height: number; displayId: string;
+  available: boolean; reason: string | null; method: "wgc-window"; protection: "allowed" | "excluded" | "unknown";
+};
 export type RecordingAudioDevice = { id: string; name: string; kind: "system" | "microphone" };
 export type RecordingConfig = {
   requestId: string;
-  source: RecordingRegion;
+  source: CaptureSource;
   fps: number;
   quality: "standard" | "high";
   countdownSeconds: number;
@@ -36,7 +42,7 @@ export type RecordingStateChange = (snapshot: RecordingSnapshot, busy: boolean) 
 
 const INITIAL_SNAPSHOT: RecordingSnapshot = {
   sessionId: null, sequence: -1, phase: "idle", elapsedMs: 0, bytesWritten: 0,
-  countdownRemaining: null, outputPath: null, message: null, config: null, selectionRequestId: null, recoveries: [],
+  countdownRemaining: null, outputPath: null, message: null, config: null, resolvedGeometry: null, selectionRequestId: null, recoveries: [],
 };
 
 function errorText(error: unknown) {
@@ -47,6 +53,8 @@ export function useRecording(onStateChange?: RecordingStateChange) {
   const [snapshot, setSnapshot] = useState(INITIAL_SNAPSHOT);
   const [capabilities, setCapabilities] = useState<RecordingCapabilities | null>(null);
   const [sources, setSources] = useState<RecordingSource[]>([]);
+  const [windows, setWindows] = useState<RecordingWindow[]>([]);
+  const [windowsTruncated, setWindowsTruncated] = useState(false);
   const [audioDevices, setAudioDevices] = useState<RecordingAudioDevice[]>([]);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -117,17 +125,22 @@ export function useRecording(onStateChange?: RecordingStateChange) {
     if (!mounted.current) return;
     setCapabilities(available);
     if (available.available) {
-      const [displays, devices] = await Promise.all([
+      const [displays, devices, targets] = await Promise.all([
         invoke<RecordingSource[]>("recording_sources"),
         invoke<RecordingAudioDevice[]>("recording_audio_devices"),
+        invoke<{ windows: RecordingWindow[]; truncated: boolean }>("recording_windows"),
       ]);
       if (mounted.current) {
         setSources(displays);
         setAudioDevices(devices);
+        setWindows(targets.windows);
+        setWindowsTruncated(targets.truncated);
       }
     } else {
       setSources([]);
       setAudioDevices([]);
+      setWindows([]);
+      setWindowsTruncated(false);
     }
   }), [run]);
 
@@ -160,7 +173,7 @@ export function useRecording(onStateChange?: RecordingStateChange) {
   }), [accept, refreshSnapshot, run]);
 
   return {
-    snapshot, capabilities, sources, audioDevices, pending, error, statusError, connected,
+    snapshot, capabilities, sources, windows, windowsTruncated, audioDevices, pending, error, statusError, connected,
     active: isRecordingActive(snapshot.phase), selecting: snapshot.selectionRequestId !== null,
     run, command, refreshDevices, refreshSnapshot,
   };
