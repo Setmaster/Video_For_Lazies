@@ -34,6 +34,39 @@ fn enumerator() -> Result<IMMDeviceEnumerator, String> {
         .map_err(|error| audio_error("Open Windows audio devices", error))
 }
 
+/// Resolve defaults once without activating a stream. Reopening uses only IDs.
+pub fn pin_config(config: &mut super::audio_types::NativeAudioConfig) -> Result<(), String> {
+    use super::audio_types::NativeRender;
+    fn pin(id: &mut String, flow: EDataFlow) -> Result<(), String> {
+        let device = if id == "default" {
+            unsafe { enumerator()?.GetDefaultAudioEndpoint(flow, eMultimedia) }
+        } else {
+            let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+            unsafe { enumerator()?.GetDevice(PCWSTR(wide.as_ptr())) }
+        }
+        .map_err(|e| audio_error("Validate pinned audio endpoint", e))?;
+        let state = unsafe { device.GetState() }
+            .map_err(|e| audio_error("Inspect pinned audio endpoint", e))?;
+        if state != DEVICE_STATE_ACTIVE {
+            return Err("The pinned audio endpoint is unavailable.".into());
+        }
+        *id = owned_string(
+            unsafe { device.GetId() }.map_err(|e| audio_error("Read pinned audio endpoint", e))?,
+        )?;
+        Ok(())
+    }
+    if let NativeRender::System { device_id } = &mut config.render {
+        pin(device_id, eRender)?;
+    }
+    if let Some(microphone) = &mut config.microphone {
+        pin(&mut microphone.device_id, eCapture)?;
+    }
+    if let NativeRender::Application { identity } = &config.render {
+        super::audio_apps::validate_identity(identity)?;
+    }
+    Ok(())
+}
+
 fn owned_string(value: PWSTR) -> Result<String, String> {
     let result = unsafe { value.to_string() }.map_err(|error| error.to_string());
     unsafe { CoTaskMemFree(Some(value.0.cast())) };
@@ -322,6 +355,14 @@ impl AudioCapture {
         stop: &std::sync::atomic::AtomicBool,
     ) -> Result<Self, String> {
         use super::audio_types::NativeRender;
+        let cancelled = || {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                Err("Audio preparation was cancelled.".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        cancelled()?;
         let mut capture = Self {
             endpoints: Vec::new(),
             stopped: false,
@@ -336,6 +377,7 @@ impl AudioCapture {
             }
             NativeRender::Application { identity } => {
                 let activated = super::audio_apps::activate(identity, stop)?;
+                cancelled()?;
                 capture.endpoints.push(Endpoint::initialize(
                     activated.client,
                     eRender,
@@ -344,19 +386,19 @@ impl AudioCapture {
                 )?);
             }
         }
+        cancelled()?;
         if let Some(id) = mic_id {
             capture
                 .endpoints
                 .push(Endpoint::open(&enumerator()?, id, eCapture)?);
         }
-        if stop.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("Audio preparation was cancelled.".into());
-        }
+        cancelled()?;
         for endpoint in &mut capture.endpoints {
             if stop.load(std::sync::atomic::Ordering::Acquire) {
                 return Err("Audio preparation was cancelled before starting an endpoint.".into());
             }
             endpoint.start()?;
+            cancelled()?;
         }
         Ok(capture)
     }

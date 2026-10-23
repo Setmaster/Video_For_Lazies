@@ -1,6 +1,7 @@
 //! One reliable ready/terminal slot and one latest progress slot; never pipe-wait in capture.
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
     io::Write,
     sync::{Arc, Condvar, Mutex},
     thread::JoinHandle,
@@ -12,11 +13,34 @@ struct Pending {
     terminal: Option<Vec<u8>>,
     saw_ready: bool,
     done: bool,
+    reliable: VecDeque<Vec<u8>>,
 }
 impl Pending {
+    fn progress(&mut self, bytes: Vec<u8>, ready: bool, reliable: bool) -> bool {
+        if self.done || self.terminal.is_some() {
+            return true;
+        }
+        if ready && !self.saw_ready {
+            self.latest = None;
+            self.saw_ready = true;
+            self.ready = Some(bytes);
+        } else if reliable {
+            if self.reliable.len() == 16 {
+                return false;
+            }
+            self.latest = None;
+            self.reliable.push_back(bytes);
+        } else {
+            self.latest = Some(bytes);
+        }
+        true
+    }
     fn take(&mut self) -> Option<Vec<u8>> {
         if self.ready.is_some() {
             return self.ready.take();
+        }
+        if let Some(bytes) = self.reliable.pop_front() {
+            return Some(bytes);
         }
         if self.terminal.is_some() {
             self.done = true;
@@ -31,7 +55,7 @@ pub struct Reporter {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 fn encode(mut value: Value) -> Result<Vec<u8>, String> {
-    value["protocolVersion"] = json!(3);
+    value["protocolVersion"] = json!(4);
     let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     if bytes.len() > 65_536 {
@@ -81,18 +105,20 @@ impl Reporter {
     }
     pub fn progress(&self, value: Value) {
         let ready = value["ready"] == true;
+        let reliable = value["transition"].is_object()
+            || value["audioReceipts"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+            || value["reconcileAck"].is_object()
+            || value["reconcileError"].is_object()
+            || value["hudIntent"].is_string()
+            || value["stopHudVisible"] == true;
         let Ok(bytes) = encode(json!({"type":"progress","value":value})) else {
             std::process::exit(2);
         };
         let mut state = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.done || state.terminal.is_some() {
-            return;
-        }
-        if ready && !state.saw_ready {
-            state.saw_ready = true;
-            state.ready = Some(bytes);
-        } else {
-            state.latest = Some(bytes);
+        if !state.progress(bytes, ready, reliable) {
+            std::process::exit(2);
         }
         self.state.1.notify_one();
     }
@@ -123,11 +149,26 @@ mod tests {
             terminal: Some(vec![3]),
             saw_ready: true,
             done: false,
+            reliable: VecDeque::new(),
         };
         assert_eq!(p.take(), Some(vec![1]));
         assert_eq!(p.take(), Some(vec![3]));
         assert!(p.take().is_none());
         assert!(p.done);
+    }
+    #[test]
+    fn reliable_boundary_discards_older_latest_but_preserves_newer_progress() {
+        let mut p = Pending::default();
+        assert!(p.progress(vec![1], false, false));
+        assert!(p.progress(vec![2], true, true));
+        assert_eq!(p.take(), Some(vec![2]));
+        assert_eq!(p.take(), None);
+        assert!(p.progress(vec![3], false, false));
+        assert!(p.progress(vec![4], true, true));
+        assert!(p.progress(vec![5], false, false));
+        assert_eq!(p.take(), Some(vec![4]));
+        assert_eq!(p.take(), Some(vec![5]));
+        assert_eq!(p.take(), None);
     }
     #[test]
     fn encoded_messages_include_version_and_enforce_full_newline_bound() {
@@ -136,7 +177,7 @@ mod tests {
         assert!(b.ends_with(b"\n"));
         assert_eq!(
             serde_json::from_slice::<Value>(&b).unwrap()["protocolVersion"],
-            3
+            4
         );
     }
 }

@@ -51,6 +51,14 @@ pub struct Progress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<serde_json::Value>,
     pub audio: Option<audio_types::AudioStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hud_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_hud_visible: bool,
+    #[serde(flatten)]
+    pub controls: serde_json::Map<String, serde_json::Value>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,11 +81,16 @@ pub struct RunError {
     pub no_media: bool,
 }
 
+#[path = "active_clock.rs"]
+mod active_clock;
 #[path = "windows_audio.rs"]
 #[allow(dead_code)]
 mod audio;
 #[path = "windows_audio_apps.rs"]
 pub mod audio_apps;
+#[path = "audio_controls.rs"]
+#[allow(dead_code)]
+pub mod audio_controls;
 #[path = "audio_envelope.rs"]
 #[allow(dead_code)]
 mod audio_envelope;
@@ -86,6 +99,9 @@ mod audio_envelope;
 mod audio_mixer;
 #[path = "windows_audio_pipeline.rs"]
 pub mod audio_pipeline;
+#[path = "audio_reconcile_wire.rs"]
+#[allow(dead_code)]
+pub mod audio_reconcile_wire;
 #[path = "audio_types.rs"]
 #[allow(dead_code)]
 pub mod audio_types;
@@ -93,6 +109,8 @@ pub mod audio_types;
 mod ffmpeg;
 #[path = "windows_gpu.rs"]
 mod gpu;
+#[path = "native_controls.rs"]
+pub mod native_controls;
 #[path = "windows_ui.rs"]
 mod ui;
 pub use ui::{enumerate_displays, select_region};
@@ -115,6 +133,14 @@ pub fn audio_capability() -> Result<Option<String>, String> {
 pub fn audio_devices() -> Result<Vec<AudioDevice>, String> {
     let _com = ComApartment::new()?;
     audio::audio_devices()
+}
+pub fn resolve_audio(
+    mut config: audio_types::NativeAudioConfig,
+) -> Result<audio_types::NativeAudioConfig, String> {
+    config.validate()?;
+    let _com = ComApartment::new()?;
+    audio::pin_config(&mut config)?;
+    Ok(config)
 }
 
 use ::windows::{
@@ -1231,6 +1257,7 @@ pub fn run(
     progress: impl Fn(Progress) + Send + 'static,
     preview_control: Arc<preview_control::Controls>,
     audio_control: Arc<audio_pipeline::Controls>,
+    transition_control: Arc<native_controls::Controls>,
 ) -> Result<Outcome, RunError> {
     let mut no_media = true;
     let result = run_inner(
@@ -1240,6 +1267,7 @@ pub fn run(
         &mut no_media,
         preview_control,
         audio_control.clone(),
+        transition_control,
     );
     if let Err(message) = &result {
         audio_control.finish(Some(message.clone()));
@@ -1254,10 +1282,21 @@ fn run_inner(
     no_media: &mut bool,
     preview_control: Arc<preview_control::Controls>,
     audio_control: Arc<audio_pipeline::Controls>,
+    transition_control: Arc<native_controls::Controls>,
 ) -> Result<Outcome, String> {
+    let preparation_live = || {
+        if stop.load(Ordering::Acquire) {
+            Err("Recording canceled during preparation.".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    preparation_live()?;
     config.audio.validate()?;
     let _dpi = PhysicalDpi::new();
     let _com = ComApartment::new()?;
+    audio::pin_config(&mut config.audio)?;
+    preparation_live()?;
     if !supports_capture() {
         return Err("Windows Graphics Capture is unavailable on this Windows session".into());
     }
@@ -1293,10 +1332,13 @@ fn run_inner(
     }
     let _mf =
         MediaRuntime::new().map_err(|e| format!("Windows Media Foundation unavailable: {e}"))?;
+    preparation_live()?;
     let capture = Capture::new(&display, r, config.show_cursor, &native)
         .map_err(|e| format!("Screen capture initialization: {e}"))?;
+    preparation_live()?;
     let mut writer =
         Writer::new(&config).map_err(|e| format!("H.264 fragmented MP4 initialization: {e}"))?;
+    preparation_live()?;
     let mut audio = audio_pipeline::Pipeline::start(
         &config.audio,
         config
@@ -1306,13 +1348,15 @@ fn run_inner(
         audio_control.clone(),
         &stop,
     )?;
-    let _hud = ui::StopHud::start(stop.clone())?;
+    preparation_live()?;
+    let _hud = ui::StopHud::start(stop.clone(), transition_control.clone())?;
+    preparation_live()?;
     capture
         .session
         .StartCapture()
         .map_err(|e| format!("Start screen capture: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(2);
-    let (zero, first) = loop {
+    let (mut zero, first) = loop {
         if stop.load(Ordering::Acquire) {
             return Err("Recording canceled before its first frame".into());
         };
@@ -1325,6 +1369,11 @@ fn run_inner(
         };
         std::thread::sleep(Duration::from_millis(3))
     };
+    let initial_domain = capture.domain();
+    let mut capture = Some(capture);
+    let mut clock = active_clock::ActiveClock::new(zero);
+    audio_control.set_epoch(zero);
+    let mut pause_request: Option<(native_controls::Transition, u64)> = None;
     preview_emitter.offer(zero, &first, geometry);
     let mut frames = VideoFrames {
         latest: Arc::new(first),
@@ -1342,7 +1391,11 @@ fn run_inner(
     let mut interruption = None;
     let cutoff = loop {
         let now = qpc100ns().map_err(|e| format!("Recording clock: {e}"))?;
-        let elapsed = (now - zero).max(0);
+        let elapsed = active_clock::ActiveClock::media_ticks(clock.sample_at(now));
+        transition_control.update_hud(
+            (elapsed / 10_000) as u64,
+            if pause_request.is_some() { 1 } else { 0 },
+        );
         let pts = (next_video as i128 * 10_000_000 / config.fps as i128) as i64;
         let lag = (elapsed - pts).max(0);
         max_video_lag = max_video_lag.max(lag);
@@ -1352,6 +1405,371 @@ fn run_inner(
         if stop.load(Ordering::Acquire) {
             validate_stop(*no_media, elapsed, next_video, config.fps)?;
             break now;
+        }
+        if pause_request.is_none()
+            && let Some(request) = transition_control.take("pause")
+        {
+            pause_request = Some((
+                request,
+                clock.pause_boundary(qpc100ns().map_err(|e| e.to_string())?.max(now))?,
+            ));
+            transition_control.update_hud((elapsed / 10_000) as u64, 1);
+        }
+        if let Some((_, boundary)) = &pause_request
+            && now >= clock.physical_at(*boundary)?
+        {
+            let (request, boundary) = pause_request.take().unwrap();
+            let active_cut = active_clock::ActiveClock::media_ticks(boundary);
+            validate_stop(*no_media, active_cut, next_video, config.fps)?;
+            preview_control.off();
+            let old_capture = capture.take().ok_or("Capture epoch is unavailable.")?;
+            if let Err(error) = old_capture.session.Close() {
+                interruption = Some(format!("Pause capture: {error}"));
+            }
+            drop(old_capture);
+            // Copy the final bounded packets before dropping every audio client.
+            std::thread::sleep(Duration::from_millis(100));
+            if let Err(error) = audio.stop() {
+                interruption.get_or_insert(error);
+            }
+            while video_time(next_video, config.fps) < active_cut {
+                let pts = video_time(next_video, config.fps);
+                frames.advance(zero + pts);
+                writer
+                    .video_sample(
+                        frames.latest.clone(),
+                        pts,
+                        video_time(next_video + 1, config.fps) - pts,
+                    )
+                    .map_err(|e| format!("Encode Pause tail: {e}"))?;
+                next_video += 1;
+            }
+            audio_control.pause_at(boundary, request.pause_revision, request.sealed_sequence);
+            while audio.frames < boundary {
+                audio.render(zero, (boundary - audio.frames).min(480) as u32, &stop, true)?;
+            }
+            audio.release_capture();
+            audio_control.paused_released();
+            clock.freeze(boundary)?;
+            if audio_control
+                .pending()
+                .iter()
+                .any(|entry| entry.target_sample.as_deref() != Some(&boundary.to_string()))
+            {
+                interruption=Some("An audio command did not match the sealed Pause boundary; the retained prefix was saved.".into());
+            }
+            if interruption.is_some() {
+                break zero + active_cut;
+            }
+            transition_control.paused(true);
+            transition_control.update_hud(active_cut as u64 / 10_000, 2);
+            progress(Progress {
+                controls: audio_control.notices(),
+                ready: true,
+                elapsed_ms: active_cut as u64 / 10_000,
+                bytes_written: writer.bytes_written() + audio.bytes(),
+                encoder: writer.encoder.clone(),
+                preview: preview_control.notice(),
+                audio: audio_control.snapshot(),
+                hud_intent: None,
+                stop_hud_visible: false,
+                transition: Some(
+                    serde_json::json!({"operationId":request.operation_id,"controlRevision":request.control_revision,
+                        "pauseRevision":request.pause_revision,"phase":"paused","cutoffSample":boundary.to_string(),"inputsReleased":true,"physicalCutoffQpc100ns":(zero+active_cut).to_string(),"releasedQpc100ns":qpc100ns().map_err(|e|e.to_string())?.to_string(),"audioPending":audio_control.pending()}),
+                ),
+            });
+            let mut heartbeat = Instant::now();
+            let mut health = Instant::now();
+            let resumed = loop {
+                if stop.load(Ordering::Acquire) {
+                    break None;
+                }
+                if heartbeat.elapsed() >= Duration::from_millis(250) {
+                    progress(Progress {
+                        controls: audio_control.notices(),
+                        ready: true,
+                        elapsed_ms: active_cut as u64 / 10_000,
+                        bytes_written: writer.bytes_written() + audio.bytes(),
+                        encoder: writer.encoder.clone(),
+                        preview: preview_control.notice(),
+                        audio: audio_control.snapshot(),
+                        transition: None,
+                        hud_intent: transition_control.take_intent().map(String::from),
+                        stop_hud_visible: false,
+                    });
+                    heartbeat = Instant::now();
+                }
+                if health.elapsed() >= Duration::from_millis(500) {
+                    if let Err(error) = interactive_desktop() {
+                        interruption = Some(error);
+                        break None;
+                    }
+                    let topology = enumerate_displays()
+                        .ok()
+                        .and_then(|all| all.into_iter().find(|d| d.id == display.id));
+                    if !topology.is_some_and(|d| {
+                        d.x == display.x
+                            && d.y == display.y
+                            && d.width == display.width
+                            && d.height == display.height
+                    }) {
+                        interruption=Some("Display topology changed while paused; the retained recording was saved.".into());
+                        break None;
+                    }
+                    // No capture/client is opened for passive identity/domain checks.
+                    if let NativeSource::Window { identity } = &native {
+                        match sources::validate_window(identity) {
+                            Ok(state)
+                                if state.monitor == initial_domain.monitor
+                                    && state.display.id == initial_domain.display_id =>
+                            {
+                                match resolve_source(native.clone()) {
+                                    Ok(resolved)
+                                        if resolved.geometry == geometry
+                                            && resolved.display.id == initial_domain.display_id => {
+                                    }
+                                    Err(error) if error.contains("minimized") => {}
+                                    Ok(_) => {
+                                        interruption=Some("Source geometry or display changed while paused; the retained recording was saved.".into());
+                                        break None;
+                                    }
+                                    Err(error) => {
+                                        interruption = Some(error);
+                                        break None;
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                interruption=Some("The selected window moved to a different display while paused.".into());
+                                break None;
+                            }
+                            Err(error) if error.contains("minimized") => {}
+                            Err(error) => {
+                                interruption = Some(error);
+                                break None;
+                            }
+                        }
+                    }
+                    match monitor_color(initial_domain.monitor, &initial_domain.display_id) {
+                        Ok((space, white))
+                            if same_color_state(
+                                initial_domain.color_space,
+                                initial_domain.white,
+                                space,
+                                white,
+                            ) => {}
+                        _ => {
+                            interruption =
+                                Some("The display color state changed while paused.".into());
+                            break None;
+                        }
+                    }
+                    if let audio_types::NativeRender::Application { identity } =
+                        &config.audio.render
+                        && let Err(error) = audio_apps::validate_identity(identity)
+                    {
+                        interruption = Some(error);
+                        break None;
+                    }
+                    health = Instant::now();
+                }
+                if let Some(resume) = transition_control.take("resume") {
+                    let source_check = match &native {
+                        NativeSource::Window { identity } => sources::validate_window(identity)
+                            .map(|state| (state.monitor, state.display.id)),
+                        _ => Ok((initial_domain.monitor, initial_domain.display_id.clone())),
+                    };
+                    let unavailable = match source_check {
+                        Ok((monitor, id)) => {
+                            if monitor != initial_domain.monitor || id != initial_domain.display_id
+                            {
+                                interruption =
+                                    Some("The selected display changed while paused.".into());
+                                break None;
+                            }
+                            false
+                        }
+                        Err(error) if error.contains("minimized") => true,
+                        Err(error) => {
+                            interruption = Some(error);
+                            break None;
+                        }
+                    };
+                    let mut pinned = config.audio.clone();
+                    if let audio_types::NativeRender::Application { identity } = &pinned.render
+                        && let Err(error) = audio_apps::validate_identity(identity)
+                    {
+                        interruption = Some(error);
+                        break None;
+                    }
+                    let fresh_resolved = match resolve_source(native.clone()) {
+                        Ok(value)
+                            if value.geometry == geometry
+                                && value.display.id == initial_domain.display_id =>
+                        {
+                            Some(value)
+                        }
+                        Err(error) if error.contains("minimized") => None,
+                        Ok(_) => {
+                            interruption =
+                                Some("Source geometry or display changed while paused.".into());
+                            break None;
+                        }
+                        Err(error) => {
+                            interruption = Some(error);
+                            break None;
+                        }
+                    };
+                    let unavailable = unavailable
+                        || fresh_resolved.is_none()
+                        || audio::pin_config(&mut pinned).is_err();
+                    if unavailable {
+                        progress(Progress {
+                            controls: audio_control.notices(),
+                            ready: true,
+                            elapsed_ms: active_cut as u64 / 10_000,
+                            bytes_written: writer.bytes_written() + audio.bytes(),
+                            encoder: writer.encoder.clone(),
+                            preview: preview_control.notice(),
+                            audio: audio_control.snapshot(),
+                            hud_intent: None,
+                            stop_hud_visible: false,
+                            transition: Some(
+                                serde_json::json!({"operationId":resume.operation_id,"controlRevision":resume.control_revision,
+                                    "pauseRevision":resume.pause_revision,"phase":"paused","errorCode":"sourceUnavailable"}),
+                            ),
+                        });
+                        continue;
+                    }
+                    match monitor_color(initial_domain.monitor, &initial_domain.display_id) {
+                        Ok((space, white))
+                            if same_color_state(
+                                initial_domain.color_space,
+                                initial_domain.white,
+                                space,
+                                white,
+                            ) => {}
+                        _ => {
+                            interruption =
+                                Some("The display color state changed while paused.".into());
+                            break None;
+                        }
+                    }
+                    break Some((resume, fresh_resolved.unwrap()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let Some((resume, fresh_resolved)) = resumed else {
+                break zero + active_cut;
+            };
+            transition_control.update_hud(active_cut as u64 / 10_000, 3);
+            progress(Progress {
+                controls: audio_control.notices(),
+                ready: true,
+                elapsed_ms: active_cut as u64 / 10_000,
+                bytes_written: writer.bytes_written() + audio.bytes(),
+                encoder: writer.encoder.clone(),
+                preview: preview_control.notice(),
+                audio: audio_control.snapshot(),
+                hud_intent: None,
+                stop_hud_visible: false,
+                transition: Some(
+                    serde_json::json!({"operationId":resume.operation_id,"controlRevision":resume.control_revision,"pauseRevision":resume.pause_revision,"phase":"resuming","cutoffSample":boundary.to_string()}),
+                ),
+            });
+            let acquired = (|| -> Result<(Capture, i64, Vec<u8>), String> {
+                if stop.load(Ordering::Acquire) {
+                    return Err("Resume canceled.".into());
+                }
+                let fresh = Capture::new(
+                    &fresh_resolved.display,
+                    &fresh_resolved.region,
+                    config.show_cursor,
+                    &native,
+                )
+                .map_err(|e| format!("Resume capture: {e}"))?;
+                fresh.verify_domain(&initial_domain)?;
+                if fresh_resolved.geometry != geometry {
+                    return Err("Source geometry changed while paused.".into());
+                }
+                if stop.load(Ordering::Acquire) {
+                    return Err("Resume canceled before audio acquisition.".into());
+                }
+                audio.reopen(&stop)?;
+                if stop.load(Ordering::Acquire) {
+                    return Err("Resume canceled.".into());
+                }
+                let inputs_ready = qpc100ns().map_err(|e| format!("Resume clock: {e}"))?;
+                fresh
+                    .session
+                    .StartCapture()
+                    .map_err(|e| format!("Resume capture: {e}"))?;
+                let deadline = Instant::now() + Duration::from_secs(8);
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return Err("Resume canceled.".into());
+                    }
+                    audio.poll()?;
+                    if let Some((time, image)) = fresh.frame()? {
+                        if time < inputs_ready {
+                            continue;
+                        }
+                        if time > qpc100ns().map_err(|e| e.to_string())? + 100_000 {
+                            return Err("Resume frame has an invalid source timestamp.".into());
+                        }
+                        fresh.verify_domain(&initial_domain)?;
+                        return Ok((fresh, time, image));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("Resume capture did not become ready.".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+            })();
+            let (fresh, time, image) = match acquired {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = audio.stop();
+                    audio.release_capture();
+                    interruption = Some(error);
+                    break zero + active_cut;
+                }
+            };
+            if stop.load(Ordering::Acquire) {
+                drop(fresh);
+                let _ = audio.stop();
+                audio.release_capture();
+                break zero + active_cut;
+            }
+            clock.resume(time)?;
+            zero = clock.render_zero()?;
+            frames = VideoFrames {
+                latest: Arc::new(image),
+                latest_time: time,
+                pending: None,
+            };
+            capture = Some(fresh);
+            audio_control.resume_at(zero);
+            transition_control.paused(false);
+            transition_control.update_hud(active_cut as u64 / 10_000, 0);
+            cadence = CadenceGuard::new(config.fps);
+            progress(Progress {
+                controls: audio_control.notices(),
+                ready: true,
+                elapsed_ms: active_cut as u64 / 10_000,
+                bytes_written: writer.bytes_written() + audio.bytes(),
+                encoder: writer.encoder.clone(),
+                preview: preview_control.notice(),
+                audio: audio_control.snapshot(),
+                hud_intent: None,
+                stop_hud_visible: false,
+                transition: Some(
+                    serde_json::json!({"operationId":resume.operation_id,"controlRevision":resume.control_revision,"pauseRevision":resume.pause_revision,"phase":"recording","cutoffSample":boundary.to_string(),"physicalEpochQpc100ns":time.to_string(),"activeEpochSample":boundary.to_string()}),
+                ),
+            });
+            last_health = Instant::now();
+            last_report = Instant::now();
+            continue;
         }
         // A short scheduler/driver stall can repeat past images without moving
         // their source timestamps. Bound both its size and recovery time;
@@ -1364,7 +1782,11 @@ fn run_inner(
         // retained CPU buffers at three. Never substitute a future image into
         // an earlier CFR slot when a capture/encoder loop is late.
         if frames.pending.is_none() {
-            match capture.frame() {
+            match capture
+                .as_ref()
+                .ok_or("Capture epoch is unavailable.")?
+                .frame()
+            {
                 Ok(Some((time, image))) if time >= zero && time <= now + 100_000 => {
                     preview_emitter.offer(time, &image, geometry);
                     frames.push(time, image, slot);
@@ -1398,13 +1820,22 @@ fn run_inner(
             }
             if next_video == 1 {
                 audio_control.ready();
+                let mut controls = audio_control.notices();
+                controls.insert(
+                    "clockEpoch".into(),
+                    serde_json::json!({"physicalQpc100ns":zero.to_string(),"activeSample":"0"}),
+                );
                 progress(Progress {
+                    controls,
                     ready: true,
                     elapsed_ms: 0,
                     bytes_written: writer.bytes_written() + audio.bytes(),
                     encoder: writer.encoder.clone(),
                     preview: preview_control.notice(),
                     audio: audio_control.snapshot(),
+                    transition: None,
+                    hud_intent: None,
+                    stop_hud_visible: true,
                 });
             }
         }
@@ -1413,7 +1844,7 @@ fn run_inner(
             interruption = Some(error);
             break audio_control.cutoff().unwrap_or(now).min(now);
         }
-        let available = ((elapsed - 1_000_000).max(0) as u64 * 48_000) / 10_000_000;
+        let available = clock.sample_at(now).saturating_sub(4_800);
         while audio.frames + 480 <= available && !stop.load(Ordering::Acquire) {
             audio.render(zero, 480, &stop, false)?;
         }
@@ -1425,17 +1856,26 @@ fn run_inner(
             })
         {
             progress(Progress {
+                controls: audio_control.notices(),
                 ready: true,
                 elapsed_ms: (elapsed / 10_000) as u64,
                 bytes_written: writer.bytes_written() + audio.bytes(),
                 encoder: writer.encoder.clone(),
                 preview: preview_control.notice(),
                 audio: audio_control.snapshot(),
+                transition: None,
+                hud_intent: transition_control.take_intent().map(String::from),
+                stop_hud_visible: false,
             });
             last_report = Instant::now()
         }
         if last_health.elapsed() >= Duration::from_millis(500) {
-            if let Err(error) = interactive_desktop().and_then(|_| capture.verify_color()) {
+            if let Err(error) = interactive_desktop().and_then(|_| {
+                capture
+                    .as_ref()
+                    .ok_or("Capture epoch is unavailable.")?
+                    .verify_color()
+            }) {
                 validate_stop(*no_media, elapsed, next_video, config.fps)?;
                 interruption = Some(error);
                 preview_control.off();
@@ -1460,12 +1900,17 @@ fn run_inner(
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    let total = ((cutoff - zero).max(0) as u64 * 48_000) / 10_000_000;
+    if let Some(error) = audio_control.failure() {
+        interruption.get_or_insert(error);
+    }
+    let total = clock.sample_at(cutoff);
     audio_control.freeze(total);
-    capture
-        .session
-        .Close()
-        .map_err(|e| format!("Stop capture: {e}"))?;
+    if let Some(capture) = capture.take() {
+        capture
+            .session
+            .Close()
+            .map_err(|e| format!("Stop capture: {e}"))?;
+    }
     // Shared-mode packets are delivered after their sampling interval. Drain the bounded tail.
     std::thread::sleep(Duration::from_millis(100));
     if let Err(error) = audio.stop() {

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { confirm as confirmDialog, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { confirm as nativeConfirmDialog, open as nativeOpenDialog, save as nativeSaveDialog, type OpenDialogOptions } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { SmoothMotionControl } from "./components/SmoothMotionControl";
 import { normalizeInterpolation, interpolationConflict, interpolationModelLabel } from "./lib/interpolation";
@@ -16,6 +16,8 @@ import { useAudioTrackPreview } from "./lib/audioTrackPreview";
 import { audioTrackLabel } from "./lib/audioTrackState";
 import RecordingWorkspace from "./components/RecordingWorkspace";
 import type { RecordingSnapshot } from "./lib/recording";
+import { isRecordingActive } from "./lib/recordingState";
+import { useRecordingControls } from "./lib/recordingControls";
 import { WorkspaceTabs, type Workspace } from "./components/WorkspaceTabs";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
 import type {
@@ -693,7 +695,7 @@ function App() {
     recordingBusyRef.current = busy;
     setRecordingBusy(busy);
     if (busy) {
-      if (["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(snapshot.phase) && exportQueueStateRef.current.autoRun) dispatchExportQueue({ type: "stop-auto-run" });
+      if (isRecordingActive(snapshot.phase) && exportQueueStateRef.current.autoRun) dispatchExportQueue({ type: "stop-auto-run" });
       cropperRef.current?.pause();
       previewPlayingRef.current = false;
       setPreviewPlaying(false);
@@ -838,6 +840,55 @@ function App() {
   const [elevatedUpdateRun, setElevatedUpdateRun] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
   const modalOpen = elevatedUpdateRun || aboutOpen || recipeDialog !== null || resetConfirmationOpen;
+  const [nativeDialogDepth, setNativeDialogDepth] = useState(0);
+  const nativeDialogDepthRef = useRef(0);
+  const recordingControls = useRecordingControls({
+    blocked: modalOpen || nativeDialogDepth > 0 || ordinaryClosing || !updateStartupReady || updateBusy,
+  });
+  const recordingControlsRef = useRef(recordingControls);
+  recordingControlsRef.current = recordingControls;
+  const workspaceChangeRevision = useRef(0);
+
+  async function invalidateRecordingDraft(reason: string) {
+    try {
+      return await recordingControlsRef.current.invalidate(reason);
+    } catch (error) {
+      setStatus(`Could not disarm recording shortcuts: ${String(error)}`);
+      return false;
+    }
+  }
+
+  async function withNativeDialog<T,>(action: () => Promise<T>): Promise<T> {
+    nativeDialogDepthRef.current += 1;
+    setNativeDialogDepth(nativeDialogDepthRef.current);
+    try {
+      if (!await invalidateRecordingDraft("native dialog")) {
+        throw new Error("Recording shortcut cleanup is not confirmed. Retry before opening a dialog.");
+      }
+      return await action();
+    } finally {
+      nativeDialogDepthRef.current -= 1;
+      setNativeDialogDepth(nativeDialogDepthRef.current);
+    }
+  }
+
+  function confirmDialog(...args: Parameters<typeof nativeConfirmDialog>) {
+    return withNativeDialog(() => nativeConfirmDialog(...args));
+  }
+  function openDialog<T extends OpenDialogOptions>(options?: T) {
+    return withNativeDialog(() => nativeOpenDialog(options));
+  }
+  function saveDialog(...args: Parameters<typeof nativeSaveDialog>) {
+    return withNativeDialog(() => nativeSaveDialog(...args));
+  }
+
+  async function openAboutDialog() {
+    if (await invalidateRecordingDraft("about dialog")) setAboutOpen(true);
+  }
+
+  async function openResetDialog() {
+    if (await invalidateRecordingDraft("reset dialog")) setResetConfirmationOpen(true);
+  }
 
   const jobIdRef = useRef<number | null>(null);
   const updateBusyRef = useRef(false);
@@ -1294,12 +1345,21 @@ function App() {
     let disposed = false, unlistenWindow: (() => void) | undefined, unlistenPreview: (() => void) | undefined;
     let inFlight: Promise<void> | null = null;
     const actualRecording = () => recordingBusyRef.current || !!recordingSnapshotRef.current?.selectionRequestId ||
-      !!recordingSnapshotRef.current && ["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(recordingSnapshotRef.current.phase);
+      !!recordingSnapshotRef.current && isRecordingActive(recordingSnapshotRef.current.phase);
     const close = () => {
       if (inFlight) return inFlight;
       let destroyed = false;
+      // Retire local Start eligibility before the first asynchronous fence.
+      // This is only a UI hold; destructive cleanup still follows approval.
+      ordinaryClosingRef.current = true;
+      setOrdinaryClosing(true);
       inFlight = (async () => {
-        if (actualRecording()) return;
+        if (!await invalidateRecordingDraft("close")) return;
+        const nativeRecording = await invoke<RecordingSnapshot>("recording_snapshot");
+        if (nativeRecording.selectionRequestId || isRecordingActive(nativeRecording.phase)) {
+          await recordingCloseHandlerRef.current?.();
+          return;
+        }
         const queuedCount = summarizeExportQueue(exportQueueStateRef.current).queued;
         const unfinished = [
           jobIdRef.current !== null || pendingEncodeRef.current !== null ? "an export is still running" : null,
@@ -1310,9 +1370,8 @@ function App() {
         ].filter(Boolean);
         if (unfinished.length && !await confirmDialog(`${unfinished.join(", and ")}. Close anyway?`, { title: "Video For Lazies", kind: "warning" })) return;
         if (disposed) return;
-        // Keep open never enters this committed-close lane. All new claims
-        // are blocked synchronously while exact media cleanup is awaited.
-        ordinaryClosingRef.current = true; setOrdinaryClosing(true);
+        // Keep open never enters cleanup. Local admission remains held while
+        // exact media cleanup is awaited.
         if (actualRecording()) { await recordingCloseHandlerRef.current?.(); return; }
         if (audioPreviewControllerRef.current && !await audioPreviewControllerRef.current.close()) throw new Error("Audio preview cleanup is not confirmed. Retry cleanup before closing.");
         if (disposed) return;
@@ -1320,7 +1379,13 @@ function App() {
         await getCurrentWindow().destroy();
         destroyed = true;
       })().catch(failure => { if (!disposed) setStatus(`Could not close safely: ${String(failure)}`); }).finally(() => {
-        if (!destroyed) { ordinaryClosingRef.current = false; if (!disposed) setOrdinaryClosing(false); }
+        if (!destroyed) {
+          ordinaryClosingRef.current = false;
+          if (!disposed) {
+            setOrdinaryClosing(false);
+            void recordingControlsRef.current.reconcile().catch(error => setStatus(`Could not refresh recording shortcuts: ${String(error)}`));
+          }
+        }
         inFlight = null;
       });
       return inFlight;
@@ -1337,6 +1402,7 @@ function App() {
       if (recordingClosePendingRef.current) return;
       recordingClosePendingRef.current = true;
       try {
+        if (!await invalidateRecordingDraft("recording close")) return;
         const save = await confirmDialog("Stop and save the recording, then close?", {
           title: "Recording in progress", kind: "warning", okLabel: "Stop and save", cancelLabel: "Keep open",
         });
@@ -1347,12 +1413,12 @@ function App() {
         // and retain the window on any recovery or polling failure.
         while (!disposed) {
           const next = await invoke<RecordingSnapshot>("recording_snapshot");
-          if (!next.selectionRequestId && !["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(next.phase)) {
+          if (!next.selectionRequestId && !isRecordingActive(next.phase)) {
             if (next.phase === "completed" || next.phase === "idle" || (next.phase === "failed" && next.recoveries.length === 0)) {
               if (audioPreviewControllerRef.current && !await audioPreviewControllerRef.current.close()) throw new Error("Audio preview cleanup is not confirmed.");
               await invoke("recording_close", { sessionId: next.sessionId });
             } else {
-              changeWorkspace("record");
+              await changeWorkspace("record");
               setStatus("Recording recovery is available. Save it before closing.");
             }
             break;
@@ -1361,7 +1427,10 @@ function App() {
         }
       } catch (error) {
         setStatus(`Could not close safely: ${String(error)}`);
-      } finally { recordingClosePendingRef.current = false; }
+      } finally {
+        recordingClosePendingRef.current = false;
+        if (!disposed) void recordingControlsRef.current.reconcile().catch(error => setStatus(`Could not refresh recording shortcuts: ${String(error)}`));
+      }
     };
     recordingCloseHandlerRef.current = closeRecording;
     void listen("recording-close-requested", closeRecording).then((handle) => { if (disposed) handle(); else unlisten = handle; }).catch(() => {});
@@ -1703,7 +1772,7 @@ function App() {
     applyFullRecipeSettings(recipe.settings, recipe.name, { resetOutput: false });
   }
 
-  function openCreateRecipeDialog() {
+  async function openCreateRecipeDialog() {
     if (
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
@@ -1714,6 +1783,7 @@ function App() {
       showPersistentRecipeStatus("Saved recipes were created by a newer app version and cannot be changed here.");
       return;
     }
+    if (!await invalidateRecordingDraft("recipe dialog")) return;
     setAboutOpen(false);
     setRecipeNameDraft(`Custom recipe ${userRecipeStore.recipes.length + 1}`);
     setRecipeDescriptionDraft("");
@@ -1722,7 +1792,7 @@ function App() {
     setRecipeDialog({ kind: "create" });
   }
 
-  function openEditRecipeDialog(recipe: UserRecipe) {
+  async function openEditRecipeDialog(recipe: UserRecipe) {
     if (
       jobIdRef.current !== null ||
       pendingEncodeRef.current !== null ||
@@ -1730,6 +1800,7 @@ function App() {
       queueSnapshotApplyingRef.current ||
       userRecipeStore.readOnly
     ) return;
+    if (!await invalidateRecordingDraft("recipe dialog")) return;
     setAboutOpen(false);
     setRecipeNameDraft(recipe.name);
     setRecipeDescriptionDraft(recipe.description);
@@ -5604,14 +5675,17 @@ function App() {
     setPreviewPlaying(false);
   }
 
-  function changeWorkspace(workspace: Workspace) {
-    if (activeWorkspaceRef.current === workspace) return;
+  async function changeWorkspace(workspace: Workspace) {
+    const revision = ++workspaceChangeRevision.current;
+    if (activeWorkspaceRef.current === workspace) return true;
+    if (!await invalidateRecordingDraft("workspace change") || revision !== workspaceChangeRevision.current) return false;
     // Native drop callbacks can arrive before the next render/effect.
     activeWorkspaceRef.current = workspace;
     setDragActive(false);
     trimDragCleanupRef.current?.();
     if (workspace !== "edit") { pausePreviewPlayback(); void audioPreviewControllerRef.current?.stop(false); }
     setActiveWorkspace(workspace);
+    return true;
   }
 
   function syncPreviewToTime(nextTimeS: number, target: TrimFocusTarget, opts?: { pause?: boolean }) {
@@ -7400,6 +7474,8 @@ function App() {
       cropDetecting ||
       frameSaving
     ) return;
+    if (!await invalidateRecordingDraft("update preparation")) return;
+    if (updateBusyRef.current || recordingBusyRef.current) return;
     updateBusyRef.current = true;
     setUpdateBusy(true);
     setUpdatePublicError(null);
@@ -7616,6 +7692,19 @@ function App() {
         />
       ) : null}
       <header className="vfl-header">
+        {!recordingControls.ready && recordingControls.error ? (
+          <div className="vfl-update-banner is-error">
+            <div className="vfl-update-copy">
+              <div className="vfl-update-kicker">Recording controls</div>
+              <div className="vfl-update-summary" role="alert">{recordingControls.error}</div>
+            </div>
+            <div className="vfl-update-actions">
+              <button type="button" disabled={ordinaryClosing} onClick={() => {
+                void recordingControls.reconnect().catch(error => setStatus(`Could not reconnect recording controls: ${String(error)}`));
+              }}>Retry controls</button>
+            </div>
+          </div>
+        ) : null}
         {updateStartupNotice ? (
           <div className={`vfl-update-banner ${updateStartupNotice.kind === "error" ? "is-error" : ""}`}>
             <div className="vfl-update-copy">
@@ -7699,7 +7788,7 @@ function App() {
           <div className="vfl-title">
             <div className="vfl-title-main">Video For Lazies</div>
           </div>
-          <WorkspaceTabs active={activeWorkspace} onChange={changeWorkspace} />
+          <WorkspaceTabs active={activeWorkspace} onChange={(workspace) => { void changeWorkspace(workspace); }} />
           <div className="vfl-header-utilities">
             {activeWorkspace === "edit" ? <div className="vfl-header-badges">
               <div className="vfl-header-badge">{sourceBadgeText}</div>
@@ -7715,17 +7804,15 @@ function App() {
               <div className="vfl-header-badge">MP4 recording</div>
             )}
             {activeWorkspace === "record" && (attemptUi.isActive || queueRunning) ? (
-              <button type="button" className="vfl-workspace-export-status" onClick={() => {
-                changeWorkspace("edit");
-                document.getElementById("vfl-workspace-tab-edit")?.focus();
+              <button type="button" className="vfl-workspace-export-status" onClick={async () => {
+                if (await changeWorkspace("edit")) document.getElementById("vfl-workspace-tab-edit")?.focus();
               }}>
                 {queueRunning ? "Queue active" : "Export active"} · View in Edit
               </button>
             ) : null}
-            {activeWorkspace === "edit" && recordingSnapshot && ["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(recordingSnapshot.phase) ? (
-              <button type="button" className="vfl-workspace-export-status" onClick={() => {
-                changeWorkspace("record");
-                document.getElementById("vfl-workspace-tab-record")?.focus();
+            {activeWorkspace === "edit" && recordingSnapshot && isRecordingActive(recordingSnapshot.phase) ? (
+              <button type="button" className="vfl-workspace-export-status" onClick={async () => {
+                if (await changeWorkspace("record")) document.getElementById("vfl-workspace-tab-record")?.focus();
               }}>
                 {recordingSnapshot.phase === "recording" ? "Recording in progress" : recordingSnapshot.phase === "finalizing" ? "Saving recording" : "Recording active"} · View
               </button>
@@ -7735,7 +7822,7 @@ function App() {
               type="button"
               aria-label="About & updates"
               title="About & updates"
-              onClick={() => setAboutOpen(true)}
+              onClick={() => void openAboutDialog()}
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <circle cx="12" cy="12" r="9" />
@@ -9272,7 +9359,7 @@ function App() {
                     <div className="vfl-actions vfl-actions-secondary">
                       <button
                         data-smoke-id="reset-all-settings"
-                        onClick={() => setResetConfirmationOpen(true)}
+                        onClick={() => void openResetDialog()}
                         disabled={encodeBusy || updateBusy}
                       >
                         Reset all settings
@@ -9555,18 +9642,22 @@ function App() {
         inert={activeWorkspace !== "record"}
       >
         <RecordingWorkspace
-          visible={activeWorkspace === "record" && !ordinaryClosing}
-          busy={exportWorkBusy || interpolationInstalling || audioTrackWorkBusy || ordinaryClosing}
+          controls={recordingControls}
+          visible={activeWorkspace === "record" && !ordinaryClosing && !modalOpen && nativeDialogDepth === 0}
+          busy={exportWorkBusy || interpolationInstalling || audioTrackWorkBusy || ordinaryClosing || modalOpen || nativeDialogDepth > 0}
           onRecordingStateChange={handleRecordingStateChange}
           onPreviewAdmissionBusyChange={handlePreviewAdmissionBusyChange}
           onEditVideo={async (path) => {
-            if (recordingSnapshotRef.current && ["preparing", "countdown", "starting", "recording", "stopping", "finalizing"].includes(recordingSnapshotRef.current.phase)) return;
+            if (recordingSnapshotRef.current && isRecordingActive(recordingSnapshotRef.current.phase)) return;
             if (inputPathRef.current && queuePathIdentity(inputPathRef.current) !== queuePathIdentity(path)) {
               const open = await confirmDialog("Open this recording in Edit? Your current source will be replaced. Queued exports keep their saved settings.", { title: "Edit recording", kind: "info" });
               if (!open) return;
             }
+            if (!await invalidateRecordingDraft("Edit recording")) return;
+            const current = await invoke<RecordingSnapshot>("recording_snapshot");
+            if (current.selectionRequestId || isRecordingActive(current.phase)) return;
+            if (!await changeWorkspace("edit")) return;
             applyNewInput(path, "mp4");
-            changeWorkspace("edit");
             document.getElementById("vfl-workspace-tab-edit")?.focus();
           }}
         />

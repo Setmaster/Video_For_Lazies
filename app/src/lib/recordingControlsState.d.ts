@@ -1,0 +1,10 @@
+import type { ControlsSnapshot, ShortcutAction, ShortcutBindings, ShortcutChord } from "./recordingControlsTypes";
+export const SHORTCUT_ACTIONS: readonly ShortcutAction[];
+export const EMPTY_SHORTCUTS: Readonly<ShortcutBindings>;
+export function controlToken(value: unknown): value is string;
+export function isShortcutChord(value: unknown): value is ShortcutChord;
+export function shortcutLabel(chord: ShortcutChord | null): string;
+export function isControlsSnapshot(value: unknown): value is ControlsSnapshot;
+export function acceptControlsSnapshot(current: ControlsSnapshot | null, incoming: ControlsSnapshot): ControlsSnapshot;
+export function captureShortcutEvent(event: Pick<KeyboardEvent, "repeat" | "isComposing" | "ctrlKey" | "shiftKey" | "altKey" | "metaKey" | "key">): { key: string; ctrl: boolean; shift: boolean; alt: boolean; meta: boolean } | null;
+export function startAdmissionFromAck(acknowledged: ControlsSnapshot): { ownerToken: string; invalidationEpoch: number; minimizeCycle: number } | null;

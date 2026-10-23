@@ -3,7 +3,7 @@ import test from "node:test";
 import { acceptRecordingSnapshot, formatRecordingDuration, isRecordingActive, isRecordingRegionWithinDisplay, recordingSourceProblem } from "../src/lib/recordingState.mjs";
 
 function snapshot(sequence, phase = "idle", overrides = {}) {
-  return { sessionId: phase === "idle" ? null : "session-a", sequence, phase,
+  return { controlRevision: 0, resolvedRoleMask: 0, pause: null, audioControlLedger: null, pendingTransition: null, sessionId: phase === "idle" ? null : "session-a", sequence, phase,
     elapsedMs: 0, bytesWritten: 0, countdownRemaining: null, outputPath: null, message: null, config: null, audio: null, resolvedGeometry: null, selectionRequestId: null, recoveries: [], ...overrides };
 }
 
@@ -25,7 +25,7 @@ test("sequence comparison spans sessions and recovery, including equal-sequence 
 });
 
 test("every setup and save phase keeps activity admission; terminal phases release it", () => {
-  for (const phase of ["preparing", "countdown", "starting", "recording", "stopping", "finalizing"]) assert.equal(isRecordingActive(phase), true, phase);
+  for (const phase of ["preparing", "countdown", "starting", "recording", "pausing", "paused", "resuming", "stopping", "finalizing"]) assert.equal(isRecordingActive(phase), true, phase);
   for (const phase of ["idle", "completed", "recoverable", "failed"]) assert.equal(isRecordingActive(phase), false, phase);
 });
 
@@ -64,4 +64,26 @@ test("source eligibility preserves exact odd selections within the native 16 to 
   assert.match(recordingSourceProblem({ ...source, height: 4322 }, display), /up to 7680/);
   assert.equal(recordingSourceProblem({ ...source, width: 641 }, display), null);
   assert.equal(isRecordingRegionWithinDisplay({ ...source, height: 481 }, display), true);
+});
+
+
+test("native pause transitions preserve compressed elapsed time and reject stale replies after Stop", () => {
+  const paused = snapshot(41, "paused", { elapsedMs: 12_340, bytesWritten: 5000 });
+  assert.equal(acceptRecordingSnapshot(snapshot(40, "pausing"), paused), paused);
+  const stopped = snapshot(44, "stopping", { elapsedMs: 12_340 });
+  for (const phase of ["pausing", "paused", "resuming"]) assert.equal(acceptRecordingSnapshot(stopped, snapshot(43, phase)), stopped);
+  assert.equal(formatRecordingDuration(paused.elapsedMs), "00:00:12");
+});
+
+test("optional native clock metadata retains exact decimal samples/QPC and rejects malformed or unbound fields", () => {
+  const clockEpoch = { activeSample: "18446744073709551615", physicalQpc100ns: "9223372036854775807" };
+  const lastPauseClock = { pauseRevision: 7, cutoffSample: "18446744073709551615", physicalCutoffQpc100ns: "123456789012345678", releasedQpc100ns: "123456789012345679" };
+  const value = snapshot(55, "paused", { clockEpoch, lastPauseClock });
+  assert.equal(acceptRecordingSnapshot(snapshot(54, "pausing"), value), value);
+  assert.equal(acceptRecordingSnapshot(snapshot(54), snapshot(55)).clockEpoch, undefined, "older fixtures may omit diagnostic metadata");
+  for (const patch of [{ clockEpoch: { ...clockEpoch, activeSample: 480 } }, { clockEpoch: { ...clockEpoch, physicalQpc100ns: "0" } },
+    { clockEpoch: { ...clockEpoch, physicalQpc100ns: "9223372036854775808" } }, { clockEpoch: { ...clockEpoch, physicalQpc100ns: "18446744073709551615" } }, { clockEpoch: { ...clockEpoch, extra: true } },
+    { lastPauseClock: { ...lastPauseClock, pauseRevision: 0 } }, { lastPauseClock: { ...lastPauseClock, cutoffSample: "01" } }, { sessionId: null }]) {
+    assert.throws(() => acceptRecordingSnapshot(snapshot(54), { ...value, ...patch }), /invalid status/);
+  }
 });

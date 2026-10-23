@@ -233,3 +233,9 @@
 .vfl-audio-meter-row meter { flex: 1; width: 0; min-width: 64px; height: 10px; }
 .vfl-audio-meter-row span { flex: 1; font-size: 11px; }
 .vfl-audio-source-controls input[type="range"] { width: 100%; }
+
+.vfl-record-shortcuts-toggle { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; justify-content: space-between; background: transparent; color: inherit; }
+.vfl-shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.vfl-shortcut-row output { display: block; font-size: 13px; margin-top: 3px; }
+.vfl-shortcut-capture { display: grid; gap: 8px; padding: 10px 0; }
+.vfl-record-transition-hint { margin-top: 8px; }

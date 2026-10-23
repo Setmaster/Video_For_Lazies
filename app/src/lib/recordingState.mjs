@@ -1,6 +1,10 @@
 import { isAudioStatus, isRecordingAudioConfig } from "./recordingAudioState.mjs";
-const activePhases = new Set(["preparing", "countdown", "starting", "recording", "stopping", "finalizing"]);
+import { isAudioLedger, isPauseSeal, isSampleIndex } from "./recordingSessionState.mjs";
+import { controlToken } from "./recordingControlsState.mjs";
+const activePhases = new Set(["preparing", "countdown", "starting", "recording", "pausing", "paused", "resuming", "stopping", "finalizing"]);
 const phases = new Set(["idle", ...activePhases, "completed", "recoverable", "failed"]);
+const fixedFields = (value, keys) => !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key));
+const qpc = value => isSampleIndex(value) && value !== "0" && (value.length < 19 || value.length === 19 && value <= "9223372036854775807");
 
 export function isRecordingActive(phase) {
   return activePhases.has(phase);
@@ -33,6 +37,17 @@ export function recordingWindowProblem(windowId, windows) {
 
 export function acceptRecordingSnapshot(current, incoming) {
   if (!incoming || !Number.isSafeInteger(incoming.sequence) || incoming.sequence < 0 ||
+      (incoming.clockEpoch != null && (!incoming.sessionId || !fixedFields(incoming.clockEpoch, ["activeSample", "physicalQpc100ns"]) ||
+        !isSampleIndex(incoming.clockEpoch.activeSample) || !qpc(incoming.clockEpoch.physicalQpc100ns))) ||
+      (incoming.lastPauseClock != null && (!incoming.sessionId || !fixedFields(incoming.lastPauseClock, ["pauseRevision", "cutoffSample", "physicalCutoffQpc100ns", "releasedQpc100ns"]) ||
+        !Number.isSafeInteger(incoming.lastPauseClock.pauseRevision) || incoming.lastPauseClock.pauseRevision <= 0 ||
+        !isSampleIndex(incoming.lastPauseClock.cutoffSample) || !qpc(incoming.lastPauseClock.physicalCutoffQpc100ns) || !qpc(incoming.lastPauseClock.releasedQpc100ns))) ||
+      !Number.isSafeInteger(incoming.controlRevision) || incoming.controlRevision < 0 ||
+      !Number.isSafeInteger(incoming.resolvedRoleMask) || incoming.resolvedRoleMask < 0 || incoming.resolvedRoleMask > 3 ||
+      (incoming.pause !== null && !isPauseSeal(incoming.pause)) ||
+      (incoming.audioControlLedger !== null && !isAudioLedger(incoming.audioControlLedger)) ||
+      (incoming.pendingTransition !== null && (!incoming.pendingTransition || !controlToken(incoming.pendingTransition.operationId) ||
+        !["pause", "resume"].includes(incoming.pendingTransition.action) || !Number.isSafeInteger(incoming.pendingTransition.controlRevision) || incoming.pendingTransition.controlRevision < 0)) ||
       !phases.has(incoming.phase) || !Array.isArray(incoming.recoveries) ||
       !Number.isFinite(incoming.elapsedMs) || incoming.elapsedMs < 0 ||
       !Number.isFinite(incoming.bytesWritten) || incoming.bytesWritten < 0 ||

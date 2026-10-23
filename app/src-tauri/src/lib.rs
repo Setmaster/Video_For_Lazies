@@ -859,6 +859,7 @@ pub fn run() {
 
     let activity = activity::ActivityCoordinator::startup_pending();
     let audio_previews = audio_preview::AudioPreviewManager::new(activity.clone());
+    let recording_controls = recording::controls_hotkeys::ControlsManager::default();
 
     let exit_code = tauri::Builder::default()
         .manage(JobManager::new())
@@ -867,8 +868,34 @@ pub fn run() {
         .manage(interpolation_commands::InterpolationInstaller::default())
         .manage(updater::UpdaterCoordinator::new())
         .manage(recording::RecordingManager::default())
+        .manage(recording_controls.clone())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let controls = app.state::<recording::controls_hotkeys::ControlsManager>();
+            if let Some(main) = app.get_webview_window("main")
+                && let Err(error) = controls.initialize(
+                    app.handle().clone(),
+                    &main,
+                    recording::controls_backend(app.handle().clone()),
+                )
+            {
+                // Optional controls must report their unavailable state
+                // without preventing the editor from starting.
+                eprintln!("Recording controls initialization failed: {error}");
+            }
+            Ok(())
+        })
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+                && let Some(controls) = webview
+                    .app_handle()
+                    .try_state::<recording::controls_hotkeys::ControlsManager>()
+            {
+                controls.page_load_started();
+            }
+        })
         // Destroyed (not CloseRequested) so the frontend close-confirm can still
         // prevent the close; once the window is really gone, no ffmpeg child may
         // outlive the app.
@@ -877,7 +904,10 @@ pub fn run() {
                 return;
             }
             let recorder: State<'_, recording::RecordingManager> = window.app_handle().state();
+            let controls: State<'_, recording::controls_hotkeys::ControlsManager> =
+                window.app_handle().state();
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                controls.invalidate_start("close requested");
                 if recorder.needs_close_guard() {
                     api.prevent_close();
                     let _ = window.emit("recording-close-requested", ());
@@ -891,6 +921,7 @@ pub fn run() {
                 }
             }
             if matches!(event, tauri::WindowEvent::Destroyed) {
+                controls.signal_shutdown();
                 let previews: State<'_, audio_preview::AudioPreviewManager> =
                     window.app_handle().state();
                 previews.signal_shutdown();
@@ -942,8 +973,14 @@ pub fn run() {
             recording::audio_manager::recording_audio_applications,
             recording::audio_manager::recording_audio_snapshot,
             recording::audio_manager::recording_audio_set_levels,
+            recording::audio_manager::recording_audio_reconcile,
+            recording::audio_manager::recording_audio_reconcile_retry,
+            recording::controls_hotkeys::recording_controls,
+            recording::controls_hotkeys::recording_controls_normalize,
             recording::recording_select_region,
             recording::recording_start,
+            recording::recording_pause,
+            recording::recording_resume,
             recording::recording_stop,
             recording::recording_close,
             recording::recording_snapshot,
@@ -954,6 +991,8 @@ pub fn run() {
         .expect("error while building tauri application")
         .run_return(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                let controls: State<'_, recording::controls_hotkeys::ControlsManager> = app.state();
+                controls.invalidate_start("exit requested");
                 let recorder: State<'_, recording::RecordingManager> = app.state();
                 if recorder.needs_close_guard() {
                     api.prevent_exit();
@@ -969,6 +1008,9 @@ pub fn run() {
                 }
             }
         });
+    if let Err(error) = recording_controls.shutdown() {
+        eprintln!("Recording controls cleanup failed: {error}");
+    }
     // Join preview workers after the event loop has released its window. The
     // Destroyed hook only signals cancellation so it never waits on a worker.
     if let Err(error) = audio_previews.shutdown() {

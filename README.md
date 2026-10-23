@@ -124,7 +124,11 @@ Recordings save as H.264 MP4 with AAC when audio is enabled. HDR displays are co
 
 Choose 24, 25, 30, 50 or 60 fps, Standard or High quality, a visible cursor, and a 0/3/5-second countdown. High quality uses more disk space. Available resolution and frame rate depend on capture and encoder throughput; the app reports a failure instead of silently reducing either setting.
 
-Use **Stop and save**, the native Stop control, or **Ctrl+Shift+F10** when that shortcut is available. Wait for **Recording saved**, then open the MP4 or choose **Edit video**. Closing during recording offers **Stop and save** or **Keep open**. Interrupted recordings appear under **Unfinished recordings** for recovery; an unfinished ending may be lost. Temporary files can be larger than the saved MP4, especially with audio. Keep extra free space. Existing output files are preserved.
+Use **Pause** and **Resume** to omit a break from the recording. The timer counts recorded time. Pausing releases screen and audio capture; preview and live audio controls remain unavailable until recording resumes. Resume uses the same selected sources. If a source is temporarily unavailable, restore it and explicitly resume. **Stop and save** also works while paused or while a transition is pending.
+
+Start, Pause, Resume and Stop can each have an optional global shortcut. All four are unset initially, including upgrades; the former Ctrl+Shift+F10 shortcut is no longer assigned automatically. Assign shortcuts in Record and check their registration status. Conflicts are reported. Assigned Start works with another app focused, including when Video For Lazies is minimized with a valid Record setup; a visible preparation control lets you cancel before capture begins. Clearing or resetting shortcuts disables them.
+
+Use **Stop and save** or the native Stop control. Wait for **Recording saved**, then open the MP4 or choose **Edit video**. Closing during recording offers **Stop and save** or **Keep open**. Interrupted recordings appear under **Unfinished recordings** for recovery; an unfinished ending may be lost, including the last unsealed fragment before a pause. Temporary files can be larger than the saved MP4, especially with audio. Keep extra free space. Existing output files are preserved.
 
 ### Smooth motion
 

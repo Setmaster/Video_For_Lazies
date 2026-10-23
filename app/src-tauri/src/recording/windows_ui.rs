@@ -549,14 +549,13 @@ pub fn select_region(display_id: &str, stop: Arc<AtomicBool>) -> Result<Option<R
     }))
 }
 
-const HUD_HOTKEY: i32 = 1;
+const HUD_PAUSE: usize = 101;
 const HUD_STOP: usize = 100;
 const HUD_SHUTDOWN: u32 = WM_APP + 1;
 struct HudState {
     stop: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    started: Instant,
-    hotkey: bool,
+    controls: Arc<super::native_controls::Controls>,
     handle: Arc<Mutex<Option<isize>>>,
 }
 
@@ -581,7 +580,7 @@ unsafe extern "system" fn hud_proc(
     let handled = {
         let state = unsafe { &mut *pointer };
         match message {
-            WM_CLOSE | WM_HOTKEY => {
+            WM_CLOSE => {
                 state.stop.store(true, Ordering::Release);
                 close = true;
                 true
@@ -589,6 +588,10 @@ unsafe extern "system" fn hud_proc(
             WM_COMMAND if wparam.0 & 0xffff == HUD_STOP => {
                 state.stop.store(true, Ordering::Release);
                 close = true;
+                true
+            }
+            WM_COMMAND if wparam.0 & 0xffff == HUD_PAUSE => {
+                state.controls.hud_intent();
                 true
             }
             HUD_SHUTDOWN => {
@@ -615,18 +618,33 @@ unsafe extern "system" fn hud_proc(
                     SetTextColor(dc, COLORREF(0x00ffffff));
                     SetBkMode(dc, TRANSPARENT);
                 }
-                let elapsed = state.started.elapsed().as_secs();
-                let hotkey = if state.hotkey {
-                    "Ctrl+Shift+F10 to stop"
-                } else {
-                    "Hotkey unavailable. Use the Stop button."
+                let (elapsed_ms, phase) = state.controls.hud_state();
+                let elapsed = elapsed_ms / 1000;
+                let label_phase = match phase {
+                    1 => "Pausing",
+                    2 => "Paused · inputs released",
+                    3 => "Resuming",
+                    _ => "Recording",
                 };
+                if let Ok(button) = unsafe { GetDlgItem(Some(hwnd), HUD_PAUSE as i32) } {
+                    let _ = unsafe {
+                        SetWindowTextW(
+                            button,
+                            if phase == 2 {
+                                w!("Resume")
+                            } else {
+                                w!("Pause")
+                            },
+                        )
+                    };
+                    let _ = unsafe { EnableWindow(button, phase == 0 || phase == 2) };
+                }
                 let mut label = wide(&format!(
-                    "Recording  {:02}:{:02}:{:02}\n{}",
+                    "{}  {:02}:{:02}:{:02}",
+                    label_phase,
                     elapsed / 3600,
                     (elapsed / 60) % 60,
-                    elapsed % 60,
-                    hotkey
+                    elapsed % 60
                 ));
                 label.pop();
                 let mut rect = RECT {
@@ -639,13 +657,7 @@ unsafe extern "system" fn hud_proc(
                 let _ = unsafe { EndPaint(hwnd, &paint) };
                 true
             }
-            WM_DESTROY => {
-                if state.hotkey {
-                    let _ = unsafe { UnregisterHotKey(Some(hwnd), HUD_HOTKEY) };
-                    state.hotkey = false;
-                }
-                true
-            }
+            WM_DESTROY => true,
             WM_NCDESTROY => {
                 if let Ok(mut handle) = state.handle.lock() {
                     *handle = None;
@@ -672,7 +684,10 @@ pub struct StopHud {
     thread: Option<JoinHandle<()>>,
 }
 impl StopHud {
-    pub fn start(stop: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn start(
+        stop: Arc<AtomicBool>,
+        controls: Arc<super::native_controls::Controls>,
+    ) -> Result<Self, String> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_thread = shutdown.clone();
         let handle = Arc::new(Mutex::new(None));
@@ -681,7 +696,13 @@ impl StopHud {
         let thread = thread::Builder::new()
             .name("recording-stop-ui".into())
             .spawn(move || {
-                let result = run_hud(stop.clone(), shutdown_thread, handle_thread, &ready_tx);
+                let result = run_hud(
+                    stop.clone(),
+                    shutdown_thread,
+                    handle_thread,
+                    controls,
+                    &ready_tx,
+                );
                 if let Err(error) = result {
                     stop.store(true, Ordering::Release);
                     let _ = ready_tx.send(Err(error));
@@ -744,6 +765,7 @@ fn run_hud(
     stop: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     handle: Arc<Mutex<Option<isize>>>,
+    controls: Arc<super::native_controls::Controls>,
     ready: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     let _dpi = PhysicalDpi::enter()?;
@@ -755,8 +777,7 @@ fn run_hud(
     let mut state = Box::new(HudState {
         stop,
         shutdown,
-        started: Instant::now(),
-        hotkey: false,
+        controls,
         handle: handle.clone(),
     });
     let hwnd = unsafe {
@@ -828,20 +849,31 @@ fn run_hud(
         )
     }
     .map_err(|e| format!("Could not create recording Stop button: {e}"))?;
-    state.hotkey = unsafe {
-        RegisterHotKey(
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Pause"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            196,
+            74,
+            170,
+            30,
             Some(hwnd),
-            HUD_HOTKEY,
-            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-            u32::from(VK_F10.0),
+            Some(HMENU(HUD_PAUSE as *mut _)),
+            Some(class.instance),
+            None,
         )
     }
-    .is_ok();
+    .map_err(|e| format!("Could not create Pause/Resume button: {e}"))?;
     if unsafe { SetTimer(Some(hwnd), 1, 100, None) } == 0 {
         return Err("Could not start recording Stop UI timer.".into());
     }
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return Err("The recording Stop window could not become visible.".into());
     }
     ready
         .send(Ok(()))

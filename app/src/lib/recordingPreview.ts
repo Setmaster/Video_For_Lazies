@@ -68,7 +68,8 @@ export function useRecordingPreview(options: Options) {
   const matches = useCallback((candidate: Request) => {
     const latest = currentOptions.current;
     return mounted.current && request.current === candidate && generation.current === candidate.generation &&
-      latest.visible && document.visibilityState !== "hidden" && latest.sourceKey === candidate.sourceKey && latest.showCursor === candidate.showCursor;
+      latest.visible && document.visibilityState !== "hidden" &&
+      !(isRecordingActive(latest.recordingPhase) && latest.recordingPhase !== "recording") && latest.sourceKey === candidate.sourceKey && latest.showCursor === candidate.showCursor;
   }, []);
 
   const cleanupRetired = useCallback(async () => {
@@ -130,7 +131,8 @@ export function useRecordingPreview(options: Options) {
 
   const start = useCallback(async () => {
     const selected = currentOptions.current;
-    if (!eventsConnected.current || !selected.visible || document.visibilityState === "hidden" || !selected.source) return;
+    if (!eventsConnected.current || !selected.visible || document.visibilityState === "hidden" || !selected.source ||
+        isRecordingActive(selected.recordingPhase) && selected.recordingPhase !== "recording") return;
     const selectedKey = selected.sourceKey, cursor = selected.showCursor;
     const cleanup = stop();
     const startGeneration = generation.current;
@@ -246,7 +248,7 @@ export function useRecordingPreview(options: Options) {
   useEffect(() => {
     const before = previousRecording.current;
     previousRecording.current = { phase: options.recordingPhase, sessionId: options.recordingSessionId };
-    if (["stopping", "finalizing"].includes(options.recordingPhase) ||
+    if (["pausing", "paused", "resuming", "stopping", "finalizing"].includes(options.recordingPhase) ||
         (isRecordingActive(before.phase) && !isRecordingActive(options.recordingPhase)) ||
         (before.sessionId && before.sessionId !== options.recordingSessionId && current.current.phase === "recording")) void stop();
   }, [options.recordingPhase, options.recordingSessionId, stop]);
@@ -256,7 +258,7 @@ export function useRecordingPreview(options: Options) {
     currentOptions.current.sourceKey === ticket.sourceKey && currentOptions.current.showCursor === ticket.showCursor, []);
   const visibleImage = image && request.current && matches(request.current) &&
     image.previewId === snapshot.previewId && image.configEpoch === snapshot.configEpoch && isPreviewLive(snapshot.phase) &&
-    !["stopping", "finalizing"].includes(options.recordingPhase) ? image : null;
+    !["pausing", "paused", "resuming", "stopping", "finalizing"].includes(options.recordingPhase) ? image : null;
   return { snapshot, image: visibleImage, starting, stopping, error, eventsReady, start, stop,
     detachForRecording: detach, finishHandoff: cleanupRetired, isCurrent,
     hasRequest: request.current !== null || retired.current.size > 0 };

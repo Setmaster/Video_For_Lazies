@@ -24,7 +24,7 @@ export default function RecordingAudioControls({ config, setConfig, devices, app
       onChange={event => changeLevel(source, { gain: Number(event.currentTarget.value) / 100 })} />
     <label className="vfl-check"><input id={`vfl-record-${source}-mute`} type="checkbox" checked={levels[source].muted} disabled={recording ? !mixer.ready : locked}
       onChange={event => changeLevel(source, { muted: event.currentTarget.checked })} /><span>Mute {name.toLowerCase()}</span></label>
-    <Meter name={name} meter={recording ? meter : undefined} />
+    <Meter name={name} meter={recording && mixer.metersActive ? meter : undefined} />
   </div>;
   return <section className="vfl-card is-open" aria-labelledby="vfl-record-audio-title">
     <div className="vfl-record-card-head"><h2 id="vfl-record-audio-title" className="vfl-card-title">Audio</h2></div>
@@ -54,10 +54,10 @@ export default function RecordingAudioControls({ config, setConfig, devices, app
         <label className="vfl-check"><input id="vfl-record-noise-reduction" type="checkbox" checked={config.microphone.suppression === "save"} disabled={locked || !capabilities?.audio.microphoneSuppression.available}
           onChange={event => setConfig({ ...config, microphone: { ...config.microphone!, suppression: event.currentTarget.checked ? "save" : "off" } })} /><span>Noise reduction</span></label>
         <div className="vfl-inline-hint">Applied when saving. Live levels are measured before noise reduction.{!capabilities?.audio.microphoneSuppression.available ? ` ${capabilities?.audio.microphoneSuppression.reason || "Noise reduction is unavailable."}` : ""}</div></>}
-      {(config.render.kind !== "off" || config.microphone) && <><Meter name="Mixed output" meter={recording ? mixer.status?.mixed : undefined} /><div className="vfl-inline-hint">Mixed playback plus separate selected-source tracks.</div></>}
+      {(config.render.kind !== "off" || config.microphone) && <><Meter name="Mixed output" meter={recording && mixer.metersActive ? mixer.status?.mixed : undefined} /><div className="vfl-inline-hint">Mixed playback plus separate selected-source tracks.</div></>}
       <div className="vfl-inline-hint">Microphone is off by default. Audio starts only when you record.</div>
-      {recording && (config.render.kind !== "off" || config.microphone) && <div className="vfl-inline-hint" role="status">{mixer.status?.rejectedCommandSequence != null ? "Audio change rejected; last confirmed levels remain in effect." : mixer.pending ? "Applying audio changes…" : mixer.status ? "Levels confirmed by the recorder." : "Waiting for recorder audio status."}</div>}
-      {mixer.error && <div className="vfl-error" role="alert">{mixer.error} <button type="button" onClick={() => void mixer.retry()}>Retry audio status</button></div>}
+      {recording && (config.render.kind !== "off" || config.microphone) && <div className="vfl-inline-hint" role="status">{!mixer.metersActive ? (mixer.phase === "paused" ? (mixer.pending ? "Audio changes are kept for Resume; they are not applied while paused." : "Audio inputs are paused. Levels are kept for Resume.") : "Waiting for recording audio status.") : mixer.status?.rejectedCommandSequence != null ? "Audio change rejected; last confirmed levels remain in effect." : mixer.pending ? "Applying audio changes…" : mixer.status ? "Levels confirmed by the recorder." : "Waiting for recorder audio status."}</div>}
+      {mixer.error && <div className="vfl-error" role="alert">{mixer.error} {!mixer.reviewRequired && <button type="button" disabled={mixer.syncing} onClick={() => void mixer.retry()}>{mixer.phase === "paused" ? "Retry synchronization" : "Retry audio status"}</button>}</div>}
     </div>
   </section>;
 }

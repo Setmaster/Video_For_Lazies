@@ -154,6 +154,17 @@ impl PreviewManager {
         drop(i);
         self.publish(app);
     }
+    pub fn pause_recording_delivery(&self, app: &AppHandle, owner: &str) {
+        let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if i.owner.as_deref() != Some(owner) || !i.recording {
+            return;
+        }
+        Self::clear(&mut i, "idle", None);
+        i.snapshot.preview_id = None;
+        i.request_id = None;
+        drop(i);
+        self.publish(app);
+    }
     pub fn stop_wait(&self, handoff: bool) -> Result<Option<ActivityLease>, String> {
         self.stop_wait_owner(handoff, None)
     }
@@ -478,6 +489,12 @@ pub(crate) fn recording_preview_start(
     if record.selecting.is_some() {
         return Err("Finish selecting the recording area first.".into());
     }
+    if matches!(
+        record.snapshot.phase.as_str(),
+        "pausing" | "paused" | "resuming"
+    ) {
+        return Err("Preview is off while recording is paused or changing state.".into());
+    }
     let recording = active(&record.snapshot.phase);
     if recording
         && record
@@ -571,8 +588,7 @@ pub(crate) fn recording_preview_start(
             stop,
             None,
             |_| {},
-            Some(tap),
-            None,
+            super::HostTaps{preview:Some(tap),..Default::default()},
         );
         preview.finish(&app, &owner, result);
     }).is_err() {

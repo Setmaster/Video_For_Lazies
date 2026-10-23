@@ -1,8 +1,10 @@
 //! Selected sources share one native QPC/sample epoch and post-mute float stems.
 use super::{
     audio,
+    audio_controls::{AcceptedIntent, AudioReceipt, LevelIntent, Placement},
     audio_envelope::{self, Envelope},
     audio_mixer::{Command, ControlQueue, Mixer},
+    audio_reconcile_wire::{self, Message, Stager},
     audio_types::*,
 };
 use std::{
@@ -23,6 +25,16 @@ struct State {
     fatal: Option<String>,
     cutoff: Option<i64>,
     final_sample: Option<u64>,
+    active_zero: Option<i64>,
+    pause_sample: Option<u64>,
+    pause_revision: u64,
+    sealed_sequence: u64,
+    receipts: Vec<AudioReceipt>,
+    stager: Stager,
+    stage_receipts: std::collections::BTreeMap<u64, i64>,
+    ack: Option<audio_reconcile_wire::Ack>,
+    reconcile_error: Option<serde_json::Value>,
+    reconciled_revision: Option<u64>,
 }
 #[derive(Default)]
 pub struct Controls {
@@ -68,6 +80,12 @@ impl Controls {
     pub fn ready(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).ready = true;
     }
+    pub fn set_epoch(&self, zero: i64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_zero = Some(zero);
+    }
     pub fn submit(&self, levels: AudioLevels) -> Result<(), String> {
         let receipt = super::qpc100ns().map_err(|e| e.to_string())?;
         levels.validate()?;
@@ -85,8 +103,29 @@ impl Controls {
             return Err("Audio controls are not active.".into());
         }
         let roles = config.role_mask();
+        let zero = s
+            .active_zero
+            .ok_or("Audio media clock is not initialized.")?;
+        let old = s
+            .queue
+            .as_ref()
+            .unwrap()
+            .lookup_command(levels.command_sequence);
+        if old.is_none() && s.receipts.len() >= CONTROL_CAPACITY {
+            let reason = "Audio receipt delivery exceeded its safe bound; recording stopped.";
+            Self::reject(&mut s, levels.command_sequence, reason, Some(receipt));
+            return Err(reason.into());
+        }
+        let target = old
+            .as_ref()
+            .and_then(|c| c.target_sample)
+            .unwrap_or_else(|| super::audio_mixer::control_sample(zero, receipt));
         let before = s.queue.as_ref().unwrap().clone();
-        let result = s.queue.as_mut().unwrap().push(levels.clone(), receipt);
+        let result = s
+            .queue
+            .as_mut()
+            .unwrap()
+            .push_preserving(levels.clone(), receipt);
         let capacity =
             s.queue.as_ref().unwrap().edge_count() + s.persisted > audio_envelope::MAX_RECORDS;
         if capacity {
@@ -106,6 +145,17 @@ impl Controls {
             let reason = "Mute history reached its safe capacity; the change was not applied.";
             Self::reject(&mut s, levels.command_sequence, reason, Some(receipt));
             return Err(reason.into());
+        }
+        s.queue
+            .as_mut()
+            .unwrap()
+            .bind_target(levels.command_sequence, target)?;
+        if old.is_none() {
+            s.receipts.push(AudioReceipt {
+                command_sequence: levels.command_sequence,
+                target_sample: target.to_string(),
+                placement: Placement::Active,
+            });
         }
         if let Some(status) = &mut s.status {
             status.accepted_command_sequence = status
@@ -127,13 +177,243 @@ impl Controls {
             s.closed = true;
         }
     }
-    fn claim(&self, zero: i64, sample: u64, final_tail: bool) -> Option<Command> {
+    fn claim(&self, _zero: i64, sample: u64, final_tail: bool) -> Option<Command> {
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if s.closed && !final_tail {
             return None;
         }
         let cutoff = s.final_sample;
-        s.queue.as_mut()?.claim_due(zero, sample, cutoff)
+        s.queue.as_mut()?.claim_due_at(sample, cutoff)
+    }
+    pub fn pause_at(&self, cutoff: u64, revision: u64, sealed: u64) {
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        s.ready = false;
+        s.final_sample = Some(cutoff);
+        s.pause_sample = Some(cutoff);
+        s.pause_revision = revision;
+        s.sealed_sequence = sealed;
+        s.reconciled_revision = None;
+    }
+    pub fn seal_admission(&self, sealed: u64) -> Result<(), String> {
+        let mut s = self
+            .inner
+            .lock()
+            .map_err(|_| "Audio controls unavailable.")?;
+        if s.closed || !s.ready || s.queue.as_ref().is_none_or(|q| q.last_sequence() != sealed) {
+            return Err("Pause did not receive the complete accepted audio watermark.".into());
+        }
+        s.ready = false;
+        Ok(())
+    }
+    pub fn resume_at(&self, zero: i64) {
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        s.active_zero = Some(zero);
+        s.final_sample = None;
+        s.pause_sample = None;
+        s.ready = true;
+        s.stager.clear();
+        s.stage_receipts.clear();
+        s.reconciled_revision = None;
+        let roles = s.config.as_ref().map_or(0, NativeAudioConfig::role_mask);
+        if let Some(status) = &mut s.status {
+            status.render.state = if roles & 1 != 0 { "pending" } else { "off" }.into();
+            status.microphone.state = if roles & 2 != 0 { "pending" } else { "off" }.into();
+            status.mixed.state = if roles != 0 { "pending" } else { "off" }.into();
+            status.sequence += 1;
+        }
+    }
+    pub fn admit_resume(&self, revision: u64) -> Result<(), String> {
+        let s = self
+            .inner
+            .lock()
+            .map_err(|_| "Audio controls unavailable.")?;
+        if s.closed || s.pause_sample.is_none() || s.pause_revision != revision {
+            return Err("Resume belongs to a different Pause boundary.".into());
+        }
+        if s.config
+            .as_ref()
+            .is_none_or(|c| c.role_mask() != 0 && s.reconciled_revision != Some(revision))
+        {
+            return Err("Resume requires a complete native audio-prefix acknowledgment.".into());
+        }
+        Ok(())
+    }
+    pub fn paused_released(&self) {
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = &mut s.status {
+            for meter in [
+                &mut status.render,
+                &mut status.microphone,
+                &mut status.mixed,
+            ] {
+                meter.state = "off".into();
+                meter.peak = 0.;
+                meter.rms = 0.;
+            }
+            status.sequence += 1;
+        }
+    }
+    pub fn pending(&self) -> Vec<AcceptedIntent> {
+        let s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        s.queue
+            .as_ref()
+            .map(|q| {
+                q.pending_commands()
+                    .into_iter()
+                    .map(|c| AcceptedIntent {
+                        intent: LevelIntent::from(&c.levels),
+                        target_sample: c.target_sample.map(|n| n.to_string()),
+                        placement: Placement::Active,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn notices(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut value = serde_json::Map::new();
+        if !s.receipts.is_empty() {
+            value.insert(
+                "audioReceipts".into(),
+                serde_json::json!(std::mem::take(&mut s.receipts)),
+            );
+        }
+        if let Some(ack) = s.ack.take() {
+            value.insert("reconcileAck".into(), serde_json::json!(ack));
+        }
+        if let Some(error) = s.reconcile_error.take() {
+            value.insert("reconcileError".into(), error);
+        }
+        value
+    }
+    pub fn reconcile(&self, message: Message) -> Result<(), String> {
+        let receipt = super::qpc100ns().map_err(|e| e.to_string())?;
+        let now = (receipt.max(0) as u64) / 10_000;
+        let mut s = self
+            .inner
+            .lock()
+            .map_err(|_| "Audio controls unavailable.")?;
+        let Some(cutoff) = s.pause_sample else {
+            return Err("Reconciliation requires a paused capture.".into());
+        };
+        let config = s
+            .config
+            .as_ref()
+            .ok_or("Audio is not initialized.")?
+            .clone();
+        if config.role_mask() == 0 {
+            return Err("This recording has no audio reconciliation fence.".into());
+        }
+        let accepted = s.queue.as_ref().unwrap().last_sequence();
+        let (token, attempt) = match &message {
+            Message::Begin(v) => (v.batch_token.clone(), v.attempt),
+            Message::Entry(v) => (v.batch_token.clone(), v.attempt),
+            Message::Seal(v) => (v.batch_token.clone(), v.attempt),
+        };
+        let result = (|| -> Result<(), String> {
+            match message {
+                Message::Begin(begin) => {
+                    let context = audio_reconcile_wire::HostContext {
+                        session_id: config.session_id,
+                        source_generation: config.source_generation,
+                        pause_revision: s.pause_revision,
+                        sealed_sequence: s.sealed_sequence,
+                        accepted_sequence: accepted,
+                    };
+                    s.stager.begin(begin, &context, now)?;
+                    s.reconciled_revision = None;
+                }
+                Message::Entry(entry) => {
+                    let target = entry
+                        .target_sample
+                        .parse::<u64>()
+                        .map_err(|_| "Invalid target sample.")?;
+                    if target < cutoff
+                        || entry.placement == Placement::ResumeBound && target != cutoff
+                    {
+                        return Err("Reconciliation target precedes the Pause boundary.".into());
+                    }
+                    if s.stage_receipts.len() >= CONTROL_CAPACITY
+                        && !s.stage_receipts.contains_key(&entry.command_sequence)
+                    {
+                        return Err("Reconciliation receipt bound exceeded.".into());
+                    }
+                    s.stage_receipts
+                        .entry(entry.command_sequence)
+                        .or_insert(receipt);
+                    s.stager.entry(entry, now)?;
+                }
+                Message::Seal(seal) => {
+                    let prefix = s.stager.seal(seal, now)?;
+                    let mut previous = s
+                        .status
+                        .as_ref()
+                        .map(|a| [a.render_level.muted, a.microphone_level.muted])
+                        .unwrap_or([false, false]);
+                    let commands: Vec<Command> = prefix
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            let levels = entry
+                                .intent()
+                                .levels(&config.session_id, &config.source_generation);
+                            let mutes = [levels.render_level.muted, levels.microphone_level.muted];
+                            let old = s
+                                .queue
+                                .as_ref()
+                                .unwrap()
+                                .lookup_command(entry.command_sequence);
+                            let edge = previous != mutes;
+                            previous = mutes;
+                            if let Some(old) = &old
+                                && (old.levels != levels
+                                    || old.target_sample != entry.target_sample.parse().ok())
+                            {
+                                return Err(
+                                    "Conflicting retained reconciliation identity or target."
+                                        .to_string(),
+                                );
+                            }
+                            Ok(old.unwrap_or_else(|| Command {
+                                levels,
+                                received_qpc: *s
+                                    .stage_receipts
+                                    .get(&entry.command_sequence)
+                                    .unwrap_or(&receipt),
+                                edge,
+                                target_sample: entry.target_sample.parse().ok(),
+                            }))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    let mut queue = s.queue.as_ref().unwrap().clone();
+                    queue.restore_prefix(&commands)?;
+                    if queue.edge_count() + s.persisted > audio_envelope::MAX_RECORDS {
+                        return Err("Mute envelope capacity exceeded.".into());
+                    }
+                    s.queue = Some(queue);
+                    s.reconciled_revision = Some(s.pause_revision);
+                    s.ack = Some(prefix.ack());
+                    if let Some(status) = s.status.as_mut() {
+                        status.accepted_command_sequence = prefix.begin.accepted_sequence;
+                        status.sequence += 1;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(reason) = &result {
+            let expired = reason.contains("expired") || reason.contains("retired");
+            s.reconcile_error = Some(
+                serde_json::json!({"batchToken":token,"attempt":attempt,"code":if expired{"stageExpired"}else{"protocolFailure"}}),
+            );
+            if expired {
+                return Ok(());
+            }
+            s.fatal = Some(reason.clone());
+            s.cutoff = Some(receipt);
+            s.closed = true;
+        }
+        result
     }
     fn commit(&self, mixer: &Mixer, meters: [AudioMeter; 3], persisted: u64) {
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -189,6 +469,7 @@ impl Controls {
         }
     }
 }
+
 pub struct Pipeline {
     capture: audio::AudioCapture,
     controls: Arc<Controls>,
@@ -196,6 +477,7 @@ pub struct Pipeline {
     envelope: Option<Envelope>,
     stems: [Option<File>; 2],
     pub frames: u64,
+    config: NativeAudioConfig,
 }
 impl Pipeline {
     pub fn start(
@@ -240,6 +522,7 @@ impl Pipeline {
             envelope,
             stems,
             frames: 0,
+            config: config.clone(),
         })
     }
     pub fn poll(&mut self) -> Result<(), String> {
@@ -312,6 +595,17 @@ impl Pipeline {
     pub fn release_capture(&mut self) {
         self.capture.release();
     }
+    pub fn reopen(&mut self, stop: &AtomicBool) -> Result<(), String> {
+        self.capture = audio::AudioCapture::start_native(
+            &self.config.render,
+            self.config
+                .microphone
+                .as_ref()
+                .map(|m| m.device_id.as_str()),
+            stop,
+        )?;
+        Ok(())
+    }
     pub fn finish(&self) -> Result<(), String> {
         for file in self.stems.iter().flatten() {
             file.sync_all()
@@ -321,5 +615,137 @@ impl Pipeline {
             envelope.finish()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod controls_tests {
+    use super::*;
+    fn config() -> NativeAudioConfig {
+        NativeAudioConfig {
+            session_id: "session".into(),
+            source_generation: "audio-session".into(),
+            render: NativeRender::System {
+                device_id: "fixed-endpoint".into(),
+            },
+            microphone: None,
+            render_level: MixLevel::default(),
+            microphone_level: MixLevel::default(),
+        }
+    }
+    fn levels(n: u64) -> AudioLevels {
+        AudioLevels {
+            session_id: "session".into(),
+            source_generation: "audio-session".into(),
+            command_sequence: n,
+            render_level: MixLevel {
+                gain: 0.5,
+                muted: false,
+            },
+            microphone_level: MixLevel::default(),
+        }
+    }
+    #[test]
+    fn receipt_capacity_rejects_before_new_identity_or_pcm_admission() {
+        let c = Controls::default();
+        c.configure(&config()).unwrap();
+        c.set_epoch(0);
+        c.ready();
+        for n in 1..=64 {
+            c.submit(levels(n)).unwrap();
+        }
+        assert!(c.submit(levels(65)).is_err());
+        let s = c.inner.lock().unwrap();
+        assert_eq!(s.queue.as_ref().unwrap().last_sequence(), 64);
+        assert_eq!(s.receipts.len(), 64);
+        assert!(s.fatal.is_some());
+        assert_eq!(s.status.as_ref().unwrap().applied_command_sequence, 0);
+    }
+    #[test]
+    fn complete_prefix_preserves_all_received_gains_and_first_targets_before_resume() {
+        use audio_reconcile_wire::*;
+        let c = Controls::default();
+        c.configure(&config()).unwrap();
+        {
+            let mut s = c.inner.lock().unwrap();
+            for n in 1..=2 {
+                let q = s.queue.as_mut().unwrap();
+                q.push_preserving(levels(n), n as i64).unwrap();
+                q.bind_target(n, 480).unwrap();
+            }
+        }
+        c.pause_at(480, 1, 2);
+        assert!(c.admit_resume(1).is_err());
+        let entries: Vec<Entry> = (1..=2)
+            .map(|n| Entry {
+                batch_token: "a".repeat(32),
+                attempt: 1,
+                ordinal: (n - 1) as usize,
+                command_sequence: n,
+                render_level: levels(n).render_level,
+                microphone_level: levels(n).microphone_level,
+                target_sample: "480".into(),
+                placement: Placement::Active,
+            })
+            .collect();
+        let digest = prefix_digest(&entries).unwrap();
+        c.reconcile(Message::Begin(Begin {
+            session_id: "session".into(),
+            source_generation: "audio-session".into(),
+            pause_revision: 1,
+            batch_token: "a".repeat(32),
+            attempt: 1,
+            count: 2,
+            prefix_digest: digest.clone(),
+            sealed_sequence: 2,
+            accepted_sequence: 2,
+        }))
+        .unwrap();
+        for entry in entries {
+            c.reconcile(Message::Entry(entry)).unwrap();
+        }
+        c.reconcile(Message::Seal(Seal {
+            batch_token: "a".repeat(32),
+            attempt: 1,
+            count: 2,
+            prefix_digest: digest,
+        }))
+        .unwrap();
+        assert!(c.notices().contains_key("reconcileAck"));
+        c.admit_resume(1).unwrap();
+        assert!(c.admit_resume(2).is_err());
+        assert_eq!(c.pending().len(), 2);
+        assert_eq!(c.snapshot().unwrap().applied_command_sequence, 0);
+        c.resume_at(100_000_000);
+        for n in 1..=2 {
+            let command = c.claim(100_000_000, 480, false).unwrap();
+            assert_eq!(command.levels.command_sequence, n);
+            assert_eq!(command.received_qpc, n as i64);
+            assert_eq!(command.target_sample, Some(480));
+        }
+        assert!(c.claim(100_000_000, 480, false).is_none());
+        assert_eq!(c.snapshot().unwrap().applied_command_sequence, 0);
+    }
+    #[test]
+    fn configured_off_status_does_not_require_an_audio_reconcile_fence() {
+        let c = Controls::default();
+        let mut config = config();
+        config.render = NativeRender::Off;
+        c.configure(&config).unwrap();
+        assert!(c.snapshot().is_some());
+        c.pause_at(480, 1, 0);
+        c.admit_resume(1).unwrap();
+        assert!(c.admit_resume(2).is_err());
+    }
+    #[test]
+    fn pause_barrier_requires_complete_accepted_watermark() {
+        let c = Controls::default();
+        c.configure(&config()).unwrap();
+        c.set_epoch(0);
+        c.ready();
+        c.submit(levels(1)).unwrap();
+        assert!(c.seal_admission(2).is_err());
+        c.seal_admission(1).unwrap();
+        assert!(c.submit(levels(2)).is_err());
     }
 }

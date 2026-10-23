@@ -7,6 +7,8 @@ pub struct Command {
     pub levels: AudioLevels,
     pub received_qpc: i64,
     pub edge: bool,
+    /// Native receipt fixes this on the compressed active sample clock once.
+    pub target_sample: Option<u64>,
 }
 #[derive(Clone)]
 pub struct ControlQueue {
@@ -29,6 +31,23 @@ impl ControlQueue {
     /// Identical retries retain their first receipt timestamp. Old settled
     /// sequences beyond the bounded retry window are stale, never rearmed.
     pub fn push(&mut self, levels: AudioLevels, received_qpc: i64) -> Result<bool, String> {
+        self.push_with_policy(levels, received_qpc, true)
+    }
+    /// Once a transport has acknowledged receipt, every identity is protected;
+    /// only the sender may coalesce gains that have not entered the pipe.
+    pub fn push_preserving(
+        &mut self,
+        levels: AudioLevels,
+        received_qpc: i64,
+    ) -> Result<bool, String> {
+        self.push_with_policy(levels, received_qpc, false)
+    }
+    fn push_with_policy(
+        &mut self,
+        levels: AudioLevels,
+        received_qpc: i64,
+        coalesce: bool,
+    ) -> Result<bool, String> {
         levels.validate()?;
         if let Some(old) = self
             .claimed
@@ -60,8 +79,10 @@ impl ControlQueue {
             levels: levels.clone(),
             received_qpc,
             edge,
+            target_sample: None,
         };
-        let replace = !edge
+        let replace = coalesce
+            && !edge
             && self
                 .pending
                 .back()
@@ -100,6 +121,150 @@ impl ControlQueue {
             return None;
         }
         self.claim_next()
+    }
+    pub fn lookup_command(&self, sequence: u64) -> Option<Command> {
+        self.claimed
+            .iter()
+            .chain(self.pending.iter())
+            .chain(self.recent.iter())
+            .find(|command| command.levels.command_sequence == sequence)
+            .cloned()
+    }
+    /// Bind every retained copy before publication; retries cannot move a target.
+    pub fn bind_target(&mut self, sequence: u64, target: u64) -> Result<(), String> {
+        let matches: Vec<_> = self
+            .claimed
+            .iter()
+            .chain(self.pending.iter())
+            .chain(self.recent.iter())
+            .filter(|c| c.levels.command_sequence == sequence)
+            .collect();
+        if matches.is_empty()
+            || matches
+                .iter()
+                .any(|c| c.target_sample.is_some_and(|old| old != target))
+        {
+            return Err("Audio receipt target is missing or conflicting.".into());
+        }
+        for command in self
+            .claimed
+            .iter_mut()
+            .chain(self.pending.iter_mut())
+            .chain(self.recent.iter_mut())
+        {
+            if command.levels.command_sequence == sequence {
+                command.target_sample = Some(target);
+            }
+        }
+        Ok(())
+    }
+    /// A resumed epoch never reinterprets the real first-receipt QPC.
+    pub fn claim_due_at(&mut self, active_sample: u64, cutoff: Option<u64>) -> Option<Command> {
+        let target = self.pending.front()?.target_sample?;
+        if target > active_sample || cutoff.is_some_and(|end| target >= end) {
+            return None;
+        }
+        self.claim_next()
+    }
+    pub fn pending_commands(&self) -> Vec<Command> {
+        self.claimed
+            .iter()
+            .chain(self.pending.iter())
+            .cloned()
+            .collect()
+    }
+    /// Commit a complete validated paused prefix in one mutation. Existing
+    /// accepted identities, first receipts and targets survive retransmission.
+    pub fn restore_prefix(&mut self, entries: &[Command]) -> Result<(), String> {
+        if entries.len() > CONTROL_CAPACITY
+            || entries
+                .windows(2)
+                .any(|w| w[0].levels.command_sequence >= w[1].levels.command_sequence)
+        {
+            return Err("Audio reconciliation prefix exceeds its ordered bound.".into());
+        }
+        for old in self.claimed.iter().chain(self.pending.iter()) {
+            if !entries.iter().any(|entry| entry.levels == old.levels) {
+                return Err("Audio reconciliation omitted an accepted pending identity.".into());
+            }
+        }
+        let mut restored = VecDeque::new();
+        let mut next_last = self.last.clone();
+        for entry in entries {
+            entry.levels.validate()?;
+            let target = entry
+                .target_sample
+                .ok_or("Audio reconciliation needs a fixed target.")?;
+            let known = self
+                .claimed
+                .iter()
+                .chain(self.pending.iter())
+                .chain(self.recent.iter())
+                .find(|old| old.levels.command_sequence == entry.levels.command_sequence);
+            if known.is_some()
+                && !self
+                    .claimed
+                    .iter()
+                    .chain(self.pending.iter())
+                    .any(|c| c.levels.command_sequence == entry.levels.command_sequence)
+            {
+                return Err("Audio reconciliation cannot rearm a settled identity.".into());
+            }
+            let command = if let Some(old) = known {
+                if old.levels != entry.levels || old.target_sample.is_some_and(|old| old != target)
+                {
+                    return Err("Conflicting duplicate audio reconciliation identity.".into());
+                }
+                let mut command = old.clone();
+                command.target_sample = Some(target);
+                command
+            } else {
+                if self
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| entry.levels.command_sequence <= last.command_sequence)
+                {
+                    return Err("Unknown old audio reconciliation identity.".into());
+                }
+                let previous = next_last
+                    .as_ref()
+                    .map(|last| [last.render_level.muted, last.microphone_level.muted])
+                    .unwrap_or(self.initial);
+                let mut command = entry.clone();
+                command.edge = previous
+                    != [
+                        entry.levels.render_level.muted,
+                        entry.levels.microphone_level.muted,
+                    ];
+                command
+            };
+            if next_last
+                .as_ref()
+                .is_none_or(|last| command.levels.command_sequence > last.command_sequence)
+            {
+                next_last = Some(command.levels.clone());
+            }
+            restored.push_back(command);
+        }
+        // No state was changed before every identity and target validated.
+        self.claimed.clear();
+        self.pending = restored;
+        self.last = next_last;
+        for command in &self.pending {
+            if let Some(old) = self
+                .recent
+                .iter_mut()
+                .find(|old| old.levels.command_sequence == command.levels.command_sequence)
+            {
+                *old = command.clone();
+            } else {
+                self.recent.push_back(command.clone());
+            }
+        }
+        while self.recent.len() > CONTROL_CAPACITY {
+            self.recent.pop_front();
+        }
+        Ok(())
     }
     pub fn pending_front(&self) -> Option<&Command> {
         self.pending.front()
@@ -423,5 +588,40 @@ mod tests {
         queue.settle(1);
         assert!(queue.claim_due(0, 60_480, Some(60_000)).is_none());
         assert_eq!(queue.front().unwrap().levels.command_sequence, 2); // explicit unapplied tail
+    }
+    #[test]
+    fn paused_prefix_restoration_is_atomic_and_preserves_fixed_targets_and_first_receipts() {
+        let mut q = ControlQueue::new(MixLevel::default(), MixLevel::default());
+        q.push(levels(1, 1., true), 100).unwrap();
+        q.bind_target(1, 480).unwrap();
+        q.claim_next();
+        let mut original = q.lookup_command(1).unwrap();
+        original.received_qpc = 99999;
+        let next = Command {
+            levels: levels(3, 0.5, false),
+            received_qpc: 200,
+            target_sample: Some(480),
+            edge: true,
+        };
+        let mut conflicting = next.clone();
+        conflicting.levels.command_sequence = 1;
+        assert!(q.restore_prefix(&[original.clone(), conflicting]).is_err());
+        assert_eq!(q.len(), 1);
+        q.restore_prefix(&[original, next]).unwrap();
+        assert_eq!(q.lookup_command(1).unwrap().received_qpc, 100);
+        assert!(q.claim_due_at(480, Some(480)).is_none());
+        assert_eq!(
+            q.claim_due_at(480, None).unwrap().levels.command_sequence,
+            1
+        );
+        assert_eq!(
+            q.claim_due_at(480, None).unwrap().levels.command_sequence,
+            3
+        );
+        assert!(q.bind_target(1, 960).is_err());
+        q.settle(3);
+        let old = q.lookup_command(1).unwrap();
+        assert!(q.restore_prefix(&[old]).is_err());
+        assert_eq!(q.len(), 0);
     }
 }

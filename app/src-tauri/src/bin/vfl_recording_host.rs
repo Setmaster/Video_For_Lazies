@@ -14,7 +14,7 @@ fn main() {
         atomic::{AtomicBool, Ordering},
     };
     fn send(mut value: serde_json::Value) {
-        value["protocolVersion"] = serde_json::json!(3);
+        value["protocolVersion"] = serde_json::json!(4);
         let mut out = std::io::stdout().lock();
         if serde_json::to_writer(&mut out, &value).is_err()
             || out.write_all(b"\n").is_err()
@@ -38,7 +38,7 @@ fn main() {
             return;
         }
     };
-    if request["protocolVersion"] != 3 {
+    if request["protocolVersion"] != 4 {
         send(
             serde_json::json!({"type":"error","message":"Recording component version mismatch. Restore the complete app folder."}),
         );
@@ -50,6 +50,8 @@ fn main() {
     let controls = preview.clone();
     let audio = Arc::new(windows::audio_pipeline::Controls::default());
     let audio_input = audio.clone();
+    let transitions = Arc::new(windows::native_controls::Controls::default());
+    let transition_input = transitions.clone();
     std::thread::spawn(move || {
         loop {
             let mut line = Vec::new();
@@ -81,6 +83,36 @@ fn main() {
                         break;
                     };
                     let _ = audio_input.submit(levels);
+                }
+                Some(action @ ("pause" | "resume")) => {
+                    let Ok(control): Result<windows::native_controls::Transition, _> =
+                        serde_json::from_value(value["value"].clone())
+                    else {
+                        break;
+                    };
+                    if action == "pause"
+                        && !transition_input.is_duplicate(action, &control)
+                        && audio_input.seal_admission(control.sealed_sequence).is_err()
+                    {
+                        break;
+                    }
+                    if action == "resume"
+                        && !transition_input.is_duplicate(action, &control)
+                        && audio_input.admit_resume(control.pause_revision).is_err()
+                    {
+                        break;
+                    }
+                    if transition_input.submit(action, control).is_err() {
+                        break;
+                    }
+                }
+                Some("reconcile-begin" | "reconcile-entry" | "reconcile-seal") => {
+                    let Ok(control) = serde_json::from_value(value) else {
+                        break;
+                    };
+                    if audio_input.reconcile(control).is_err() {
+                        break;
+                    }
                 }
                 _ => break,
             }
@@ -141,6 +173,11 @@ fn main() {
         "audio-devices" => {
             serde_json::to_value(windows::audio_devices()?).map_err(|e| e.to_string())
         }
+        "resolve-audio" => {
+            let config = serde_json::from_value(request["config"].clone())
+                .map_err(|_| "Invalid audio resolution request.")?;
+            serde_json::to_value(windows::resolve_audio(config)?).map_err(|e| e.to_string())
+        }
         "select-region" => {
             let id = request["displayId"]
                 .as_str()
@@ -157,6 +194,7 @@ fn main() {
                 move |progress| progress_reporter.progress(serde_json::to_value(progress).unwrap()),
                 preview,
                 audio.clone(),
+                transitions,
             )
             .map_err(|failure| {
                 no_media = failure.no_media;

@@ -561,6 +561,15 @@ fn wait_state(completed: bool, stopped: bool, elapsed: Duration) -> WaitState {
     }
 }
 
+pub fn validate_identity(identity: &ProcessIdentity) -> Result<(), String> {
+    let expected = parse_creation(&identity.process_started)?;
+    let guard = ProcessGuard::open(identity.process_id)?;
+    if guard.creation != expected {
+        return Err("The selected application has changed. Select it again.".into());
+    }
+    guard.verify()
+}
+
 pub fn activate(identity: &ProcessIdentity, stop: &AtomicBool) -> Result<ActivatedProcess, String> {
     if let Some(reason) = capability()? {
         return Err(reason);

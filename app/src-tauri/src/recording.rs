@@ -27,17 +27,26 @@ const RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
 // The writer and checked reader are shared with the separate native helper.
 #[allow(dead_code)]
+mod active_clock;
+pub(crate) mod audio_control_state;
+pub(crate) mod audio_controls;
+#[allow(dead_code)]
 mod audio_envelope;
 mod audio_finalize;
 pub(crate) mod audio_manager;
 #[allow(dead_code)]
 mod audio_mixer;
+#[allow(dead_code)]
+pub(crate) mod audio_reconcile_wire;
 mod audio_suppression;
 #[allow(dead_code)]
 mod audio_types;
+mod clock_status;
+pub(crate) mod controls_hotkeys;
 #[allow(dead_code)]
 mod preview;
 pub(crate) mod preview_manager;
+pub(crate) mod session_controls;
 use audio_types::{AudioStatus, Microphone, RecordingAudioConfig, RenderAudio, Suppression};
 mod source;
 #[cfg(test)]
@@ -47,19 +56,19 @@ pub(crate) use source::{Geometry, Source};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecordingConfig {
-    request_id: String,
-    source: Source,
-    fps: u32,
-    quality: String,
-    countdown_seconds: u32,
-    show_cursor: bool,
+    pub(crate) request_id: String,
+    pub(crate) source: Source,
+    pub(crate) fps: u32,
+    pub(crate) quality: String,
+    pub(crate) countdown_seconds: u32,
+    pub(crate) show_cursor: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    audio: Option<RecordingAudioConfig>,
+    pub(crate) audio: Option<RecordingAudioConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     system_audio_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     microphone_device_id: Option<String>,
-    output_directory: String,
+    pub(crate) output_directory: String,
 }
 
 impl RecordingConfig {
@@ -111,14 +120,128 @@ pub(crate) struct Snapshot {
     selection_request_id: Option<String>,
     resolved_geometry: Option<Geometry>,
     audio: Option<AudioStatus>,
+    control_revision: u64,
+    pause: Option<audio_controls::PauseSeal>,
+    audio_control_ledger: Option<audio_controls::AudioLedger>,
+    pending_transition: Option<session_controls::PendingTransition>,
+    resolved_role_mask: u8,
+    clock_epoch: Option<clock_status::ClockEpoch>,
+    last_pause_clock: Option<clock_status::PauseClock>,
 }
 
 impl Snapshot {
+    fn matches_transition(&self, operation: &str, revision: Option<u64>) -> bool {
+        self.pending_transition
+            .as_ref()
+            .is_some_and(|p| p.operation_id == operation && Some(p.control_revision) == revision)
+    }
+    fn apply_transition_timeout(&mut self, timeout: &session_controls::TransitionTimeout) -> bool {
+        if self.session_id.as_deref() != Some(&timeout.session_id)
+            || !self.pending_transition.as_ref().is_some_and(|p| {
+                p.operation_id == timeout.operation_id
+                    && p.control_revision == timeout.control_revision
+            })
+        {
+            return false;
+        }
+        self.pending_transition = None;
+        self.phase = if timeout.code == "resumeTimeout" {
+            "paused"
+        } else {
+            "stopping"
+        }
+        .into();
+        self.message=Some(if timeout.code=="resumeTimeout"{"Resume expired before synchronization completed. Use a fresh Resume after synchronization."}else{"The recording transition timed out. Stopping and saving the retained prefix."}.into());
+        true
+    }
+    fn retain_clock(
+        &mut self,
+        session: &str,
+        kind: &str,
+        value: Value,
+        revision: u64,
+    ) -> Result<bool, String> {
+        if self.session_id.as_deref() != Some(session) {
+            return Ok(false);
+        }
+        match kind {
+            "initial" => {
+                let epoch = clock_status::ClockEpoch::read(value)?;
+                if epoch.active_sample != "0" {
+                    return Err("Initial recording clock must start at sample zero.".into());
+                }
+                if let Some(old) = &self.clock_epoch {
+                    return if *old == epoch {
+                        Ok(false)
+                    } else {
+                        Err("Initial recording clock changed.".into())
+                    };
+                }
+                self.clock_epoch = Some(epoch);
+            }
+            "pause" => {
+                let epoch = self
+                    .clock_epoch
+                    .as_ref()
+                    .ok_or("Recording clock epoch is unavailable.")?;
+                let pause = clock_status::PauseClock::read(value, epoch, revision)?;
+                if let Some(old) = &self.last_pause_clock
+                    && old.pause_revision >= revision
+                {
+                    return if *old == pause {
+                        Ok(false)
+                    } else {
+                        Err("Pause clock revision regressed.".into())
+                    };
+                }
+                self.last_pause_clock = Some(pause);
+            }
+            "resume" => {
+                let epoch = clock_status::ClockEpoch::read(value)?;
+                let pause = self
+                    .last_pause_clock
+                    .as_ref()
+                    .ok_or("Paused recording clock is unavailable.")?;
+                if pause.pause_revision != revision {
+                    return Err("Resumed clock belongs to another Pause.".into());
+                }
+                epoch.resumed_after(pause)?;
+                if self.clock_epoch.as_ref() == Some(&epoch) {
+                    return Ok(false);
+                }
+                self.clock_epoch = Some(epoch);
+            }
+            _ => return Err("Unknown recording clock event.".into()),
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        Ok(true)
+    }
+    fn sync_audio_control(&mut self, audio: audio_controls::ControlSnapshot) -> bool {
+        let changed = self.audio_control_ledger != audio.ledger
+            || self
+                .pause
+                .as_ref()
+                .is_some_and(|p| p.audio != audio.pause_audio);
+        if changed {
+            if let Some(pause) = &mut self.pause {
+                pause.audio = audio.pause_audio;
+            }
+            self.audio_control_ledger = audio.ledger;
+            self.sequence = self.sequence.saturating_add(1);
+        }
+        changed
+    }
     fn set_recovery_source(&mut self, journal: &Journal) {
         self.session_id = Some(journal.session_id.clone());
         self.config = Some(journal.config.public_snapshot_config());
         // Recovery finalizes retained media; it has no live audio-meter session.
         self.audio = None;
+        self.pause = None;
+        self.pending_transition = None;
+        self.audio_control_ledger = None;
+        self.resolved_role_mask = 0;
+        self.clock_epoch = None;
+        self.last_pause_clock = None;
     }
 }
 
@@ -138,13 +261,28 @@ impl Default for Snapshot {
             selection_request_id: None,
             resolved_geometry: None,
             audio: None,
+            control_revision: 0,
+            pause: None,
+            audio_control_ledger: None,
+            pending_transition: None,
+            resolved_role_mask: 0,
+            clock_epoch: None,
+            last_pause_clock: None,
         }
     }
 }
 fn active(phase: &str) -> bool {
     matches!(
         phase,
-        "preparing" | "countdown" | "starting" | "recording" | "stopping" | "finalizing"
+        "preparing"
+            | "countdown"
+            | "starting"
+            | "recording"
+            | "pausing"
+            | "paused"
+            | "resuming"
+            | "stopping"
+            | "finalizing"
     )
 }
 
@@ -156,6 +294,7 @@ struct Inner {
     selecting: Option<(String, Arc<AtomicBool>)>,
     loaded: bool,
     recovery_revision: u64,
+    start_attempt: Option<String>,
 }
 impl Inner {
     fn replace_recoveries(&mut self, recoveries: Vec<Recovery>) {
@@ -169,6 +308,7 @@ pub(crate) struct RecordingManager {
     startup_load: Arc<Mutex<()>>,
     preview: Arc<preview_manager::PreviewManager>,
     audio: Arc<audio_manager::AudioManager>,
+    pub(crate) controls: Arc<session_controls::SessionControls>,
 }
 
 impl RecordingManager {
@@ -188,11 +328,25 @@ impl RecordingManager {
         self.preview.shutdown();
     }
     fn snapshot(&self) -> Snapshot {
-        self.inner
+        let snapshot = self
+            .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .snapshot
-            .clone()
+            .clone();
+        let context = self.controls.context();
+        self.audio.set_context(context.clone());
+        if snapshot.session_id == context.session_id {
+            let audio = self.audio.snapshot_control();
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if i.snapshot.session_id == snapshot.session_id
+                && i.snapshot.sequence == snapshot.sequence
+            {
+                i.snapshot.sync_audio_control(audio);
+            }
+            return i.snapshot.clone();
+        }
+        snapshot
     }
     fn update(&self, app: &AppHandle, id: &str, change: impl FnOnce(&mut Snapshot)) {
         self.update_inner(app, id, None, change);
@@ -213,6 +367,8 @@ impl RecordingManager {
         recoveries: Option<Vec<Recovery>>,
         change: impl FnOnce(&mut Snapshot),
     ) {
+        let audio = self.audio.snapshot_control();
+        let audio_session = self.controls.context().session_id;
         let snapshot = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if i.snapshot.session_id.as_deref() != Some(id) {
@@ -222,10 +378,49 @@ impl RecordingManager {
                 i.replace_recoveries(recoveries);
             }
             change(&mut i.snapshot);
+            if audio_session.as_deref() == Some(id) {
+                if let Some(pause) = &mut i.snapshot.pause {
+                    pause.audio = audio.pause_audio;
+                }
+                i.snapshot.audio_control_ledger = audio.ledger;
+            }
+            self.controls.phase(id, &i.snapshot.phase);
             i.snapshot.sequence = i.snapshot.sequence.saturating_add(1);
             i.snapshot.clone()
         };
+        self.publish_control_target(app);
         let _ = app.emit("recording-status", snapshot);
+    }
+    fn publish_control_target(&self, app: &AppHandle) {
+        let Some(service) = app.try_state::<controls_hotkeys::ControlsManager>() else {
+            return;
+        };
+        let target = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match (&i.snapshot.session_id, &i.stop) {
+                (Some(id), Some(stop)) if active(&i.snapshot.phase) => {
+                    Some(controls_hotkeys::SessionTarget {
+                        session_id: id.clone(),
+                        control_revision: i.snapshot.control_revision,
+                        can_pause: i.snapshot.phase == "recording",
+                        can_resume: i.snapshot.phase == "paused"
+                            && i.snapshot.pending_transition.is_none()
+                            && !i
+                                .snapshot
+                                .pause
+                                .as_ref()
+                                .and_then(|p| p.audio.as_ref())
+                                .is_some_and(|a| {
+                                    a.fence.state
+                                        == audio_controls::FencePhase::ReplacementReviewRequired
+                                }),
+                        stop: stop.clone(),
+                    })
+                }
+                _ => None,
+            }
+        };
+        service.set_session(target);
     }
     fn load(&self, app: &AppHandle) -> Result<(), String> {
         self.load_with(|| find_recoveries(app))
@@ -272,6 +467,198 @@ impl RecordingManager {
             return Ok(());
         }
     }
+}
+
+pub(crate) fn validate_start_draft(
+    app: &AppHandle,
+    manager: &RecordingManager,
+    config: RecordingConfig,
+) -> Result<RecordingConfig, String> {
+    validate_start_draft_cancel(app, manager, config, Arc::new(AtomicBool::new(false)))
+}
+fn validate_start_draft_cancel(
+    app: &AppHandle,
+    manager: &RecordingManager,
+    mut config: RecordingConfig,
+    cancel: Arc<AtomicBool>,
+) -> Result<RecordingConfig, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("Recording preparation was canceled.".into());
+    }
+    config = config.public_snapshot_config();
+    validate_config(&config)?;
+    helper_path(app)?;
+    let native_audio = manager
+        .audio
+        .resolve_audio_config("draft-validation", &config.audio_config())?;
+    let pinned = if config.audio_config().enabled() {
+        let resolved_audio = helper_call(
+            app,
+            json!({"operation":"resolve-audio","config":native_audio}),
+            cancel.clone(),
+            Some(Duration::from_secs(10)),
+            |_| {},
+        )?;
+        serde_json::from_value::<audio_types::NativeAudioConfig>(resolved_audio).map_err(error)?
+    } else {
+        native_audio
+    };
+    if let Some(audio) = &mut config.audio {
+        if let (
+            RenderAudio::System { device_id },
+            audio_types::NativeRender::System {
+                device_id: pinned_id,
+            },
+        ) = (&mut audio.render, &pinned.render)
+        {
+            *device_id = pinned_id.clone();
+        }
+        if let (Some(mic), Some(pinned_mic)) = (&mut audio.microphone, &pinned.microphone) {
+            mic.device_id = pinned_mic.device_id.clone();
+        }
+    }
+    let output =
+        fs::canonicalize(&config.output_directory).map_err(|e| format!("Recording folder: {e}"))?;
+    if !output.is_dir() {
+        return Err("Choose a recording output folder.".into());
+    }
+    regular_ancestors(&output)?;
+    ensure_local_space(&output, RESERVE_BYTES)?;
+    config.output_directory = output.to_string_lossy().into_owned();
+    let source = manager.preview.native_source(&config.source)?;
+    let resolved = helper_call(
+        app,
+        json!({"operation":"resolve-source","source":source}),
+        cancel.clone(),
+        Some(Duration::from_secs(10)),
+        |_| {},
+    )?;
+    let geometry: Geometry = serde_json::from_value(resolved["geometry"].clone()).map_err(error)?;
+    geometry.validate()?;
+    if cancel.load(Ordering::Acquire) {
+        return Err("Recording preparation was canceled.".into());
+    }
+    Ok(config)
+}
+
+struct ControlsBackend {
+    app: AppHandle,
+}
+impl controls_hotkeys::ControlsBackend for ControlsBackend {
+    fn is_idle(&self) -> bool {
+        !self.app.state::<RecordingManager>().needs_close_guard()
+    }
+    fn validate_draft(&self, config: RecordingConfig) -> Result<RecordingConfig, String> {
+        validate_start_draft(
+            &self.app,
+            self.app.state::<RecordingManager>().inner(),
+            config,
+        )
+    }
+    fn replace_owner(&self, owner: Option<String>) {
+        let manager = self.app.state::<RecordingManager>();
+        manager.controls.replace_owner_option(owner.clone());
+        manager.audio.set_context(manager.controls.context());
+        let context = manager.controls.context();
+        if let Some(session) = context.session_id {
+            manager.update(&self.app, &session, |s| {
+                s.control_revision = context.control_revision
+            });
+        }
+    }
+    fn dispatch(&self, intent: controls_hotkeys::ControlIntent) -> Result<(), String> {
+        let app = self.app.clone();
+        let manager = app.state::<RecordingManager>().inner().clone();
+        match intent {
+            controls_hotkeys::ControlIntent::Start(attempt) => {
+                let activity = app.state::<ActivityCoordinator>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let token = attempt.token;
+                    let service = app
+                        .state::<controls_hotkeys::ControlsManager>()
+                        .inner()
+                        .clone();
+                    let checked = {
+                        let app = app.clone();
+                        let manager = manager.clone();
+                        let cancel = attempt.cancel.clone();
+                        let config = attempt.config;
+                        tauri::async_runtime::spawn_blocking(move || {
+                            validate_start_draft_cancel(&app, &manager, config, cancel)
+                        })
+                        .await
+                        .map_err(error)
+                        .and_then(|r| r)
+                    };
+                    let config = match checked {
+                        Ok(config) => config,
+                        Err(reason) => {
+                            service.fail_attempt(&token, &reason);
+                            return;
+                        }
+                    };
+                    if let Err(reason) = start_internal(
+                        app.clone(),
+                        manager,
+                        activity,
+                        config,
+                        StartAdmission {
+                            permit: attempt.permit,
+                            cancel: attempt.cancel,
+                            attempt: Some(token.clone()),
+                        },
+                    )
+                    .await
+                    {
+                        eprintln!("Recording shortcut Start: {reason}");
+                        service.fail_attempt(&token, &reason);
+                    }
+                });
+            }
+            controls_hotkeys::ControlIntent::Pause {
+                owner_token,
+                operation_id,
+                session_id,
+                control_revision,
+            } => {
+                let request = session_controls::TransitionRequest {
+                    owner_token,
+                    operation_id,
+                    session_id,
+                    expected_control_revision: control_revision,
+                    reconcile_fence_token: None,
+                };
+                if let audio_controls::ControlResult::Err { failure, .. } =
+                    request_transition(&app, &manager, request, "pause")
+                {
+                    return Err(failure.error.message);
+                }
+            }
+            controls_hotkeys::ControlIntent::Resume {
+                owner_token,
+                operation_id,
+                session_id,
+                control_revision,
+            } => {
+                let request = session_controls::TransitionRequest {
+                    owner_token,
+                    operation_id,
+                    session_id,
+                    expected_control_revision: control_revision,
+                    reconcile_fence_token: None,
+                };
+                if let audio_controls::ControlResult::Err { failure, .. } =
+                    request_transition(&app, &manager, request, "resume")
+                {
+                    return Err(failure.error.message);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+pub(crate) fn controls_backend(app: AppHandle) -> Arc<dyn controls_hotkeys::ControlsBackend> {
+    Arc::new(ControlsBackend { app })
 }
 
 fn main_window(window: &Window) -> Result<(), String> {
@@ -325,7 +712,13 @@ fn helper_call(
     timeout: Option<Duration>,
     progress: impl FnMut(&Value),
 ) -> Result<Value, String> {
-    helper_call_stream(app, request, stop, timeout, progress, None, None)
+    helper_call_stream(app, request, stop, timeout, progress, HostTaps::default())
+}
+#[derive(Default)]
+struct HostTaps {
+    preview: Option<preview_manager::Tap>,
+    audio: Option<audio_manager::Tap>,
+    session: Option<RecordingManager>,
 }
 fn control_line(value: &Value) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec(value).map_err(error)?;
@@ -341,9 +734,16 @@ fn helper_call_stream(
     stop: Arc<AtomicBool>,
     timeout: Option<Duration>,
     mut progress: impl FnMut(&Value),
-    tap: Option<preview_manager::Tap>,
-    audio: Option<audio_manager::Tap>,
+    taps: HostTaps,
 ) -> Result<Value, String> {
+    let HostTaps {
+        preview: tap,
+        audio,
+        session,
+    } = taps;
+    if stop.load(Ordering::Acquire) {
+        return Err("Recording preparation was canceled.".into());
+    }
     let path = helper_path(app)?;
     regular_ancestors(&path)?;
     let command = Command::new(&path);
@@ -352,11 +752,14 @@ fn helper_call_stream(
             "Cannot start Windows recording components: {e}. Windows N may need Media Feature Pack."
         )
     })?;
+    if stop.load(Ordering::Acquire) {
+        return Err("Recording preparation was canceled before its first request.".into());
+    }
     let mut input = child
         .stdin
         .take()
         .ok_or("Recording control pipe is unavailable.")?;
-    request["protocolVersion"] = json!(3);
+    request["protocolVersion"] = json!(4);
     serde_json::to_writer(&mut input, &request).map_err(error)?;
     input
         .write_all(b"\n")
@@ -367,6 +770,7 @@ fn helper_call_stream(
     let input_stop = stop.clone();
     let control_error = Arc::new(Mutex::new(None::<String>));
     let writer_error = control_error.clone();
+    let transition_writer = session.as_ref().map(|m| m.controls.clone());
     let input_writer = std::thread::spawn(move || {
         loop {
             if input_stop.load(Ordering::Acquire) {
@@ -375,7 +779,22 @@ fn helper_call_stream(
             }
             match control_receive.recv_timeout(Duration::from_millis(50)) {
                 Ok(value) => {
-                    let result = control_line(&value).and_then(|line| {
+                    let result = (|| -> Result<Vec<u8>, String> {
+                        if matches!(value["operation"].as_str(), Some("pause" | "resume")) {
+                            let operation = value["value"]["operationId"].as_str().unwrap_or("");
+                            if transition_writer
+                                .as_ref()
+                                .is_none_or(|c| !c.write_permitted(operation))
+                            {
+                                return Err(
+                                    "The recording transition expired before its private write."
+                                        .into(),
+                                );
+                            }
+                        }
+                        control_line(&value)
+                    })()
+                    .and_then(|line| {
                         input
                             .write_all(&line)
                             .and_then(|_| input.flush())
@@ -478,6 +897,39 @@ fn helper_call_stream(
             if let Some(audio) = &audio {
                 audio.control(&control_send, &stop);
             }
+            if let Some(manager) = &session {
+                let context = manager.controls.context();
+                manager.audio.set_context(context.clone());
+                let snapshot = manager.snapshot();
+                let fence_ready = context.resolved_role_mask == 0
+                    || snapshot
+                        .pause
+                        .as_ref()
+                        .and_then(|p| p.audio.as_ref())
+                        .and_then(|a| a.fence.token.as_deref())
+                        .is_some_and(|token| {
+                            manager.audio.fence_ready(
+                                context.session_id.as_deref().unwrap_or(""),
+                                context.pause_revision,
+                                token,
+                            )
+                        });
+                if let Some(value) = manager
+                    .controls
+                    .control(fence_ready, manager.audio.accepted_sequence())
+                {
+                    let operation = value["value"]["operationId"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    if control_send.try_send(value).is_err() {
+                        manager.controls.unsent(&operation);
+                    }
+                }
+                if let Some(reason) = manager.controls.timed_out() {
+                    progress(&json!({"transitionError":reason}));
+                }
+            }
         }
         if stop.load(Ordering::Acquire) && stopping.is_none() {
             stopping = Some(Instant::now());
@@ -499,7 +951,7 @@ fn helper_call_stream(
         }
         match receive.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(message)) => {
-                if message["protocolVersion"] != 3 {
+                if message["protocolVersion"] != 4 {
                     break Err("Recording component version mismatch.".into());
                 }
                 match message["type"].as_str() {
@@ -1082,28 +1534,294 @@ pub(crate) async fn recording_snapshot(
     .map_err(error)?
 }
 
+fn transition_failure(
+    manager: &RecordingManager,
+    code: &str,
+) -> audio_controls::ControlResult<Snapshot> {
+    use audio_controls::*;
+    let code: FailureCode =
+        serde_json::from_value(json!(code)).unwrap_or(FailureCode::ProtocolFailure);
+    let (retry, action, message) = code.policy();
+    let snapshot = manager.snapshot();
+    let mut pause = snapshot.pause.clone();
+    if code == FailureCode::StaleOwner
+        && let Some(audio) = pause.as_mut().and_then(|p| p.audio.as_mut())
+    {
+        audio.fence.token = None;
+        audio.fence.replacement_review_token = None;
+    }
+    ControlResult::failure(ControlFailure {
+        error: FailureDetail {
+            code,
+            retry,
+            action,
+            command_sequence: None,
+            message: message.into(),
+        },
+        context: FailureContext {
+            session_id: snapshot.session_id.clone(),
+            source_generation: snapshot.audio.as_ref().map(|a| a.source_generation.clone()),
+            control_revision: Some(snapshot.control_revision),
+            pause_revision: snapshot.pause.as_ref().map(|p| p.pause_revision),
+            timed_out_attempt: None,
+        },
+        state: FailureState {
+            phase: snapshot.phase,
+            audio_status: snapshot.audio,
+            ledger: snapshot.audio_control_ledger,
+            pause,
+        },
+    })
+}
+fn publish_transition_timeout(
+    app: &AppHandle,
+    manager: &RecordingManager,
+    timeout: &session_controls::TransitionTimeout,
+) {
+    manager.update(app, &timeout.session_id, |s| {
+        s.apply_transition_timeout(timeout);
+    });
+}
+fn wait_transition(
+    app: AppHandle,
+    manager: RecordingManager,
+    request: session_controls::TransitionRequest,
+    action: &str,
+) -> audio_controls::ControlResult<Snapshot> {
+    let initial = request_transition(&app, &manager, request.clone(), action);
+    if matches!(initial, audio_controls::ControlResult::Err { .. }) {
+        return initial;
+    }
+    loop {
+        let context = manager.controls.context();
+        if context.owner_token.as_deref() != Some(&request.owner_token) {
+            return transition_failure(&manager, "staleOwner");
+        }
+        if context.session_id.as_deref() != Some(&request.session_id) {
+            return transition_failure(&manager, "staleSession");
+        }
+        if let Some(code) = manager.controls.timed_out() {
+            publish_transition_timeout(&app, &manager, &code);
+        }
+        match manager.controls.outcome(&request.operation_id) {
+            Ok(Some(())) => {
+                let snapshot = manager.snapshot();
+                if snapshot
+                    .pending_transition
+                    .as_ref()
+                    .is_none_or(|p| p.operation_id != request.operation_id)
+                {
+                    return audio_controls::ControlResult::success(snapshot)
+                        .unwrap_or_else(|_| transition_failure(&manager, "oversizedRequest"));
+                }
+            }
+            Err(code) => return transition_failure(&manager, &code),
+            Ok(None) => {}
+        }
+        if context
+            .stop
+            .as_ref()
+            .is_none_or(|s| s.load(Ordering::Acquire))
+        {
+            return transition_failure(&manager, "sessionTerminal");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn admit_transition(
+    manager: &RecordingManager,
+    request: session_controls::TransitionRequest,
+    action: &str,
+) -> Result<session_controls::PendingTransition, String> {
+    if let Err(reason) = audio_controls::checked_bytes(&request, 512) {
+        return Err(if reason == audio_controls::FailureCode::OversizedRequest {
+            "oversizedRequest"
+        } else {
+            "invalidRequest"
+        }
+        .into());
+    }
+    // Known exact identities join their original outcome before checking a
+    // fence that successful Resume has already consumed.
+    if manager.controls.known_request(&request, action)? {
+        return Ok(session_controls::PendingTransition {
+            operation_id: request.operation_id,
+            action: action.into(),
+            control_revision: request.expected_control_revision + 1,
+        });
+    }
+    let context = manager.controls.context();
+    if context.owner_token.as_deref() != Some(&request.owner_token) {
+        return Err("staleOwner".into());
+    }
+    if action == "resume"
+        && let Some(token) = &request.reconcile_fence_token
+        && (context.resolved_role_mask == 0
+            || !manager
+                .audio
+                .fence_ready(&request.session_id, context.pause_revision, token))
+    {
+        return Err("staleAdmission".into());
+    }
+
+    if action == "resume"
+        && manager
+            .snapshot()
+            .pause
+            .as_ref()
+            .and_then(|p| p.audio.as_ref())
+            .is_some_and(|a| a.fence.state == audio_controls::FencePhase::ReplacementReviewRequired)
+    {
+        return Err("replacementReviewRequired".into());
+    }
+    if action == "pause" && request.reconcile_fence_token.is_some() {
+        return Err("invalidRequest".into());
+    }
+    manager.controls.admit(request, action)
+}
+pub(crate) fn request_transition(
+    app: &AppHandle,
+    manager: &RecordingManager,
+    request: session_controls::TransitionRequest,
+    action: &str,
+) -> audio_controls::ControlResult<Snapshot> {
+    let session = request.session_id.clone();
+    match admit_transition(manager, request, action) {
+        Ok(pending) => {
+            if !manager.controls.is_pending(&pending.operation_id) {
+                return audio_controls::ControlResult::success(manager.snapshot())
+                    .unwrap_or_else(|_| transition_failure(manager, "oversizedRequest"));
+            }
+            let context = manager.controls.context();
+            if action == "pause" {
+                manager.preview.pause_recording_delivery(app, &session);
+            }
+            manager.audio.set_context(context.clone());
+            manager.update(app, &session, |s| {
+                s.control_revision = context.control_revision;
+                s.phase = context.phase;
+                s.pending_transition = Some(pending);
+                if action == "pause" {
+                    s.message = Some("Pausing and releasing recording inputs…".into());
+                }
+            });
+            audio_controls::ControlResult::success(manager.snapshot())
+                .unwrap_or_else(|_| transition_failure(manager, "oversizedRequest"))
+        }
+        Err(reason) => transition_failure(manager, &reason),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn recording_pause(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, RecordingManager>,
+    request: session_controls::TransitionRequest,
+) -> Result<audio_controls::ControlResult<Snapshot>, String> {
+    main_window(&window)?;
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || wait_transition(app, manager, request, "pause"))
+        .await
+        .map_err(error)
+}
+#[tauri::command]
+pub(crate) async fn recording_resume(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, RecordingManager>,
+    request: session_controls::TransitionRequest,
+) -> Result<audio_controls::ControlResult<Snapshot>, String> {
+    main_window(&window)?;
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || wait_transition(app, manager, request, "resume"))
+        .await
+        .map_err(error)
+}
+
 #[tauri::command]
 pub(crate) async fn recording_start(
     window: Window,
     app: AppHandle,
     state: State<'_, RecordingManager>,
     activity: State<'_, ActivityCoordinator>,
-    mut config: RecordingConfig,
+    config: RecordingConfig,
+    admission: controls_hotkeys::UiStartContext,
 ) -> Result<Snapshot, String> {
     main_window(&window)?;
+    start_owned(
+        app,
+        state.inner().clone(),
+        activity.inner().clone(),
+        config,
+        admission,
+    )
+    .await
+}
+
+pub(crate) async fn start_owned(
+    app: AppHandle,
+    manager: RecordingManager,
+    activity: ActivityCoordinator,
+    config: RecordingConfig,
+    admission: controls_hotkeys::UiStartContext,
+) -> Result<Snapshot, String> {
+    let service = app
+        .state::<controls_hotkeys::ControlsManager>()
+        .inner()
+        .clone();
+    let permit = service.ui_start_permit(admission)?;
+    let token = permit.token().to_string();
+    let cancel = permit.cancel();
+    let result = start_internal(
+        app,
+        manager,
+        activity,
+        config,
+        StartAdmission {
+            permit,
+            cancel,
+            attempt: Some(token.clone()),
+        },
+    )
+    .await;
+    if result.is_err() {
+        service.finish_attempt(&token);
+    }
+    result
+}
+struct StartAdmission {
+    permit: controls_hotkeys::StartPermit,
+    cancel: Arc<AtomicBool>,
+    attempt: Option<String>,
+}
+async fn start_internal(
+    app: AppHandle,
+    manager: RecordingManager,
+    activity: ActivityCoordinator,
+    mut config: RecordingConfig,
+    admission: StartAdmission,
+) -> Result<Snapshot, String> {
     config.audio = Some(config.audio_config());
     config.system_audio_device_id = None;
     config.microphone_device_id = None;
     validate_config(&config)?;
     helper_path(&app)?;
-    let (id, stop, snapshot) = {
-        let mut i = state
+    {
+        let i = manager
             .inner
             .lock()
             .map_err(|_| "Recording is unavailable.")?;
         if i.request_id.as_deref() == Some(&config.request_id) {
             return Ok(i.snapshot.clone());
         }
+    }
+    let (id, stop, snapshot) = admission.permit.admit(|| {
+        let mut i = manager
+            .inner
+            .lock()
+            .map_err(|_| "Recording is unavailable.")?;
         if active(&i.snapshot.phase) || i.selecting.is_some() {
             return Err("A recording operation is already active.".into());
         }
@@ -1116,7 +1834,11 @@ pub(crate) async fn recording_start(
                 .as_nanos(),
             std::process::id()
         );
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = admission.cancel.clone();
+        let audio = config.audio_config();
+        let roles = u8::from(!matches!(audio.render, RenderAudio::Off))
+            | (u8::from(audio.microphone.is_some()) << 1);
+        manager.controls.set_session(&id, stop.clone(), roles)?;
         i.snapshot = Snapshot {
             session_id: Some(id.clone()),
             sequence: i.snapshot.sequence + 1,
@@ -1127,11 +1849,42 @@ pub(crate) async fn recording_start(
         };
         i.stop = Some(stop.clone());
         i.request_id = Some(config.request_id.clone());
+        i.start_attempt = admission.attempt.clone();
+        i.snapshot.control_revision = manager.controls.context().control_revision;
+        i.snapshot.resolved_role_mask = roles;
         let snapshot = i.snapshot.clone();
-        (id, stop, snapshot)
+        Ok((id, stop, snapshot))
+    })?;
+    manager.audio.set_context(manager.controls.context());
+    manager.publish_control_target(&app);
+    let checked = {
+        let app = app.clone();
+        let manager = manager.clone();
+        let config = config.clone();
+        let cancel = stop.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            validate_start_draft_cancel(&app, &manager, config, cancel)
+        })
+        .await
+        .map_err(error)
+        .and_then(|r| r)
     };
-    let manager = state.inner().clone();
-    let activity = activity.inner().clone();
+    config = match checked {
+        Ok(config) => config,
+        Err(reason) => {
+            manager.update(&app, &id, |s| {
+                s.phase = if stop.load(Ordering::Acquire) {
+                    "idle"
+                } else {
+                    "failed"
+                }
+                .into();
+                s.message = Some(reason.clone());
+            });
+            return Err(reason);
+        }
+    };
+    manager.update(&app, &id, |s| s.config = Some(config.clone()));
     let preview = manager.preview.clone();
     let transfer = tauri::async_runtime::spawn_blocking(move || preview.stop_wait(true))
         .await
@@ -1184,6 +1937,7 @@ fn run_session(
             video::require_recording_audio()?;
         }
         let native_audio = manager.audio.prepare(&id, &audio_config)?;
+        manager.audio.set_context(manager.controls.context());
         let native = manager.preview.native_source(&config.source)?;
         let resolved = helper_call(
             &app,
@@ -1228,11 +1982,54 @@ fn run_session(
                 stop.clone(),
                 None,
                 |progress| {
+                    if let Some(timeout) = progress.get("transitionError").and_then(|v| {
+                        serde_json::from_value::<session_controls::TransitionTimeout>(v.clone())
+                            .ok()
+                    }) {
+                        publish_transition_timeout(&app, &manager, &timeout);
+                    }
                     no_media |= progress["noMedia"] == true;
                     if let Some(reason) = progress["interruption"].as_str() {
                         space_error = Some(reason.to_string());
                     }
+                    if progress["stopHudVisible"] == true {
+                        let attempt = manager
+                            .inner
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .start_attempt
+                            .clone();
+                        if let Some(attempt) = attempt {
+                            app.state::<controls_hotkeys::ControlsManager>()
+                                .helper_hud_visible(&attempt, &id);
+                        }
+                    }
+                    if let Some(action @ ("pause" | "resume")) = progress["hudIntent"].as_str() {
+                        let context = manager.controls.context();
+                        if let (Some(owner), Ok(operation)) =
+                            (context.owner_token, session_controls::new_operation_id())
+                        {
+                            let _ = request_transition(
+                                &app,
+                                &manager,
+                                session_controls::TransitionRequest {
+                                    owner_token: owner,
+                                    session_id: id.clone(),
+                                    operation_id: operation,
+                                    expected_control_revision: context.control_revision,
+                                    reconcile_fence_token: None,
+                                },
+                                action,
+                            );
+                        }
+                    }
+                    let mut clock_error = None;
                     manager.update(&app, &id, |s| {
+                        if let Some(epoch) = progress.get("clockEpoch")
+                            && let Err(error) = s.retain_clock(&id, "initial", epoch.clone(), 0)
+                        {
+                            clock_error = Some(error);
+                        }
                         if progress["ready"].as_bool().unwrap_or(false) && s.phase == "starting" {
                             s.phase = "recording".into();
                         }
@@ -1241,6 +2038,158 @@ fn run_session(
                         s.bytes_written =
                             progress["bytesWritten"].as_u64().unwrap_or(s.bytes_written);
                     });
+                    if let Some(error) = clock_error {
+                        space_error = Some(error);
+                        stop.store(true, Ordering::Release);
+                    }
+                    let context = manager.controls.context();
+                    if let Some(transition) = progress["transition"].as_object()
+                        && context.session_id.as_deref() == Some(&id)
+                        && transition.get("pauseRevision").and_then(Value::as_u64)
+                            == Some(context.pause_revision)
+                    {
+                        let operation = transition
+                            .get("operationId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let phase = transition
+                            .get("phase")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let current = manager.snapshot();
+                        let exact_pending = current.matches_transition(
+                            operation,
+                            transition.get("controlRevision").and_then(Value::as_u64),
+                        ) && manager.controls.is_pending(operation);
+                        if exact_pending
+                            && phase == "paused"
+                            && transition.get("errorCode").and_then(Value::as_str)
+                                == Some("sourceUnavailable")
+                        {
+                            if manager.controls.complete_result(
+                                operation,
+                                "paused",
+                                Err("sourceUnavailable".into()),
+                            ) {
+                                manager.update(&app, &id, |s| {
+                                    s.phase = "paused".into();
+                                    s.pending_transition = None;
+                                    s.message = Some("The pinned source is temporarily unavailable. Repair it before another Resume.".into());
+                                });
+                            }
+                        } else if exact_pending
+                            && phase == "paused"
+                            && transition.get("inputsReleased") == Some(&json!(true))
+                        {
+                            // Validate the complete receipt before exposing a successful Pause.
+                            // Tap.progress has already applied this FIFO event's audio status.
+                            let sealed = (|| -> Result<Snapshot, String> {
+                                let mut next = current.clone();
+                                next.retain_clock(&id, "pause", json!({
+                                    "pauseRevision": transition.get("pauseRevision"),
+                                    "cutoffSample": transition.get("cutoffSample"),
+                                    "physicalCutoffQpc100ns": transition.get("physicalCutoffQpc100ns"),
+                                    "releasedQpc100ns": transition.get("releasedQpc100ns")
+                                }), context.pause_revision)?;
+                                let cutoff = next
+                                    .last_pause_clock
+                                    .as_ref()
+                                    .ok_or("Pause clock is missing.")?
+                                    .cutoff_sample
+                                    .parse::<u64>()
+                                    .map_err(|_| "Invalid Pause cutoff.")?;
+                                let pending = serde_json::from_value(
+                                    transition
+                                        .get("audioPending")
+                                        .cloned()
+                                        .ok_or("Pause pending prefix is missing.")?,
+                                )
+                                .map_err(|_| "Invalid Pause pending prefix.")?;
+                                manager.audio.pause_seal(
+                                    &id,
+                                    context.pause_revision,
+                                    cutoff,
+                                    pending,
+                                )?;
+                                Ok(next)
+                            })();
+                            match sealed {
+                                Ok(next) if manager.controls.complete(operation, "paused") => {
+                                    let audio = manager.audio.snapshot_control();
+                                    manager.update(&app, &id, |s| {
+                                        s.phase = "paused".into();
+                                        s.control_revision = context.control_revision;
+                                        s.pending_transition = None;
+                                        s.last_pause_clock = next.last_pause_clock;
+                                        s.pause = Some(audio_controls::PauseSeal {
+                                            pause_revision: context.pause_revision,
+                                            cutoff_sample: s
+                                                .last_pause_clock
+                                                .as_ref()
+                                                .unwrap()
+                                                .cutoff_sample
+                                                .clone(),
+                                            audio: audio.pause_audio,
+                                        });
+                                        s.audio_control_ledger = audio.ledger;
+                                    });
+                                }
+                                Ok(_) => {}
+                                Err(reason) => {
+                                    manager.controls.complete_result(
+                                        operation,
+                                        "stopping",
+                                        Err("protocolFailure".into()),
+                                    );
+                                    manager.update(&app, &id, |s| {
+                                        s.phase = "stopping".into();
+                                        s.pending_transition = None;
+                                        s.message = Some(reason.clone());
+                                    });
+                                    space_error = Some(reason);
+                                    stop.store(true, Ordering::Release);
+                                }
+                            }
+                        } else if exact_pending && phase == "resuming" {
+                            manager.update(&app, &id, |s| s.phase = "resuming".into());
+                        } else if exact_pending && phase == "recording" {
+                            let mut next = current;
+                            let clock = next.retain_clock(
+                                &id,
+                                "resume",
+                                json!({
+                                    "activeSample":transition.get("activeEpochSample"),
+                                    "physicalQpc100ns":transition.get("physicalEpochQpc100ns")
+                                }),
+                                context.pause_revision,
+                            );
+                            match clock {
+                                Ok(_) if manager.controls.complete(operation, "recording") => {
+                                    manager.update(&app, &id, |s| {
+                                        s.phase = "recording".into();
+                                        s.pause = None;
+                                        s.pending_transition = None;
+                                        s.clock_epoch = next.clock_epoch;
+                                    });
+                                }
+                                Ok(_) => {}
+                                Err(reason) => {
+                                    manager.controls.complete_result(
+                                        operation,
+                                        "stopping",
+                                        Err("protocolFailure".into()),
+                                    );
+                                    manager.update(&app, &id, |s| {
+                                        s.phase = "stopping".into();
+                                        s.pending_transition = None;
+                                        s.message = Some(reason.clone());
+                                    });
+                                    space_error = Some(reason);
+                                    stop.store(true, Ordering::Release);
+                                }
+                            }
+                        }
+                    }
                     if last_space.elapsed() > Duration::from_secs(1) {
                         last_space = Instant::now();
                         if let Err(e) = ensure_local_space(&journal.directory, RESERVE_BYTES) {
@@ -1249,16 +2198,19 @@ fn run_session(
                         }
                     }
                 },
-                Some(preview_manager::Tap {
-                    manager: manager.preview.clone(),
-                    app: app.clone(),
-                    owner: id.clone(),
-                }),
-                Some(audio_manager::Tap {
-                    manager: manager.audio.clone(),
-                    app: app.clone(),
-                    owner: id.clone(),
-                }),
+                HostTaps {
+                    preview: Some(preview_manager::Tap {
+                        manager: manager.preview.clone(),
+                        app: app.clone(),
+                        owner: id.clone(),
+                    }),
+                    audio: Some(audio_manager::Tap {
+                        manager: manager.audio.clone(),
+                        app: app.clone(),
+                        owner: id.clone(),
+                    }),
+                    session: Some(manager.clone()),
+                },
             )?;
             if let Some(audio) = &mut journal.audio_capture {
                 audio.samples = outcome["audioFrames"].as_u64();
@@ -1270,6 +2222,8 @@ fn run_session(
 
             manager.update(&app, &id, |s| {
                 s.phase = "finalizing".into();
+                s.pause = None;
+                s.pending_transition = None;
                 s.elapsed_ms = outcome["elapsedMs"].as_u64().unwrap_or(s.elapsed_ms);
                 s.bytes_written = outcome["bytesWritten"].as_u64().unwrap_or(s.bytes_written);
                 s.message = space_error;
@@ -1290,6 +2244,16 @@ fn run_session(
     })();
     manager.audio.finish(&app, &id);
     manager.preview.finish_recording(&app, &id);
+    let attempt = manager
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .start_attempt
+        .clone();
+    if let Some(attempt) = attempt {
+        app.state::<controls_hotkeys::ControlsManager>()
+            .finish_attempt(&attempt);
+    }
     // Release exclusive admission before exposing the terminal state.
     drop(lease);
     let recoveries = find_recoveries(&app).unwrap_or_default();
@@ -1900,6 +2864,181 @@ mod tests {
         }
     }
     #[test]
+    fn inflight_pause_ack_keeps_its_admitted_revision_after_owner_rotation() {
+        let manager = RecordingManager::default();
+        manager.controls.replace_owner_option(Some("a".repeat(32)));
+        manager
+            .controls
+            .set_session("session", Arc::new(AtomicBool::new(false)), 0)
+            .unwrap();
+        manager.controls.phase("session", "recording");
+        let pending = manager
+            .controls
+            .admit(
+                session_controls::TransitionRequest {
+                    owner_token: "a".repeat(32),
+                    session_id: "session".into(),
+                    operation_id: "b".repeat(32),
+                    expected_control_revision: manager.controls.context().control_revision,
+                    reconcile_fence_token: None,
+                },
+                "pause",
+            )
+            .unwrap();
+        let snapshot = Snapshot {
+            session_id: Some("session".into()),
+            pending_transition: Some(pending.clone()),
+            ..Default::default()
+        };
+        manager.controls.replace_owner_option(Some("c".repeat(32)));
+        assert!(manager.controls.context().control_revision > pending.control_revision);
+        assert!(snapshot.matches_transition(&pending.operation_id, Some(pending.control_revision)));
+        assert!(!snapshot.matches_transition(
+            &pending.operation_id,
+            Some(manager.controls.context().control_revision)
+        ));
+        assert!(manager.controls.is_pending(&pending.operation_id));
+        let wire = manager.controls.control(true, 0).unwrap();
+        assert_eq!(wire["value"]["controlRevision"], pending.control_revision);
+        assert_eq!(wire["value"]["pauseRevision"], 1);
+        assert!(manager.controls.complete(&pending.operation_id, "paused"));
+        assert_eq!(manager.controls.context().owner_token, Some("c".repeat(32)));
+    }
+    #[test]
+    fn expired_transition_publication_cannot_clear_a_newer_pending_operation() {
+        let mut snapshot = Snapshot {
+            session_id: Some("session".into()),
+            phase: "paused".into(),
+            pending_transition: Some(session_controls::PendingTransition {
+                operation_id: "b".repeat(32),
+                action: "resume".into(),
+                control_revision: 4,
+            }),
+            ..Default::default()
+        };
+        let old = session_controls::TransitionTimeout {
+            session_id: "session".into(),
+            operation_id: "a".repeat(32),
+            control_revision: 3,
+            code: "resumeTimeout".into(),
+        };
+        let before = serde_json::to_value(&snapshot).unwrap();
+        assert!(!snapshot.apply_transition_timeout(&old));
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), before);
+        let current = session_controls::TransitionTimeout {
+            operation_id: "b".repeat(32),
+            control_revision: 4,
+            ..old
+        };
+        assert!(snapshot.apply_transition_timeout(&current));
+        assert!(snapshot.pending_transition.is_none());
+        assert_eq!(snapshot.phase, "paused");
+    }
+    #[test]
+    fn exact_resume_retry_joins_consumed_fence_before_current_admission_checks() {
+        let manager = RecordingManager::default();
+        manager.controls.replace_owner_option(Some("a".repeat(32)));
+        manager
+            .controls
+            .set_session("current", Arc::new(AtomicBool::new(false)), 1)
+            .unwrap();
+        manager.controls.phase("current", "paused");
+        let request = session_controls::TransitionRequest {
+            owner_token: "a".repeat(32),
+            session_id: "current".into(),
+            operation_id: "b".repeat(32),
+            expected_control_revision: manager.controls.context().control_revision,
+            reconcile_fence_token: Some("c".repeat(32)),
+        };
+        // The native seal/fence has already authorized and completed this exact
+        // operation. Its fence is no longer present in the public Paused state.
+        manager.controls.admit(request.clone(), "resume").unwrap();
+        manager.controls.control(true, 0).unwrap();
+        assert!(
+            manager
+                .controls
+                .complete(&request.operation_id, "recording")
+        );
+        assert!(admit_transition(&manager, request.clone(), "resume").is_ok());
+        assert!(!manager.controls.is_pending(&request.operation_id));
+        assert!(manager.controls.control(true, 0).is_none());
+        let mut conflict = request;
+        conflict.reconcile_fence_token = Some("d".repeat(32));
+        assert_eq!(
+            admit_transition(&manager, conflict, "resume").unwrap_err(),
+            "identityConflict"
+        );
+    }
+    #[test]
+    fn clock_receipts_bind_session_and_reset_without_retaining_a_history() {
+        let mut snapshot = Snapshot {
+            session_id: Some("current".into()),
+            ..Default::default()
+        };
+        let initial = json!({"activeSample":"0","physicalQpc100ns":"1000000"});
+        assert!(
+            !snapshot
+                .retain_clock("old", "initial", initial.clone(), 0)
+                .unwrap()
+        );
+        assert!(snapshot.clock_epoch.is_none());
+        assert!(
+            snapshot
+                .retain_clock("current", "initial", initial.clone(), 0)
+                .unwrap()
+        );
+        assert!(
+            !snapshot
+                .retain_clock("current", "initial", initial, 0)
+                .unwrap()
+        );
+        assert!(snapshot.retain_clock("current","pause",json!({"pauseRevision":1,"cutoffSample":"480","physicalCutoffQpc100ns":"1100000","releasedQpc100ns":"2200000"}),1).unwrap());
+        assert!(
+            snapshot
+                .retain_clock(
+                    "current",
+                    "resume",
+                    json!({"activeSample":"480","physicalQpc100ns":"5000000"}),
+                    1
+                )
+                .unwrap()
+        );
+        assert!(snapshot.retain_clock("current","pause",json!({"pauseRevision":2,"cutoffSample":"960","physicalCutoffQpc100ns":"5100000","releasedQpc100ns":"5200000"}),2).unwrap());
+        assert_eq!(
+            snapshot.last_pause_clock.as_ref().unwrap().pause_revision,
+            2
+        );
+        assert_eq!(snapshot.clock_epoch.as_ref().unwrap().active_sample, "480");
+        let before = serde_json::to_value(&snapshot).unwrap();
+        assert!(
+            snapshot
+                .retain_clock(
+                    "current",
+                    "resume",
+                    json!({"activeSample":"960","physicalQpc100ns":"5199999"}),
+                    2
+                )
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), before);
+        let journal = Journal {
+            version: 1,
+            session_id: "recovery".into(),
+            created_at: "0".into(),
+            directory: "owned".into(),
+            destination: "output.mp4".into(),
+            config: config(),
+            resolved_geometry: None,
+            published_size: None,
+            published_hash: None,
+            candidate_directory: None,
+            audio_capture: None,
+        };
+        snapshot.set_recovery_source(&journal);
+        assert!(snapshot.clock_epoch.is_none());
+        assert!(snapshot.last_pause_clock.is_none());
+    }
+    #[test]
     fn validates_settings_before_native_work() {
         let mut c = config();
         assert!(validate_config(&c).is_ok());
@@ -1919,6 +3058,48 @@ mod tests {
         c = config();
         c.countdown_seconds = 100;
         assert!(validate_config(&c).is_err());
+    }
+    #[test]
+    fn authoritative_pause_fence_read_advances_snapshot_sequence_only_when_changed() {
+        use audio_controls::*;
+        let mut snapshot = Snapshot {
+            sequence: 7,
+            phase: "paused".into(),
+            pause: Some(PauseSeal {
+                pause_revision: 1,
+                cutoff_sample: "480".into(),
+                audio: Some(PauseAudio {
+                    source_generation: "audio-session".into(),
+                    sealed_accepted_sequence: 0,
+                    fence: FenceState {
+                        state: FencePhase::Waiting,
+                        token: None,
+                        replacement_review_token: None,
+                    },
+                }),
+            }),
+            ..Default::default()
+        };
+        let ready = ControlSnapshot {
+            pause_audio: Some(PauseAudio {
+                source_generation: "audio-session".into(),
+                sealed_accepted_sequence: 0,
+                fence: FenceState {
+                    state: FencePhase::Ready,
+                    token: Some("a".repeat(32)),
+                    replacement_review_token: None,
+                },
+            }),
+            ledger: Some(AudioLedger::default()),
+        };
+        assert!(snapshot.sync_audio_control(ready.clone()));
+        assert_eq!(snapshot.sequence, 8);
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["pause"]["audio"]["fence"]["state"],
+            "ready"
+        );
+        assert!(!snapshot.sync_audio_control(ready));
+        assert_eq!(snapshot.sequence, 8);
     }
     #[test]
     fn legacy_recovery_public_snapshot_normalizes_audio_without_changing_journal() {
