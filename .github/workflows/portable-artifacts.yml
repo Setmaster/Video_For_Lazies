@@ -162,7 +162,18 @@ jobs:
         working-directory: app/src-tauri
 
       - name: Test Rust backend
+        if: runner.os != 'Windows'
         run: cargo test --manifest-path app/src-tauri/Cargo.toml
+
+      - name: Test Rust backend on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $runner = Join-Path $env:GITHUB_WORKSPACE 'app/scripts/windows-rust-test-runner.ps1'
+          $command = @('powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $runner)
+          $config = 'target.x86_64-pc-windows-msvc.runner = ' + (ConvertTo-Json -Compress -InputObject $command)
+          cargo test --manifest-path app/src-tauri/Cargo.toml --config $config
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Lint Rust backend
         run: cargo clippy --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings
@@ -207,6 +218,13 @@ jobs:
                   fs.cpSync(from, path.join(dest, entry), { recursive: true });
                 } catch {}
               }
+            }
+            if (process.platform === "win32") {
+              const dll = path.join(process.env.SystemRoot, "System32", "comctl32.dll");
+              if (fs.existsSync(dll)) fs.copyFileSync(dll, path.join(dest, "comctl32.dll"));
+              fs.writeFileSync(path.join(dest, "windows-runtime.json"), JSON.stringify({
+                release: os.release(), version: os.version(), arch: os.arch(),
+              }, null, 2));
             }
           '
 
