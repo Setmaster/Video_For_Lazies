@@ -32,12 +32,15 @@ const phaseTitles: Record<RecordingPhase, string> = {
 };
 
 export default function RecordingWorkspace({ visible, controls, busy = false, onRecordingStateChange, onPreviewAdmissionBusyChange, onEditVideo }: Props) {
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   const recorder = useRecording(onRecordingStateChange, async () => {
-    if (!await controls.invalidate("devices")) return false;
+    // Hidden catalogs are inert metadata. They must not retire an Edit dialog's
+    // newer shortcut fence; actual defaults still use commitConfig below.
+    if (!visibleRef.current) return true;
+    if (!await controls.invalidate("devices") || !visibleRef.current) return false;
     await recorder.refreshSnapshot();
-    // Catalogs are inert metadata, including for a restored active session.
-    // Actual defaults/source/config mutations still use commitConfig's guard.
-    return true;
+    return visibleRef.current;
   });
   const { snapshot, capabilities, sources, windows, windowsTruncated, audioDevices, applications, applicationsTruncated, pending, active } = recorder;
   const [captureMode, setCaptureMode] = useState<"area" | "display" | "window">("area");
@@ -59,14 +62,20 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
   const [countdown, setCountdown] = useState("3");
   const [outputDirectory, setOutputDirectory] = useState("");
   const configChanges = useRef(Promise.resolve(false));
-  const commitConfig = (change: () => void) => {
-    const next = configChanges.current.catch(() => false).then(() => holdPreview(async () => {
-      if (!await controls.invalidate("config")) return false;
-      const current = await recorder.refreshSnapshot();
-      if (isRecordingActive(current.phase) || current.selectionRequestId) return false;
-      if (!await preview.stop()) return false;
-      change(); return true;
-    }));
+  const commitConfig = (change: () => void, isCurrent: () => boolean = () => true) => {
+    const next = configChanges.current.catch(() => false).then(() => {
+      // An automatic default may have waited behind another configuration edit.
+      // Cancel it before holding preview or retiring a newer modal's draft.
+      if (!isCurrent()) return false;
+      return holdPreview(async () => {
+        if (!isCurrent()) return false;
+        if (!await controls.invalidate("config") || !isCurrent()) return false;
+        const current = await recorder.refreshSnapshot();
+        if (!isCurrent() || isRecordingActive(current.phase) || current.selectionRequestId) return false;
+        if (!await preview.stop() || !isCurrent()) return false;
+        change(); return true;
+      });
+    });
     configChanges.current = next;
     return next;
   };
@@ -109,12 +118,20 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
     onOverflow: () => { if (snapshot.sessionId) void recorder.command("recording_stop", { sessionId: snapshot.sessionId }); } });
 
   useEffect(() => {
-    if (!displayId && sources.length) void commitConfig(() => setDisplayId(sources[0].id));
-  }, [displayId, sources]);
+    if (!visible || displayId || !sources.length) return;
+    let cancelled = false;
+    const firstDisplayId = sources[0].id;
+    void commitConfig(() => setDisplayId(firstDisplayId), () => !cancelled && visibleRef.current);
+    return () => { cancelled = true; };
+  }, [visible, displayId, sources]);
 
   useEffect(() => {
-    if (capabilities?.defaultOutputDirectory && !outputDirectory) void commitConfig(() => setOutputDirectory(capabilities.defaultOutputDirectory || ""));
-  }, [capabilities]);
+    const directory = capabilities?.defaultOutputDirectory;
+    if (!visible || !directory || outputDirectory) return;
+    let cancelled = false;
+    void commitConfig(() => setOutputDirectory(directory), () => !cancelled && visibleRef.current);
+    return () => { cancelled = true; };
+  }, [visible, capabilities, outputDirectory]);
   useEffect(() => {
     const config = snapshot.config;
     if (!active || !snapshot.sessionId || !config) return;
