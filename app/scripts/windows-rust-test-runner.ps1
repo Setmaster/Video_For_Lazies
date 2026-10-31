@@ -3,7 +3,7 @@ param(
   [string]$TestExecutable,
 
   [Parameter(ValueFromRemainingArguments = $true)]
-  [string[]]$TestArguments
+  [string[]]$TestArguments = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,5 +54,29 @@ if ([System.IO.Path]::GetFileName($executable) -match '^video_for_lazies_lib-[0-
   Write-Host "Library test manifest verified: Common Controls 6, no UAC declaration."
 }
 
-& $executable @TestArguments
-exit $LASTEXITCODE
+# Windows PowerShell may return immediately for GUI-subsystem test binaries
+# (including the update-helper harness), leaving LASTEXITCODE unset. Wait on
+# the actual process and drain both redirected streams for every target.
+function Quote-NativeArgument([string]$Argument) {
+  '"' + ($Argument -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+}
+$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+$startInfo.FileName = $executable
+$startInfo.UseShellExecute = $false
+$startInfo.Arguments = (@($TestArguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+$process = New-Object System.Diagnostics.Process
+$process.StartInfo = $startInfo
+try {
+  if (-not $process.Start()) { throw "The test executable did not start." }
+  $stdout = $process.StandardOutput.ReadToEndAsync()
+  $stderr = $process.StandardError.ReadToEndAsync()
+  $process.WaitForExit()
+  [Console]::Out.Write($stdout.GetAwaiter().GetResult())
+  [Console]::Error.Write($stderr.GetAwaiter().GetResult())
+  $testExit = $process.ExitCode
+} finally {
+  $process.Dispose()
+}
+exit $testExit
