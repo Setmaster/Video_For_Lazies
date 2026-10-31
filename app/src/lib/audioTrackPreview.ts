@@ -6,11 +6,13 @@ export type AudioPreviewAsset = { requestId: string; path: string; sourceIdentit
   { kind: "original"; proxyId: null; timelineOffsetS: 0 } | { kind: "proxy"; proxyId: string; timelineOffsetS: number });
 type Playback = { timeS: number; playing: boolean };
 type Request = { requestId: string; path: string; sourceIdentity: string; streamIndex: number; generation: number; asset: AudioPreviewAsset | null };
+type SilentSource = { path: string; probe: VideoProbe; generation: number; token: string };
 type Options = { visible: boolean; enabled: boolean; path: string; probe: VideoProbe | null;
   unload: () => Playback; restore: (playback: Playback) => void; onAdmissionBusyChange: (busy: boolean) => void };
 const errorText = (failure: unknown) => failure instanceof Error ? failure.message : String(failure);
 export function useAudioTrackPreview(options: Options) {
   const [asset, setAsset] = useState<AudioPreviewAsset | null>(null);
+  const [silentSource, setSilentSource] = useState<SilentSource | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -52,7 +54,7 @@ export function useAudioTrackPreview(options: Options) {
     else if (!preservePlayback && playback.current) playback.current.playing = false;
     generation.current += 1; current.current = null; restored.current = null;
     if (old) retired.current.set(old.requestId, old);
-    if (mounted.current) setAsset(null);
+    if (mounted.current) { setAsset(null); setSilentSource(null); }
     publish();
     return cleanup();
   }, [cleanup, publish]);
@@ -68,12 +70,19 @@ export function useAudioTrackPreview(options: Options) {
   const key = `${options.path}\n${options.probe?.sourceIdentity || ""}\n${options.probe?.audioStreamIndex ?? ""}`;
   // A fresh probe also restarts a same-source preview unloaded by queue snapshot application.
   useEffect(() => {
-    if (!options.visible || !options.enabled || !options.probe?.hasAudio) { void stop(options.visible && !!options.path); return; }
+    if (!options.visible || !options.enabled || !options.probe) { void stop(options.visible && !!options.path); return; }
     const selected = options.probe;
     const path = options.path;
     const launch = async () => {
       const done = stop(true), token = generation.current;
       if (closing.current || cancelled.current || !await done || token !== generation.current || !mounted.current || !latest.current.visible || !latest.current.enabled || latest.current.path !== path || latest.current.probe?.sourceIdentity !== selected.sourceIdentity || latest.current.probe.audioStreamIndex !== selected.audioStreamIndex) return;
+      if (!selected.hasAudio) {
+        if (latest.current.probe !== selected) return;
+        // Reload even the same silent path, only after owned cleanup has settled.
+        setSilentSource({ path, probe: selected, generation: token, token: `silent:${token}` });
+        setError(null);
+        return;
+      }
       if (!selected.sourceIdentity || selected.audioStreamIndex === null || selected.audioStreamIndex === undefined) { setError("The selected audio track is unavailable. Reload or reselect the source."); return; }
       const request: Request = { requestId: crypto.randomUUID(), path, sourceIdentity: selected.sourceIdentity, streamIndex: selected.audioStreamIndex, generation: token, asset: null };
       current.current = request; setError(null); publish();
@@ -93,7 +102,10 @@ export function useAudioTrackPreview(options: Options) {
     };
     void launch();
   }, [key, options.probe, options.enabled, options.visible, options.probe?.hasAudio, revision, cleanup, matches, publish, stop]);
-  const sourceToken = asset?.requestId || (!options.probe?.hasAudio ? `silent:${options.path}` : "");
+  const silent = silentSource && mounted.current && !closing.current && !cancelled.current &&
+    silentSource.generation === generation.current && options.visible && options.enabled &&
+    options.path === silentSource.path && options.probe === silentSource.probe ? silentSource : null;
+  const sourceToken = asset?.requestId || silent?.token || "";
   const ready = useCallback((token: string) => {
     const request = current.current;
     if (!request?.asset || request.requestId !== token || !matches(request)) return;
@@ -104,7 +116,7 @@ export function useAudioTrackPreview(options: Options) {
   }, [matches]);
   return { asset, sourceToken, pending, error, stop, ready, cancelled: cancelled.current,
     playbackError: (token: string) => { if (current.current?.requestId === token && mounted.current) setError("The selected audio/video cannot be played in this browser. The export track choice is unchanged."); },
-    path: asset?.path || (options.visible && options.enabled && options.probe && !options.probe.hasAudio ? options.path : ""),
+    path: asset?.path || silent?.path || "",
     timelineOffsetS: asset?.timelineOffsetS || 0,
     close: () => { closing.current = true; return stop(false); },
     cancel: () => { cancelled.current = true; return stop(false); },
