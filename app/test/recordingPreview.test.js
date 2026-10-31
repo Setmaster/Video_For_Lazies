@@ -1,9 +1,49 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { INITIAL_PREVIEW, acceptPreviewSnapshot, decodePreviewEnvelope, frameMatchesPreview } from "../src/lib/recordingPreviewState.mjs";
+import { INITIAL_PREVIEW, acceptPreviewSnapshot, automaticPreviewAction, canRunRecordingPreview, decodePreviewEnvelope, frameMatchesPreview } from "../src/lib/recordingPreviewState.mjs";
 import { captureSourceKey, isCaptureSource, recordingWindowProblem } from "../src/lib/recordingState.mjs";
 
 const source = { kind: "window", windowId: "opaque-window" };
+const automatic = { enabled: true, visible: true, documentVisible: true, canPreview: true, recordingPhase: "idle",
+  error: null, handoff: false, stopping: false, hasRequest: false, starting: false, previewPhase: "idle" };
+
+test("a selected visible source starts preview without output or audio configuration", () => {
+  assert.equal(automaticPreviewAction(automatic), "start");
+  for (const patch of [{ hasRequest: true }, { starting: true }, { stopping: true }, { previewPhase: "starting" }]) {
+    assert.equal(automaticPreviewAction({ ...automatic, ...patch }), "none");
+  }
+  assert.equal(automaticPreviewAction({ ...automatic, canPreview: false }), "none", "Area without a region must not fall back to the display");
+});
+
+test("explicit hide survives source availability, visibility and recording changes", () => {
+  for (const recordingPhase of ["idle", "recording", "completed"]) {
+    assert.equal(automaticPreviewAction({ ...automatic, enabled: false, recordingPhase }), "none");
+    assert.equal(automaticPreviewAction({ ...automatic, enabled: false, recordingPhase, hasRequest: true }), "stop");
+  }
+  for (const patch of [{ visible: false }, { documentVisible: false }, { canPreview: false }]) {
+    assert.equal(automaticPreviewAction({ ...automatic, hasRequest: true, ...patch }), "stop");
+    assert.equal(canRunRecordingPreview({ ...automatic, ...patch }), false);
+  }
+  assert.equal(automaticPreviewAction(automatic), "start", "returning to visible Record can reconcile enabled preview");
+});
+
+test("recording handoff cannot start another standalone helper", () => {
+  assert.equal(automaticPreviewAction({ ...automatic, handoff: true }), "none");
+  assert.equal(automaticPreviewAction({ ...automatic, handoff: true, hasRequest: true }), "none");
+  for (const recordingPhase of ["preparing", "countdown", "starting", "pausing", "paused", "resuming", "stopping", "finalizing"]) {
+    assert.equal(canRunRecordingPreview({ ...automatic, recordingPhase }), false);
+    assert.equal(automaticPreviewAction({ ...automatic, recordingPhase, hasRequest: true }), "stop");
+  }
+  assert.equal(automaticPreviewAction({ ...automatic, recordingPhase: "recording" }), "start", "attach only after actual recording acknowledgement");
+});
+
+test("failed start or unconfirmed cleanup waits for an explicit retry", () => {
+  for (const patch of [{ error: "Start failed" }, { previewPhase: "failed" }, { error: "Stop unconfirmed", hasRequest: true },
+    { error: "Stop unconfirmed", hasRequest: true, enabled: false }]) {
+    for (let render = 0; render < 5; render++) assert.equal(automaticPreviewAction({ ...automatic, ...patch }), "none");
+  }
+  assert.equal(automaticPreviewAction({ ...automatic, stopping: true, hasRequest: true, visible: false }), "none", "do not overlap cleanup calls while stopping");
+});
 function status(overrides = {}) {
   return { previewId: "native-preview-a", sequence: 10, configEpoch: 1, phase: "previewing", source,
     frameSequence: 8, sourceWidth: 641, sourceHeight: 481, lastFrameAgeMs: 0, message: null, ...overrides };

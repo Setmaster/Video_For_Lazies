@@ -7,6 +7,19 @@ export const INITIAL_PREVIEW = Object.freeze({
 const phases = new Set(["idle", "starting", "previewing", "recording", "stopping", "failed"]);
 export function isPreviewLive(phase) { return phase === "previewing" || phase === "recording"; }
 
+export function canRunRecordingPreview({ enabled, visible, documentVisible, canPreview, recordingPhase }) {
+  return enabled && visible && documentVisible && canPreview &&
+    ["idle", "completed", "recoverable", "failed", "recording"].includes(recordingPhase);
+}
+
+export function automaticPreviewAction(options) {
+  // A failed Stop keeps native admission until an explicit cleanup retry.
+  // Neither a start failure nor cleanup failure may become a render retry loop.
+  if (options.error || options.handoff || options.stopping) return "none";
+  if (!canRunRecordingPreview(options)) return options.hasRequest ? "stop" : "none";
+  return !options.hasRequest && !options.starting && options.previewPhase === "idle" ? "start" : "none";
+}
+
 export function acceptPreviewSnapshot(current, incoming) {
   const integer = (value) => Number.isSafeInteger(value) && value >= 0;
   if (!incoming || !phases.has(incoming.phase) ||

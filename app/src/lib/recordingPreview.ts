@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { CaptureSource, RecordingPhase } from "./recording";
 import { captureSourceKey, isRecordingActive } from "./recordingState";
-import { INITIAL_PREVIEW, acceptPreviewSnapshot, decodePreviewEnvelope, frameMatchesPreview, isPreviewLive } from "./recordingPreviewState";
+import { INITIAL_PREVIEW, acceptPreviewSnapshot, automaticPreviewAction, canRunRecordingPreview, decodePreviewEnvelope, frameMatchesPreview, isPreviewLive } from "./recordingPreviewState";
 
 export type RecordingPreviewSnapshot = {
   previewId: string | null; sequence: number; configEpoch: number;
@@ -13,7 +13,7 @@ export type RecordingPreviewSnapshot = {
 };
 type Request = { requestId: string; previewId: string | null; generation: number; sourceKey: string; showCursor: boolean };
 export type PreviewHandoff = { generation: number; sourceKey: string; showCursor: boolean; resume: boolean };
-type Options = { visible: boolean; source: CaptureSource | null; showCursor: boolean; recordingPhase: RecordingPhase; recordingSessionId: string | null; onAdmissionBusyChange?: (busy: boolean) => void };
+type Options = { enabled: boolean; canPreview: boolean; visible: boolean; source: CaptureSource | null; showCursor: boolean; recordingPhase: RecordingPhase; recordingSessionId: string | null; onAdmissionBusyChange?: (busy: boolean) => void };
 type ImageFrame = { url: string; sequence: number; previewId: string; configEpoch: number };
 const message = (failure: unknown) => failure instanceof Error ? failure.message : String(failure);
 
@@ -24,10 +24,16 @@ export function useRecordingPreview(options: Options) {
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [eventsReady, setEventsReady] = useState(false);
+  const [documentVisible, setDocumentVisible] = useState(document.visibilityState !== "hidden");
+  const consumerVisible = useRef(document.visibilityState !== "hidden");
+  const [handoff, setHandoff] = useState(false);
+  const [startAttempt, setStartAttempt] = useState(0);
+  const handoffPending = useRef(false);
+  const startInFlight = useRef(false);
   const eventsConnected = useRef(false);
   const current = useRef(INITIAL_PREVIEW);
-  const currentOptions = useRef({ ...options, sourceKey: captureSourceKey(options.source) });
-  currentOptions.current = { ...options, sourceKey: captureSourceKey(options.source) };
+  const currentOptions = useRef({ ...options, sourceKey: captureSourceKey(options.source), documentVisible });
+  currentOptions.current = { ...options, sourceKey: captureSourceKey(options.source), documentVisible };
   const mounted = useRef(false);
   const generation = useRef(0);
   const request = useRef<Request | null>(null);
@@ -41,6 +47,7 @@ export function useRecordingPreview(options: Options) {
   const heartbeatAt = useRef(0);
   const polling = useRef(false);
   const previousRecording = useRef({ phase: options.recordingPhase, sessionId: options.recordingSessionId });
+  const previousIntent = useRef({ enabled: options.enabled, sourceKey: captureSourceKey(options.source), showCursor: options.showCursor });
 
   // Native admission lasts until Stop confirms teardown, even after local
   // imagery is cleared or a start reply is lost. Publish before invoking IPC
@@ -68,8 +75,8 @@ export function useRecordingPreview(options: Options) {
   const matches = useCallback((candidate: Request) => {
     const latest = currentOptions.current;
     return mounted.current && request.current === candidate && generation.current === candidate.generation &&
-      latest.visible && document.visibilityState !== "hidden" &&
-      !(isRecordingActive(latest.recordingPhase) && latest.recordingPhase !== "recording") && latest.sourceKey === candidate.sourceKey && latest.showCursor === candidate.showCursor;
+      canRunRecordingPreview({ ...latest, documentVisible: consumerVisible.current && latest.documentVisible && document.visibilityState !== "hidden" }) &&
+      latest.sourceKey === candidate.sourceKey && latest.showCursor === candidate.showCursor;
   }, []);
 
   const cleanupRetired = useCallback(async () => {
@@ -129,15 +136,16 @@ export function useRecordingPreview(options: Options) {
     return next;
   }, [clearImage, matches]);
 
-  const start = useCallback(async () => {
+  const begin = useCallback(async () => {
     const selected = currentOptions.current;
-    if (!eventsConnected.current || !selected.visible || document.visibilityState === "hidden" || !selected.source ||
-        isRecordingActive(selected.recordingPhase) && selected.recordingPhase !== "recording") return;
+    if (!eventsConnected.current || handoffPending.current || !selected.source ||
+        !canRunRecordingPreview({ ...selected, documentVisible: consumerVisible.current && selected.documentVisible && document.visibilityState !== "hidden" })) return;
     const selectedKey = selected.sourceKey, cursor = selected.showCursor;
     const cleanup = stop();
     const startGeneration = generation.current;
-    if (!await cleanup || !mounted.current || generation.current !== startGeneration ||
-        !currentOptions.current.visible || currentOptions.current.sourceKey !== selectedKey || currentOptions.current.showCursor !== cursor) return;
+    if (!await cleanup || !mounted.current || generation.current !== startGeneration || handoffPending.current ||
+        !canRunRecordingPreview({ ...currentOptions.current, documentVisible: consumerVisible.current && currentOptions.current.documentVisible && document.visibilityState !== "hidden" }) ||
+        currentOptions.current.sourceKey !== selectedKey || currentOptions.current.showCursor !== cursor) return;
     const candidate: Request = { requestId: crypto.randomUUID(), previewId: null, generation: startGeneration, sourceKey: selectedKey, showCursor: cursor };
     request.current = candidate;
     publishAdmission();
@@ -203,6 +211,29 @@ export function useRecordingPreview(options: Options) {
     } finally { if (matches(candidate)) setStarting(false); }
   }, [accept, cleanupRetired, matches, publishAdmission, stop]);
 
+  const start = useCallback(async () => {
+    if (startInFlight.current) return;
+    startInFlight.current = true;
+    try { await begin(); }
+    finally {
+      startInFlight.current = false;
+      if (mounted.current) setStartAttempt(value => value + 1);
+    }
+  }, [begin]);
+
+  const detachForRecording = useCallback(() => {
+    handoffPending.current = true;
+    setHandoff(true);
+    return detach();
+  }, [detach]);
+  const finishHandoff = useCallback(async () => {
+    try { return await cleanupRetired(); }
+    finally {
+      handoffPending.current = false;
+      if (mounted.current) setHandoff(false);
+    }
+  }, [cleanupRetired]);
+
   useEffect(() => {
     mounted.current = true;
     eventsConnected.current = false;
@@ -220,10 +251,16 @@ export function useRecordingPreview(options: Options) {
     }).catch(() => {
       if (!disposed) { setError("Preview status events are unavailable. Reopen the app before previewing."); void stop(); }
     });
-    const hidden = () => { if (document.visibilityState === "hidden") void stop(); };
+    const hidden = () => {
+      consumerVisible.current = document.visibilityState !== "hidden";
+      setDocumentVisible(consumerVisible.current);
+      if (!consumerVisible.current) void stop();
+    };
     document.addEventListener("visibilitychange", hidden);
-    const leaving = () => { void stop(); };
+    const leaving = () => { consumerVisible.current = false; setDocumentVisible(false); void stop(); };
+    const showing = () => { consumerVisible.current = document.visibilityState !== "hidden"; setDocumentVisible(consumerVisible.current); };
     window.addEventListener("pagehide", leaving);
+    window.addEventListener("pageshow", showing);
     const heartbeat = setInterval(() => {
       const candidate = request.current;
       if (candidate?.previewId && matches(candidate) && ["starting", "previewing", "recording"].includes(current.current.phase) &&
@@ -240,11 +277,18 @@ export function useRecordingPreview(options: Options) {
       unlisten?.();
       document.removeEventListener("visibilitychange", hidden);
       window.removeEventListener("pagehide", leaving);
+      window.removeEventListener("pageshow", showing);
       clearInterval(heartbeat);
     };
   }, [accept, matches, stop]);
 
-  useEffect(() => { void stop(); }, [options.visible, currentOptions.current.sourceKey, options.showCursor, stop]);
+  useEffect(() => {
+    const before = previousIntent.current;
+    const next = { enabled: options.enabled, sourceKey: currentOptions.current.sourceKey, showCursor: options.showCursor };
+    previousIntent.current = next;
+    if (before.sourceKey !== next.sourceKey || before.showCursor !== next.showCursor || !before.enabled && next.enabled) setError(null);
+    void stop();
+  }, [options.enabled, options.visible, currentOptions.current.sourceKey, options.showCursor, stop]);
   useEffect(() => {
     const before = previousRecording.current;
     previousRecording.current = { phase: options.recordingPhase, sessionId: options.recordingSessionId };
@@ -253,6 +297,16 @@ export function useRecordingPreview(options: Options) {
         (before.sessionId && before.sessionId !== options.recordingSessionId && current.current.phase === "recording")) void stop();
   }, [options.recordingPhase, options.recordingSessionId, stop]);
 
+  const hasRequest = request.current !== null || retired.current.size > 0;
+  useEffect(() => {
+    if (!eventsReady) return;
+    const action = automaticPreviewAction({ ...options, documentVisible, handoff: handoff || handoffPending.current,
+      hasRequest, starting: starting || startInFlight.current, stopping, error, previewPhase: snapshot.phase });
+    if (action === "start") void start();
+    else if (action === "stop") void stop();
+  }, [options.enabled, options.canPreview, options.visible, options.recordingPhase, currentOptions.current.sourceKey,
+    options.showCursor, documentVisible, eventsReady, handoff, hasRequest, starting, stopping, error, snapshot.phase, startAttempt, start, stop]);
+
   const isCurrent = useCallback((ticket: PreviewHandoff) => generation.current === ticket.generation &&
     currentOptions.current.visible && document.visibilityState !== "hidden" &&
     currentOptions.current.sourceKey === ticket.sourceKey && currentOptions.current.showCursor === ticket.showCursor, []);
@@ -260,6 +314,5 @@ export function useRecordingPreview(options: Options) {
     image.previewId === snapshot.previewId && image.configEpoch === snapshot.configEpoch && isPreviewLive(snapshot.phase) &&
     !["pausing", "paused", "resuming", "stopping", "finalizing"].includes(options.recordingPhase) ? image : null;
   return { snapshot, image: visibleImage, starting, stopping, error, eventsReady, start, stop,
-    detachForRecording: detach, finishHandoff: cleanupRetired, isCurrent,
-    hasRequest: request.current !== null || retired.current.size > 0 };
+    detachForRecording, finishHandoff, isCurrent, hasRequest };
 }

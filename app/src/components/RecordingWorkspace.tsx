@@ -6,7 +6,6 @@ import { useRecording } from "../lib/recording";
 import type { CaptureSource, RecordingConfig, RecordingPhase, RecordingRegion, RecordingStateChange } from "../lib/recording";
 import { captureSourceKey, formatRecordingDuration, isRecordingActive, isRecordingRegionWithinDisplay, recordingSourceProblem, recordingWindowProblem } from "../lib/recordingState";
 import { useRecordingPreview } from "../lib/recordingPreview";
-import type { PreviewHandoff } from "../lib/recordingPreview";
 import RecordingShortcuts from "./RecordingShortcuts";
 import { recordingControlId } from "../lib/recordingControls";
 import RecordingAudioControls from "./RecordingAudioControls";
@@ -44,7 +43,13 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
   const [captureMode, setCaptureMode] = useState<"area" | "display" | "window">("area");
   const [displayId, setDisplayId] = useState("");
   const [windowId, setWindowId] = useState("");
-  const resumePreview = useRef<PreviewHandoff | null>(null);
+  const [previewEnabled, setPreviewEnabled] = useState(true);
+  const [previewHolds, setPreviewHolds] = useState(0);
+  async function holdPreview<T,>(action: () => Promise<T>): Promise<T> {
+    setPreviewHolds(count => count + 1);
+    try { return await action(); }
+    finally { setPreviewHolds(count => count - 1); }
+  }
   const [region, setRegion] = useState<RecordingRegion | null>(null);
   const [regionDisplayGeometry, setRegionDisplayGeometry] = useState("");
   const [audioConfig, setAudioConfig] = useState<RecordingAudioConfig>(() => structuredClone(DEFAULT_AUDIO));
@@ -55,14 +60,13 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
   const [outputDirectory, setOutputDirectory] = useState("");
   const configChanges = useRef(Promise.resolve(false));
   const commitConfig = (change: () => void) => {
-    const next = configChanges.current.catch(() => false).then(async () => {
+    const next = configChanges.current.catch(() => false).then(() => holdPreview(async () => {
       if (!await controls.invalidate("config")) return false;
       const current = await recorder.refreshSnapshot();
       if (isRecordingActive(current.phase) || current.selectionRequestId) return false;
-      resumePreview.current = null;
-      void preview.stop();
+      if (!await preview.stop()) return false;
       change(); return true;
-    });
+    }));
     configChanges.current = next;
     return next;
   };
@@ -85,12 +89,12 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
   const audioReady = (audioConfig.render.kind === "off" || audioConfig.render.kind === "system" && systems.some(device => device.id === (audioConfig.render.kind === "system" ? audioConfig.render.deviceId : "")) ||
     audioConfig.render.kind === "application" && capabilities?.audio.application.available && applications.some(app => app.id === (audioConfig.render.kind === "application" ? audioConfig.render.applicationId : "") && app.available)) &&
     (!audioConfig.microphone || microphones.some(device => device.id === audioConfig.microphone?.deviceId) && (audioConfig.microphone.suppression === "off" || capabilities?.audio.microphoneSuppression.available));
-  const disabled = busy || active || recorder.selecting || pending !== null || !capabilities?.available;
-  const preview = useRecordingPreview({ visible, source: active && snapshot.config ? snapshot.config.source : selectedSource,
+  const disabled = busy || active || previewHolds > 0 || recorder.selecting || pending !== null || !capabilities?.available;
+  const canPreview = visible && !!capabilities?.available && !busy && previewHolds === 0 && !recorder.selecting && pending === null &&
+    (!active ? !!selectedSource : snapshot.phase === "recording");
+  const preview = useRecordingPreview({ enabled: previewEnabled, canPreview, visible, source: active && snapshot.config ? snapshot.config.source : selectedSource,
     showCursor: active && snapshot.config ? snapshot.config.showCursor : showCursor, recordingPhase: snapshot.phase, recordingSessionId: snapshot.sessionId,
     onAdmissionBusyChange: onPreviewAdmissionBusyChange });
-  const canPreview = visible && !!capabilities?.available && !busy && !recorder.selecting && pending === null &&
-    (!active ? !!selectedSource : snapshot.phase === "recording");
   const ready = controls.ready && !preview.starting && !preview.stopping && preview.snapshot.phase !== "starting" && !disabled && recorder.connected && selectedSource !== null && audioReady && outputDirectory.trim() !== "";
   const canCancel = ["preparing", "countdown", "starting"].includes(snapshot.phase);
   const canStop = ["recording", "pausing", "paused", "resuming"].includes(snapshot.phase) || canCancel;
@@ -131,27 +135,14 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
     setCountdown(String(config.countdownSeconds)); setOutputDirectory(config.outputDirectory);
   }, [active, snapshot, sources]);
 
-  useEffect(() => {
-    const intent = resumePreview.current;
-    if (!intent) return;
-    if (!preview.isCurrent(intent) || !active) { resumePreview.current = null; return; }
-    if (snapshot.phase === "recording") { resumePreview.current = null; void preview.start(); }
-  }, [active, snapshot.phase, preview]);
-
-  useEffect(() => {
-    if (["pausing", "paused", "resuming", "stopping", "finalizing"].includes(snapshot.phase)) {
-      resumePreview.current = null;
-      void preview.stop();
-    }
-  }, [snapshot.phase, preview.stop]);
-
   function changeCaptureMode(mode: "area" | "display" | "window") {
     void commitConfig(() => setCaptureMode(mode));
   }
 
   async function refreshDevices() {
-    resumePreview.current = null;
-    if (await preview.stop()) await recorder.refreshDevices();
+    await holdPreview(async () => {
+      if (await preview.stop()) await recorder.refreshDevices();
+    });
   }
 
 
@@ -167,16 +158,17 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
     if (disabled || !display) return;
     if (!await controls.invalidate("source")) return;
     const geometry = displayGeometry;
-    resumePreview.current = null;
-    if (!await preview.stop()) return;
-    await recorder.run("selection", async () => {
-      const chosen = await invoke<RecordingRegion | null>("recording_select_region", { displayId: display.id, requestId: crypto.randomUUID() });
-      if (chosen !== null) {
-        const problem = recordingSourceProblem(chosen, display);
-        if (problem) throw new Error(problem);
-        await commitConfig(() => { setRegion(chosen); setRegionDisplayGeometry(geometry); });
-      }
-    }, true);
+    await holdPreview(async () => {
+      if (!await preview.stop()) return;
+      await recorder.run("selection", async () => {
+        const chosen = await invoke<RecordingRegion | null>("recording_select_region", { displayId: display.id, requestId: crypto.randomUUID() });
+        if (chosen !== null) {
+          const problem = recordingSourceProblem(chosen, display);
+          if (problem) throw new Error(problem);
+          await commitConfig(() => { setRegion(chosen); setRegionDisplayGeometry(geometry); });
+        }
+      }, true);
+    });
   }
 
   async function start() {
@@ -189,13 +181,9 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
       audio: audioConfig, outputDirectory,
     };
     startedRequest.current = config.requestId;
-    const intent = preview.detachForRecording();
-    const result = await recorder.command("recording_start", { config, admission });
-    await preview.finishHandoff();
-    if (result && intent.resume && preview.isCurrent(intent) && ["preparing", "countdown", "starting", "recording"].includes(result.phase)) {
-      resumePreview.current = intent;
-      if (result.phase === "recording") { resumePreview.current = null; void preview.start(); }
-    }
+    preview.detachForRecording();
+    try { await recorder.command("recording_start", { config, admission }); }
+    finally { await preview.finishHandoff(); }
   }
 
   const draftKey = JSON.stringify({ visible, busy, active, selecting: recorder.selecting, pending, source: selectedSource,
@@ -212,7 +200,6 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
 
   async function changeRecordingPhase(action: "pause" | "resume") {
     if (!snapshot.sessionId || !controls.ownerToken || pending !== null) return;
-    resumePreview.current = null;
     void preview.stop();
     if (action === "pause") mixer.freeze();
     await recorder.transition(action, { ownerToken: controls.ownerToken, sessionId: snapshot.sessionId,
@@ -273,16 +260,10 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
           </div>
           {isWindow && <div id="vfl-record-window-method" className="vfl-inline-hint">Windows capture (WGC) · Windowed and borderless games. Protected or exclusive full-screen content may be unavailable. Preview follows resizing; recording stops and saves if the window changes size.{windowsTruncated ? " Window list limited to 128 entries. Close unused windows and refresh if needed." : ""}</div>}
           <div className={`vfl-record-stage ${active ? "is-recording-active" : ""} ${preview.image ? "has-preview" : ""}`}>
+            <RecordingPreview preview={preview} canPreview={canPreview} recording={active}
+              enabled={previewEnabled} onEnabledChange={setPreviewEnabled} recordingPhase={snapshot.phase}
+              emptyHint={sourceProblem || (!capabilities?.available ? capabilities?.reason || "Recording support is unavailable." : selectedSource ? "Preview is off while settings or another task are being updated." : isWindow ? "Choose a window or game above." : isArea ? "Select an area to see what will be recorded." : "Choose a display above.")} />
             <div className="vfl-record-empty">
-              {(!preview.hasRequest && !preview.starting) && <svg className="vfl-record-illustration" viewBox="0 0 200 152" fill="none" aria-hidden="true">
-                <rect x="24" y="18" width="152" height="100" rx="8" />
-                <path d="M24 100h152M100 118v18m-27 0h54" />
-                {isArea ? <>
-                  <rect className="vfl-record-area-outline" x="53" y="38" width="94" height="48" rx="2" />
-                  <path className="vfl-record-area-corners" d="M48 44V33h12m80 0h12v11M48 80v11h12m80 0h12V80" />
-                </> : <rect className="vfl-record-display-outline" x="33" y="27" width="134" height="64" rx="3" />}
-              </svg>}
-              <RecordingPreview preview={preview} canPreview={canPreview} recording={active} />
               <h3 aria-live="polite">{statusTitle}</h3>
               {snapshot.phase === "countdown" && <div className="vfl-record-countdown" role="timer" aria-live="polite" aria-atomic="true" aria-label="Seconds until recording">{snapshot.countdownRemaining ?? "…"}</div>}
               {active && snapshot.phase !== "countdown" && <div className="vfl-record-timer" role="timer" aria-label="Recording duration">{formatRecordingDuration(snapshot.elapsedMs)}</div>}
@@ -359,7 +340,7 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
           <div className="vfl-footer-actions">
             {snapshot.phase === "recording" && <button id="vfl-record-pause" type="button" disabled={pending !== null || snapshot.pendingTransition !== null || !controls.ownerToken} onClick={() => void changeRecordingPhase("pause")}>Pause</button>}
             {snapshot.phase === "paused" && <button id="vfl-record-resume" type="button" disabled={pending !== null || snapshot.pendingTransition !== null || !controls.ownerToken || mixer.syncing || mixer.reviewRequired || !mixer.synchronized} onClick={() => void changeRecordingPhase("resume")}>Resume</button>}
-            {canStop && snapshot.sessionId ? <button type="button" className="danger vfl-record-start" disabled={pending === "recording_stop"} onClick={() => { resumePreview.current = null; void preview.stop(); void recorder.command("recording_stop", { sessionId: snapshot.sessionId }); }}>{canCancel ? "Cancel recording" : "Stop and save"}</button>
+            {canStop && snapshot.sessionId ? <button type="button" className="danger vfl-record-start" disabled={pending === "recording_stop"} onClick={() => { void preview.stop(); void recorder.command("recording_stop", { sessionId: snapshot.sessionId }); }}>{canCancel ? "Cancel recording" : "Stop and save"}</button>
               : <button type="button" className="primary vfl-record-start" disabled={!ready} onClick={() => void start()}>{snapshot.phase === "stopping" || snapshot.phase === "finalizing" ? "Saving…" : pending === "recording_start" ? "Preparing…" : "Start recording"}</button>}
           </div>
         </div>
