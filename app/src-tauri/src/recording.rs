@@ -24,6 +24,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow as Window};
 const PROTOCOL_LIMIT: u64 = 65_536;
 const JOURNAL_VERSION: u32 = 2;
 const RESERVE_BYTES: u64 = 128 * 1024 * 1024;
+const PAUSE_PROGRESS_MESSAGE: &str = "Pausing and releasing recording inputs…";
 
 // The writer and checked reader are shared with the separate native helper.
 #[allow(dead_code)]
@@ -130,6 +131,11 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    fn clear_pause_progress_message(&mut self) {
+        if self.message.as_deref() == Some(PAUSE_PROGRESS_MESSAGE) {
+            self.message = None;
+        }
+    }
     fn matches_transition(&self, operation: &str, revision: Option<u64>) -> bool {
         self.pending_transition
             .as_ref()
@@ -1703,7 +1709,7 @@ pub(crate) fn request_transition(
                 s.phase = context.phase;
                 s.pending_transition = Some(pending);
                 if action == "pause" {
-                    s.message = Some("Pausing and releasing recording inputs…".into());
+                    s.message = Some(PAUSE_PROGRESS_MESSAGE.into());
                 }
             });
             audio_controls::ControlResult::success(manager.snapshot())
@@ -2132,6 +2138,7 @@ fn run_session(
                                             audio: audio.pause_audio,
                                         });
                                         s.audio_control_ledger = audio.ledger;
+                                        s.clear_pause_progress_message();
                                     });
                                 }
                                 Ok(_) => {}
@@ -2170,6 +2177,7 @@ fn run_session(
                                         s.pause = None;
                                         s.pending_transition = None;
                                         s.clock_epoch = next.clock_epoch;
+                                        s.clear_pause_progress_message();
                                     });
                                 }
                                 Ok(_) => {}
@@ -2905,10 +2913,52 @@ mod tests {
         assert_eq!(manager.controls.context().owner_token, Some("c".repeat(32)));
     }
     #[test]
+    fn acknowledged_pause_and_resume_clear_only_the_pause_progress_message() {
+        for phase in ["paused", "recording"] {
+            let mut snapshot = Snapshot {
+                phase: phase.into(),
+                session_id: Some("current-session".into()),
+                elapsed_ms: 23_750,
+                message: Some(PAUSE_PROGRESS_MESSAGE.into()),
+                ..Default::default()
+            };
+            let mut expected = serde_json::to_value(&snapshot).unwrap();
+            expected["message"] = Value::Null;
+            snapshot.clear_pause_progress_message();
+            assert_eq!(serde_json::to_value(&snapshot).unwrap(), expected);
+        }
+    }
+    #[test]
+    fn acknowledged_transition_preserves_failure_and_recovery_messages() {
+        for phase in ["paused", "recording"] {
+            for message in [
+                None,
+                Some(
+                    "The pinned source is temporarily unavailable. Repair it before another Resume.",
+                ),
+                Some(
+                    "Resume expired before synchronization completed. Use a fresh Resume after synchronization.",
+                ),
+                Some("Pause clock does not match the active capture epoch."),
+                Some("Recovery may omit the unfinished end."),
+            ] {
+                let mut snapshot = Snapshot {
+                    phase: phase.into(),
+                    message: message.map(str::to_owned),
+                    ..Default::default()
+                };
+                let before = serde_json::to_value(&snapshot).unwrap();
+                snapshot.clear_pause_progress_message();
+                assert_eq!(serde_json::to_value(&snapshot).unwrap(), before);
+            }
+        }
+    }
+    #[test]
     fn expired_transition_publication_cannot_clear_a_newer_pending_operation() {
         let mut snapshot = Snapshot {
             session_id: Some("session".into()),
             phase: "paused".into(),
+            message: Some(PAUSE_PROGRESS_MESSAGE.into()),
             pending_transition: Some(session_controls::PendingTransition {
                 operation_id: "b".repeat(32),
                 action: "resume".into(),
@@ -2933,6 +2983,12 @@ mod tests {
         assert!(snapshot.apply_transition_timeout(&current));
         assert!(snapshot.pending_transition.is_none());
         assert_eq!(snapshot.phase, "paused");
+        assert_eq!(
+            snapshot.message.as_deref(),
+            Some(
+                "Resume expired before synchronization completed. Use a fresh Resume after synchronization."
+            )
+        );
     }
     #[test]
     fn exact_resume_retry_joins_consumed_fence_before_current_admission_checks() {
