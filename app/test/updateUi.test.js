@@ -33,7 +33,7 @@ test("update application streams safe phase progress and blocks conflicting medi
   assert.match(raw, /aria-valuetext=\{updateProgressUi\.valueText\}/);
   assert.match(raw, /role=\{updatePublicError \? "alert" : "status"\}/);
   assert.match(raw, /if \(updateBusyRef\.current\) \{\s*return \{ ok: false, message: "Finish the current update before starting an export\." \};/s);
-  assert.match(raw, /updating \? "an update is still being prepared" : null/);
+  assert.match(raw, /updateBusyRef\.current \? "an update is still being prepared" : null/);
   assert.match(raw, /status === "recoveryRequired"/);
   assert.doesNotMatch(raw, /setUpdateStatus\(coerceErrorMessage\(error/);
 

@@ -24,8 +24,15 @@ test("close-confirm flow keeps the JS destroy path working", async () => {
 
   // The JS onCloseRequested listener takes over the close flow; the
   // capabilities test asserts the destroy permission that completes it.
-  assert.match(raw, /getCurrentWindow\(\)\.onCloseRequested/);
-  assert.match(raw, /if \(!ok\) event\.preventDefault\(\);/);
+  assert.match(raw, /getCurrentWindow\(\)\.onCloseRequested\(async event => \{ event\.preventDefault\(\); await close\(\); \}\)/);
+  const closeStart = raw.indexOf("const close = () => {");
+  const closeEnd = raw.indexOf("void getCurrentWindow().onCloseRequested", closeStart);
+  assert.ok(closeStart >= 0 && closeEnd > closeStart, "the close flow must remain present");
+  const closeFlow = raw.slice(closeStart, closeEnd);
+  assert.match(closeFlow, /if \(unfinished\.length && !await confirmDialog\([^;]+\)\) return;/);
+  const confirmation = closeFlow.indexOf("if (unfinished.length && !await confirmDialog(");
+  const destroy = closeFlow.indexOf("await getCurrentWindow().destroy();");
+  assert.ok(destroy > confirmation, "destroy must remain after the cancellable close confirmation");
 });
 
 test("elevated update flow is wired end to end", async () => {

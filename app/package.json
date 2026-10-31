@@ -1,7 +1,7 @@
 {
   "name": "video-for-lazies",
   "private": true,
-  "version": "2.6.1",
+  "version": "2.7.0",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
@@ -40,6 +40,6 @@
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.0.2",
     "typescript": "^5.9.3",
-    "vite": "^8.0.16"
+    "vite": "^8.3.5"
   }
 }

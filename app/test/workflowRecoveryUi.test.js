@@ -67,7 +67,7 @@ test("drop, output claims, retry, snapshot, and diagnostics are wired through pr
   assert.match(app, /async function retryQueueItem/);
   assert.match(app, /suggestedOutputForInput\(item\.inputPath, item\.format, takenPaths\)/);
   assert.match(app, /async function applyQueueItemSnapshot/);
-  assert.match(app, /invoke<VideoProbe>\("probe_video", \{ path: item\.inputPath \}\)/);
+  assert.match(app, /invoke<VideoProbe>\("probe_video", \{ path: item\.inputPath, audioStreamIndex: item\.request\.audioStreamIndex \?\? null, audioSourceIdentity: item\.request\.audioSourceIdentity \?\? null \}\)/);
   assert.match(app, /queueSnapshotApplyTokenRef\.current !== token/);
   assert.match(app, /JSON\.stringify\(currentItem\.request\) !== requestFingerprint/);
   assert.match(app, /p\.outputPath \?\? completedContext\.outputPath/);
