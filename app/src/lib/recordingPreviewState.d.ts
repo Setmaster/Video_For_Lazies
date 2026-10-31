@@ -3,7 +3,7 @@ import type { RecordingPhase } from "./recording";
 type PreviewEligibility = { enabled: boolean; visible: boolean; documentVisible: boolean; canPreview: boolean; recordingPhase: RecordingPhase };
 export function canRunRecordingPreview(options: PreviewEligibility): boolean;
 export function automaticPreviewAction(options: PreviewEligibility & { error: string | null; handoff: boolean; stopping: boolean; hasRequest: boolean; starting: boolean; previewPhase: RecordingPreviewSnapshot["phase"] }): "start" | "stop" | "none";
-export type PreviewFrame = { previewId: string; configEpoch: number; sequence: number; width: number; height: number; capturedAtQpc100ns: string; bmp: ArrayBuffer };
+export type PreviewFrame = { previewId: string; configEpoch: number; sequence: number; width: number; height: number; capturedAtQpc100ns: string; bmp: Uint8Array<ArrayBuffer> };
 export const INITIAL_PREVIEW: RecordingPreviewSnapshot;
 export function isPreviewLive(phase: string): boolean;
 export function acceptPreviewSnapshot(current: RecordingPreviewSnapshot, incoming: RecordingPreviewSnapshot): RecordingPreviewSnapshot;

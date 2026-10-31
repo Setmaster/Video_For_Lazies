@@ -238,16 +238,79 @@ fn qpc100ns() -> ::windows::core::Result<i64> {
     Ok(((tick as i128) * 10_000_000 / (freq as i128)) as i64)
 }
 
-fn capture_buffer_bytes(display: &Display, region: &Region, hdr: bool) -> u64 {
-    // Two WGC textures, crop SRV, GPU/staging NV12 and up to three CPU
-    // NV12 frames (latest/pending/pipe worker), plus padding/LUT allowance.
-    // Driver and codec internals are separate from these controlled buffers.
+const CAPTURE_BUFFER_LIMIT: u64 = 512 * 1024 * 1024;
+fn capture_buffer_bytes(
+    display: &Display,
+    region: &Region,
+    hdr: bool,
+    scaled_preview: bool,
+    standalone: bool,
+    preview_bounds: (u32, u32),
+) -> u64 {
+    let pixels = |w: u32, h: u32| u64::from(w).saturating_mul(u64::from(h));
+    let nv12 = |w: u32, h: u32| pixels((w + 1) & !1, (h + 1) & !1) * 3 / 2;
+    let gpu = |w: u32, h: u32| pixels((((w + 1) & !1) + 3) & !3, (h + 1) & !1) * 3 / 2;
+    let (pw, ph) = preview::dimensions_with_bounds(
+        region.width,
+        region.height,
+        preview_bounds.0,
+        preview_bounds.1,
+    );
+    let full = nv12(region.width, region.height);
+    // Two WGC surfaces + one source crop. GPU device/codec/driver internals
+    // are separate from controlled payloads; reserve 64 KiB for LUT/constants/padding.
+    let source = pixels(display.width, display.height) * if hdr { 16 } else { 8 }
+        + pixels(region.width, region.height) * if hdr { 8 } else { 4 };
+    let conversion = if standalone {
+        2 * gpu(pw, ph)
+    } else {
+        2 * gpu(region.width, region.height) + 3 * full
+    };
+    let tap = if scaled_preview {
+        // Recording shares the crop/SRVs, adding only capped output/readback.
+        (if standalone { 0 } else { 2 * gpu(pw, ph) }) + 2 * nv12(pw, ph)
+    } else {
+        2 * full
+    };
+    let bmp = 12 + preview::MAX_HEADER as u64 + 54 + pixels((pw * 3 + 3) & !3, ph);
+    source + conversion + tap + bmp + 65_536
+}
+// Preserve the inherited admission estimate for legacy-only fallback. It never
+// claimed a strict process-resident ceiling (driver/codec internals are separate).
+fn legacy_capture_buffer_bytes(display: &Display, region: &Region, hdr: bool) -> u64 {
     let display_pixels = u64::from(display.width).saturating_mul(u64::from(display.height));
     let crop_pixels =
         u64::from((region.width + 1) & !1).saturating_mul(u64::from((region.height + 1) & !1));
     display_pixels
         .saturating_mul(if hdr { 16 } else { 8 })
         .saturating_add(crop_pixels.saturating_mul(if hdr { 16 } else { 12 }))
+}
+fn preview_plan(
+    display: &Display,
+    region: &Region,
+    hdr: bool,
+    standalone: bool,
+) -> Option<(bool, (u32, u32), bool)> {
+    let mut bounds = (preview::MAX_WIDTH, preview::MAX_HEIGHT);
+    let scaled = standalone
+        || capture_buffer_bytes(display, region, hdr, false, false, bounds) > CAPTURE_BUFFER_LIMIT;
+    if scaled
+        && capture_buffer_bytes(display, region, hdr, true, standalone, bounds)
+            > CAPTURE_BUFFER_LIMIT
+    {
+        bounds = (480, 270);
+    }
+    if capture_buffer_bytes(display, region, hdr, scaled, standalone, bounds)
+        <= CAPTURE_BUFFER_LIMIT
+    {
+        Some((scaled, bounds, false))
+    } else if !standalone
+        && legacy_capture_buffer_bytes(display, region, hdr) <= CAPTURE_BUFFER_LIMIT
+    {
+        Some((false, (480, 270), true))
+    } else {
+        None
+    }
 }
 fn interactive_desktop() -> Result<(), String> {
     unsafe {
@@ -337,6 +400,8 @@ struct Capture {
     closed: Arc<AtomicBool>,
     closed_token: i64,
     converter: gpu::Converter,
+    scaled_preview: bool,
+    legacy_preview: bool,
     crop: D3D11_BOX,
     monitor_width: i32,
     monitor_height: i32,
@@ -380,6 +445,23 @@ impl Capture {
         region: &Region,
         cursor: bool,
         source: &NativeSource,
+    ) -> ::windows::core::Result<Self> {
+        Self::build(display, region, cursor, source, false)
+    }
+    fn new_preview(
+        display: &Display,
+        region: &Region,
+        cursor: bool,
+        source: &NativeSource,
+    ) -> ::windows::core::Result<Self> {
+        Self::build(display, region, cursor, source, true)
+    }
+    fn build(
+        display: &Display,
+        region: &Region,
+        cursor: bool,
+        source: &NativeSource,
+        preview: bool,
     ) -> ::windows::core::Result<Self> {
         unsafe {
             let window = match source {
@@ -432,11 +514,12 @@ impl Capture {
                 height: size.Height as u32,
                 ..display.clone()
             };
-            if capture_buffer_bytes(&buffers, region, hdr) > 512 * 1024 * 1024 {
-                return Err(capture_error(
-                    "This source needs more than512MiB of controlled capture buffers",
-                ));
-            }
+            let (scaled_preview, preview_bounds, legacy_preview) =
+                preview_plan(&buffers, region, hdr, preview).ok_or_else(|| {
+                    capture_error(
+                        "This source needs more than 512 MiB of controlled capture buffers",
+                    )
+                })?;
             let (mut device, mut context) = (None, None);
             D3D11CreateDevice(
                 None,
@@ -473,14 +556,36 @@ impl Capture {
                 signal.store(true, Ordering::Release);
                 Ok(())
             }))?;
-            let converter =
+            let converter = if preview {
+                gpu::Converter::new_preview(
+                    &device,
+                    &context,
+                    region.width,
+                    region.height,
+                    hdr,
+                    white,
+                    preview_bounds,
+                )
+            } else {
                 gpu::Converter::new(&device, &context, region.width, region.height, hdr, white)
-                    .map_err(|message| {
-                        ::windows::core::Error::new(
-                            ::windows::core::HRESULT(0x80004005u32 as i32),
-                            message,
-                        )
-                    })?;
+            }
+            .map_err(|message| {
+                ::windows::core::Error::new(::windows::core::HRESULT(0x80004005u32 as i32), message)
+            })?;
+            if scaled_preview && !preview {
+                // Allocate/compile before capture starts, never on an active recording slot.
+                converter
+                    .prepare_shared_preview(hdr, white, {
+                        let (width, height) = preview::dimensions_with_bounds(
+                            region.width,
+                            region.height,
+                            preview_bounds.0,
+                            preview_bounds.1,
+                        );
+                        Geometry { width, height }
+                    })
+                    .map_err(capture_error)?;
+            }
             let left = if window.is_some() {
                 0
             } else {
@@ -499,6 +604,8 @@ impl Capture {
                 closed,
                 closed_token,
                 converter,
+                scaled_preview,
+                legacy_preview,
                 crop: D3D11_BOX {
                     left,
                     top,
@@ -555,6 +662,31 @@ impl Capture {
             ))
         }
     }
+    fn offer_preview(
+        &self,
+        emitter: &mut preview_control::Emitter,
+        qpc: i64,
+        pixels: &Arc<Vec<u8>>,
+        geometry: Geometry,
+    ) -> Result<(), String> {
+        if self.legacy_preview {
+            emitter.offer_legacy(qpc, pixels, geometry);
+            return Ok(());
+        }
+        if !emitter.wants_frame() {
+            return Ok(());
+        }
+        if self.scaled_preview {
+            if !emitter.discard_pending() {
+                return Ok(());
+            }
+            let (geometry, pixels) = self.converter.shared_preview_frame()?;
+            emitter.offer(qpc, Arc::new(pixels), geometry);
+        } else {
+            emitter.offer(qpc, pixels.clone(), geometry);
+        }
+        Ok(())
+    }
     fn frame(&self) -> Result<Option<(i64, Vec<u8>)>, String> {
         self.frame_inner(false)
     }
@@ -573,7 +705,7 @@ impl Capture {
         let Some(mut frame) = self.take_frame()? else {
             return Ok(None);
         };
-        // Standalone preview samples at5Hz. Drain at most the second queued
+        // Standalone preview samples at 30 Hz. Drain at most the second queued
         // pool frame, releasing the older one without any GPU conversion/readback.
         // The recording path takes exactly one frame as before.
         if latest && let Some(newer) = self.take_frame()? {
@@ -1133,17 +1265,11 @@ pub fn resolve_source(source: NativeSource) -> Result<ResolvedCapture, String> {
 }
 #[derive(Default)]
 struct PreviewSampling {
-    next: Option<Instant>,
+    cadence: preview::Cadence,
 }
 impl PreviewSampling {
     fn due(&mut self, now: Instant) -> bool {
-        if self.next.is_some_and(|next| now < next) {
-            return false;
-        }
-        // Schedule from actual sampling time: late scheduling never causes
-        // a burst of expensive conversions to catch up missed preview slots.
-        self.next = Some(now + Duration::from_millis(200));
-        true
+        self.cadence.poll(now)
     }
 }
 pub fn run_preview(
@@ -1161,8 +1287,8 @@ pub fn run_preview(
     interactive_desktop()?;
     let mut resolved = resolve_source(source.clone())?;
     control.geometry(resolved.geometry);
-    let mut emitter = preview_control::Emitter::new(control.clone())?;
-    let mut capture = Capture::new(&resolved.display, &resolved.region, cursor, &source)
+    let emitter = preview_control::Emitter::new(control.clone())?;
+    let mut capture = Capture::new_preview(&resolved.display, &resolved.region, cursor, &source)
         .map_err(|e| format!("Preview capture initialization: {e}"))?;
     if stop.load(Ordering::Acquire) || control.current().is_none() {
         return Ok(serde_json::json!({"previewStopped":true}));
@@ -1183,11 +1309,15 @@ pub fn run_preview(
         if stop.load(Ordering::Acquire) || control.current().is_none() {
             break;
         }
-        if sampling.due(Instant::now()) {
+        if sampling.due(Instant::now()) && emitter.discard_pending() {
             match capture.latest_frame() {
                 Ok(Some((time, image))) => {
                     ready = true;
-                    emitter.offer(time, &image, resolved.geometry);
+                    emitter.offer_sampled(
+                        time,
+                        Arc::new(image),
+                        capture.converter.pixel_geometry(),
+                    );
                 }
                 Ok(None) => {
                     if !ready && Instant::now() > first_deadline {
@@ -1219,8 +1349,9 @@ pub fn run_preview(
                     drop(capture);
                     resolved = resolve_source(source.clone())?;
                     control.geometry(resolved.geometry);
-                    capture = Capture::new(&resolved.display, &resolved.region, cursor, &source)
-                        .map_err(|e| format!("Reconfigure preview: {e}"))?;
+                    capture =
+                        Capture::new_preview(&resolved.display, &resolved.region, cursor, &source)
+                            .map_err(|e| format!("Reconfigure preview: {e}"))?;
                     capture.verify_domain(&initial_domain)?;
                     if stop.load(Ordering::Acquire) || control.current().is_none() {
                         break;
@@ -1377,9 +1508,17 @@ fn run_inner(
     let mut clock = active_clock::ActiveClock::new(zero);
     audio_control.set_epoch(zero);
     let mut pause_request: Option<(native_controls::Transition, u64)> = None;
-    preview_emitter.offer(zero, &first, geometry);
+    let first = Arc::new(first);
+    if capture
+        .as_ref()
+        .unwrap()
+        .offer_preview(&mut preview_emitter, zero, &first, geometry)
+        .is_err()
+    {
+        preview_control.off();
+    }
     let mut frames = VideoFrames {
-        latest: Arc::new(first),
+        latest: first,
         latest_time: zero,
         pending: None,
     };
@@ -1782,7 +1921,8 @@ fn run_inner(
         frames.advance(slot);
         // Keep at most one future frame, and do not allocate another while it
         // is pending. Together with Arc sharing to the pipe worker, this caps
-        // retained CPU buffers at three. Never substitute a future image into
+        // recording CPU buffers at three; preview may retain two shared frames.
+        // Never substitute a future image into
         // an earlier CFR slot when a capture/encoder loop is late.
         if frames.pending.is_none() {
             match capture
@@ -1791,7 +1931,16 @@ fn run_inner(
                 .frame()
             {
                 Ok(Some((time, image))) if time >= zero && time <= now + 100_000 => {
-                    preview_emitter.offer(time, &image, geometry);
+                    let image = Arc::new(image);
+                    // Preview failures disable only its consumer, never the saved recording.
+                    if capture
+                        .as_ref()
+                        .unwrap()
+                        .offer_preview(&mut preview_emitter, time, &image, geometry)
+                        .is_err()
+                    {
+                        preview_control.off();
+                    }
                     frames.push(time, image, slot);
                 }
                 Ok(_) => {}
@@ -2032,15 +2181,16 @@ impl VideoFrames {
             self.latest_time = time;
         }
     }
-    fn push(&mut self, time: i64, image: Vec<u8>, slot: i64) {
+    fn push(&mut self, time: i64, image: impl Into<Arc<Vec<u8>>>, slot: i64) {
         if time < self.latest_time {
             return;
         }
+        let image = image.into();
         if time <= slot {
-            self.latest = Arc::new(image);
+            self.latest = image;
             self.latest_time = time;
         } else {
-            self.pending = Some((time, Arc::new(image)));
+            self.pending = Some((time, image));
         }
     }
 }
@@ -2085,18 +2235,16 @@ mod tests {
         assert_eq!(allocated, (1..=1024).collect::<Vec<_>>());
     }
     #[test]
-    fn preview_sampling_is_five_hz_without_catch_up_bursts() {
+    fn preview_sampling_is_thirty_hz_without_catch_up_bursts() {
         let mut sampling = PreviewSampling::default();
         let start = Instant::now();
         assert!(sampling.due(start));
-        for millis in [1, 5, 100, 199] {
-            assert!(!sampling.due(start + Duration::from_millis(millis)));
-        }
-        assert!(sampling.due(start + Duration::from_millis(200)));
-        assert!(sampling.due(start + Duration::from_millis(1100)));
-        assert!(!sampling.due(start + Duration::from_millis(1101)));
-        assert!(!sampling.due(start + Duration::from_millis(1299)));
-        assert!(sampling.due(start + Duration::from_millis(1300)));
+        assert!(!sampling.due(start + preview::FRAME_INTERVAL - Duration::from_millis(3)));
+        assert!(sampling.due(start + preview::FRAME_INTERVAL));
+        let late = start + Duration::from_millis(1100);
+        assert!(sampling.due(late));
+        assert!(!sampling.due(late + Duration::from_millis(1)));
+        assert!(sampling.due(late + preview::FRAME_INTERVAL));
     }
     #[test]
     fn resize_cannot_adopt_another_display_or_color_domain() {
@@ -2324,18 +2472,78 @@ mod tests {
             width: 7680,
             height: 2160,
         };
-        assert_eq!(capture_buffer_bytes(&display, &region, true), 530_841_600);
-        assert!(capture_buffer_bytes(&display, &region, true) < 512 * 1024 * 1024);
+        assert!(
+            capture_buffer_bytes(&display, &region, true, false, false, (960, 540))
+                > CAPTURE_BUFFER_LIMIT
+        );
+        assert_eq!(
+            capture_buffer_bytes(&display, &region, true, true, false, (960, 540)),
+            524_946_626
+        );
+        assert_eq!(
+            preview_plan(&display, &region, true, false),
+            Some((true, (960, 540), false))
+        );
+        assert!(
+            capture_buffer_bytes(&display, &region, true, true, false, (960, 540))
+                < CAPTURE_BUFFER_LIMIT
+        );
+        assert!(
+            capture_buffer_bytes(&display, &region, true, true, true, (960, 540))
+                < CAPTURE_BUFFER_LIMIT
+        );
         region.width = 641;
         region.height = 481;
-        assert!(capture_buffer_bytes(&display, &region, true) < 272_000_000);
+        assert!(
+            capture_buffer_bytes(&display, &region, true, false, false, (960, 540)) < 276_000_000
+        );
         let large = Display {
             height: 4320,
             ..display
         };
+        assert!(
+            capture_buffer_bytes(&large, &region, true, true, false, (960, 540))
+                > CAPTURE_BUFFER_LIMIT
+        );
+        assert_eq!(
+            capture_buffer_bytes(&large, &region, true, true, false, (480, 270)),
+            536_573_316
+        );
+        assert_eq!(
+            preview_plan(&large, &region, true, false),
+            Some((true, (480, 270), false))
+        );
+        region.width = 736;
+        region.height = 416;
+        assert_eq!(
+            capture_buffer_bytes(&large, &region, true, true, false, (480, 270)),
+            536_816_574
+        );
+        assert_eq!(
+            preview_plan(&large, &region, true, false),
+            Some((true, (480, 270), false))
+        );
+        region.width = 800;
+        region.height = 470;
+        assert_eq!(
+            legacy_capture_buffer_bytes(&large, &region, true),
+            536_857_600
+        );
+        assert!(
+            capture_buffer_bytes(&large, &region, true, true, false, (480, 270))
+                > CAPTURE_BUFFER_LIMIT
+        );
+        assert_eq!(
+            preview_plan(&large, &region, true, false),
+            Some((false, (480, 270), true))
+        );
         region.width = 7680;
         region.height = 4320;
-        assert!(capture_buffer_bytes(&large, &region, true) > 512 * 1024 * 1024);
+        assert!(preview_plan(&large, &region, true, false).is_none());
+        assert!(
+            capture_buffer_bytes(&large, &region, true, true, false, (960, 540))
+                > CAPTURE_BUFFER_LIMIT
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Owner-thread D3D11 conversion of cropped WGC frames to limited-range BT.709 NV12.
-use std::{marker::PhantomData, rc::Rc};
+use std::{cell::RefCell, marker::PhantomData, rc::Rc};
 use windows::{
     Win32::Graphics::{
         Direct3D::{D3D_SRV_DIMENSION_BUFFER, Fxc::D3DCompile, ID3DBlob},
@@ -62,8 +62,11 @@ pub struct Converter {
     readback: ID3D11Buffer,
     selected_width: u32,
     selected_height: u32,
+    pixel_width: u32,
+    pixel_height: u32,
     format: DXGI_FORMAT,
     layout: Layout,
+    shared_preview: RefCell<Option<Box<Converter>>>,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
@@ -76,7 +79,46 @@ impl Converter {
         hdr: bool,
         white: f32,
     ) -> Result<Self, String> {
-        let layout = Layout::new(width, height)?;
+        Self::build(device, context, width, height, hdr, white, None)
+    }
+
+    /// Preview alone scales on the capture owner thread before CPU readback.
+    pub fn new_preview(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        hdr: bool,
+        white: f32,
+        bounds: (u32, u32),
+    ) -> Result<Self, String> {
+        let _ = Layout::new(width, height)?;
+        let output = super::preview::dimensions_with_bounds(width, height, bounds.0, bounds.1);
+        Self::build(
+            device,
+            context,
+            width,
+            height,
+            hdr,
+            white,
+            Some((output, None)),
+        )
+    }
+
+    fn build(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        hdr: bool,
+        white: f32,
+        preview: Option<((u32, u32), Option<&Self>)>,
+    ) -> Result<Self, String> {
+        // Validate source dimensions independently from the capped output.
+        let _ = Layout::new(width, height)?;
+        let (pixel_width, pixel_height) = preview.map(|(size, _)| size).unwrap_or((width, height));
+        let shared = preview.and_then(|(_, shared)| shared);
+        let layout = Layout::new(pixel_width, pixel_height)?;
         if !white.is_finite() || white <= 0.0 {
             return Err("GPU conversion requires a finite positive SDR white level".into());
         }
@@ -95,63 +137,76 @@ impl Converter {
             } else {
                 DXGI_FORMAT_B8G8R8A8_UNORM
             };
-            let mut texture = None;
-            device
-                .CreateTexture2D(
-                    &D3D11_TEXTURE2D_DESC {
-                        Width: width,
-                        Height: height,
-                        MipLevels: 1,
-                        ArraySize: 1,
-                        Format: format,
-                        SampleDesc: DXGI_SAMPLE_DESC {
-                            Count: 1,
-                            Quality: 0,
+            let (texture, source_view, transfer_view) = if let Some(shared) = shared {
+                (
+                    shared.texture.clone(),
+                    shared.source_view.clone(),
+                    shared.transfer_view.clone(),
+                )
+            } else {
+                let mut texture = None;
+                device
+                    .CreateTexture2D(
+                        &D3D11_TEXTURE2D_DESC {
+                            Width: width,
+                            Height: height,
+                            MipLevels: 1,
+                            ArraySize: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Usage: D3D11_USAGE_DEFAULT,
+                            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                            ..Default::default()
                         },
-                        Usage: D3D11_USAGE_DEFAULT,
+                        None,
+                        Some(&mut texture),
+                    )
+                    .map_err(gpu_error)?;
+                let texture = required(texture, "crop texture")?;
+                let mut source_view = None;
+                device
+                    .CreateShaderResourceView(&texture, None, Some(&mut source_view))
+                    .map_err(gpu_error)?;
+
+                let transfer = transfer_table();
+                let transfer_buffer = create_buffer(
+                    device,
+                    &D3D11_BUFFER_DESC {
+                        ByteWidth: TRANSFER_ENTRIES * 4,
+                        Usage: D3D11_USAGE_IMMUTABLE,
                         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                         ..Default::default()
                     },
-                    None,
-                    Some(&mut texture),
-                )
-                .map_err(gpu_error)?;
-            let texture = required(texture, "crop texture")?;
-            let mut source_view = None;
-            device
-                .CreateShaderResourceView(&texture, None, Some(&mut source_view))
-                .map_err(gpu_error)?;
-
-            let transfer = transfer_table();
-            let transfer_buffer = create_buffer(
-                device,
-                &D3D11_BUFFER_DESC {
-                    ByteWidth: TRANSFER_ENTRIES * 4,
-                    Usage: D3D11_USAGE_IMMUTABLE,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    ..Default::default()
-                },
-                Some(transfer.as_ptr().cast()),
-            )?;
-            let mut transfer_view = None;
-            device
-                .CreateShaderResourceView(
-                    &transfer_buffer,
-                    Some(&D3D11_SHADER_RESOURCE_VIEW_DESC {
-                        Format: DXGI_FORMAT_R32_UINT,
-                        ViewDimension: D3D_SRV_DIMENSION_BUFFER,
-                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Buffer: D3D11_BUFFER_SRV {
-                                Anonymous1: D3D11_BUFFER_SRV_0 { FirstElement: 0 },
-                                Anonymous2: D3D11_BUFFER_SRV_1 {
-                                    NumElements: TRANSFER_ENTRIES,
+                    Some(transfer.as_ptr().cast()),
+                )?;
+                let mut transfer_view = None;
+                device
+                    .CreateShaderResourceView(
+                        &transfer_buffer,
+                        Some(&D3D11_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            ViewDimension: D3D_SRV_DIMENSION_BUFFER,
+                            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D11_BUFFER_SRV {
+                                    Anonymous1: D3D11_BUFFER_SRV_0 { FirstElement: 0 },
+                                    Anonymous2: D3D11_BUFFER_SRV_1 {
+                                        NumElements: TRANSFER_ENTRIES,
+                                    },
                                 },
                             },
-                        },
-                    }),
-                    Some(&mut transfer_view),
+                        }),
+                        Some(&mut transfer_view),
+                    )
+                    .map_err(gpu_error)?;
+                (
+                    texture,
+                    required(source_view, "source view")?,
+                    required(transfer_view, "transfer view")?,
                 )
-                .map_err(gpu_error)?;
+            };
             // Two HLSL registers. No per-frame constant updates or map allocation.
             let constants_data = [
                 width,
@@ -161,7 +216,11 @@ impl Converter {
                 layout.pitch,
                 u32::from(hdr),
                 white.to_bits(),
-                0,
+                if preview.is_some() {
+                    pixel_width | (pixel_height << 16)
+                } else {
+                    0
+                },
             ];
             let constants = create_buffer(
                 device,
@@ -212,7 +271,7 @@ impl Converter {
                 },
                 None,
             )?;
-            let bytecode = compile_shader()?;
+            let bytecode = compile_shader(preview.is_some())?;
             let bytes = std::slice::from_raw_parts(
                 bytecode.GetBufferPointer().cast(),
                 bytecode.GetBufferSize(),
@@ -224,8 +283,8 @@ impl Converter {
             Ok(Self {
                 context: context.clone(),
                 texture,
-                source_view: required(source_view, "source view")?,
-                transfer_view: required(transfer_view, "transfer view")?,
+                source_view,
+                transfer_view,
                 constants,
                 shader: required(shader, "compute shader")?,
                 output,
@@ -233,10 +292,20 @@ impl Converter {
                 readback,
                 selected_width: width,
                 selected_height: height,
+                pixel_width,
+                pixel_height,
                 format,
                 layout,
+                shared_preview: RefCell::new(None),
                 _owner_thread: PhantomData,
             })
+        }
+    }
+
+    pub fn pixel_geometry(&self) -> super::source::Geometry {
+        super::source::Geometry {
+            width: self.pixel_width,
+            height: self.pixel_height,
         }
     }
 
@@ -264,6 +333,45 @@ impl Converter {
             }
             self.context
                 .CopySubresourceRegion(&self.texture, 0, 0, 0, 0, texture, 0, Some(crop));
+        }
+        self.render()
+    }
+
+    /// Reuses the just-captured crop/SRVs on this same immediate-context owner.
+    /// Only capped GPU output/readback and capped CPU pixels are additional.
+    pub fn prepare_shared_preview(
+        &self,
+        hdr: bool,
+        white: f32,
+        output: super::source::Geometry,
+    ) -> Result<(), String> {
+        let mut preview = self.shared_preview.borrow_mut();
+        if preview.is_none() {
+            let device = unsafe { self.context.GetDevice() }.map_err(gpu_error)?;
+            let output = (output.width, output.height);
+            *preview = Some(Box::new(Self::build(
+                &device,
+                &self.context,
+                self.selected_width,
+                self.selected_height,
+                hdr,
+                white,
+                Some((output, Some(self))),
+            )?));
+        }
+        Ok(())
+    }
+
+    pub fn shared_preview_frame(&self) -> Result<(super::source::Geometry, Vec<u8>), String> {
+        let preview = self.shared_preview.borrow();
+        let preview = preview
+            .as_ref()
+            .ok_or("Preview readback was not prepared before capture")?;
+        Ok((preview.pixel_geometry(), preview.render()?))
+    }
+
+    fn render(&self) -> Result<Vec<u8>, String> {
+        unsafe {
             self.context.CSSetShader(&self.shader, None);
             self.context.CSSetShaderResources(
                 0,
@@ -366,12 +474,19 @@ fn transfer_table() -> Vec<u32> {
         }))
         .collect()
 }
-fn compile_shader() -> Result<ID3DBlob, String> {
+fn compile_shader(preview: bool) -> Result<ID3DBlob, String> {
+    // The recording shader stays byte-for-byte unchanged; only the separate
+    // preview variant filters/scales its source sampling before identical color math.
+    let shader = if preview {
+        SHADER.replace(RECORDING_SAMPLE, PREVIEW_SAMPLE)
+    } else {
+        SHADER.into()
+    };
     let (mut code, mut messages) = (None, None);
     let result = unsafe {
         D3DCompile(
-            SHADER.as_ptr().cast(),
-            SHADER.len(),
+            shader.as_ptr().cast(),
+            shader.len(),
             s!("recording-nv12"),
             None,
             None,
@@ -401,6 +516,17 @@ fn compile_shader() -> Result<ID3DBlob, String> {
     }
     required(code, "compiled shader")
 }
+
+const RECORDING_SAMPLE: &str = "if (x >= SelectedWidth || y >= SelectedHeight) return uint3(0, 0, 0);\n    float3 rgb = Source.Load(int3(x, y, 0)).rgb;";
+const PREVIEW_SAMPLE: &str = r#"uint PreviewWidth = Reserved & 65535, PreviewHeight = Reserved >> 16;
+    if (x >= PreviewWidth || y >= PreviewHeight) return uint3(0, 0, 0);
+    float2 samplePosition = clamp((float2(x, y) + 0.5) * float2(SelectedWidth, SelectedHeight) / float2(PreviewWidth, PreviewHeight) - 0.5,
+                         float2(0, 0), float2(SelectedWidth - 1, SelectedHeight - 1));
+    uint2 low = (uint2)floor(samplePosition), high = min(low + 1, uint2(SelectedWidth - 1, SelectedHeight - 1));
+    float2 blend = samplePosition - low;
+    float3 top = lerp(Source.Load(int3(low.x, low.y, 0)).rgb, Source.Load(int3(high.x, low.y, 0)).rgb, blend.x);
+    float3 bottom = lerp(Source.Load(int3(low.x, high.y, 0)).rgb, Source.Load(int3(high.x, high.y, 0)).rgb, blend.x);
+    float3 rgb = lerp(top, bottom, blend.y);"#;
 
 const SHADER: &str = r#"
 Texture2D<float4> Source : register(t0);
@@ -455,6 +581,25 @@ void main(uint3 id : SV_DispatchThreadID) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn recording_and_preview_hlsl_compile_without_device() {
+        compile_shader(false).expect("recording HLSL must compile");
+        compile_shader(true).expect("preview HLSL must compile");
+    }
+    #[test]
+    fn preview_shader_changes_only_sampling_and_caps_readback() {
+        assert_eq!(SHADER.matches(RECORDING_SAMPLE).count(), 1);
+        let preview = SHADER.replace(RECORDING_SAMPLE, PREVIEW_SAMPLE);
+        assert!(preview.contains(PREVIEW_SAMPLE));
+        assert_eq!(preview.replace(PREVIEW_SAMPLE, RECORDING_SAMPLE), SHADER);
+        for (width, height) in [(7680, 4320), (1080, 1920), (641, 481), (1, 1)] {
+            let (w, h) = super::super::preview::dimensions(width, height);
+            let layout = Layout::new(w, h).unwrap();
+            assert!(layout.width <= 960 && layout.height <= 540);
+            assert!(layout.packed_bytes <= 960 * 540 * 3 / 2);
+        }
+    }
     #[test]
     fn nv12_layout_preserves_odd_region_and_word_alignment() {
         let layout = Layout::new(641, 481).unwrap();

@@ -51,11 +51,11 @@ export function decodePreviewEnvelope(buffer) {
   if (!(buffer instanceof ArrayBuffer)) throw new Error("Preview returned an invalid binary frame.");
   if (buffer.byteLength === 0) return null;
   const fail = () => { throw new Error("Preview returned a malformed or oversized frame."); };
-  if (buffer.byteLength < 12 || buffer.byteLength > 389890) return fail();
+  if (buffer.byteLength < 12 || buffer.byteLength > 1556290) return fail();
   const bytes = new Uint8Array(buffer), view = new DataView(buffer);
   if (bytes[0] !== 86 || bytes[1] !== 70 || bytes[2] !== 76 || bytes[3] !== 80) return fail();
   const headerLength = view.getUint32(4, true), bmpLength = view.getUint32(8, true);
-  if (headerLength < 1 || headerLength > 1024 || bmpLength < 54 || bmpLength > 388854 ||
+  if (headerLength < 1 || headerLength > 1024 || bmpLength < 54 || bmpLength > 1555254 ||
       12 + headerLength + bmpLength !== buffer.byteLength) return fail();
   let header;
   try { header = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(12, 12 + headerLength))); }
@@ -63,8 +63,8 @@ export function decodePreviewEnvelope(buffer) {
   if (!header || typeof header.previewId !== "string" || !header.previewId || header.previewId.length > 256 ||
       !Number.isSafeInteger(header.sequence) || header.sequence < 1 ||
       !Number.isSafeInteger(header.configEpoch) || header.configEpoch < 1 ||
-      !Number.isSafeInteger(header.width) || header.width < 1 || header.width > 480 ||
-      !Number.isSafeInteger(header.height) || header.height < 1 || header.height > 270 ||
+      !Number.isSafeInteger(header.width) || header.width < 1 || header.width > 960 ||
+      !Number.isSafeInteger(header.height) || header.height < 1 || header.height > 540 ||
       typeof header.capturedAtQpc100ns !== "string" || !/^\d{1,20}$/.test(header.capturedAtQpc100ns)) return fail();
   const offset = 12 + headerLength, bmp = new DataView(buffer, offset, bmpLength);
   const imageBytes = Math.ceil(header.width * 3 / 4) * 4 * header.height;
@@ -74,5 +74,5 @@ export function decodePreviewEnvelope(buffer) {
       bmp.getUint16(26, true) !== 1 || bmp.getUint16(28, true) !== 24 || bmp.getUint32(30, true) !== 0 ||
       (bmp.getUint32(34, true) !== 0 && bmp.getUint32(34, true) !== imageBytes) ||
       imageBytes + 54 !== bmpLength) return fail();
-  return { ...header, bmp: buffer.slice(offset) };
+  return { ...header, bmp: new Uint8Array(buffer, offset, bmpLength) };
 }

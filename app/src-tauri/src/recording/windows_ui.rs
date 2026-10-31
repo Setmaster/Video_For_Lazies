@@ -289,6 +289,12 @@ impl Selector {
             _ => {}
         }
     }
+    fn finish_drag(&mut self) {
+        if self.dragging {
+            self.dragging = false;
+            self.confirmed = self.error.is_none() && self.bounds.is_some_and(Bounds::valid);
+        }
+    }
 }
 
 unsafe extern "system" fn selector_proc(
@@ -338,9 +344,9 @@ unsafe extern "system" fn selector_proc(
             }
             WM_LBUTTONUP if state.dragging => {
                 state.update_drag();
-                state.dragging = false;
+                state.finish_drag();
                 release_capture = true;
-                close = state.error.is_some();
+                close = state.confirmed || state.error.is_some();
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 true
             }
@@ -417,7 +423,7 @@ unsafe extern "system" fn selector_proc(
                     .map(|b| format!("   {} × {} px", b.right - b.left, b.bottom - b.top))
                     .unwrap_or_default();
                 let mut text = wide(&format!(
-                    "Drag an area · Enter: confirm · Esc: cancel\nArrows: move · Shift+Arrows: resize · Ctrl: 10 px{}",
+                    "Drag and release to select · Esc: cancel\nArrows: move · Shift+Arrows: resize · Ctrl: 10 px · Enter: confirm{}",
                     dimensions
                 ));
                 text.pop();
@@ -885,7 +891,68 @@ fn run_hud(
 
 #[cfg(test)]
 mod tests {
-    use super::Bounds;
+    use super::{Bounds, Display, Selector};
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn selector(bounds: Option<Bounds>) -> Selector {
+        Selector {
+            display: Display {
+                id: "test-display".into(),
+                name: "Test display".into(),
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            stop: Arc::new(AtomicBool::new(false)),
+            start: Some((100, 80)),
+            bounds,
+            dragging: true,
+            confirmed: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn left_release_confirms_valid_drag_without_keyboard_input() {
+        let bounds = Bounds::drag((742, 564), (101, 83), 1920, 1080);
+        let mut state = selector(Some(bounds));
+        state.finish_drag();
+        assert!(state.confirmed);
+        assert!(!state.dragging);
+        assert_eq!(state.bounds, Some(bounds));
+    }
+
+    #[test]
+    fn left_release_keeps_empty_tiny_and_oversized_areas_uncommitted() {
+        for bounds in [
+            None,
+            Some(Bounds::drag((100, 80), (100, 80), 1920, 1080)),
+            Some(Bounds::drag((100, 80), (115, 180), 1920, 1080)),
+            Some(Bounds::drag((0, 0), (7681, 4320), 15360, 8640)),
+        ] {
+            let mut state = selector(bounds);
+            state.finish_drag();
+            assert!(!state.confirmed);
+            assert!(!state.dragging);
+            assert_eq!(state.bounds, bounds);
+        }
+    }
+
+    #[test]
+    fn release_does_not_confirm_after_cursor_error_or_lost_capture() {
+        let bounds = Bounds::drag((100, 80), (300, 180), 1920, 1080);
+        let mut failed = selector(Some(bounds));
+        failed.error = Some("Cursor position unavailable".into());
+        failed.finish_drag();
+        assert!(!failed.confirmed);
+        assert!(!failed.dragging);
+
+        let mut lost_capture = selector(Some(bounds));
+        lost_capture.dragging = false;
+        lost_capture.finish_drag();
+        assert!(!lost_capture.confirmed);
+    }
 
     #[test]
     fn reverse_drag_clamps_to_one_display() {

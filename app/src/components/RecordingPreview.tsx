@@ -46,7 +46,7 @@ export default function RecordingPreview({ preview, canPreview, recording, enabl
 
   return <div className="vfl-record-preview" id="vfl-record-preview"
     data-preview-id={snapshot.previewId || ""} data-preview-phase={snapshot.phase}
-    data-preview-epoch={snapshot.configEpoch} data-preview-sequence={visibleImage?.sequence || 0}
+    data-preview-epoch={snapshot.configEpoch}
     data-preview-frame-age-ms={snapshot.lastFrameAgeMs ?? ""} data-recording-phase={recordingPhase}>
     <div className="vfl-record-preview-head">
       <div className="vfl-record-preview-heading">
@@ -65,9 +65,10 @@ export default function RecordingPreview({ preview, canPreview, recording, enabl
       </div>
     </div>
     <div id="vfl-record-preview-canvas" className="vfl-record-preview-canvas" aria-busy={waiting}>
-      {visibleImage ? <img id="vfl-record-preview-image" className="vfl-record-preview-image" src={visibleImage.url}
-        alt={recordingPhase === "recording" ? "Live preview of the recording source" : "Live preview of the selected capture source"} />
-        : <div className="vfl-record-preview-placeholder"><strong>{placeholderTitle}</strong><p>{placeholderHint}</p></div>}
+      <canvas ref={preview.canvasRef} id="vfl-record-preview-image" className="vfl-record-preview-image"
+        style={{ display: visibleImage ? "block" : "none" }} aria-hidden={!visibleImage} role="img"
+        aria-label={recordingPhase === "recording" ? "Live preview of the recording source" : "Live preview of the selected capture source"} />
+      {!visibleImage && <div className="vfl-record-preview-placeholder"><strong>{placeholderTitle}</strong><p>{placeholderHint}</p></div>}
     </div>
     {visibleImage && snapshot.sourceWidth > 0 && <div className="vfl-inline-hint vfl-record-preview-dimensions">{snapshot.sourceWidth} × {snapshot.sourceHeight} source pixels</div>}
     {snapshot.message && <div className="vfl-inline-hint">{snapshot.message}</div>}

@@ -49,7 +49,7 @@ struct PreviewState {
     stop: Option<Arc<AtomicBool>>,
     lease: Option<ActivityLease>,
     consumer: Option<Instant>,
-    latest: Option<Frame>,
+    latest: Option<Arc<Frame>>,
     arrived: Option<Instant>,
     #[cfg(test)]
     waiters: usize,
@@ -319,18 +319,21 @@ impl PreviewManager {
         Ok(self.snapshot())
     }
     pub fn frame(&self, id: &str, after: u64) -> Result<Vec<u8>, String> {
-        let i = self.inner.lock().map_err(|_| "Preview is unavailable.")?;
-        if i.snapshot.preview_id.as_deref() != Some(id) {
-            return Err("This preview is no longer active.".into());
-        }
-        Ok(i.latest
-            .as_ref()
-            .filter(|frame| {
-                frame.header.config_epoch == i.snapshot.config_epoch
-                    && frame.header.sequence > after
-            })
-            .map(|frame| frame.bytes.clone())
-            .unwrap_or_default())
+        let frame = {
+            let i = self.inner.lock().map_err(|_| "Preview is unavailable.")?;
+            if i.snapshot.preview_id.as_deref() != Some(id) {
+                return Err("This preview is no longer active.".into());
+            }
+            i.latest
+                .as_ref()
+                .filter(|frame| {
+                    frame.header.config_epoch == i.snapshot.config_epoch
+                        && frame.header.sequence > after
+                })
+                .cloned()
+        };
+        // Keep control/lease operations responsive during the bounded IPC copy.
+        Ok(frame.map(|frame| frame.bytes.clone()).unwrap_or_default())
     }
 }
 #[derive(Clone)]
@@ -378,7 +381,7 @@ impl Tap {
             "previewing"
         }
         .into();
-        i.latest = Some(frame);
+        i.latest = Some(Arc::new(frame));
         i.arrived = Some(Instant::now());
         drop(i);
         if was_starting {

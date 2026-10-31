@@ -4,7 +4,7 @@ use super::{
     source::Geometry,
 };
 use std::{
-    sync::{Arc, Mutex, atomic::AtomicU64, mpsc},
+    sync::{Arc, Condvar, Mutex, atomic::AtomicU64},
     time::{Duration, Instant},
 };
 #[derive(Clone)]
@@ -97,24 +97,117 @@ impl Controls {
         )
     }
 }
+struct Job {
+    lease: Lease,
+    qpc: i64,
+    pixels: Arc<Vec<u8>>,
+    geometry: Geometry,
+    frame: Option<Frame>,
+}
+#[derive(Default)]
+struct Pending {
+    job: Option<Job>,
+    closed: bool,
+}
+#[derive(Default)]
+struct Latest {
+    pending: Mutex<Pending>,
+    ready: Condvar,
+}
+impl Latest {
+    fn offer(&self, job: Job) {
+        // Never wait behind preview work on the recording capture thread.
+        if let Ok(mut pending) = self.pending.try_lock()
+            && !pending.closed
+        {
+            pending.job = Some(job);
+            self.ready.notify_one();
+        }
+    }
+    fn discard_pending(&self) -> bool {
+        if let Ok(mut pending) = self.pending.try_lock()
+            && !pending.closed
+        {
+            pending.job = None;
+            return true;
+        }
+        false
+    }
+    fn take(&self) -> Option<Job> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if pending.closed {
+                return None;
+            }
+            if let Some(job) = pending.job.take() {
+                return Some(job);
+            }
+            pending = self.ready.wait(pending).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    fn close(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.closed = true;
+        pending.job = None;
+        self.ready.notify_one();
+    }
+}
 pub struct Emitter {
     control: Arc<Controls>,
-    send: Option<mpsc::SyncSender<Frame>>,
-    last: Instant,
+    latest: Arc<Latest>,
+    cadence: preview::Cadence,
+    legacy_last: Option<Instant>,
 }
 impl Emitter {
     pub fn new(control: Arc<Controls>) -> Result<Self, String> {
-        let (send, receive) = mpsc::sync_channel::<Frame>(1);
+        let latest = Arc::new(Latest::default());
+        let writer_latest = latest.clone();
         let writer_control = control.clone();
         std::thread::Builder::new()
             .name("recording-preview-pipe".into())
             .spawn(move || {
                 let mut output = std::io::stderr().lock();
-                while let Ok(frame) = receive.recv() {
-                    if writer_control.current().is_none_or(|lease| {
-                        lease.id != frame.header.preview_id
-                            || lease.epoch != frame.header.config_epoch
-                    }) {
+                let valid = |job: &Job| {
+                    writer_control.current().is_some_and(|lease| {
+                        lease.id == job.lease.id && lease.epoch == job.lease.epoch
+                    })
+                };
+                while let Some(mut job) = writer_latest.take() {
+                    if !valid(&job) {
+                        continue;
+                    }
+                    let frame = if let Some(frame) = job.frame.take() {
+                        frame
+                    } else {
+                        let Ok((width, height, bmp)) = preview::thumbnail(
+                            &job.pixels,
+                            job.geometry.width,
+                            job.geometry.height,
+                        ) else {
+                            writer_control.off();
+                            continue;
+                        };
+                        let Some(sequence) =
+                            super::allocate_preview_sequence(&writer_control.sequence)
+                        else {
+                            writer_control.off();
+                            continue;
+                        };
+                        let header = FrameHeader {
+                            preview_id: job.lease.id.clone(),
+                            config_epoch: job.lease.epoch,
+                            sequence,
+                            width,
+                            height,
+                            captured_at_qpc100ns: job.qpc.max(0).to_string(),
+                        };
+                        let Ok(frame) = Frame::from_bmp(header, bmp) else {
+                            writer_control.off();
+                            continue;
+                        };
+                        frame
+                    };
+                    if !valid(&job) {
                         continue;
                     }
                     if preview::write_frame(&mut output, &frame).is_err() {
@@ -126,19 +219,30 @@ impl Emitter {
             .map_err(|_| "Cannot start bounded preview delivery.")?;
         Ok(Self {
             control,
-            send: Some(send),
-            last: Instant::now() - Duration::from_secs(1),
+            latest,
+            cadence: preview::Cadence::default(),
+            legacy_last: None,
         })
     }
-    pub fn offer(&mut self, qpc: i64, nv12: &[u8], geometry: Geometry) {
-        if self.last.elapsed() < Duration::from_millis(200) {
+    /// Rare legacy-admission sources retain their previous 480x270/5Hz tap.
+    /// Inline conversion retains no additional full-resolution NV12; the sole
+    /// writer and replaceable pending slot contain only bounded encoded frames.
+    pub fn offer_legacy(&mut self, qpc: i64, pixels: &[u8], geometry: Geometry) {
+        if self
+            .legacy_last
+            .is_some_and(|last| last.elapsed() < Duration::from_millis(200))
+        {
             return;
         }
         let Some(lease) = self.control.current() else {
             return;
         };
-        self.last = Instant::now();
-        let Ok((width, height, bmp)) = preview::thumbnail(nv12, geometry.width, geometry.height)
+        if !self.latest.discard_pending() {
+            return;
+        }
+        self.legacy_last = Some(Instant::now());
+        let Ok((width, height, bmp)) =
+            preview::thumbnail_with_bounds(pixels, geometry.width, geometry.height, (480, 270))
         else {
             self.control.off();
             return;
@@ -148,29 +252,123 @@ impl Emitter {
             return;
         };
         let header = FrameHeader {
-            preview_id: lease.id,
+            preview_id: lease.id.clone(),
             config_epoch: lease.epoch,
             sequence,
             width,
             height,
             captured_at_qpc100ns: qpc.max(0).to_string(),
         };
-        if let Ok(frame) = Frame::new(header, &bmp)
-            && let Some(send) = &self.send
-        {
-            let _ = send.try_send(frame);
+        let Ok(frame) = Frame::from_bmp(header, bmp) else {
+            self.control.off();
+            return;
+        };
+        self.latest.offer(Job {
+            lease,
+            qpc,
+            pixels: Arc::new(Vec::new()),
+            geometry,
+            frame: Some(frame),
+        });
+    }
+    pub fn wants_frame(&self) -> bool {
+        self.cadence.due(Instant::now()) && self.control.current().is_some()
+    }
+    /// Called before scaled GPU readback: the sole worker may retain one frame,
+    /// but any obsolete pending allocation must be released before its replacement.
+    pub fn discard_pending(&self) -> bool {
+        self.latest.discard_pending()
+    }
+    pub fn offer(&mut self, qpc: i64, pixels: Arc<Vec<u8>>, geometry: Geometry) {
+        if !self.cadence.poll(Instant::now()) {
+            return;
         }
+        self.offer_sampled(qpc, pixels, geometry);
+    }
+    /// Standalone capture has already applied its sole cadence before readback.
+    pub fn offer_sampled(&self, qpc: i64, pixels: Arc<Vec<u8>>, geometry: Geometry) {
+        let Some(lease) = self.control.current() else {
+            return;
+        };
+        self.latest.offer(Job {
+            lease,
+            qpc,
+            pixels,
+            geometry,
+            frame: None,
+        });
     }
 }
 impl Drop for Emitter {
     fn drop(&mut self) {
-        self.send = None; /* A blocked writer cannot delay media drain; process/job exit closes its pipe. */
+        // A blocked pipe cannot delay media drain; process/job exit closes it.
+        // Only one working frame and one replaceable pending frame are retained.
+        self.latest.close();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn job(qpc: i64) -> Job {
+        Job {
+            lease: Lease {
+                id: "preview-1".into(),
+                epoch: 1,
+                until: Instant::now() + Duration::from_secs(1),
+            },
+            qpc,
+            pixels: Arc::new(vec![0]),
+            geometry: Geometry {
+                width: 1,
+                height: 1,
+            },
+            frame: None,
+        }
+    }
+    #[test]
+    fn scaled_producer_releases_pending_before_allocating_replacement() {
+        let latest = Latest::default();
+        latest.offer(job(1));
+        let working = latest.take().unwrap();
+        let obsolete = job(2);
+        let obsolete_pixels = Arc::downgrade(&obsolete.pixels);
+        latest.offer(obsolete);
+        assert!(latest.discard_pending());
+        assert!(obsolete_pixels.upgrade().is_none());
+        let replacement = job(3);
+        latest.offer(replacement);
+        assert_eq!(working.qpc, 1);
+        assert_eq!(latest.take().unwrap().qpc, 3);
+        latest.close();
+    }
+    #[test]
+    fn slow_worker_keeps_only_newest_pending_frame_and_close_drops_it() {
+        let latest = Latest::default();
+        latest.offer(job(1));
+        let working = latest.take().unwrap();
+        let overwritten = job(2);
+        let weak = Arc::downgrade(&overwritten.pixels);
+        latest.offer(overwritten);
+        latest.offer(job(3));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(working.qpc, 1);
+        assert_eq!(latest.take().unwrap().qpc, 3);
+        let pending = job(4);
+        let weak = Arc::downgrade(&pending.pixels);
+        latest.offer(pending);
+        latest.close();
+        assert!(weak.upgrade().is_none());
+        assert!(latest.take().is_none());
+    }
+    #[test]
+    fn busy_preview_slot_never_waits_on_capture_producer() {
+        let latest = Latest::default();
+        let held = latest.pending.lock().unwrap();
+        latest.offer(job(1));
+        drop(held);
+        assert!(latest.pending.lock().unwrap().job.is_none());
+    }
     #[test]
     fn stale_epochs_do_not_renew_and_expiry_does_not_own_recording_stop() {
         let controls = Controls::default();

@@ -102,11 +102,13 @@ test("bounded BMP envelope retains exact odd rows and lossless QPC text", () => 
   assert.equal(decoded.bmp.byteLength, 78);
   assert.equal(decoded.capturedAtQpc100ns, "1234567890123456789");
   assert.equal(decodePreviewEnvelope(new ArrayBuffer(0)), null);
-  assert.equal(decodePreviewEnvelope(frame({ width: 480, height: 270 })).bmp.byteLength, 388854);
+  assert.equal(decodePreviewEnvelope(frame({ width: 960, height: 540 })).bmp.byteLength, 1555254);
+  const buffer = frame();
+  assert.equal(decodePreviewEnvelope(buffer).bmp.buffer, buffer, "validated BMP is a bounded view without another frame copy");
 });
 
 test("envelope rejects truncated, oversized, malformed UTF8 and unsupported BMP layouts", () => {
-  assert.throws(() => decodePreviewEnvelope(new ArrayBuffer(389891)), /oversized/);
+  assert.throws(() => decodePreviewEnvelope(new ArrayBuffer(1556291)), /oversized/);
   const good = frame();
   assert.throws(() => decodePreviewEnvelope(good.slice(0, -1)), /malformed/);
   for (const mutate of [
@@ -119,7 +121,7 @@ test("envelope rejects truncated, oversized, malformed UTF8 and unsupported BMP 
     const altered = good.slice(0); mutate(new DataView(altered));
     assert.throws(() => decodePreviewEnvelope(altered), /malformed/);
   }
-  for (const invalid of [{ configEpoch: 0 }, { sequence: -1 }, { capturedAtQpc100ns: 1234 }, { width: 481 }, { height: 271 }]) {
+  for (const invalid of [{ configEpoch: 0 }, { sequence: -1 }, { capturedAtQpc100ns: 1234 }, { width: 961 }, { height: 541 }]) {
     assert.throws(() => decodePreviewEnvelope(frame(invalid)), /malformed/);
   }
 });

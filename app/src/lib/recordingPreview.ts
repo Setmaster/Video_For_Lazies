@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { CaptureSource, RecordingPhase } from "./recording";
 import { captureSourceKey, isRecordingActive } from "./recordingState";
 import { INITIAL_PREVIEW, acceptPreviewSnapshot, automaticPreviewAction, canRunRecordingPreview, decodePreviewEnvelope, frameMatchesPreview, isPreviewLive } from "./recordingPreviewState";
+import { createPreviewPollCadence, createRecordingPreviewRenderer } from "./recordingPreviewRenderer";
 
 export type RecordingPreviewSnapshot = {
   previewId: string | null; sequence: number; configEpoch: number;
@@ -14,7 +15,9 @@ export type RecordingPreviewSnapshot = {
 type Request = { requestId: string; previewId: string | null; generation: number; sourceKey: string; showCursor: boolean };
 export type PreviewHandoff = { generation: number; sourceKey: string; showCursor: boolean; resume: boolean };
 type Options = { enabled: boolean; canPreview: boolean; visible: boolean; source: CaptureSource | null; showCursor: boolean; recordingPhase: RecordingPhase; recordingSessionId: string | null; onAdmissionBusyChange?: (busy: boolean) => void };
-type ImageFrame = { url: string; sequence: number; previewId: string; configEpoch: number };
+type ImageFrame = { sequence: number; previewId: string; configEpoch: number };
+const FRAME_INTERVAL_MS = 1000 / 60;
+const STATUS_INTERVAL_MS = 250;
 const message = (failure: unknown) => failure instanceof Error ? failure.message : String(failure);
 
 export function useRecordingPreview(options: Options) {
@@ -41,9 +44,7 @@ export function useRecordingPreview(options: Options) {
   const cleanupCount = useRef(0);
   const admissionBusy = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const imageUrl = useRef<string | null>(null);
-  const decoding = useRef<{ url: string; image: HTMLImageElement } | null>(null);
-  const renderedSequence = useRef(0);
+  const renderer = useRef<ReturnType<typeof createRecordingPreviewRenderer> | null>(null);
   const heartbeatAt = useRef(0);
   const polling = useRef(false);
   const previousRecording = useRef({ phase: options.recordingPhase, sessionId: options.recordingSessionId });
@@ -61,14 +62,7 @@ export function useRecordingPreview(options: Options) {
   }, []);
 
   const clearImage = useCallback(() => {
-    if (imageUrl.current) URL.revokeObjectURL(imageUrl.current);
-    imageUrl.current = null;
-    if (decoding.current) {
-      URL.revokeObjectURL(decoding.current.url);
-      decoding.current.image.src = "";
-      decoding.current = null;
-    }
-    renderedSequence.current = 0;
+    renderer.current?.clear();
     if (mounted.current) setImage(null);
   }, []);
 
@@ -124,6 +118,16 @@ export function useRecordingPreview(options: Options) {
     return cleanupRetired();
   }, [cleanupRetired, detach]);
 
+  if (!renderer.current) renderer.current = createRecordingPreviewRenderer({
+    isCurrent: (frame) => {
+      const candidate = request.current;
+      return !!candidate && matches(candidate) && frameMatchesPreview(frame, current.current);
+    },
+    onFirstFrame: (frame) => setImage({ sequence: frame.sequence, previewId: frame.previewId, configEpoch: frame.configEpoch }),
+    onError: (failure) => { setError(`Preview stopped: ${message(failure)}`); void stop(); },
+  });
+  const canvasRef = useCallback((canvas: HTMLCanvasElement | null) => renderer.current?.setCanvas(canvas), []);
+
   const accept = useCallback((incoming: RecordingPreviewSnapshot, candidate: Request) => {
     if (!matches(candidate) || (incoming.previewId !== candidate.previewId &&
       !(incoming.previewId === null && ["idle", "failed"].includes(incoming.phase)))) return current.current;
@@ -166,43 +170,37 @@ export function useRecordingPreview(options: Options) {
       if (!incoming.previewId) throw new Error(incoming.message || "Preview could not start.");
       candidate.previewId = incoming.previewId;
       accept(incoming, candidate);
+      let nextStatusAt = 0;
+      const nextFrameDelay = createPreviewPollCadence(FRAME_INTERVAL_MS);
       const poll = async () => {
         if (!matches(candidate) || !candidate.previewId) return;
         // A superseded request can still be returning. Never accumulate polls
         // or decodes across generations; Stop remains on its own control lane.
-        if (polling.current) { timer.current = setTimeout(() => void poll(), 200); return; }
+        if (polling.current) { timer.current = setTimeout(() => void poll(), FRAME_INTERVAL_MS); return; }
         polling.current = true;
+        const cycleStarted = performance.now();
         try {
-          const status = await invoke<RecordingPreviewSnapshot>("recording_preview_snapshot", { previewId: candidate.previewId });
-          const accepted = accept(status, candidate);
-          if (!matches(candidate) || !isPreviewLive(accepted.phase)) return;
-          const payload = await invoke<ArrayBuffer>("recording_preview_frame", { previewId: candidate.previewId, afterSequence: renderedSequence.current });
+          // Status/lease feedback has a separate cadence; each image needs only
+          // the existing binary response, not a second status round trip.
+          if (cycleStarted >= nextStatusAt) {
+            nextStatusAt = cycleStarted + STATUS_INTERVAL_MS;
+            const status = await invoke<RecordingPreviewSnapshot>("recording_preview_snapshot", { previewId: candidate.previewId });
+            accept(status, candidate);
+          }
+          if (!matches(candidate) || !isPreviewLive(current.current.phase)) return;
+          const payload = await invoke<ArrayBuffer>("recording_preview_frame", { previewId: candidate.previewId, afterSequence: renderer.current?.afterSequence() ?? 0 });
           if (!matches(candidate)) return;
           const frame = decodePreviewEnvelope(payload);
-          if (frameMatchesPreview(frame, current.current, renderedSequence.current) && frame) {
-            const url = URL.createObjectURL(new Blob([frame.bmp], { type: "image/bmp" }));
-            const decoded = new Image();
-            decoding.current = { url, image: decoded };
-            decoded.src = url;
-            try { await decoded.decode(); }
-            catch (failure) {
-              if (decoding.current?.url === url) { decoding.current = null; URL.revokeObjectURL(url); }
-              if (matches(candidate) && frameMatchesPreview(frame, current.current, renderedSequence.current)) throw failure;
-              return;
-            }
-            if (decoding.current?.url === url) decoding.current = null;
-            // Status events can change the epoch while decoding is pending.
-            if (!matches(candidate) || !frameMatchesPreview(frame, current.current, renderedSequence.current)) { URL.revokeObjectURL(url); return; }
-            if (imageUrl.current) URL.revokeObjectURL(imageUrl.current);
-            imageUrl.current = url;
-            renderedSequence.current = frame.sequence;
-            setImage({ url, sequence: frame.sequence, previewId: frame.previewId, configEpoch: frame.configEpoch });
-          }
+          if (frame && frameMatchesPreview(frame, current.current, renderer.current?.afterSequence() ?? 0)) await renderer.current?.offer(frame);
         } catch (failure) {
           if (matches(candidate)) { setError(`Preview stopped: ${message(failure)}`); void stop(); }
         } finally {
           polling.current = false;
-          if (matches(candidate) && ["starting", "previewing", "recording"].includes(current.current.phase)) timer.current = setTimeout(() => void poll(), 200);
+          // Decode and IPC time count toward the frame period. A late cycle
+          // never creates overlapping requests or a catch-up queue.
+          if (matches(candidate) && ["starting", "previewing", "recording"].includes(current.current.phase)) {
+            timer.current = setTimeout(() => void poll(), nextFrameDelay(cycleStarted, performance.now()));
+          }
         }
       };
       void poll();
@@ -313,6 +311,6 @@ export function useRecordingPreview(options: Options) {
   const visibleImage = image && request.current && matches(request.current) &&
     image.previewId === snapshot.previewId && image.configEpoch === snapshot.configEpoch && isPreviewLive(snapshot.phase) &&
     !["pausing", "paused", "resuming", "stopping", "finalizing"].includes(options.recordingPhase) ? image : null;
-  return { snapshot, image: visibleImage, starting, stopping, error, eventsReady, start, stop,
+  return { snapshot, image: visibleImage, canvasRef, starting, stopping, error, eventsReady, start, stop,
     detachForRecording, finishHandoff, isCurrent, hasRequest };
 }
