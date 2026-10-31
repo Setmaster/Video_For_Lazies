@@ -66,6 +66,7 @@ export function useAudioTrackPreview(options: Options) {
     return () => { void stop(false); mounted.current = false; };
   }, [stop]);
   const key = `${options.path}\n${options.probe?.sourceIdentity || ""}\n${options.probe?.audioStreamIndex ?? ""}`;
+  // A fresh probe also restarts a same-source preview unloaded by queue snapshot application.
   useEffect(() => {
     if (!options.visible || !options.enabled || !options.probe?.hasAudio) { void stop(options.visible && !!options.path); return; }
     const selected = options.probe;
@@ -91,7 +92,7 @@ export function useAudioTrackPreview(options: Options) {
       }
     };
     void launch();
-  }, [key, options.enabled, options.visible, options.probe?.hasAudio, revision, cleanup, matches, publish, stop]);
+  }, [key, options.probe, options.enabled, options.visible, options.probe?.hasAudio, revision, cleanup, matches, publish, stop]);
   const sourceToken = asset?.requestId || (!options.probe?.hasAudio ? `silent:${options.path}` : "");
   const ready = useCallback((token: string) => {
     const request = current.current;

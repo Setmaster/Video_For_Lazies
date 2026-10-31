@@ -6362,7 +6362,9 @@ function App() {
       const snapshotApplied = await waitForSmokeCondition(
         () =>
           document.querySelector(".vfl-footer-status")?.textContent?.includes("Applied the full queue snapshot") === true &&
-          !queueSnapshotApplyingRef.current,
+          !queueSnapshotApplyingRef.current &&
+          !audioTrackWorkBusyRef.current &&
+          (!probe.hasAudio || audioPreviewControllerRef.current?.asset != null),
       );
       if (!snapshotApplied) return { ok: false, message: "Workflow smoke did not apply the full queue snapshot." };
       setOutputAuto(false);
