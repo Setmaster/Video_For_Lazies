@@ -146,7 +146,7 @@ fn decode(bytes: &[u8], session: &str, roles: u8, initial: u8) -> Result<History
     let (mut sample, mut command, mut mask) = (0, 0, initial);
     // A single incomplete terminal append is safe ONLY because the writer
     // syncs the complete edge before any affected PCM or applied ACK.
-    for record in bytes[64..].chunks_exact(64) {
+    for record in bytes[64..].as_chunks::<64>().0 {
         let edge = Edge {
             ordinal: u64_at(record, 0),
             sample: u64_at(record, 8),

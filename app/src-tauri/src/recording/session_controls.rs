@@ -103,12 +103,17 @@ pub(crate) fn new_operation_id() -> Result<String, String> {
         h.write_u32(std::process::id());
         h.finish()
     });
-    let next = NEXT
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            n.checked_add(1).filter(|n| *n <= SAFE_INTEGER)
-        })
-        .map_err(|_| "counterExhausted")?
-        + 1;
+    let mut current = NEXT.load(Ordering::Acquire);
+    let next = loop {
+        let next = current
+            .checked_add(1)
+            .filter(|n| *n <= SAFE_INTEGER)
+            .ok_or("counterExhausted")?;
+        match NEXT.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break next,
+            Err(observed) => current = observed,
+        }
+    };
     Ok(format!("{seed:016x}{next:016x}"))
 }
 impl SessionControls {
@@ -476,6 +481,26 @@ impl SessionControls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn operation_ids_remain_valid_and_unique_under_contention() {
+        let ids = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..128)
+                            .map(|_| new_operation_id().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(ids.len(), 1024);
+        assert!(ids.iter().all(|id| token(id)));
+    }
     fn ready() -> (SessionControls, Arc<AtomicBool>) {
         let controls = SessionControls::default();
         controls.replace_owner("a".repeat(32)).unwrap();

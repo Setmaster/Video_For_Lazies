@@ -371,7 +371,9 @@ mod tests {
     }
     fn decode(bytes: &[u8]) -> Vec<[f32; 2]> {
         bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|b| {
                 [
                     f32::from_le_bytes(b[..4].try_into().unwrap()),

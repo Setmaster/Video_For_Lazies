@@ -1049,13 +1049,16 @@ fn capture_error(message: impl AsRef<str>) -> ::windows::core::Error {
     )
 }
 fn allocate_preview_sequence(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-            old.checked_add(1)
-                .filter(|value| *value <= 9_007_199_254_740_991)
-        })
-        .ok()
-        .map(|old| old + 1)
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .filter(|value| *value <= 9_007_199_254_740_991)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
+        }
+    }
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2048,6 +2051,39 @@ fn file_size(path: &std::path::Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_sequence_exhaustion_does_not_advance_or_wrap() {
+        use std::sync::atomic::AtomicU64;
+        let limit = 9_007_199_254_740_991;
+        let counter = AtomicU64::new(limit - 1);
+        assert_eq!(allocate_preview_sequence(&counter), Some(limit));
+        assert_eq!(allocate_preview_sequence(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), limit);
+        let overflow = AtomicU64::new(u64::MAX);
+        assert_eq!(allocate_preview_sequence(&overflow), None);
+        assert_eq!(overflow.load(Ordering::Relaxed), u64::MAX);
+    }
+    #[test]
+    fn preview_sequence_allocations_remain_unique_under_contention() {
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let mut allocated = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..128)
+                            .map(|_| allocate_preview_sequence(&counter).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        allocated.sort_unstable();
+        assert_eq!(allocated, (1..=1024).collect::<Vec<_>>());
+    }
     #[test]
     fn preview_sampling_is_five_hz_without_catch_up_bursts() {
         let mut sampling = PreviewSampling::default();
