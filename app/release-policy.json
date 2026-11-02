@@ -12,6 +12,10 @@
     "2.7.0": {
       "targets": ["windows-x64"],
       "makeLatest": false
+    },
+    "2.8.0": {
+      "targets": ["windows-x64"],
+      "makeLatest": false
     }
   }
 }

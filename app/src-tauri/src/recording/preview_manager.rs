@@ -566,6 +566,8 @@ pub(crate) async fn recording_windows(
     .await
 }
 #[tauri::command]
+// Tauri injects the window/app/state alongside the existing IPC fields.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn recording_preview_viewport(
     window: Window,
     app: AppHandle,
@@ -628,6 +630,8 @@ pub(crate) fn recording_preview_viewport(
 }
 
 #[tauri::command]
+// Keep the flat IPC contract; four arguments are injected Tauri context.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn recording_preview_start(
     window: Window,
     app: AppHandle,

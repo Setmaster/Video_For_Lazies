@@ -328,7 +328,7 @@ mod tests {
         };
         viewport.validate().unwrap();
         let packet=serde_json::to_vec(&serde_json::json!({"operation":"preview-renew","previewId":"preview-123456-123456","configEpoch":9_007_199_254_740_991_u64,"leaseMs":3000,"viewport":viewport})).unwrap();
-        assert!(packet.len() + 1 <= 512);
+        assert!(packet.len() < 512);
         for invalid in [
             Viewport {
                 parent_pid: 0,
