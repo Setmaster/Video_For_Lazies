@@ -41,6 +41,50 @@ impl Cadence {
         true
     }
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContentRect {
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+}
+/// Physical Main-client viewport; only the backend supplies the owner identity.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Viewport {
+    pub parent_hwnd: String,
+    pub parent_pid: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub revision: u64,
+}
+impl Viewport {
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .parent_hwnd
+            .parse::<usize>()
+            .ok()
+            .is_none_or(|hwnd| hwnd == 0)
+            || self.parent_pid == 0
+            || self.revision == 0
+            || self.revision > 9_007_199_254_740_991
+            || self.x < 0
+            || self.y < 0
+            || self.width == 0
+            || self.height == 0
+            || self.width > 16_384
+            || self.height > 16_384
+            || i64::from(self.x) + i64::from(self.width) > 32_767
+            || i64::from(self.y) + i64::from(self.height) > 32_767
+        {
+            return Err("Invalid native preview viewport.".into());
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FrameHeader {
@@ -271,6 +315,53 @@ pub fn thumbnail_with_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_viewport_is_bounded_and_fits_existing_control_packet() {
+        let viewport = Viewport {
+            parent_hwnd: "1844674407370955".into(),
+            parent_pid: 4321,
+            x: 10,
+            y: 20,
+            width: 1920,
+            height: 1080,
+            revision: 9_007_199_254_740_991,
+        };
+        viewport.validate().unwrap();
+        let packet=serde_json::to_vec(&serde_json::json!({"operation":"preview-renew","previewId":"preview-123456-123456","configEpoch":9_007_199_254_740_991_u64,"leaseMs":3000,"viewport":viewport})).unwrap();
+        assert!(packet.len() + 1 <= 512);
+        for invalid in [
+            Viewport {
+                parent_pid: 0,
+                ..viewport.clone()
+            },
+            Viewport {
+                parent_hwnd: "0".into(),
+                ..viewport.clone()
+            },
+            Viewport {
+                width: 0,
+                ..viewport.clone()
+            },
+            Viewport {
+                x: -1,
+                ..viewport.clone()
+            },
+            Viewport {
+                width: 16_385,
+                ..viewport.clone()
+            },
+            Viewport {
+                y: 32_767,
+                ..viewport.clone()
+            },
+            Viewport {
+                revision: 0,
+                ..viewport.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
     #[test]
     fn off_phase_stall_does_not_allow_an_immediate_tolerance_catch_up() {
         for late_by in [

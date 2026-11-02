@@ -110,9 +110,7 @@ impl Reporter {
                 .as_array()
                 .is_some_and(|a| !a.is_empty())
             || value["reconcileAck"].is_object()
-            || value["reconcileError"].is_object()
-            || value["hudIntent"].is_string()
-            || value["stopHudVisible"] == true;
+            || value["reconcileError"].is_object();
         let Ok(bytes) = encode(json!({"type":"progress","value":value})) else {
             std::process::exit(2);
         };

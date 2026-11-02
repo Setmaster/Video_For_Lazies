@@ -47,6 +47,17 @@ export default function RecordingPreview({ preview, canPreview, recording, enabl
   return <div className="vfl-record-preview" id="vfl-record-preview"
     data-preview-id={snapshot.previewId || ""} data-preview-phase={snapshot.phase}
     data-preview-epoch={snapshot.configEpoch}
+    data-preview-transport={snapshot.transport || "bitmap"}
+    data-preview-sequence={snapshot.transport === "native" ? snapshot.frameSequence : undefined}
+    data-preview-presented-frames={snapshot.presentedFrames}
+    data-preview-presented-qpc={snapshot.presentedAtQpc100ns ?? ""}
+    data-preview-captured-qpc={snapshot.capturedAtQpc100ns ?? ""}
+    data-preview-native-window={snapshot.nativeWindow ?? ""}
+    data-preview-native-visible={snapshot.nativeVisible ? "true" : "false"}
+    data-preview-native-viewport-width={snapshot.viewportWidth ?? 0}
+    data-preview-native-viewport-height={snapshot.viewportHeight ?? 0}
+    data-preview-native-content-rect={snapshot.nativeContentRect ? JSON.stringify(snapshot.nativeContentRect) : ""}
+    data-preview-capture-border={snapshot.captureBorder ? JSON.stringify(snapshot.captureBorder) : ""}
     data-preview-frame-age-ms={snapshot.lastFrameAgeMs ?? ""} data-recording-phase={recordingPhase}>
     <div className="vfl-record-preview-head">
       <div className="vfl-record-preview-heading">
@@ -64,7 +75,7 @@ export default function RecordingPreview({ preview, canPreview, recording, enabl
           onClick={() => void preview.stop()}>Retry Stop preview</button>}
       </div>
     </div>
-    <div id="vfl-record-preview-canvas" className="vfl-record-preview-canvas" aria-busy={waiting}>
+    <div ref={preview.viewportRef} id="vfl-record-preview-canvas" className="vfl-record-preview-canvas" aria-busy={waiting}>
       <canvas ref={preview.canvasRef} id="vfl-record-preview-image" className="vfl-record-preview-image"
         style={{ display: visibleImage ? "block" : "none" }} aria-hidden={!visibleImage} role="img"
         aria-label={recordingPhase === "recording" ? "Live preview of the recording source" : "Live preview of the selected capture source"} />

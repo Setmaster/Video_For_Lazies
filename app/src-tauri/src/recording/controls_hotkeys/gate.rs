@@ -27,10 +27,8 @@ pub(super) struct Assignment {
 }
 pub(super) struct AttemptState {
     pub token: String,
-    pub session_id: Option<String>,
     pub cancel: Arc<AtomicBool>,
     pub admitted: bool,
-    pub hud_visible: bool,
 }
 pub(super) struct ArmGate {
     pub revision: u64,
@@ -205,6 +203,11 @@ impl ArmGate {
                 .filter(|n| *n <= MAX_REVISION)
                 .unwrap_or(MAX_REVISION);
             self.invalidate("Window changed; reconcile a fresh Record draft.");
+        } else {
+            // A completed restore may follow a pre-forward Hidden fence. Its
+            // actual visibility must publish a newer snapshot, without another
+            // invalidation or reviving the retired draft.
+            self.bump();
         }
     }
     pub fn arm_snapshot(&self, now: Instant) -> Option<ArmSnapshot> {
@@ -298,7 +301,7 @@ impl StartPermit {
             || !g
                 .attempt
                 .as_ref()
-                .is_some_and(|p| p.token == self.token && p.hud_visible && !p.admitted)
+                .is_some_and(|p| p.token == self.token && !p.admitted)
         {
             return Err("Start admission is no longer available.".into());
         }

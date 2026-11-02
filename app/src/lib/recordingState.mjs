@@ -64,6 +64,7 @@ export function acceptRecordingSnapshot(current, incoming) {
         typeof incoming.config.requestId !== "string" || !isCaptureSource(incoming.config.source) ||
         ![24, 25, 30, 50, 60].includes(incoming.config.fps) || !["standard", "high"].includes(incoming.config.quality) ||
         ![0, 3, 5].includes(incoming.config.countdownSeconds) || typeof incoming.config.showCursor !== "boolean" ||
+        (incoming.config.showCaptureBorder !== undefined && typeof incoming.config.showCaptureBorder !== "boolean") ||
         !isRecordingAudioConfig(incoming.config.audio) ||
         typeof incoming.config.outputDirectory !== "string")) ||
       (incoming.countdownRemaining !== null && (!Number.isSafeInteger(incoming.countdownRemaining) || incoming.countdownRemaining < 0)) ||

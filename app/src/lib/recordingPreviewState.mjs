@@ -17,11 +17,16 @@ export function automaticPreviewAction(options) {
   // Neither a start failure nor cleanup failure may become a render retry loop.
   if (options.error || options.handoff || options.stopping) return "none";
   if (!canRunRecordingPreview(options)) return options.hasRequest ? "stop" : "none";
+  // Native minimize/lease expiry can end capture without a WebView visibility
+  // event. Retire that completed request before admitting a fresh preview.
+  if (options.hasRequest && !options.starting && options.previewPhase === "idle") return "stop";
   return !options.hasRequest && !options.starting && options.previewPhase === "idle" ? "start" : "none";
 }
 
 export function acceptPreviewSnapshot(current, incoming) {
   const integer = (value) => Number.isSafeInteger(value) && value >= 0;
+  const ticks = (value) => value === null || typeof value === "string" && /^\d{1,20}$/.test(value);
+  const hresult = (value) => value === null || typeof value === "string" && /^0x[\da-f]{8}$/i.test(value);
   if (!incoming || !phases.has(incoming.phase) ||
       ![incoming.sequence, incoming.configEpoch, incoming.frameSequence, incoming.sourceWidth, incoming.sourceHeight].every(integer) ||
       incoming.sourceWidth > 7680 || incoming.sourceHeight > 4320 ||
@@ -29,6 +34,21 @@ export function acceptPreviewSnapshot(current, incoming) {
       (incoming.source !== null && !isCaptureSource(incoming.source)) ||
       (incoming.message !== null && typeof incoming.message !== "string") ||
       (incoming.lastFrameAgeMs !== null && (!Number.isFinite(incoming.lastFrameAgeMs) || incoming.lastFrameAgeMs < 0)) ||
+      (incoming.transport !== undefined && !["native", "bitmap"].includes(incoming.transport)) ||
+      (incoming.transport === "native" && (!integer(incoming.presentedFrames) ||
+        !ticks(incoming.presentedAtQpc100ns) || !ticks(incoming.capturedAtQpc100ns) ||
+        (incoming.nativeWindow !== null && (typeof incoming.nativeWindow !== "string" || !/^\d{1,20}$/.test(incoming.nativeWindow))) ||
+        typeof incoming.nativeVisible !== "boolean" || !integer(incoming.viewportWidth) || !integer(incoming.viewportHeight) ||
+        incoming.viewportWidth > 32767 || incoming.viewportHeight > 32767)) ||
+      (incoming.nativeContentRect != null && (!Object.values(incoming.nativeContentRect).every(integer) ||
+        !["left", "top", "width", "height"].every(key => integer(incoming.nativeContentRect[key])) ||
+        incoming.nativeContentRect.left + incoming.nativeContentRect.width > incoming.viewportWidth ||
+        incoming.nativeContentRect.top + incoming.nativeContentRect.height > incoming.viewportHeight)) ||
+      (incoming.captureBorder != null && (typeof incoming.captureBorder.requested !== "boolean" ||
+        typeof incoming.captureBorder.apiSupported !== "boolean" ||
+        (incoming.captureBorder.accessStatus !== null && !integer(incoming.captureBorder.accessStatus)) ||
+        !hresult(incoming.captureBorder.accessHresult) || !hresult(incoming.captureBorder.setHresult) ||
+        (incoming.captureBorder.isBorderRequired !== null && typeof incoming.captureBorder.isBorderRequired !== "boolean"))) ||
       (["starting", "previewing", "recording", "stopping"].includes(incoming.phase) &&
         (!incoming.previewId || !incoming.source || incoming.configEpoch < 1))) {
     throw new Error("Preview returned an invalid status. Stop preview and try again.");

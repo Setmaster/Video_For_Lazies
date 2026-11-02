@@ -1,9 +1,6 @@
 //! Bounded helper transition mailbox; permanent Stop remains a separate atomic.
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU8, AtomicU64, Ordering},
-};
+use std::sync::Mutex;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Transition {
@@ -24,9 +21,6 @@ struct State {
 #[derive(Default)]
 pub struct Controls {
     state: Mutex<State>,
-    elapsed: AtomicU64,
-    phase: AtomicU8,
-    intent: AtomicU8,
 }
 impl Controls {
     pub fn is_duplicate(&self, action: &str, value: &Transition) -> bool {
@@ -35,34 +29,6 @@ impl Controls {
             .into_iter()
             .flatten()
             .any(|old| old.0 == action && old.1 == *value)
-    }
-    pub fn hud_state(&self) -> (u64, u8) {
-        (
-            self.elapsed.load(Ordering::Acquire),
-            self.phase.load(Ordering::Acquire),
-        )
-    }
-    pub fn update_hud(&self, elapsed_ms: u64, phase: u8) {
-        self.elapsed.store(elapsed_ms, Ordering::Release);
-        self.phase.store(phase, Ordering::Release);
-    }
-    pub fn hud_intent(&self) {
-        let phase = self.phase.load(Ordering::Acquire);
-        if phase == 0 || phase == 2 {
-            let _ = self.intent.compare_exchange(
-                0,
-                if phase == 0 { 1 } else { 2 },
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-    }
-    pub fn take_intent(&self) -> Option<&'static str> {
-        match self.intent.swap(0, Ordering::AcqRel) {
-            1 => Some("pause"),
-            2 => Some("resume"),
-            _ => None,
-        }
     }
     pub fn submit(&self, action: &str, value: Transition) -> Result<(), String> {
         if !matches!(action, "pause" | "resume")

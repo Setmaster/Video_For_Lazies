@@ -101,6 +101,8 @@ pub(crate) struct StartDraft {
     pub countdown_seconds: u32,
     pub show_cursor: bool,
     #[serde(default)]
+    pub show_capture_border: bool,
+    #[serde(default)]
     pub audio: Option<RecordingAudioConfig>,
     pub output_directory: String,
 }
@@ -113,6 +115,7 @@ impl StartDraft {
             quality: self.quality,
             countdown_seconds: self.countdown_seconds,
             show_cursor: self.show_cursor,
+            show_capture_border: self.show_capture_border,
             audio: self.audio,
             system_audio_device_id: None,
             microphone_device_id: None,

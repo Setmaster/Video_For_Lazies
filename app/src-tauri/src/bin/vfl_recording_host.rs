@@ -72,7 +72,20 @@ fn main() {
                     if let (Some(id), Some(epoch)) =
                         (value["previewId"].as_str(), value["configEpoch"].as_u64())
                     {
-                        controls.renew(id, epoch, value["leaseMs"].as_u64().unwrap_or(3000));
+                        let viewport = if value["viewport"].is_null() {
+                            None
+                        } else {
+                            match serde_json::from_value(value["viewport"].clone()) {
+                                Ok(viewport) => Some(viewport),
+                                Err(_) => break,
+                            }
+                        };
+                        controls.renew_viewport(
+                            id,
+                            epoch,
+                            value["leaseMs"].as_u64().unwrap_or(3000),
+                            viewport,
+                        );
                     } else {
                         break;
                     }
@@ -165,6 +178,7 @@ fn main() {
             windows::run_preview(
                 source,
                 request["showCursor"].as_bool().unwrap_or(true),
+                request["showCaptureBorder"].as_bool().unwrap_or(false),
                 stop,
                 preview,
                 |value| reporter.progress(value),

@@ -19,6 +19,16 @@ pub(crate) struct PreviewSnapshot {
     pub source_height: u32,
     pub last_frame_age_ms: Option<u64>,
     pub message: Option<String>,
+    pub transport: String,
+    pub presented_frames: u64,
+    pub presented_at_qpc100ns: Option<String>,
+    pub captured_at_qpc100ns: Option<String>,
+    pub native_window: Option<String>,
+    pub native_visible: bool,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub native_content_rect: Option<preview::ContentRect>,
+    pub capture_border: Option<Value>,
 }
 impl Default for PreviewSnapshot {
     fn default() -> Self {
@@ -33,6 +43,16 @@ impl Default for PreviewSnapshot {
             source_height: 0,
             last_frame_age_ms: None,
             message: None,
+            transport: if cfg!(windows) { "native" } else { "bitmap" }.into(),
+            presented_frames: 0,
+            presented_at_qpc100ns: None,
+            captured_at_qpc100ns: None,
+            native_window: None,
+            native_visible: false,
+            viewport_width: 0,
+            viewport_height: 0,
+            native_content_rect: None,
+            capture_border: None,
         }
     }
 }
@@ -42,6 +62,9 @@ struct PreviewState {
     request_id: Option<String>,
     seen: HashSet<String>,
     show_cursor: bool,
+    show_capture_border: bool,
+    viewport: Option<preview::Viewport>,
+    viewport_revision: u64,
     owner: Option<String>,
     recording: bool,
     running: bool,
@@ -85,6 +108,10 @@ impl PreviewManager {
         i.latest = None;
         i.arrived = None;
         i.consumer = None;
+        i.viewport = None;
+        i.snapshot.native_visible = false;
+        i.snapshot.native_window = None;
+        i.snapshot.native_content_rect = None;
     }
     pub fn shutdown(&self) {
         let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -356,7 +383,7 @@ impl Tap {
                 "starting" | "previewing" | "recording"
             );
         if active {
-            json!({"operation":"preview-renew","previewId":i.snapshot.preview_id,"configEpoch":i.snapshot.config_epoch,"leaseMs":i.consumer.map(|at|preview::LEASE_MS.saturating_sub(at.elapsed().as_millis() as u64)).unwrap_or(0)})
+            json!({"operation":"preview-renew","previewId":i.snapshot.preview_id,"configEpoch":i.snapshot.config_epoch,"leaseMs":i.consumer.map(|at|preview::LEASE_MS.saturating_sub(at.elapsed().as_millis() as u64)).unwrap_or(0),"viewport":i.viewport})
         } else {
             json!({"operation":"preview-off"})
         }
@@ -381,6 +408,7 @@ impl Tap {
             "previewing"
         }
         .into();
+        i.snapshot.transport = "bitmap".into();
         i.latest = Some(Arc::new(frame));
         i.arrived = Some(Instant::now());
         drop(i);
@@ -430,6 +458,77 @@ impl Tap {
             i.snapshot.phase = "starting".into();
             i.snapshot.message = None;
         }
+        if let Some(border) = notice
+            .get("captureBorder")
+            .filter(|border| border.is_object())
+        {
+            i.snapshot.capture_border = Some(border.clone());
+        }
+        if let Some(reason) = notice["error"].as_str() {
+            PreviewManager::clear(&mut i, "failed", Some(reason.into()));
+            drop(i);
+            self.manager.publish(&self.app);
+            return;
+        }
+        if let Some(transport) = notice["transport"]
+            .as_str()
+            .filter(|value| matches!(*value, "native" | "bitmap"))
+        {
+            i.snapshot.transport = transport.into();
+            if transport == "bitmap" {
+                i.snapshot.native_visible = false;
+                i.snapshot.native_window = None;
+                i.snapshot.native_content_rect = None;
+            }
+        }
+        if notice["transport"] == "native" {
+            let presented = notice["presentedFrames"].as_u64().unwrap_or(0);
+            if presented >= i.snapshot.presented_frames && presented <= 9_007_199_254_740_991 {
+                let sequence = notice["presentedSequence"]
+                    .as_u64()
+                    .filter(|value| *value <= 9_007_199_254_740_991)
+                    .unwrap_or(i.snapshot.frame_sequence);
+                let fresh = sequence > i.snapshot.frame_sequence;
+                if sequence < i.snapshot.frame_sequence {
+                    return;
+                }
+                i.snapshot.presented_frames = presented;
+                i.snapshot.frame_sequence = sequence;
+                let snapshot = &mut i.snapshot;
+                for (field, target) in [
+                    ("presentedAtQpc100ns", &mut snapshot.presented_at_qpc100ns),
+                    ("capturedAtQpc100ns", &mut snapshot.captured_at_qpc100ns),
+                    ("nativeWindow", &mut snapshot.native_window),
+                ] {
+                    *target = notice[field]
+                        .as_str()
+                        .filter(|value| value.parse::<u64>().is_ok())
+                        .map(str::to_owned);
+                }
+                i.snapshot.native_visible = notice["nativeVisible"].as_bool().unwrap_or(false);
+                i.snapshot.native_content_rect =
+                    serde_json::from_value(notice["nativeContentRect"].clone()).ok();
+                i.snapshot.viewport_width = notice["viewportWidth"]
+                    .as_u64()
+                    .filter(|value| *value <= 32767)
+                    .unwrap_or(0) as u32;
+                i.snapshot.viewport_height = notice["viewportHeight"]
+                    .as_u64()
+                    .filter(|value| *value <= 32767)
+                    .unwrap_or(0) as u32;
+                if i.snapshot.native_visible && presented > 0 {
+                    i.snapshot.phase = if i.recording {
+                        "recording"
+                    } else {
+                        "previewing"
+                    }
+                    .into();
+                    if fresh {
+                        i.arrived = Some(Instant::now());
+                    }
+                }
+            }
+        }
         i.snapshot.source_width = geometry.width;
         i.snapshot.source_height = geometry.height;
         if notice["expired"] == true {
@@ -467,6 +566,68 @@ pub(crate) async fn recording_windows(
     .await
 }
 #[tauri::command]
+pub(crate) fn recording_preview_viewport(
+    window: Window,
+    app: AppHandle,
+    state: State<'_, RecordingManager>,
+    preview_id: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    visible: bool,
+) -> Result<PreviewSnapshot, String> {
+    main_window(&window)?;
+    if !visible {
+        return state.preview.renew(&app, &preview_id, false);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (x, y, width, height);
+        Err("Native recording preview is available on Windows.".into())
+    }
+    #[cfg(windows)]
+    {
+        if !window.is_visible().map_err(error)? || window.is_minimized().map_err(error)? {
+            return state.preview.renew(&app, &preview_id, false);
+        }
+        let parent = window.hwnd().map_err(error)?;
+        let mut i = state
+            .preview
+            .inner
+            .lock()
+            .map_err(|_| "Preview is unavailable.")?;
+        if i.snapshot.preview_id.as_deref() != Some(&preview_id)
+            || !matches!(
+                i.snapshot.phase.as_str(),
+                "starting" | "previewing" | "recording"
+            )
+        {
+            return Err("This preview is no longer active.".into());
+        }
+        let revision = i
+            .viewport_revision
+            .checked_add(1)
+            .filter(|value| *value <= 9_007_199_254_740_991)
+            .ok_or("Restart preview before another viewport.")?;
+        let viewport = preview::Viewport {
+            parent_hwnd: (parent.0 as usize).to_string(),
+            parent_pid: std::process::id(),
+            x,
+            y,
+            width,
+            height,
+            revision,
+        };
+        viewport.validate()?;
+        i.viewport_revision = revision;
+        i.viewport = Some(viewport);
+        i.consumer = Some(Instant::now());
+        Ok(i.snapshot.clone())
+    }
+}
+
+#[tauri::command]
 pub(crate) fn recording_preview_start(
     window: Window,
     app: AppHandle,
@@ -475,6 +636,7 @@ pub(crate) fn recording_preview_start(
     request_id: String,
     source: Source,
     show_cursor: bool,
+    show_capture_border: bool,
 ) -> Result<PreviewSnapshot, String> {
     main_window(&window)?;
     if !window.is_visible().map_err(error)? || window.is_minimized().map_err(error)? {
@@ -500,11 +662,11 @@ pub(crate) fn recording_preview_start(
     }
     let recording = active(&record.snapshot.phase);
     if recording
-        && record
-            .snapshot
-            .config
-            .as_ref()
-            .is_none_or(|config| config.source != source || config.show_cursor != show_cursor)
+        && record.snapshot.config.as_ref().is_none_or(|config| {
+            config.source != source
+                || config.show_cursor != show_cursor
+                || config.show_capture_border != show_capture_border
+        })
     {
         return Err("Preview must match the active recording source and cursor.".into());
     }
@@ -514,7 +676,10 @@ pub(crate) fn recording_preview_start(
         .lock()
         .map_err(|_| "Preview is unavailable.")?;
     if i.request_id.as_deref() == Some(&request_id) {
-        if i.snapshot.source.as_ref() != Some(&source) || i.show_cursor != show_cursor {
+        if i.snapshot.source.as_ref() != Some(&source)
+            || i.show_cursor != show_cursor
+            || i.show_capture_border != show_capture_border
+        {
             return Err("This preview request belongs to different settings.".into());
         }
         return Ok(i.snapshot.clone());
@@ -550,6 +715,9 @@ pub(crate) fn recording_preview_start(
     i.seen.insert(request_id.clone());
     i.request_id = Some(request_id);
     i.show_cursor = show_cursor;
+    i.show_capture_border = show_capture_border;
+    i.viewport = None;
+    i.viewport_revision = 0;
     i.snapshot = PreviewSnapshot {
         preview_id: Some(id.clone()),
         sequence: i.snapshot.sequence + 1,
@@ -587,7 +755,7 @@ pub(crate) fn recording_preview_start(
     if std::thread::Builder::new().name("recording-preview".into()).spawn(move || {
         let result = helper_call_stream(
             &app,
-            json!({"operation":"preview","source":native,"showCursor":show_cursor,"previewId":id}),
+            json!({"operation":"preview","source":native,"showCursor":show_cursor,"showCaptureBorder":show_capture_border,"previewId":id}),
             stop,
             None,
             |_| {},

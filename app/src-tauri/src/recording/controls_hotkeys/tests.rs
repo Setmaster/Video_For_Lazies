@@ -384,6 +384,55 @@ fn minimized_only_promotes_live_acknowledged_draft_and_restore_retires_first() {
     assert!(g.arm.is_none());
 }
 #[test]
+fn restore_fences_before_forwarding_and_publishes_completed_visibility() {
+    let now = Instant::now();
+    let m = ControlsManager::default();
+    owner(&m);
+    {
+        let mut g = m.shared.gate.lock().unwrap();
+        g.observer_live = true;
+        g.window = NativeWindow::Visible;
+        arm(&mut g, now);
+        g.observe(NativeWindow::Minimized, now);
+        assert_eq!(g.arm.as_ref().unwrap().mode, ArmMode::Retained);
+        assert!(Shared::targets(&g).contains_key(&Action::Start));
+    }
+    let old_context = context(&m);
+    let old_permit = m.ui_start_permit(context(&m)).unwrap();
+    let (fenced_revision, fenced_epoch, fenced_cycle) = {
+        let mut g = m.shared.gate.lock().unwrap();
+        // SC_RESTORE entry, before the native default procedure runs.
+        g.observe(NativeWindow::Hidden, now);
+        assert!(g.arm.is_none());
+        assert!(!Shared::targets(&g).contains_key(&Action::Start));
+        (g.revision, g.invalidation_epoch, g.minimize_cycle)
+    };
+    assert!(m.ui_start_permit(old_context).is_err());
+    let called = AtomicBool::new(false);
+    assert!(
+        old_permit
+            .admit(|| {
+                called.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(!called.load(Ordering::Acquire));
+    {
+        let mut g = m.shared.gate.lock().unwrap();
+        // Only the actual post-forward classification makes preview eligible.
+        g.observe(NativeWindow::Visible, now);
+        assert!(g.revision > fenced_revision);
+        assert_eq!(g.invalidation_epoch, fenced_epoch);
+        assert_eq!(g.minimize_cycle, fenced_cycle);
+        assert!(g.arm.is_none());
+        assert!(!Shared::targets(&g).contains_key(&Action::Start));
+        let visible_revision = g.revision;
+        g.observe(NativeWindow::Visible, now);
+        assert_eq!(g.revision, visible_revision);
+    }
+}
+#[test]
 fn background_and_occlusion_hints_do_not_retire_ordinary_lease() {
     let now = Instant::now();
     let mut g = gate::ArmGate::default();
@@ -574,6 +623,136 @@ fn exact_stop_does_not_wait_for_start_gate() {
     thread.join().unwrap();
     assert!(result.is_ok());
     assert!(stop.load(Ordering::Acquire));
+}
+
+#[test]
+fn pending_preparation_with_unset_shortcuts_registers_nothing() {
+    let m = ControlsManager::default();
+    owner(&m);
+    let permit = m.ui_start_permit(context(&m)).unwrap();
+    let mut r = Registry::new(registrar(), Bindings::default());
+    r.refresh(&Shared::targets(&m.shared.gate.lock().unwrap()), false);
+    assert!(r.entries.is_empty());
+    assert_eq!(r.registrar.calls, 0);
+    assert!(!permit.cancel().load(Ordering::Acquire));
+}
+
+#[test]
+fn configured_stop_cancels_preparation_without_waiting_for_start_gate() {
+    let m = ControlsManager::default();
+    owner(&m);
+    let permit = m.ui_start_permit(context(&m)).unwrap();
+    let mut r = Registry::new(
+        registrar(),
+        Bindings {
+            stop: Some(chord("F8")),
+            ..Default::default()
+        },
+    );
+    r.refresh(&Shared::targets(&m.shared.gate.lock().unwrap()), false);
+    let id = r.entries[&Action::Stop].id;
+    assert_eq!(
+        r.entries[&Action::Stop].target.key,
+        TargetKey::Cancel {
+            attempt: permit.token().into(),
+        }
+    );
+    m.shared.publish(&r);
+    let held = m.shared.gate.lock().unwrap();
+    let worker = m.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        worker.shared.key(id, 6, chord("F8").virtual_key().unwrap());
+        let _ = tx.send(());
+    });
+    let result = rx.recv_timeout(Duration::from_secs(1));
+    drop(held);
+    thread.join().unwrap();
+    assert!(result.is_ok());
+    assert!(permit.cancel().load(Ordering::Acquire));
+    let committed = AtomicBool::new(false);
+    assert!(
+        permit
+            .admit(|| {
+                committed.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(!committed.load(Ordering::Acquire));
+}
+
+#[test]
+fn stale_preparation_stop_cannot_cancel_a_new_attempt_or_session() {
+    let m = ControlsManager::default();
+    owner(&m);
+    let first = m.ui_start_permit(context(&m)).unwrap();
+    let mut r = Registry::new(
+        registrar(),
+        Bindings {
+            stop: Some(chord("F8")),
+            ..Default::default()
+        },
+    );
+    r.refresh(&Shared::targets(&m.shared.gate.lock().unwrap()), false);
+    m.shared.publish(&r);
+    let old_id = r.entries[&Action::Stop].id;
+    m.finish_attempt(first.token());
+    let second = m.ui_start_permit(context(&m)).unwrap();
+    r.refresh(&Shared::targets(&m.shared.gate.lock().unwrap()), false);
+    m.shared.publish(&r);
+    assert_ne!(r.entries[&Action::Stop].id, old_id);
+    m.shared.key(old_id, 6, chord("F8").virtual_key().unwrap());
+    assert!(!second.cancel().load(Ordering::Acquire));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    m.set_session(Some(SessionTarget {
+        session_id: "new-session".into(),
+        control_revision: 1,
+        can_pause: true,
+        can_resume: false,
+        stop: stop.clone(),
+    }));
+    r.refresh(&Shared::targets(&m.shared.gate.lock().unwrap()), false);
+    m.shared.publish(&r);
+    m.shared.key(old_id, 6, chord("F8").virtual_key().unwrap());
+    assert!(!stop.load(Ordering::Acquire));
+    assert!(!second.cancel().load(Ordering::Acquire));
+    let current_id = r.entries[&Action::Stop].id;
+    m.shared
+        .key(current_id, 6, chord("F8").virtual_key().unwrap());
+    assert!(stop.load(Ordering::Acquire));
+}
+
+#[test]
+fn preparation_stop_latch_still_stops_admitted_session_before_registration_refresh() {
+    let m = ControlsManager::default();
+    owner(&m);
+    let permit = m.ui_start_permit(context(&m)).unwrap();
+    let mut r = Registry::new(
+        registrar(),
+        Bindings {
+            stop: Some(chord("F8")),
+            ..Default::default()
+        },
+    );
+    r.refresh(&Shared::targets(&m.shared.gate.lock().unwrap()), false);
+    m.shared.publish(&r);
+    let preparation_id = r.entries[&Action::Stop].id;
+    permit.admit(|| Ok(())).unwrap();
+    m.set_session(Some(SessionTarget {
+        session_id: "admitted-session".into(),
+        control_revision: 1,
+        can_pause: true,
+        can_resume: false,
+        stop: permit.cancel(),
+    }));
+    // The owner has published the session, but the native registration still
+    // carries its previous attempt target. The shared latch must remain live.
+    m.shared
+        .key(preparation_id, 6, chord("F8").virtual_key().unwrap());
+    let g = m.shared.gate.lock().unwrap();
+    assert!(g.session.as_ref().unwrap().stop.load(Ordering::Acquire));
 }
 #[test]
 fn registration_id_exhaustion_never_wraps_or_reuses() {

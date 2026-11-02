@@ -966,6 +966,7 @@ pub fn run() {
             recording::recording_sources,
             recording::preview_manager::recording_windows,
             recording::preview_manager::recording_preview_start,
+            recording::preview_manager::recording_preview_viewport,
             recording::preview_manager::recording_preview_snapshot,
             recording::preview_manager::recording_preview_frame,
             recording::preview_manager::recording_preview_stop,

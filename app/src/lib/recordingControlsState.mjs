@@ -1,6 +1,17 @@
 export const SHORTCUT_ACTIONS = Object.freeze(["start", "pause", "resume", "stop"]);
 export const EMPTY_SHORTCUTS = Object.freeze({ start: null, pause: null, resume: null, stop: null });
 export const controlToken = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+export function controlsWindowAction(before, next, held, publishingCurrent) {
+  if (!before) return "none";
+  const cycleChanged = next.minimizeCycle > before.minimizeCycle;
+  const restored = next.nativeWindow === "visible" && (before.nativeWindow !== "visible" || cycleChanged);
+  // Native visibility cycles already retire the actual arm. Preserve live
+  // publication intent through their intermediate Hidden snapshot; never
+  // release an explicit local hold merely because a window was restored.
+  if (next.invalidationEpoch > before.invalidationEpoch && !restored && !cycleChanged && !held) return "retire";
+  if (restored && (!held || publishingCurrent)) return "reconcile";
+  return "none";
+}
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 export function isShortcutChord(value) {
   return !!value && ["ctrlShift", "ctrlAlt", "ctrlShiftAlt"].includes(value.modifiers) && typeof value.key === "string" &&

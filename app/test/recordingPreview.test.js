@@ -9,10 +9,19 @@ const automatic = { enabled: true, visible: true, documentVisible: true, canPrev
 
 test("a selected visible source starts preview without output or audio configuration", () => {
   assert.equal(automaticPreviewAction(automatic), "start");
-  for (const patch of [{ hasRequest: true }, { starting: true }, { stopping: true }, { previewPhase: "starting" }]) {
+  for (const patch of [{ hasRequest: true, previewPhase: "previewing" }, { starting: true }, { stopping: true }, { previewPhase: "starting" }]) {
     assert.equal(automaticPreviewAction({ ...automatic, ...patch }), "none");
   }
   assert.equal(automaticPreviewAction({ ...automatic, canPreview: false }), "none", "Area without a region must not fall back to the display");
+});
+
+test("native minimize and terminal leases recover even without document visibility events", () => {
+  const live = { ...automatic, hasRequest: true, previewPhase: "previewing" };
+  assert.equal(automaticPreviewAction({ ...live, canPreview: false }), "stop", "native window state revokes capture");
+  assert.equal(automaticPreviewAction({ ...automatic, canPreview: false }), "none", "a minimized window cannot restart");
+  assert.equal(automaticPreviewAction({ ...automatic, hasRequest: true }), "stop", "retire a native-ended request on restore");
+  assert.equal(automaticPreviewAction({ ...automatic, hasRequest: true, starting: true }), "none", "do not retire an in-flight admission");
+  assert.equal(automaticPreviewAction(automatic), "start", "restored native visibility admits a fresh request after cleanup");
 });
 
 test("explicit hide survives source availability, visibility and recording changes", () => {
@@ -48,6 +57,19 @@ function status(overrides = {}) {
   return { previewId: "native-preview-a", sequence: 10, configEpoch: 1, phase: "previewing", source,
     frameSequence: 8, sourceWidth: 641, sourceHeight: 481, lastFrameAgeMs: 0, message: null, ...overrides };
 }
+test("native presentation telemetry keeps exact clocks and rejects malformed surfaces", () => {
+  const native = status({ transport: "native", presentedFrames: 8, presentedAtQpc100ns: "12345678901234567",
+    capturedAtQpc100ns: "12345678901230000", nativeWindow: "123456", nativeVisible: true, viewportWidth: 900, viewportHeight: 500,
+    nativeContentRect: { left: 100, top: 0, width: 700, height: 500 } });
+  assert.equal(acceptPreviewSnapshot(INITIAL_PREVIEW, native), native);
+  for (const patch of [{ transport: "other" }, { presentedFrames: -1 }, { nativeWindow: 123456 },
+    { nativeVisible: "true" }, { viewportWidth: 32768 }, { capturedAtQpc100ns: 123 }, { presentedAtQpc100ns: "NaN" },
+    { nativeContentRect: { left: 500, top: 0, width: 700, height: 500 } }]) {
+    assert.throws(() => acceptPreviewSnapshot(INITIAL_PREVIEW, { ...native, ...patch }), /invalid status/);
+  }
+  const stopped = { ...native, sequence: 11, phase: "idle", nativeVisible: false, nativeWindow: null };
+  assert.equal(acceptPreviewSnapshot(stopped, native), stopped, "late native telemetry cannot resurrect a stopped surface");
+});
 function frame(overrides = {}) {
   const metadata = { previewId: "native-preview-a", configEpoch: 1, sequence: 9, width: 3, height: 2, capturedAtQpc100ns: "1234567890123456789", ...overrides };
   const json = new TextEncoder().encode(JSON.stringify(metadata));

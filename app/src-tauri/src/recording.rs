@@ -63,6 +63,8 @@ pub(crate) struct RecordingConfig {
     pub(crate) quality: String,
     pub(crate) countdown_seconds: u32,
     pub(crate) show_cursor: bool,
+    #[serde(default)]
+    pub(crate) show_capture_border: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) audio: Option<RecordingAudioConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1979,7 +1981,7 @@ fn run_session(
                 s.countdown_remaining = None;
             });
             let spool = journal.directory.join("capture.mp4");
-            let host = json!({"region":resolved["region"],"source":native,"fps":config.fps,"showCursor":config.show_cursor,"quality":config.quality,"audio":native_audio,"spoolPath":spool,"ffmpegPath":bundled_media(&app,"ffmpeg")?});
+            let host = json!({"region":resolved["region"],"source":native,"fps":config.fps,"showCursor":config.show_cursor,"showCaptureBorder":config.show_capture_border,"quality":config.quality,"audio":native_audio,"spoolPath":spool,"ffmpegPath":bundled_media(&app,"ffmpeg")?});
             let mut last_space = Instant::now();
             let mut space_error = None;
             let outcome = helper_call_stream(
@@ -1997,37 +1999,6 @@ fn run_session(
                     no_media |= progress["noMedia"] == true;
                     if let Some(reason) = progress["interruption"].as_str() {
                         space_error = Some(reason.to_string());
-                    }
-                    if progress["stopHudVisible"] == true {
-                        let attempt = manager
-                            .inner
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .start_attempt
-                            .clone();
-                        if let Some(attempt) = attempt {
-                            app.state::<controls_hotkeys::ControlsManager>()
-                                .helper_hud_visible(&attempt, &id);
-                        }
-                    }
-                    if let Some(action @ ("pause" | "resume")) = progress["hudIntent"].as_str() {
-                        let context = manager.controls.context();
-                        if let (Some(owner), Ok(operation)) =
-                            (context.owner_token, session_controls::new_operation_id())
-                        {
-                            let _ = request_transition(
-                                &app,
-                                &manager,
-                                session_controls::TransitionRequest {
-                                    owner_token: owner,
-                                    session_id: id.clone(),
-                                    operation_id: operation,
-                                    expected_control_revision: context.control_revision,
-                                    reconcile_fence_token: None,
-                                },
-                                action,
-                            );
-                        }
                     }
                     let mut clock_error = None;
                     manager.update(&app, &id, |s| {
@@ -2865,11 +2836,27 @@ mod tests {
             quality: "standard".into(),
             countdown_seconds: 3,
             show_cursor: true,
+            show_capture_border: false,
             audio: None,
             system_audio_device_id: None,
             microphone_device_id: None,
             output_directory: "out".into(),
         }
+    }
+    #[test]
+    fn older_recording_configs_default_border_off_and_keep_countdown() {
+        let mut value = serde_json::to_value(config()).unwrap();
+        value.as_object_mut().unwrap().remove("showCaptureBorder");
+        let old: RecordingConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(!old.show_capture_border);
+        assert_eq!(old.countdown_seconds, 3);
+        value["showCaptureBorder"] = serde_json::json!(true);
+        value["countdownSeconds"] = serde_json::json!(0);
+        let enabled: RecordingConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(enabled.show_capture_border);
+        assert_eq!(enabled.countdown_seconds, 0);
+        value["showCaptureBorder"] = serde_json::json!("false");
+        assert!(serde_json::from_value::<RecordingConfig>(value).is_err());
     }
     #[test]
     fn inflight_pause_ack_keeps_its_admitted_revision_after_owner_rotation() {

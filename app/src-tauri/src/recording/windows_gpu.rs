@@ -6,7 +6,7 @@ use windows::{
         Direct3D11::*,
         Dxgi::Common::*,
     },
-    core::{Interface, s},
+    core::{Interface, PCSTR, s},
 };
 
 const TRANSFER_ENTRIES: u32 = 4097 + 256;
@@ -312,6 +312,19 @@ impl Converter {
     /// Copies and converts one selected source region. Clears its compute slots
     /// before readback; the caller must not share these slots during conversion.
     pub fn convert(&self, texture: &ID3D11Texture2D, crop: &D3D11_BOX) -> Result<Vec<u8>, String> {
+        self.copy_source(texture, crop)?;
+        self.render()
+    }
+    pub fn source_view(&self) -> &ID3D11ShaderResourceView {
+        &self.source_view
+    }
+    pub fn transfer_view(&self) -> &ID3D11ShaderResourceView {
+        &self.transfer_view
+    }
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+    pub fn copy_source(&self, texture: &ID3D11Texture2D, crop: &D3D11_BOX) -> Result<(), String> {
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             texture.GetDesc(&mut desc);
@@ -334,7 +347,7 @@ impl Converter {
             self.context
                 .CopySubresourceRegion(&self.texture, 0, 0, 0, 0, texture, 0, Some(crop));
         }
-        self.render()
+        Ok(())
     }
 
     /// Reuses the just-captured crop/SRVs on this same immediate-context owner.
@@ -482,6 +495,9 @@ fn compile_shader(preview: bool) -> Result<ID3DBlob, String> {
     } else {
         SHADER.into()
     };
+    compile_code(&shader, s!("main"), s!("cs_5_0"))
+}
+fn compile_code(shader: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DBlob, String> {
     let (mut code, mut messages) = (None, None);
     let result = unsafe {
         D3DCompile(
@@ -490,8 +506,8 @@ fn compile_shader(preview: bool) -> Result<ID3DBlob, String> {
             s!("recording-nv12"),
             None,
             None,
-            s!("main"),
-            s!("cs_5_0"),
+            entry,
+            target,
             1 << 11,
             0,
             &mut code,
@@ -516,6 +532,45 @@ fn compile_shader(preview: bool) -> Result<ID3DBlob, String> {
     }
     required(code, "compiled shader")
 }
+
+/// Share the recorder's exact SDR-white/highlight/chroma/transfer routine.
+/// The native display omits only the intermediate NV12 quantization/readback.
+fn display_shader() -> String {
+    let color = SHADER
+        .split("uint y709")
+        .next()
+        .unwrap()
+        .replace("RWByteAddressBuffer Output : register(u0);", "")
+        .replace(RECORDING_SAMPLE, PREVIEW_SAMPLE);
+    format!("{color}\n{DISPLAY_SHADER}")
+}
+pub fn compile_display_shader(pixel: bool) -> Result<ID3DBlob, String> {
+    compile_code(
+        &display_shader(),
+        if pixel { s!("ps_main") } else { s!("vs_main") },
+        if pixel { s!("ps_5_0") } else { s!("vs_5_0") },
+    )
+}
+const DISPLAY_SHADER: &str = r#"
+struct DisplayVertex { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
+DisplayVertex vs_main(uint id : SV_VertexID) {
+    DisplayVertex result;
+    result.uv = float2((id << 1) & 2, id & 2);
+    result.position = float4(result.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return result;
+}
+float displayTransfer(float encoded) {
+    float linearValue = encoded < 0.081 ? encoded / 4.5 : pow((encoded + 0.099) / 1.099, 1.0 / 0.45);
+    return linearValue <= 0.0031308 ? linearValue * 12.92 : 1.055 * pow(linearValue, 1.0 / 2.4) - 0.055;
+}
+float4 ps_main(DisplayVertex input) : SV_TARGET {
+    uint pixelWidth = Reserved & 65535, pixelHeight = Reserved >> 16;
+    uint x = min((uint)(saturate(input.uv.x) * pixelWidth), pixelWidth - 1);
+    uint y = min((uint)(saturate(input.uv.y) * pixelHeight), pixelHeight - 1);
+    float3 encoded = pixel(x, y) / 255.0;
+    return float4(displayTransfer(encoded.r), displayTransfer(encoded.g), displayTransfer(encoded.b), 1);
+}
+"#;
 
 const RECORDING_SAMPLE: &str = "if (x >= SelectedWidth || y >= SelectedHeight) return uint3(0, 0, 0);\n    float3 rgb = Source.Load(int3(x, y, 0)).rgb;";
 const PREVIEW_SAMPLE: &str = r#"uint PreviewWidth = Reserved & 65535, PreviewHeight = Reserved >> 16;
@@ -586,6 +641,8 @@ mod tests {
     fn recording_and_preview_hlsl_compile_without_device() {
         compile_shader(false).expect("recording HLSL must compile");
         compile_shader(true).expect("preview HLSL must compile");
+        compile_display_shader(false).expect("native preview vertex HLSL must compile");
+        compile_display_shader(true).expect("native preview pixel HLSL must compile");
     }
     #[test]
     fn preview_shader_changes_only_sampling_and_caps_readback() {

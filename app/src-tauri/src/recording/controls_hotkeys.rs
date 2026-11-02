@@ -135,10 +135,8 @@ impl ControlsManager {
         };
         g.attempt = Some(gate::AttemptState {
             token,
-            session_id: None,
             cancel,
             admitted: false,
-            hud_visible: true,
         });
         Ok(permit)
     }
@@ -181,8 +179,6 @@ impl Default for Effects {
 enum WorkerCommand {
     Request(Box<ControlsRequest>, mpsc::Sender<ControlsReply>),
     Refresh,
-    HudVisible { attempt: String, session: String },
-    Finish { attempt: String },
 }
 #[tauri::command]
 pub(crate) async fn recording_controls(

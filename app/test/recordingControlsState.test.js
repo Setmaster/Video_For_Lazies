@@ -1,12 +1,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { EMPTY_SHORTCUTS, SHORTCUT_ACTIONS, acceptControlsSnapshot, captureShortcutEvent, isShortcutChord, shortcutLabel, startAdmissionFromAck } from "../src/lib/recordingControlsState.mjs";
+import { EMPTY_SHORTCUTS, SHORTCUT_ACTIONS, acceptControlsSnapshot, controlsWindowAction, captureShortcutEvent, isShortcutChord, shortcutLabel, startAdmissionFromAck } from "../src/lib/recordingControlsState.mjs";
 const token = "a".repeat(32);
 function state(revision, invalidationEpoch, minimizeCycle = 0) {
   return { revision, invalidationEpoch, minimizeCycle, ownerToken: token, nativeWindow: "visible", bindings: { ...EMPTY_SHORTCUTS },
     rows: Object.fromEntries(SHORTCUT_ACTIONS.map(action => [action, { configured: null, registered: null, dispatchEnabled: false, status: "unset", reason: null }])),
     assignment: null, arm: null, message: null };
 }
+test("restore through an intermediate Hidden state preserves live shortcut intent without releasing explicit holds", () => {
+  const visible = state(10, 2, 0);
+  const minimized = { ...state(11, 2, 1), nativeWindow: "minimized" };
+  const restoring = { ...state(12, 3, 2), nativeWindow: "hidden" };
+  const restored = state(13, 3, 2);
+  for (const before of [visible, minimized]) {
+    assert.equal(controlsWindowAction(before, restoring, false, false), "none", "native cycle keeps publication intent, including coalesced events");
+  }
+  assert.equal(controlsWindowAction(restoring, restored, false, false), "reconcile");
+  assert.equal(controlsWindowAction(restoring, restored, true, false), "none", "an explicit local retirement remains held after restore");
+  assert.equal(controlsWindowAction(restoring, restored, true, true), "reconcile", "same-generation publisher can queue a fresh restore reconciliation");
+  assert.equal(controlsWindowAction(restored, state(14, 4, 2), false, false), "retire", "stable-cycle close/retirement still fences local publication");
+  assert.equal(controlsWindowAction(restored, restored, false, false), "none", "ordinary snapshots cannot retry publication");
+});
 test("a newer native event cannot replace the exact older Start acknowledgement", () => {
   const acknowledged = state(8, 3, 1);
   for (const observed of [state(9, 4, 1), state(10, 4, 2)]) {

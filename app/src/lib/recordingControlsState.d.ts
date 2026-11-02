@@ -2,6 +2,7 @@ import type { ControlsSnapshot, ShortcutAction, ShortcutBindings, ShortcutChord 
 export const SHORTCUT_ACTIONS: readonly ShortcutAction[];
 export const EMPTY_SHORTCUTS: Readonly<ShortcutBindings>;
 export function controlToken(value: unknown): value is string;
+export function controlsWindowAction(before: ControlsSnapshot | null, next: ControlsSnapshot, held: boolean, publishingCurrent: boolean): "none" | "retire" | "reconcile";
 export function isShortcutChord(value: unknown): value is ShortcutChord;
 export function shortcutLabel(chord: ShortcutChord | null): string;
 export function isControlsSnapshot(value: unknown): value is ControlsSnapshot;

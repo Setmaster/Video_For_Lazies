@@ -27,6 +27,20 @@ impl Shared {
                     stop: Some(s.stop.clone()),
                 },
             );
+        } else if !g.stopped
+            && let Some(attempt) = &g.attempt
+        {
+            // A configured Stop cancels the exact preparation attempt, even
+            // before a session exists. It never depends on a floating window.
+            result.insert(
+                Action::Stop,
+                Target {
+                    key: TargetKey::Cancel {
+                        attempt: attempt.token.clone(),
+                    },
+                    stop: Some(attempt.cancel.clone()),
+                },
+            );
         }
         if !inactive {
             if g.session.is_none()
@@ -113,8 +127,8 @@ impl Shared {
         {
             return;
         }
-        // A registration captures a permanent exact-session latch. Even an old
-        // queued Stop can only stop that old session, never a newer one. It
+        // A registration captures a permanent exact-session or attempt latch.
+        // Even an old queued Stop cannot stop a newer session or attempt. It
         // must not wait for the Start fence, manager, or transition worker.
         if entry.action == Action::Stop {
             if let Some(stop) = entry.target.stop {
@@ -242,28 +256,12 @@ impl ControlsManager {
                 .as_ref()
                 .map(|s| (&s.session_id, s.control_revision, s.can_pause, s.can_resume));
             let changed = before != after;
-            if let Some(t) = target.as_ref()
-                && let Some(a) = g.attempt.as_mut().filter(|a| a.admitted)
-                && a.session_id.is_none()
-            {
-                a.session_id = Some(t.session_id.clone());
-            }
             g.session = target;
             if changed {
                 g.bump();
             }
         }
         self.shared.wake();
-    }
-    pub(crate) fn helper_hud_visible(&self, attempt_token: &str, session_id: &str) {
-        if let Ok(tx) = self.shared.commands.lock()
-            && let Some(tx) = tx.as_ref()
-        {
-            let _ = tx.try_send(WorkerCommand::HudVisible {
-                attempt: attempt_token.into(),
-                session: session_id.into(),
-            });
-        }
     }
     pub(crate) fn fail_attempt(&self, attempt_token: &str, reason: &str) {
         let exact = if let Ok(mut g) = self.shared.gate.lock() {
@@ -280,13 +278,6 @@ impl ControlsManager {
             false
         };
         if exact {
-            if let Ok(tx) = self.shared.commands.lock()
-                && let Some(tx) = tx.as_ref()
-            {
-                let _ = tx.try_send(WorkerCommand::Finish {
-                    attempt: attempt_token.into(),
-                });
-            }
             self.shared.wake();
         }
     }
@@ -297,13 +288,6 @@ impl ControlsManager {
             g.attempt = None;
             let _ = g.advance_start();
             g.bump();
-        }
-        if let Ok(tx) = self.shared.commands.lock()
-            && let Some(tx) = tx.as_ref()
-        {
-            let _ = tx.try_send(WorkerCommand::Finish {
-                attempt: attempt_token.into(),
-            });
         }
         self.shared.wake();
     }

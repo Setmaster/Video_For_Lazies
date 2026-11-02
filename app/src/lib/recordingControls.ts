@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ControlsReply, ControlsRequest, ControlsSnapshot, DraftProjection, ShortcutBindings, ShortcutChord } from "./recordingControlsTypes";
-import { acceptControlsSnapshot, controlToken, isShortcutChord, startAdmissionFromAck } from "./recordingControlsState";
+import { acceptControlsSnapshot, controlsWindowAction, controlToken, isShortcutChord, startAdmissionFromAck } from "./recordingControlsState";
 export type { ControlsSnapshot, DraftProjection, ShortcutBindings, ShortcutChord } from "./recordingControlsTypes";
 export const recordingControlId = () => crypto.randomUUID().replace(/-/g, "");
 const explanation = (failure: unknown) => failure instanceof Error ? failure.message : String(failure);
@@ -35,14 +35,14 @@ export function useRecordingControls({ blocked }: { blocked: boolean }) {
       publicationRequested.current = false; publicationContext.current = null;
       setError("Recording controls moved to another app page. Reload to reconnect.");
     }
-    const restored = before && next.nativeWindow === "visible" &&
-      (before.nativeWindow !== "visible" || next.minimizeCycle > before.minimizeCycle);
-    if (before && next.invalidationEpoch > before.invalidationEpoch && !restored && !held.current) {
+    const windowAction = controlsWindowAction(before, next, held.current,
+      publishing.current !== null && publicationGeneration.current === generation.current);
+    if (windowAction === "retire") {
       // A native close/retirement fence is not a restored-window projection.
       // Retire both a current publication and its pending follow-up locally.
       held.current = true; generation.current += 1; publicationRequested.current = false; publicationContext.current = null;
     }
-    if (restored && !blockedRef.current && (!held.current || publishing.current && publicationGeneration.current === generation.current)) void reconcileRef.current();
+    if (windowAction === "reconcile" && !blockedRef.current) void reconcileRef.current();
     return next;
   }, []);
 

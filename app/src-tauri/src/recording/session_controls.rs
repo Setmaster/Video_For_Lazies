@@ -90,32 +90,6 @@ pub(crate) fn token(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-pub(crate) fn new_operation_id() -> Result<String, String> {
-    use std::{
-        collections::hash_map::RandomState,
-        hash::{BuildHasher, Hasher},
-        sync::{OnceLock, atomic::AtomicU64},
-    };
-    static SEED: OnceLock<u64> = OnceLock::new();
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let seed = *SEED.get_or_init(|| {
-        let mut h = RandomState::new().build_hasher();
-        h.write_u32(std::process::id());
-        h.finish()
-    });
-    let mut current = NEXT.load(Ordering::Acquire);
-    let next = loop {
-        let next = current
-            .checked_add(1)
-            .filter(|n| *n <= SAFE_INTEGER)
-            .ok_or("counterExhausted")?;
-        match NEXT.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => break next,
-            Err(observed) => current = observed,
-        }
-    };
-    Ok(format!("{seed:016x}{next:016x}"))
-}
 impl SessionControls {
     pub(crate) fn replace_owner_option(&self, owner: Option<String>) {
         let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -481,26 +455,6 @@ impl SessionControls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn operation_ids_remain_valid_and_unique_under_contention() {
-        let ids = std::thread::scope(|scope| {
-            let threads: Vec<_> = (0..8)
-                .map(|_| {
-                    scope.spawn(|| {
-                        (0..128)
-                            .map(|_| new_operation_id().unwrap())
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            threads
-                .into_iter()
-                .flat_map(|thread| thread.join().unwrap())
-                .collect::<std::collections::HashSet<_>>()
-        });
-        assert_eq!(ids.len(), 1024);
-        assert!(ids.iter().all(|id| token(id)));
-    }
     fn ready() -> (SessionControls, Arc<AtomicBool>) {
         let controls = SessionControls::default();
         controls.replace_owner("a".repeat(32)).unwrap();

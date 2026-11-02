@@ -35,6 +35,8 @@ pub struct Config {
     pub region: Region,
     pub fps: u32,
     pub show_cursor: bool,
+    #[serde(default)]
+    pub show_capture_border: bool,
     pub audio: audio_types::NativeAudioConfig,
     pub quality: String,
     pub spool_path: PathBuf,
@@ -53,10 +55,6 @@ pub struct Progress {
     pub audio: Option<audio_types::AudioStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transition: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hud_intent: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stop_hud_visible: bool,
     #[serde(flatten)]
     pub controls: serde_json::Map<String, serde_json::Value>,
 }
@@ -111,6 +109,8 @@ mod ffmpeg;
 mod gpu;
 #[path = "native_controls.rs"]
 pub mod native_controls;
+#[path = "windows_surface.rs"]
+pub mod surface;
 #[path = "windows_ui.rs"]
 mod ui;
 pub use ui::{enumerate_displays, select_region};
@@ -275,6 +275,44 @@ fn capture_buffer_bytes(
     let bmp = 12 + preview::MAX_HEADER as u64 + 54 + pixels((pw * 3 + 3) & !3, ph);
     source + conversion + tap + bmp + 65_536
 }
+fn native_capture_buffer_bytes(
+    display: &Display,
+    region: &Region,
+    hdr: bool,
+    standalone: bool,
+) -> u64 {
+    let pixels = |w: u32, h: u32| u64::from(w) * u64::from(h);
+    let (w, h) = if standalone {
+        preview::dimensions(region.width, region.height)
+    } else {
+        (region.width, region.height)
+    };
+    let gpu = pixels((((w + 1) & !1) + 3) & !3, (h + 1) & !1) * 3 / 2;
+    let cpu = if standalone {
+        0
+    } else {
+        pixels((region.width + 1) & !1, (region.height + 1) & !1) * 3 / 2 * 3
+    };
+    pixels(display.width, display.height) * if hdr { 16 } else { 8 }
+        + pixels(region.width, region.height) * if hdr { 8 } else { 4 }
+        + 2 * gpu
+        + cpu
+        + 65_536
+}
+fn native_preview_budget(
+    display: &Display,
+    region: &Region,
+    hdr: bool,
+    standalone: bool,
+) -> (u64, bool) {
+    let base = native_capture_buffer_bytes(display, region, hdr, standalone);
+    let budget = CAPTURE_BUFFER_LIMIT
+        .saturating_sub(base)
+        .min(surface::MAX_SURFACE_BYTES);
+    let bitmap = budget < 480 * 270 * 8
+        && legacy_capture_buffer_bytes(display, region, hdr) <= CAPTURE_BUFFER_LIMIT;
+    (budget, bitmap)
+}
 // Preserve the inherited admission estimate for legacy-only fallback. It never
 // claimed a strict process-resident ceiling (driver/codec internals are separate).
 fn legacy_capture_buffer_bytes(display: &Display, region: &Region, hdr: bool) -> u64 {
@@ -400,8 +438,14 @@ struct Capture {
     closed: Arc<AtomicBool>,
     closed_token: i64,
     converter: gpu::Converter,
-    scaled_preview: bool,
-    legacy_preview: bool,
+    border_info: serde_json::Value,
+    presenter: std::cell::RefCell<Option<surface::Presenter>>,
+    preview_error: Option<String>,
+    use_bitmap_preview: bool,
+    bitmap_preview: std::cell::RefCell<Option<preview_control::Emitter>>,
+    native_cadence: std::cell::RefCell<preview::Cadence>,
+    native_qpc: std::cell::Cell<Option<i64>>,
+    hdr: bool,
     crop: D3D11_BOX,
     monitor_width: i32,
     monitor_height: i32,
@@ -444,22 +488,25 @@ impl Capture {
         display: &Display,
         region: &Region,
         cursor: bool,
+        border: bool,
         source: &NativeSource,
     ) -> ::windows::core::Result<Self> {
-        Self::build(display, region, cursor, source, false)
+        Self::build(display, region, cursor, border, source, false)
     }
     fn new_preview(
         display: &Display,
         region: &Region,
         cursor: bool,
+        border: bool,
         source: &NativeSource,
     ) -> ::windows::core::Result<Self> {
-        Self::build(display, region, cursor, source, true)
+        Self::build(display, region, cursor, border, source, true)
     }
     fn build(
         display: &Display,
         region: &Region,
         cursor: bool,
+        border: bool,
         source: &NativeSource,
         preview: bool,
     ) -> ::windows::core::Result<Self> {
@@ -514,7 +561,7 @@ impl Capture {
                 height: size.Height as u32,
                 ..display.clone()
             };
-            let (scaled_preview, preview_bounds, legacy_preview) =
+            let (_, preview_bounds, _) =
                 preview_plan(&buffers, region, hdr, preview).ok_or_else(|| {
                     capture_error(
                         "This source needs more than 512 MiB of controlled capture buffers",
@@ -550,6 +597,31 @@ impl Capture {
             )?;
             let session = pool.CreateCaptureSession(&item)?;
             session.SetIsCursorCaptureEnabled(cursor)?;
+            // Unsupported/denied border suppression is a structured observation,
+            // never text on stderr (reserved for the bounded binary protocol).
+            let supported = session.IsBorderRequired().is_ok();
+            let mut access_status = None;
+            let mut access_error = None;
+            let mut set_error = None;
+            if !border && supported {
+                use ::windows::Graphics::Capture::{
+                    GraphicsCaptureAccess, GraphicsCaptureAccessKind,
+                };
+                match GraphicsCaptureAccess::RequestAccessAsync(
+                    GraphicsCaptureAccessKind::Borderless,
+                )
+                .and_then(|operation| operation.get())
+                {
+                    Ok(status) => access_status = Some(status.0),
+                    Err(error) => access_error = Some(format!("0x{:08X}", error.code().0 as u32)),
+                }
+            }
+            if supported {
+                if let Err(error) = session.SetIsBorderRequired(border) {
+                    set_error = Some(format!("0x{:08X}", error.code().0 as u32));
+                }
+            }
+            let border_info = serde_json::json!({"requested":border,"apiSupported":supported,"accessStatus":access_status,"accessHresult":access_error,"setHresult":set_error,"isBorderRequired":session.IsBorderRequired().ok(),"visualBorderObserved":serde_json::Value::Null});
             let closed = Arc::new(AtomicBool::new(false));
             let signal = closed.clone();
             let closed_token = item.Closed(&TypedEventHandler::new(move |_, _| {
@@ -572,20 +644,17 @@ impl Capture {
             .map_err(|message| {
                 ::windows::core::Error::new(::windows::core::HRESULT(0x80004005u32 as i32), message)
             })?;
-            if scaled_preview && !preview {
-                // Allocate/compile before capture starts, never on an active recording slot.
-                converter
-                    .prepare_shared_preview(hdr, white, {
-                        let (width, height) = preview::dimensions_with_bounds(
-                            region.width,
-                            region.height,
-                            preview_bounds.0,
-                            preview_bounds.1,
-                        );
-                        Geometry { width, height }
-                    })
-                    .map_err(capture_error)?;
-            }
+            let (budget, use_bitmap_preview) =
+                native_preview_budget(&buffers, region, hdr, preview);
+            let (presenter, preview_error) = if use_bitmap_preview {
+                (None, None)
+            } else {
+                match surface::Presenter::new(&device, &context, budget) {
+                    Ok(presenter) => (Some(presenter), None),
+                    Err(error) if !preview => (None, Some(error)),
+                    Err(error) => return Err(capture_error(error)),
+                }
+            };
             let left = if window.is_some() {
                 0
             } else {
@@ -604,8 +673,14 @@ impl Capture {
                 closed,
                 closed_token,
                 converter,
-                scaled_preview,
-                legacy_preview,
+                border_info,
+                presenter: std::cell::RefCell::new(presenter),
+                preview_error,
+                use_bitmap_preview,
+                bitmap_preview: std::cell::RefCell::new(None),
+                native_cadence: std::cell::RefCell::new(preview::Cadence::default()),
+                native_qpc: std::cell::Cell::new(None),
+                hdr,
                 crop: D3D11_BOX {
                     left,
                     top,
@@ -662,30 +737,128 @@ impl Capture {
             ))
         }
     }
-    fn offer_preview(
-        &self,
-        emitter: &mut preview_control::Emitter,
-        qpc: i64,
-        pixels: &Arc<Vec<u8>>,
-        geometry: Geometry,
-    ) -> Result<(), String> {
-        if self.legacy_preview {
-            emitter.offer_legacy(qpc, pixels, geometry);
-            return Ok(());
-        }
-        if !emitter.wants_frame() {
-            return Ok(());
-        }
-        if self.scaled_preview {
-            if !emitter.discard_pending() {
-                return Ok(());
-            }
-            let (geometry, pixels) = self.converter.shared_preview_frame()?;
-            emitter.offer(qpc, Arc::new(pixels), geometry);
-        } else {
-            emitter.offer(qpc, pixels.clone(), geometry);
+    fn configure_preview(&self, control: &Arc<preview_control::Controls>) -> Result<(), String> {
+        control.border_info(self.border_info.clone());
+        control.transport(self.use_bitmap_preview);
+        if self.use_bitmap_preview {
+            *self.bitmap_preview.borrow_mut() =
+                Some(preview_control::Emitter::new(control.clone())?);
         }
         Ok(())
+    }
+    fn offer_bitmap_preview(&self, time: i64, pixels: &[u8], geometry: Geometry) {
+        if let Some(emitter) = self.bitmap_preview.borrow_mut().as_mut() {
+            emitter.offer_legacy(time, pixels, geometry);
+        }
+    }
+    fn offer_native_preview(
+        &self,
+        control: &preview_control::Controls,
+        time: i64,
+        geometry: Geometry,
+        already_sampled: bool,
+    ) -> Result<bool, String> {
+        if self.use_bitmap_preview {
+            return Ok(false);
+        }
+        let mut holder = self.presenter.borrow_mut();
+        let Some((lease, viewport)) = control.target() else {
+            if let Some(presenter) = holder.as_mut() {
+                presenter.hide();
+            }
+            control.hidden();
+            return Ok(false);
+        };
+        let Some(presenter) = holder.as_mut() else {
+            return Err(self
+                .preview_error
+                .clone()
+                .unwrap_or_else(|| "Native preview is unavailable.".into()));
+        };
+        if !surface::available(&viewport)? {
+            presenter.hide();
+            control.off();
+            return Ok(false);
+        }
+        if !already_sampled && !self.native_cadence.borrow_mut().poll(Instant::now()) {
+            return Ok(control.has_presented(&lease));
+        }
+        let drawn = presenter.draw(
+            &viewport,
+            &self.converter,
+            geometry,
+            (self.hdr, self.white),
+            (&lease.id, lease.epoch),
+            || control.target_matches(&lease, &viewport),
+        );
+        let frame = match drawn {
+            Ok(frame) => frame,
+            Err(error) => {
+                presenter.hide();
+                return Err(error);
+            }
+        };
+        match frame {
+            Some(frame) => control.presented(
+                &lease,
+                &viewport,
+                &frame,
+                time,
+                qpc100ns().map_err(|error| error.to_string())?,
+            ),
+            None if !presenter.visible() => control.hidden(),
+            None => {}
+        }
+        Ok(control.has_presented(&lease))
+    }
+    fn native_frame(
+        &self,
+        control: &preview_control::Controls,
+        geometry: Geometry,
+    ) -> Result<Option<i64>, String> {
+        if self.use_bitmap_preview {
+            if self
+                .bitmap_preview
+                .borrow()
+                .as_ref()
+                .is_none_or(|emitter| !emitter.wants_legacy_frame())
+            {
+                return Ok(self.native_qpc.get());
+            }
+            if let Some((time, pixels)) = self.latest_frame()? {
+                self.native_qpc.set(Some(time));
+                self.offer_bitmap_preview(time, &pixels, self.converter.pixel_geometry());
+            }
+            return Ok(self.native_qpc.get());
+        }
+        if let Some((_, viewport)) = control.target() {
+            if !surface::available(&viewport)? {
+                self.presenter
+                    .borrow_mut()
+                    .as_mut()
+                    .map(|presenter| presenter.hide());
+                control.off();
+                return Ok(None);
+            }
+        } else {
+            self.presenter
+                .borrow_mut()
+                .as_mut()
+                .map(|presenter| presenter.hide());
+            control.hidden();
+            return Ok(None);
+        }
+        if let Some((time, ())) = self.with_frame(true, |_, texture, crop| {
+            self.converter.copy_source(texture, crop)
+        })? {
+            self.native_qpc.set(Some(time));
+        }
+        if let Some(time) = self.native_qpc.get() {
+            return Ok(self
+                .offer_native_preview(control, time, geometry, true)?
+                .then_some(time));
+        }
+        Ok(None)
     }
     fn frame(&self) -> Result<Option<(i64, Vec<u8>)>, String> {
         self.frame_inner(false)
@@ -694,6 +867,15 @@ impl Capture {
         self.frame_inner(true)
     }
     fn frame_inner(&self, latest: bool) -> Result<Option<(i64, Vec<u8>)>, String> {
+        self.with_frame(latest, |_, texture, crop| {
+            self.converter.convert(texture, crop)
+        })
+    }
+    fn with_frame<R>(
+        &self,
+        latest: bool,
+        action: impl FnOnce(i64, &ID3D11Texture2D, &D3D11_BOX) -> Result<R, String>,
+    ) -> Result<Option<(i64, R)>, String> {
         if self.closed.load(Ordering::Acquire) {
             return Err("Recording source was closed or disconnected".into());
         }
@@ -712,7 +894,7 @@ impl Capture {
             let _ = frame.Close();
             frame = newer;
         }
-        let result = (|| -> ::windows::core::Result<(i64, Vec<u8>)> {
+        let result = (|| -> ::windows::core::Result<(i64, R)> {
             let size = frame.ContentSize()?;
             if size.Width != self.monitor_width || size.Height != self.monitor_height {
                 return Err(::windows::core::Error::new(
@@ -724,17 +906,9 @@ impl Capture {
             let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
             unsafe {
                 let texture: ID3D11Texture2D = access.GetInterface()?;
-                let nv12 = self
-                    .converter
-                    .convert(&texture, &self.crop)
-                    .map_err(|message| {
-                        ::windows::core::Error::new(
-                            ::windows::core::HRESULT(0x80004005u32 as i32),
-                            message,
-                        )
-                    })?;
+                let value = action(timestamp, &texture, &self.crop).map_err(capture_error)?;
                 frame.Close()?;
-                Ok((timestamp, nv12))
+                Ok((timestamp, value))
             }
         })();
         let _ = frame.Close();
@@ -1275,6 +1449,7 @@ impl PreviewSampling {
 pub fn run_preview(
     source: NativeSource,
     cursor: bool,
+    border: bool,
     stop: Arc<AtomicBool>,
     control: Arc<preview_control::Controls>,
     progress: impl Fn(serde_json::Value),
@@ -1287,9 +1462,20 @@ pub fn run_preview(
     interactive_desktop()?;
     let mut resolved = resolve_source(source.clone())?;
     control.geometry(resolved.geometry);
-    let emitter = preview_control::Emitter::new(control.clone())?;
-    let mut capture = Capture::new_preview(&resolved.display, &resolved.region, cursor, &source)
-        .map_err(|e| format!("Preview capture initialization: {e}"))?;
+    let mut capture =
+        Capture::new_preview(&resolved.display, &resolved.region, cursor, border, &source)
+            .map_err(|e| format!("Preview capture initialization: {e}"))?;
+    if stop.load(Ordering::Acquire) || control.current().is_none() {
+        return Ok(serde_json::json!({"previewStopped":true}));
+    }
+    capture.configure_preview(&control)?;
+    while !capture.use_bitmap_preview
+        && control.target().is_none()
+        && !stop.load(Ordering::Acquire)
+        && control.current().is_some()
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     if stop.load(Ordering::Acquire) || control.current().is_none() {
         return Ok(serde_json::json!({"previewStopped":true}));
     }
@@ -1309,15 +1495,10 @@ pub fn run_preview(
         if stop.load(Ordering::Acquire) || control.current().is_none() {
             break;
         }
-        if sampling.due(Instant::now()) && emitter.discard_pending() {
-            match capture.latest_frame() {
-                Ok(Some((time, image))) => {
+        if sampling.due(Instant::now()) {
+            match capture.native_frame(&control, resolved.geometry) {
+                Ok(Some(_)) => {
                     ready = true;
-                    emitter.offer_sampled(
-                        time,
-                        Arc::new(image),
-                        capture.converter.pixel_geometry(),
-                    );
                 }
                 Ok(None) => {
                     if !ready && Instant::now() > first_deadline {
@@ -1349,10 +1530,16 @@ pub fn run_preview(
                     drop(capture);
                     resolved = resolve_source(source.clone())?;
                     control.geometry(resolved.geometry);
-                    capture =
-                        Capture::new_preview(&resolved.display, &resolved.region, cursor, &source)
-                            .map_err(|e| format!("Reconfigure preview: {e}"))?;
+                    capture = Capture::new_preview(
+                        &resolved.display,
+                        &resolved.region,
+                        cursor,
+                        border,
+                        &source,
+                    )
+                    .map_err(|e| format!("Reconfigure preview: {e}"))?;
                     capture.verify_domain(&initial_domain)?;
+                    capture.configure_preview(&control)?;
                     if stop.load(Ordering::Acquire) || control.current().is_none() {
                         break;
                     }
@@ -1455,7 +1642,7 @@ fn run_inner(
     let r = &config.region;
     let geometry = resolved.geometry;
     preview_control.geometry(geometry);
-    let mut preview_emitter = preview_control::Emitter::new(preview_control.clone())?;
+
     if !config.spool_path.is_absolute() || config.spool_path.exists() {
         return Err(
             "A fresh absolute spool path is required; existing files are never replaced".into(),
@@ -1467,8 +1654,17 @@ fn run_inner(
     let _mf =
         MediaRuntime::new().map_err(|e| format!("Windows Media Foundation unavailable: {e}"))?;
     preparation_live()?;
-    let capture = Capture::new(&display, r, config.show_cursor, &native)
-        .map_err(|e| format!("Screen capture initialization: {e}"))?;
+    let capture = Capture::new(
+        &display,
+        r,
+        config.show_cursor,
+        config.show_capture_border,
+        &native,
+    )
+    .map_err(|e| format!("Screen capture initialization: {e}"))?;
+    if let Err(error) = capture.configure_preview(&preview_control) {
+        preview_control.fail(&error);
+    }
     preparation_live()?;
     let mut writer =
         Writer::new(&config).map_err(|e| format!("H.264 fragmented MP4 initialization: {e}"))?;
@@ -1482,8 +1678,6 @@ fn run_inner(
         audio_control.clone(),
         &stop,
     )?;
-    preparation_live()?;
-    let _hud = ui::StopHud::start(stop.clone(), transition_control.clone())?;
     preparation_live()?;
     capture
         .session
@@ -1509,14 +1703,18 @@ fn run_inner(
     audio_control.set_epoch(zero);
     let mut pause_request: Option<(native_controls::Transition, u64)> = None;
     let first = Arc::new(first);
-    if capture
+    capture.as_ref().unwrap().native_qpc.set(Some(zero));
+    if capture.as_ref().unwrap().use_bitmap_preview {
+        capture
+            .as_ref()
+            .unwrap()
+            .offer_bitmap_preview(zero, &first, geometry);
+    }
+    let _ = capture
         .as_ref()
         .unwrap()
-        .offer_preview(&mut preview_emitter, zero, &first, geometry)
-        .is_err()
-    {
-        preview_control.off();
-    }
+        .offer_native_preview(&preview_control, zero, geometry, false)
+        .map_err(|error| preview_control.fail(&error));
     let mut frames = VideoFrames {
         latest: first,
         latest_time: zero,
@@ -1534,10 +1732,6 @@ fn run_inner(
     let cutoff = loop {
         let now = qpc100ns().map_err(|e| format!("Recording clock: {e}"))?;
         let elapsed = active_clock::ActiveClock::media_ticks(clock.sample_at(now));
-        transition_control.update_hud(
-            (elapsed / 10_000) as u64,
-            if pause_request.is_some() { 1 } else { 0 },
-        );
         let pts = (next_video as i128 * 10_000_000 / config.fps as i128) as i64;
         let lag = (elapsed - pts).max(0);
         max_video_lag = max_video_lag.max(lag);
@@ -1555,7 +1749,6 @@ fn run_inner(
                 request,
                 clock.pause_boundary(qpc100ns().map_err(|e| e.to_string())?.max(now))?,
             ));
-            transition_control.update_hud((elapsed / 10_000) as u64, 1);
         }
         if let Some((_, boundary)) = &pause_request
             && now >= clock.physical_at(*boundary)?
@@ -1604,7 +1797,7 @@ fn run_inner(
                 break zero + active_cut;
             }
             transition_control.paused(true);
-            transition_control.update_hud(active_cut as u64 / 10_000, 2);
+
             progress(Progress {
                 controls: audio_control.notices(),
                 ready: true,
@@ -1613,8 +1806,7 @@ fn run_inner(
                 encoder: writer.encoder.clone(),
                 preview: preview_control.notice(),
                 audio: audio_control.snapshot(),
-                hud_intent: None,
-                stop_hud_visible: false,
+
                 transition: Some(
                     serde_json::json!({"operationId":request.operation_id,"controlRevision":request.control_revision,
                         "pauseRevision":request.pause_revision,"phase":"paused","cutoffSample":boundary.to_string(),"inputsReleased":true,"physicalCutoffQpc100ns":(zero+active_cut).to_string(),"releasedQpc100ns":qpc100ns().map_err(|e|e.to_string())?.to_string(),"audioPending":audio_control.pending()}),
@@ -1636,8 +1828,6 @@ fn run_inner(
                         preview: preview_control.notice(),
                         audio: audio_control.snapshot(),
                         transition: None,
-                        hud_intent: transition_control.take_intent().map(String::from),
-                        stop_hud_visible: false,
                     });
                     heartbeat = Instant::now();
                 }
@@ -1774,8 +1964,7 @@ fn run_inner(
                             encoder: writer.encoder.clone(),
                             preview: preview_control.notice(),
                             audio: audio_control.snapshot(),
-                            hud_intent: None,
-                            stop_hud_visible: false,
+
                             transition: Some(
                                 serde_json::json!({"operationId":resume.operation_id,"controlRevision":resume.control_revision,
                                     "pauseRevision":resume.pause_revision,"phase":"paused","errorCode":"sourceUnavailable"}),
@@ -1804,7 +1993,7 @@ fn run_inner(
             let Some((resume, fresh_resolved)) = resumed else {
                 break zero + active_cut;
             };
-            transition_control.update_hud(active_cut as u64 / 10_000, 3);
+
             progress(Progress {
                 controls: audio_control.notices(),
                 ready: true,
@@ -1813,8 +2002,7 @@ fn run_inner(
                 encoder: writer.encoder.clone(),
                 preview: preview_control.notice(),
                 audio: audio_control.snapshot(),
-                hud_intent: None,
-                stop_hud_visible: false,
+
                 transition: Some(
                     serde_json::json!({"operationId":resume.operation_id,"controlRevision":resume.control_revision,"pauseRevision":resume.pause_revision,"phase":"resuming","cutoffSample":boundary.to_string()}),
                 ),
@@ -1827,10 +2015,14 @@ fn run_inner(
                     &fresh_resolved.display,
                     &fresh_resolved.region,
                     config.show_cursor,
+                    config.show_capture_border,
                     &native,
                 )
                 .map_err(|e| format!("Resume capture: {e}"))?;
                 fresh.verify_domain(&initial_domain)?;
+                if let Err(error) = fresh.configure_preview(&preview_control) {
+                    preview_control.fail(&error);
+                }
                 if fresh_resolved.geometry != geometry {
                     return Err("Source geometry changed while paused.".into());
                 }
@@ -1890,10 +2082,11 @@ fn run_inner(
                 latest_time: time,
                 pending: None,
             };
+            fresh.native_qpc.set(Some(time));
             capture = Some(fresh);
             audio_control.resume_at(zero);
             transition_control.paused(false);
-            transition_control.update_hud(active_cut as u64 / 10_000, 0);
+
             cadence = CadenceGuard::new(config.fps);
             progress(Progress {
                 controls: audio_control.notices(),
@@ -1903,8 +2096,7 @@ fn run_inner(
                 encoder: writer.encoder.clone(),
                 preview: preview_control.notice(),
                 audio: audio_control.snapshot(),
-                hud_intent: None,
-                stop_hud_visible: false,
+
                 transition: Some(
                     serde_json::json!({"operationId":resume.operation_id,"controlRevision":resume.control_revision,"pauseRevision":resume.pause_revision,"phase":"recording","cutoffSample":boundary.to_string(),"physicalEpochQpc100ns":time.to_string(),"activeEpochSample":boundary.to_string()}),
                 ),
@@ -1933,13 +2125,10 @@ fn run_inner(
                 Ok(Some((time, image))) if time >= zero && time <= now + 100_000 => {
                     let image = Arc::new(image);
                     // Preview failures disable only its consumer, never the saved recording.
-                    if capture
-                        .as_ref()
-                        .unwrap()
-                        .offer_preview(&mut preview_emitter, time, &image, geometry)
-                        .is_err()
-                    {
-                        preview_control.off();
+                    let current = capture.as_ref().unwrap();
+                    current.native_qpc.set(Some(time));
+                    if current.use_bitmap_preview {
+                        current.offer_bitmap_preview(time, &image, geometry);
                     }
                     frames.push(time, image, slot);
                 }
@@ -1951,6 +2140,13 @@ fn run_inner(
                     break now;
                 }
             }
+        }
+        if let Some(current) = capture.as_ref()
+            && let Some(time) = current.native_qpc.get()
+        {
+            let _ = current
+                .offer_native_preview(&preview_control, time, geometry, false)
+                .map_err(|error| preview_control.fail(&error));
         }
         let due = (elapsed as u64 * config.fps as u64) / 10_000_000;
         if next_video <= due {
@@ -1986,8 +2182,6 @@ fn run_inner(
                     preview: preview_control.notice(),
                     audio: audio_control.snapshot(),
                     transition: None,
-                    hud_intent: None,
-                    stop_hud_visible: true,
                 });
             }
         }
@@ -2016,8 +2210,6 @@ fn run_inner(
                 preview: preview_control.notice(),
                 audio: audio_control.snapshot(),
                 transition: None,
-                hud_intent: transition_control.take_intent().map(String::from),
-                stop_hud_visible: false,
             });
             last_report = Instant::now()
         }
@@ -2492,6 +2684,13 @@ mod tests {
             capture_buffer_bytes(&display, &region, true, true, true, (960, 540))
                 < CAPTURE_BUFFER_LIMIT
         );
+        let (budget, bitmap) = native_preview_budget(&display, &region, true, false);
+        assert!(!bitmap);
+        assert!(budget >= 480 * 270 * 8);
+        assert!(
+            native_capture_buffer_bytes(&display, &region, true, false) + budget
+                <= CAPTURE_BUFFER_LIMIT
+        );
         region.width = 641;
         region.height = 481;
         assert!(
@@ -2525,6 +2724,11 @@ mod tests {
         );
         region.width = 800;
         region.height = 470;
+        let (_, bitmap) = native_preview_budget(&large, &region, true, false);
+        assert!(
+            bitmap,
+            "rare native surface retains legacy bitmap transport"
+        );
         assert_eq!(
             legacy_capture_buffer_bytes(&large, &region, true),
             536_857_600

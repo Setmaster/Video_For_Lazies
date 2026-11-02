@@ -44,6 +44,7 @@ export type RecordingConfig = {
   quality: "standard" | "high";
   countdownSeconds: number;
   showCursor: boolean;
+  showCaptureBorder: boolean;
   audio: RecordingAudioConfig;
   outputDirectory: string;
 };

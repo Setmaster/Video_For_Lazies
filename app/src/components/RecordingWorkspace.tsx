@@ -60,6 +60,8 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
   const [quality, setQuality] = useState<"standard" | "high">("standard");
   const [frameRate, setFrameRate] = useState("30");
   const [countdown, setCountdown] = useState("3");
+  const [countdownEnabled, setCountdownEnabled] = useState(false);
+  const [showCaptureBorder, setShowCaptureBorder] = useState(false);
   const [outputDirectory, setOutputDirectory] = useState("");
   const configChanges = useRef(Promise.resolve(false));
   const commitConfig = (change: () => void, isCurrent: () => boolean = () => true) => {
@@ -99,10 +101,11 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
     audioConfig.render.kind === "application" && capabilities?.audio.application.available && applications.some(app => app.id === (audioConfig.render.kind === "application" ? audioConfig.render.applicationId : "") && app.available)) &&
     (!audioConfig.microphone || microphones.some(device => device.id === audioConfig.microphone?.deviceId) && (audioConfig.microphone.suppression === "off" || capabilities?.audio.microphoneSuppression.available));
   const disabled = busy || active || previewHolds > 0 || recorder.selecting || pending !== null || !capabilities?.available;
-  const canPreview = visible && !!capabilities?.available && !busy && previewHolds === 0 && !recorder.selecting && pending === null &&
+  const canPreview = visible && controls.snapshot?.nativeWindow === "visible" && !!capabilities?.available && !busy && previewHolds === 0 && !recorder.selecting && pending === null &&
     (!active ? !!selectedSource : snapshot.phase === "recording");
-  const preview = useRecordingPreview({ enabled: previewEnabled, canPreview, visible, source: active && snapshot.config ? snapshot.config.source : selectedSource,
-    showCursor: active && snapshot.config ? snapshot.config.showCursor : showCursor, recordingPhase: snapshot.phase, recordingSessionId: snapshot.sessionId,
+  const preview = useRecordingPreview({ enabled: previewEnabled, canPreview, visible, windowCycle: controls.snapshot?.minimizeCycle ?? 0, source: active && snapshot.config ? snapshot.config.source : selectedSource,
+    showCursor: active && snapshot.config ? snapshot.config.showCursor : showCursor,
+    showCaptureBorder: active && snapshot.config ? snapshot.config.showCaptureBorder : showCaptureBorder, recordingPhase: snapshot.phase, recordingSessionId: snapshot.sessionId,
     onAdmissionBusyChange: onPreviewAdmissionBusyChange });
   const ready = controls.ready && !preview.starting && !preview.stopping && preview.snapshot.phase !== "starting" && !disabled && recorder.connected && selectedSource !== null && audioReady && outputDirectory.trim() !== "";
   const canCancel = ["preparing", "countdown", "starting"].includes(snapshot.phase);
@@ -149,7 +152,8 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
     }
     setAudioConfig(config.audio);
     setShowCursor(config.showCursor); setQuality(config.quality); setFrameRate(String(config.fps));
-    setCountdown(String(config.countdownSeconds)); setOutputDirectory(config.outputDirectory);
+    setCountdownEnabled(config.countdownSeconds > 0);
+    setCountdown(String(config.countdownSeconds || 3)); setShowCaptureBorder(config.showCaptureBorder); setOutputDirectory(config.outputDirectory);
   }, [active, snapshot, sources]);
 
   function changeCaptureMode(mode: "area" | "display" | "window") {
@@ -194,7 +198,7 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
     if (!admission) return;
     const config: RecordingConfig = {
       requestId: crypto.randomUUID(), source: selectedSource, fps: Number(frameRate), quality,
-      countdownSeconds: Number(countdown), showCursor,
+      countdownSeconds: countdownEnabled ? Number(countdown) : 0, showCursor, showCaptureBorder,
       audio: audioConfig, outputDirectory,
     };
     startedRequest.current = config.requestId;
@@ -204,11 +208,11 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
   }
 
   const draftKey = JSON.stringify({ visible, busy, active, selecting: recorder.selecting, pending, source: selectedSource,
-    quality, frameRate, countdown, showCursor, audio: audioConfig, outputDirectory, connected: recorder.connected, available: capabilities?.available, audioReady });
+    quality, frameRate, countdown, countdownEnabled, showCursor, showCaptureBorder, audio: audioConfig, outputDirectory, connected: recorder.connected, available: capabilities?.available, audioReady });
   useLayoutEffect(() => {
     controls.projectDraft({ visible, busy: busy || active || recorder.selecting || pending !== null,
       config: recorder.connected && capabilities?.available && selectedSource && audioReady && outputDirectory.trim() ? {
-        source: selectedSource, fps: Number(frameRate), quality, countdownSeconds: Number(countdown), showCursor,
+        source: selectedSource, fps: Number(frameRate), quality, countdownSeconds: countdownEnabled ? Number(countdown) : 0, showCursor, showCaptureBorder,
         audio: audioConfig, outputDirectory,
       } : null });
   // Deliberately keyed to committed draft/context, never controls snapshots or lease replies.
@@ -321,9 +325,11 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
               <div className="vfl-inline-hint">HDR displays are converted to SDR.</div>
               <div className="vfl-row2">
                 <div className="vfl-field"><label htmlFor="vfl-record-frame-rate">Frame rate</label><select id="vfl-record-frame-rate" value={frameRate} disabled={disabled} onChange={(event) => { const value = event.currentTarget.value; void commitConfig(() => setFrameRate(value)); }}>{[24, 25, 30, 50, 60].map((fps) => <option key={fps} value={String(fps)}>{fps} fps</option>)}</select></div>
-                <div className="vfl-field"><label htmlFor="vfl-record-countdown">Countdown</label><select id="vfl-record-countdown" value={countdown} disabled={disabled} aria-describedby="vfl-record-countdown-hint" onChange={(event) => { const value = event.currentTarget.value; void commitConfig(() => setCountdown(value)); }}><option value="0">None</option><option value="3">3 seconds</option><option value="5">5 seconds</option></select></div>
+                <div className="vfl-field"><label className="vfl-check"><input id="vfl-record-countdown-enabled" type="checkbox" aria-describedby="vfl-record-countdown-hint" checked={countdownEnabled} disabled={disabled} onChange={(event) => { const value = event.currentTarget.checked; void commitConfig(() => setCountdownEnabled(value)); }} /><span>Countdown</span></label>{countdownEnabled && <select aria-label="Countdown duration" id="vfl-record-countdown" value={countdown} disabled={disabled} aria-describedby="vfl-record-countdown-hint" onChange={(event) => { const value = event.currentTarget.value; void commitConfig(() => setCountdown(value)); }}><option value="3">3 seconds</option><option value="5">5 seconds</option></select>}</div>
               </div>
-              <div id="vfl-record-countdown-hint" className="vfl-inline-hint">None starts capture as soon as preparation finishes; 3 or 5 seconds gives you time to get ready.</div>
+              <div id="vfl-record-countdown-hint" className="vfl-inline-hint">Start immediately after preparation, or enable a countdown to get ready.</div>
+              <label className="vfl-check"><input id="vfl-record-capture-border" type="checkbox" checked={showCaptureBorder} disabled={disabled} aria-describedby="vfl-record-capture-border-hint" onChange={(event) => { const value = event.currentTarget.checked; void commitConfig(() => setShowCaptureBorder(value)); }} /><span>Show capture border</span></label>
+              <div id="vfl-record-capture-border-hint" className="vfl-inline-hint">Windows may require the border if permission is denied or another app needs it.</div>
               <label className="vfl-check"><input type="checkbox" checked={showCursor} disabled={disabled} onChange={(event) => { const value = event.currentTarget.checked; void commitConfig(() => setShowCursor(value)); }} /><span>Show cursor</span></label>
             </div>
           </section>
@@ -352,7 +358,7 @@ export default function RecordingWorkspace({ visible, controls, busy = false, on
         <div className="vfl-footer-main">
           <div className="vfl-record-footer-copy">
             <div className="vfl-record-footer-line"><span className="vfl-footer-kicker">Record</span><span role="status" aria-live="polite">{pending === "selection" ? "Select an area on your display" : capabilities?.available === false ? "Recording unavailable" : phaseTitles[snapshot.phase]}</span></div>
-            <div className="vfl-inline-hint">{active ? `${formatRecordingDuration(snapshot.elapsedMs)} · ${(snapshot.bytesWritten / 1048576).toFixed(1)} MB written` : busy ? "Finish the current app activity before recording." : !capabilities?.available ? capabilities?.reason || "Checking recording support." : sourceProblem ? sourceProblem : !audioReady ? "Choose an available audio device or turn that source off." : !outputDirectory ? "Choose a local output folder." : "Recording begins only after Start recording and the countdown."}</div>
+            <div className="vfl-inline-hint">{active ? `${formatRecordingDuration(snapshot.elapsedMs)} · ${(snapshot.bytesWritten / 1048576).toFixed(1)} MB written` : busy ? "Finish the current app activity before recording." : !capabilities?.available ? capabilities?.reason || "Checking recording support." : sourceProblem ? sourceProblem : !audioReady ? "Choose an available audio device or turn that source off." : !outputDirectory ? "Choose a local output folder." : countdownEnabled ? "Recording begins after Start recording and the countdown." : "Recording begins after Start recording and preparation."}</div>
           </div>
           <div className="vfl-footer-actions">
             {snapshot.phase === "recording" && <button id="vfl-record-pause" type="button" disabled={pending !== null || snapshot.pendingTransition !== null || !controls.ownerToken} onClick={() => void changeRecordingPhase("pause")}>Pause</button>}

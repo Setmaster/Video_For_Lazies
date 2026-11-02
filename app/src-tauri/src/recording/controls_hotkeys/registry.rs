@@ -21,6 +21,9 @@ pub(super) enum TargetKey {
     Stop {
         session: String,
     },
+    Cancel {
+        attempt: String,
+    },
 }
 #[derive(Clone)]
 pub(super) struct Target {

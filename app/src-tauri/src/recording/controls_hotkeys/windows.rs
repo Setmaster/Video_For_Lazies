@@ -1,4 +1,4 @@
-//! All registrations and preparation windows belong to this one native thread.
+//! All shortcut registrations belong to this one native message-only thread.
 //! The main-window subclass only fences a small state object and forwards.
 use super::*;
 use ::windows::{
@@ -59,8 +59,10 @@ unsafe extern "system" fn observer(
 ) -> LRESULT {
     // The stable allocation belongs to this exact subclass until NCDESTROY.
     let reference = unsafe { &*(data as *const Observer) };
+    // Forwarding can synchronously destroy the window and free the Observer.
+    let shared = reference.shared.clone();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Some(shared) = reference.shared.upgrade()
+        if let Some(shared) = shared.upgrade()
             && let Ok(mut g) = shared.gate.lock()
         {
             if g.hwnd != h.0 as usize {
@@ -70,15 +72,14 @@ unsafe extern "system" fn observer(
                 && (wp.0 & 0xfff0) == SC_RESTORE as usize
                 && g.window == NativeWindow::Minimized
             {
-                // Fence before Tao/DefSubclassProc can forward a restore transition.
-                g.observe(NativeWindow::Visible, Instant::now());
+                // Retire retained shortcuts before forwarding, without claiming
+                // that the native window has already finished restoring.
+                g.observe(NativeWindow::Hidden, Instant::now());
             } else if message == WM_SIZE {
                 let next = if wp.0 as u32 == SIZE_MINIMIZED {
                     NativeWindow::Minimized
-                } else if unsafe { IsWindowVisible(h) }.as_bool() {
-                    NativeWindow::Visible
                 } else {
-                    NativeWindow::Hidden
+                    classify(h.0 as usize)
                 };
                 g.observe(next, Instant::now());
             } else if message == WM_SHOWWINDOW {
@@ -103,7 +104,7 @@ unsafe extern "system" fn observer(
         // No callback can use this reference once this subclass is removed.
         if removed {
             drop(unsafe { Box::from_raw(data as *mut Observer) });
-        } else if let Some(shared) = reference.shared.upgrade()
+        } else if let Some(shared) = shared.upgrade()
             && let Ok(mut error) = shared.cleanup_error.lock()
         {
             *error = Some(
@@ -113,7 +114,22 @@ unsafe extern "system" fn observer(
         }
         result
     } else {
-        unsafe { DefSubclassProc(h, message, wp, lp) }
+        let result = unsafe { DefSubclassProc(h, message, wp, lp) };
+        if message == WM_SYSCOMMAND && (wp.0 & 0xfff0) == SC_RESTORE as usize {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(shared) = shared.upgrade() {
+                    if let Ok(mut g) = shared.gate.lock()
+                        && g.observer_live
+                        && g.hwnd == h.0 as usize
+                    {
+                        let current = classify(g.hwnd);
+                        g.observe(current, Instant::now());
+                    }
+                    shared.wake();
+                }
+            }));
+        }
+        result
     }
 }
 pub(super) fn initialize(
@@ -281,7 +297,6 @@ impl Registrar for WinRegistrar {
 }
 struct WindowState {
     shared: Weak<Shared>,
-    cancel: Option<Arc<AtomicBool>>,
 }
 unsafe extern "system" fn window_proc(h: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
@@ -300,15 +315,6 @@ unsafe extern "system" fn window_proc(h: HWND, message: u32, wp: WPARAM, lp: LPA
                         ((lp.0 as u32) >> 16) & 0xffff,
                     );
                 }
-                return Some(LRESULT(0));
-            }
-            if message == WM_MOUSEACTIVATE && state.cancel.is_some() {
-                return Some(LRESULT(MA_NOACTIVATE as isize));
-            }
-            if (message == WM_CLOSE || (message == WM_COMMAND && (wp.0 & 0xffff) == 100))
-                && let Some(cancel) = &state.cancel
-            {
-                cancel.store(true, Ordering::Release);
                 return Some(LRESULT(0));
             }
         }
@@ -370,78 +376,35 @@ impl Class {
         }
         Ok(Self { name, instance })
     }
-    fn window(
-        &self,
-        shared: Weak<Shared>,
-        cancel: Option<Arc<AtomicBool>>,
-    ) -> Result<OwnedWindow, String> {
-        let hud = cancel.is_some();
-        let mut state = Box::new(WindowState { shared, cancel });
+    fn window(&self, shared: Weak<Shared>) -> Result<OwnedWindow, String> {
+        let mut state = Box::new(WindowState { shared });
         let h = unsafe {
             CreateWindowExW(
-                if hud {
-                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
-                } else {
-                    WINDOW_EX_STYLE(0)
-                },
+                WINDOW_EX_STYLE(0),
                 PCWSTR(self.name.as_ptr()),
-                w!("Recording preparation - Cancel to stop"),
-                if hud {
-                    WS_CAPTION | WS_SYSMENU
-                } else {
-                    WINDOW_STYLE(0)
-                },
-                24,
-                24,
-                380,
-                110,
-                if hud { None } else { Some(HWND_MESSAGE) },
+                w!("VFL recording shortcuts"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
                 None,
                 Some(self.instance),
                 Some((&mut *state as *mut WindowState).cast()),
             )
         }
         .map_err(|e| e.to_string())?;
-        let owned = OwnedWindow {
+        Ok(OwnedWindow {
             h,
             state: Some(state),
-        };
-        if hud {
-            unsafe { SetWindowDisplayAffinity(h, WINDOW_DISPLAY_AFFINITY(0x11)) }
-                .map_err(|e| format!("Preparation HUD capture exclusion failed: {e}"))?;
-            unsafe {
-                CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
-                    w!("BUTTON"),
-                    w!("Cancel recording"),
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    16,
-                    16,
-                    330,
-                    34,
-                    Some(h),
-                    Some(HMENU(100 as *mut _)),
-                    Some(self.instance),
-                    None,
-                )
-            }
-            .map_err(|e| e.to_string())?;
-            let _ = unsafe { ShowWindow(h, SW_SHOWNOACTIVATE) };
-            if !unsafe { IsWindowVisible(h) }.as_bool() {
-                return Err("Recording preparation Cancel HUD could not be shown.".into());
-            }
-        }
-        Ok(owned)
+        })
     }
 }
 impl Drop for Class {
     fn drop(&mut self) {
         let _ = unsafe { UnregisterClassW(PCWSTR(self.name.as_ptr()), Some(self.instance)) };
     }
-}
-struct Hud {
-    token: String,
-    _window: OwnedWindow,
 }
 fn owner(
     manager: ControlsManager,
@@ -452,7 +415,7 @@ fn owner(
 ) -> Result<(), String> {
     let init = (|| {
         let class = Class::new()?;
-        let window = class.window(Arc::downgrade(&manager.shared), None)?;
+        let window = class.window(Arc::downgrade(&manager.shared))?;
         Ok::<_, String>((class, window))
     })();
     let (class, window) = match init {
@@ -467,7 +430,6 @@ fn owner(
     };
     let mut registry = Registry::new(WinRegistrar { window: window.h }, bindings);
     let mut mutations = service::Mutations::new();
-    let mut hud: Option<Hud> = None;
     let mut message = MSG::default();
     let mut last_emit = Instant::now();
     let mut emitted_revision = u64::MAX;
@@ -487,26 +449,6 @@ fn owner(
                 Ok(WorkerCommand::Request(request, reply)) => {
                     let result = mutations.execute(&manager, &mut registry, &mut store, *request);
                     let _ = reply.send(result);
-                }
-                Ok(WorkerCommand::HudVisible { attempt, session }) => {
-                    let matching = manager
-                        .shared
-                        .gate
-                        .lock()
-                        .map(|g| {
-                            g.attempt.as_ref().is_some_and(|a| {
-                                a.token == attempt && a.session_id.as_deref() == Some(&session)
-                            }) && g.session.as_ref().is_some_and(|s| s.session_id == session)
-                        })
-                        .unwrap_or(false);
-                    if matching && hud.as_ref().is_some_and(|h| h.token == attempt) {
-                        hud.take();
-                    }
-                }
-                Ok(WorkerCommand::Finish { attempt }) => {
-                    if hud.as_ref().is_some_and(|h| h.token == attempt) {
-                        hud.take();
-                    }
                 }
                 Ok(WorkerCommand::Refresh) => {}
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -539,21 +481,7 @@ fn owner(
                 .ok()
                 .and_then(|mut q| q.pop_front());
             let Some(entry) = next else { break };
-            dispatch(&manager, &class, &mut hud, entry);
-        }
-        // A failed validation/terminal retires only its exact HUD. An admitted attempt
-        // retains Cancel until the helper's explicit Stop-HUD-visible acknowledgement.
-        let keep = manager
-            .shared
-            .gate
-            .lock()
-            .ok()
-            .and_then(|g| g.attempt.as_ref().map(|a| a.token.clone()));
-        if hud
-            .as_ref()
-            .is_some_and(|h| Some(&h.token) != keep.as_ref())
-        {
-            hud.take();
+            dispatch(&manager, entry);
         }
         let revision = manager.shared.gate.lock().map(|g| g.revision).unwrap_or(0);
         if revision != emitted_revision && last_emit.elapsed() >= Duration::from_millis(50) {
@@ -565,17 +493,11 @@ fn owner(
     }
     let cleanup = registry.disable_all();
     manager.shared.publish(&registry);
-    hud.take();
     drop(window);
     drop(class);
     cleanup
 }
-fn dispatch(
-    manager: &ControlsManager,
-    class: &Class,
-    hud: &mut Option<Hud>,
-    entry: registry::Entry,
-) {
+fn dispatch(manager: &ControlsManager, entry: registry::Entry) {
     let backend = manager.shared.backend.lock().ok().and_then(|b| b.clone());
     let Some(backend) = backend else { return };
     let prepared = (|| -> Result<ControlIntent, String> {
@@ -621,10 +543,8 @@ fn dispatch(
                 };
                 g.attempt = Some(gate::AttemptState {
                     token: token.clone(),
-                    session_id: None,
                     cancel: cancel.clone(),
                     admitted: false,
-                    hud_visible: false,
                 });
                 g.bump();
                 Ok(ControlIntent::Start(Box::new(StartAttempt {
@@ -662,7 +582,7 @@ fn dispatch(
                     })
                 }
             }
-            Action::Stop => Err("Stop is dispatched directly to its exact-session latch.".into()),
+            Action::Stop => Err("Stop is dispatched directly to its exact target latch.".into()),
         }
     })();
     let intent = match prepared {
@@ -670,17 +590,8 @@ fn dispatch(
         Err(_) => return,
     };
     if let ControlIntent::Start(attempt) = &intent {
-        // Show a real independent Cancel path before any backend resolution/work.
-        let window = match class.window(
-            Arc::downgrade(&manager.shared),
-            Some(attempt.cancel.clone()),
-        ) {
-            Ok(window) => window,
-            Err(e) => {
-                manager.fail_attempt(&attempt.token, &e);
-                return;
-            }
-        };
+        // The main controls and optional exact-attempt Stop latch own cancellation.
+        // Recheck the permit before backend work without creating a native HUD.
         let eligible = manager
             .shared
             .gate
@@ -688,27 +599,15 @@ fn dispatch(
             .map(|mut g| {
                 let current = classify(g.hwnd);
                 g.observe(current, Instant::now());
-                if let Some(a) = g
-                    .attempt
-                    .as_mut()
-                    .filter(|a| a.token == attempt.token && !a.cancel.load(Ordering::Acquire))
-                {
-                    a.hud_visible = true;
-                    true
-                } else {
-                    false
-                }
+                g.attempt
+                    .as_ref()
+                    .is_some_and(|a| a.token == attempt.token && !a.cancel.load(Ordering::Acquire))
             })
             .unwrap_or(false);
         if !eligible {
-            drop(window);
             manager.finish_attempt(&attempt.token);
             return;
         }
-        *hud = Some(Hud {
-            token: attempt.token.clone(),
-            _window: window,
-        });
     }
     let token = match &intent {
         ControlIntent::Start(a) => Some(a.token.clone()),
