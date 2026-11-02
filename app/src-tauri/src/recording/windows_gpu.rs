@@ -1,5 +1,5 @@
 //! Owner-thread D3D11 conversion of cropped WGC frames to limited-range BT.709 NV12.
-use std::{cell::RefCell, marker::PhantomData, rc::Rc};
+use std::{marker::PhantomData, rc::Rc};
 use windows::{
     Win32::Graphics::{
         Direct3D::{D3D_SRV_DIMENSION_BUFFER, Fxc::D3DCompile, ID3DBlob},
@@ -66,7 +66,6 @@ pub struct Converter {
     pixel_height: u32,
     format: DXGI_FORMAT,
     layout: Layout,
-    shared_preview: RefCell<Option<Box<Converter>>>,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
@@ -296,7 +295,6 @@ impl Converter {
                 pixel_height,
                 format,
                 layout,
-                shared_preview: RefCell::new(None),
                 _owner_thread: PhantomData,
             })
         }
@@ -320,9 +318,6 @@ impl Converter {
     }
     pub fn transfer_view(&self) -> &ID3D11ShaderResourceView {
         &self.transfer_view
-    }
-    pub fn context(&self) -> &ID3D11DeviceContext {
-        &self.context
     }
     pub fn copy_source(&self, texture: &ID3D11Texture2D, crop: &D3D11_BOX) -> Result<(), String> {
         unsafe {
@@ -348,39 +343,6 @@ impl Converter {
                 .CopySubresourceRegion(&self.texture, 0, 0, 0, 0, texture, 0, Some(crop));
         }
         Ok(())
-    }
-
-    /// Reuses the just-captured crop/SRVs on this same immediate-context owner.
-    /// Only capped GPU output/readback and capped CPU pixels are additional.
-    pub fn prepare_shared_preview(
-        &self,
-        hdr: bool,
-        white: f32,
-        output: super::source::Geometry,
-    ) -> Result<(), String> {
-        let mut preview = self.shared_preview.borrow_mut();
-        if preview.is_none() {
-            let device = unsafe { self.context.GetDevice() }.map_err(gpu_error)?;
-            let output = (output.width, output.height);
-            *preview = Some(Box::new(Self::build(
-                &device,
-                &self.context,
-                self.selected_width,
-                self.selected_height,
-                hdr,
-                white,
-                Some((output, Some(self))),
-            )?));
-        }
-        Ok(())
-    }
-
-    pub fn shared_preview_frame(&self) -> Result<(super::source::Geometry, Vec<u8>), String> {
-        let preview = self.shared_preview.borrow();
-        let preview = preview
-            .as_ref()
-            .ok_or("Preview readback was not prepared before capture")?;
-        Ok((preview.pixel_geometry(), preview.render()?))
     }
 
     fn render(&self) -> Result<Vec<u8>, String> {

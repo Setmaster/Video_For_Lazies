@@ -616,10 +616,8 @@ impl Capture {
                     Err(error) => access_error = Some(format!("0x{:08X}", error.code().0 as u32)),
                 }
             }
-            if supported {
-                if let Err(error) = session.SetIsBorderRequired(border) {
-                    set_error = Some(format!("0x{:08X}", error.code().0 as u32));
-                }
+            if supported && let Err(error) = session.SetIsBorderRequired(border) {
+                set_error = Some(format!("0x{:08X}", error.code().0 as u32));
             }
             let border_info = serde_json::json!({"requested":border,"apiSupported":supported,"accessStatus":access_status,"accessHresult":access_error,"setHresult":set_error,"isBorderRequired":session.IsBorderRequired().ok(),"visualBorderObserved":serde_json::Value::Null});
             let closed = Arc::new(AtomicBool::new(false));
@@ -833,18 +831,16 @@ impl Capture {
         }
         if let Some((_, viewport)) = control.target() {
             if !surface::available(&viewport)? {
-                self.presenter
-                    .borrow_mut()
-                    .as_mut()
-                    .map(|presenter| presenter.hide());
+                if let Some(presenter) = self.presenter.borrow_mut().as_mut() {
+                    presenter.hide();
+                }
                 control.off();
                 return Ok(None);
             }
         } else {
-            self.presenter
-                .borrow_mut()
-                .as_mut()
-                .map(|presenter| presenter.hide());
+            if let Some(presenter) = self.presenter.borrow_mut().as_mut() {
+                presenter.hide();
+            }
             control.hidden();
             return Ok(None);
         }

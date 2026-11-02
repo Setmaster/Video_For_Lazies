@@ -293,7 +293,6 @@ impl Latest {
 pub struct Emitter {
     control: Arc<Controls>,
     latest: Arc<Latest>,
-    cadence: preview::Cadence,
     legacy_last: Option<Instant>,
 }
 impl Emitter {
@@ -358,7 +357,6 @@ impl Emitter {
         Ok(Self {
             control,
             latest,
-            cadence: preview::Cadence::default(),
             legacy_last: None,
         })
     }
@@ -413,33 +411,6 @@ impl Emitter {
             pixels: Arc::new(Vec::new()),
             geometry,
             frame: Some(frame),
-        });
-    }
-    pub fn wants_frame(&self) -> bool {
-        self.cadence.due(Instant::now()) && self.control.current().is_some()
-    }
-    /// Called before scaled GPU readback: the sole worker may retain one frame,
-    /// but any obsolete pending allocation must be released before its replacement.
-    pub fn discard_pending(&self) -> bool {
-        self.latest.discard_pending()
-    }
-    pub fn offer(&mut self, qpc: i64, pixels: Arc<Vec<u8>>, geometry: Geometry) {
-        if !self.cadence.poll(Instant::now()) {
-            return;
-        }
-        self.offer_sampled(qpc, pixels, geometry);
-    }
-    /// Standalone capture has already applied its sole cadence before readback.
-    pub fn offer_sampled(&self, qpc: i64, pixels: Arc<Vec<u8>>, geometry: Geometry) {
-        let Some(lease) = self.control.current() else {
-            return;
-        };
-        self.latest.offer(Job {
-            lease,
-            qpc,
-            pixels,
-            geometry,
-            frame: None,
         });
     }
 }
