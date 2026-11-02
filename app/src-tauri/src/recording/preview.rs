@@ -446,7 +446,7 @@ mod tests {
         let (width, height) = (1920, 1080);
         let mut nv12 = vec![128; width * height * 3 / 2];
         for row in nv12[..width * height].chunks_exact_mut(width) {
-            for pair in row.chunks_exact_mut(2) {
+            for pair in row.as_chunks_mut::<2>().0 {
                 pair.copy_from_slice(&[16, 235]);
             }
         }
