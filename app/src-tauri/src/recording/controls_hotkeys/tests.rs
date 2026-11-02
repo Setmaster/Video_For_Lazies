@@ -408,16 +408,7 @@ fn restore_fences_before_forwarding_and_publishes_completed_visibility() {
         (g.revision, g.invalidation_epoch, g.minimize_cycle)
     };
     assert!(m.ui_start_permit(old_context).is_err());
-    let called = AtomicBool::new(false);
-    assert!(
-        old_permit
-            .admit(|| {
-                called.store(true, Ordering::Release);
-                Ok(())
-            })
-            .is_err()
-    );
-    assert!(!called.load(Ordering::Acquire));
+    assert!(old_permit.cancel.load(Ordering::Acquire));
     {
         let mut g = m.shared.gate.lock().unwrap();
         // Only the actual post-forward classification makes preview eligible.
@@ -431,6 +422,19 @@ fn restore_fences_before_forwarding_and_publishes_completed_visibility() {
         g.observe(NativeWindow::Visible, now);
         assert_eq!(g.revision, visible_revision);
     }
+    // Admission also classifies the real HWND on Windows. This fixture has no
+    // HWND, so check the synthetic restore transition before that separate
+    // validation can observe Unavailable and advance its invalidation epoch.
+    let called = AtomicBool::new(false);
+    assert!(
+        old_permit
+            .admit(|| {
+                called.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(!called.load(Ordering::Acquire));
 }
 #[test]
 fn background_and_occlusion_hints_do_not_retire_ordinary_lease() {
