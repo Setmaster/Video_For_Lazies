@@ -202,7 +202,16 @@
 }
 
 .vfl-record-preview-heading {
+  /* Capture starts only inside the visible canvas. Keep status changes from
+     wrapping the controls and moving that canvas outside its scroll clip. */
+  flex: 1 1 0;
   min-width: 0;
+}
+
+#vfl-record-preview-status {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .vfl-record-preview-heading h3 {
@@ -261,6 +270,9 @@
 
 .vfl-record-preview-dimensions {
   flex: 0 0 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   text-align: right;
   font-variant-numeric: tabular-nums;
 }

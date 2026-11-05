@@ -62,7 +62,7 @@ export default function RecordingPreview({ preview, canPreview, recording, enabl
     <div className="vfl-record-preview-head">
       <div className="vfl-record-preview-heading">
         <h3>Source preview</h3>
-        <div id="vfl-record-preview-status" className="vfl-inline-hint" role="status" aria-live="polite">{status}</div>
+        <div id="vfl-record-preview-status" className="vfl-inline-hint" role="status" aria-live="polite" title={status}>{status}</div>
       </div>
       <div className="vfl-actions vfl-actions-wrap">
         <button id={enabled ? "vfl-record-preview-stop" : "vfl-record-preview-start"} type="button"
@@ -81,7 +81,11 @@ export default function RecordingPreview({ preview, canPreview, recording, enabl
         aria-label={recordingPhase === "recording" ? "Live preview of the recording source" : "Live preview of the selected capture source"} />
       {!visibleImage && <div className="vfl-record-preview-placeholder"><strong>{placeholderTitle}</strong><p>{placeholderHint}</p></div>}
     </div>
-    {visibleImage && snapshot.sourceWidth > 0 && <div className="vfl-inline-hint vfl-record-preview-dimensions">{snapshot.sourceWidth} × {snapshot.sourceHeight} source pixels</div>}
+    <div className="vfl-inline-hint vfl-record-preview-dimensions"
+      aria-hidden={!visibleImage || snapshot.sourceWidth <= 0}
+      style={{ visibility: visibleImage && snapshot.sourceWidth > 0 ? "visible" : "hidden" }}>
+      {snapshot.sourceWidth > 0 ? `${snapshot.sourceWidth} × ${snapshot.sourceHeight} source pixels` : "\u00a0"}
+    </div>
     {snapshot.message && <div className="vfl-inline-hint">{snapshot.message}</div>}
     {error && <div className="vfl-error" role="alert">{error}</div>}
   </div>;
