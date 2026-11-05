@@ -108,7 +108,8 @@ impl PreparedVideo {
             120000 / target
         );
         if let Some(i) = result.iter().position(|arg| arg == "-vf") {
-            result[i + 1] = format!("{prefix},{},{suffix}", result[i + 1]);
+            result[i + 1] =
+                crate::video::thumbnail::wrap_timeline(&result[i + 1], &prefix, &suffix);
         } else {
             // Options must precede the final destination.
             let end = result.len().saturating_sub(1);

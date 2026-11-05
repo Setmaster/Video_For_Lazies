@@ -7,6 +7,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { confirm as nativeConfirmDialog, open as nativeOpenDialog, save as nativeSaveDialog, type OpenDialogOptions } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { SmoothMotionControl } from "./components/SmoothMotionControl";
+import { ThumbnailControl } from "./components/ThumbnailControl";
 import { normalizeInterpolation, interpolationConflict, interpolationModelLabel } from "./lib/interpolation";
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
@@ -36,6 +37,8 @@ import type {
   EncodeFinishedPayload,
   EncodeProgressPayload,
   EncodeRequest,
+  ThumbnailSettings,
+  ThumbnailInspection,
   ExportDiagnostics,
   OutputFormat,
   InterpolationSettings,
@@ -229,11 +232,12 @@ const APP_LINKS = {
   security: "https://github.com/Setmaster/Video_For_Lazies/security/advisories/new",
 } as const;
 
-type RailCardKey = "source" | "recipes" | "smoothMotion" | "output" | "crop" | "transform" | "advanced" | "plan" | "queue";
+type RailCardKey = "source" | "recipes" | "smoothMotion" | "thumbnail" | "output" | "crop" | "transform" | "advanced" | "plan" | "queue";
 const DEFAULT_OPEN_CARDS: Record<RailCardKey, boolean> = {
   source: true,
   recipes: true,
   smoothMotion: false,
+  thumbnail: false,
   output: true,
   crop: false,
   transform: false,
@@ -750,6 +754,11 @@ function App() {
   const [perturbFirstFrame, setPerturbFirstFrame] = useState(false);
   const [colorPolicy, setColorPolicy] = useState<ColorPolicy>("auto");
   const [interpolation, setInterpolation] = useState<InterpolationSettings | null>(null);
+  const [thumbnail, setThumbnail] = useState<ThumbnailSettings | null>(null);
+  const [thumbnailInspection, setThumbnailInspection] = useState<ThumbnailInspection | null>(null);
+  const [thumbnailInspecting, setThumbnailInspecting] = useState(false);
+  const [thumbnailError, setThumbnailError] = useState<string | null>(null);
+  const thumbnailTokenRef = useRef(0);
   const [interpolationStatus, setInterpolationStatus] = useState<InterpolationStatus | null>(null);
   const [interpolationInstalling, setInterpolationInstalling] = useState(false);
   const interpolationInstallingRef = useRef(false);
@@ -1612,6 +1621,7 @@ function App() {
     setColorPolicy("auto");
     if (queuePathIdentity(path) !== queuePathIdentity(inputPathRef.current)) {
       clearExternalSubtitle("External subtitles cleared for the new source.");
+      clearThumbnail();
     }
 
     if (nextFormat !== formatRef.current) setFormat(nextFormat);
@@ -1653,6 +1663,7 @@ function App() {
     setAudioEnabled(true);
     setStrictFit(false);
     clearExternalSubtitle("External subtitles cleared by Reset.");
+    clearThumbnail();
     setNormalizeAudio(false);
     setPerturbFirstFrame(false);
     setColorPolicy("auto");
@@ -1968,6 +1979,23 @@ function App() {
     const smokeStrictFit = smokeConfig.format !== "mp3" && smokeConfig.sizeLimitMb > 0 && smokeConfig.strictFit === true;
     setStrictFit(smokeStrictFit);
     clearExternalSubtitle("No external subtitles selected.");
+    clearThumbnail();
+    if (smokeConfig.thumbnailPath) {
+      const path = smokeConfig.thumbnailPath;
+      const token = ++thumbnailTokenRef.current;
+      setThumbnailInspecting(true);
+      void invoke<ThumbnailInspection>("inspect_thumbnail", { path }).then(inspection => {
+        if (thumbnailTokenRef.current !== token) return;
+        setThumbnail({ imagePath: path, fit: smokeConfig.thumbnailFit ?? "fit", sourceIdentity: inspection.sourceIdentity });
+        setThumbnailInspection(inspection);
+      }).catch(error => {
+        if (thumbnailTokenRef.current !== token) return;
+        setThumbnailError(String(error));
+        void reportSmokeFailure(`Packaged app smoke thumbnail validation failed: ${String(error)}`);
+      }).finally(() => {
+        if (thumbnailTokenRef.current === token) setThumbnailInspecting(false);
+      });
+    }
     if (smokeConfig.subtitlePath) {
       const configuredSubtitlePath = smokeConfig.subtitlePath;
       const token = subtitleInspectionTokenRef.current + 1;
@@ -2151,6 +2179,7 @@ function App() {
       (probe.frameRate === null || probe.frameRate === undefined ||
         probe.frameRate * speedNum > planningFrameRateCap + 0.01);
     const videoEncodeAlreadyDefinite =
+      thumbnail !== null ||
       interpolation !== null ||
       !sourceVideoCopyCompatibleForPlanning ||
       trimRequestIsActive({ startS: startRaw, endS: endRaw, durationS: probe.durationS }) ||
@@ -2206,6 +2235,7 @@ function App() {
     format,
     loopVideo,
     squarePixelVideoDimensions,
+    thumbnail,
     interpolation,
     shapedVideoDimensions,
     resizeMode,
@@ -2459,6 +2489,7 @@ function App() {
   );
   const externalSubtitleActive = Boolean(subtitlePath);
   const hasVideoEditTransforms =
+    (format !== "mp3" && thumbnail !== null) ||
     (format !== "mp3" && interpolation !== null) ||
     trimForcesReencode ||
     cropFilterPlanned ||
@@ -3052,6 +3083,10 @@ function App() {
       : null;
   const exactExportPlanBlockingReason =
     (!updateStartupReady ? "Finishing the app startup check before export." : null) ??
+    (thumbnailInspecting ? "Wait for thumbnail validation to finish." : null) ??
+    (thumbnail && format === "mp3" ? "Remove the thumbnail or choose MP4 or WebM video output." : null) ??
+    (thumbnail && !thumbnailInspection ? "Validate the thumbnail image before exporting." : null) ??
+    (thumbnail ? describeMissingFeature("thumbnail", "Thumbnail images") : null) ??
     interpolationBlockingReason ??
     encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
@@ -3071,6 +3106,10 @@ function App() {
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting." : null);
   const exactSamplePlanBlockingReason =
     (!updateStartupReady ? "Finishing the app startup check before export." : null) ??
+    (thumbnailInspecting ? "Wait for thumbnail validation to finish." : null) ??
+    (thumbnail && format === "mp3" ? "Remove the thumbnail or choose MP4 or WebM video output." : null) ??
+    (thumbnail && !thumbnailInspection ? "Validate the thumbnail image before exporting." : null) ??
+    (thumbnail ? describeMissingFeature("thumbnail", "Thumbnail images") : null) ??
     interpolationBlockingReason ??
     encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
@@ -3159,6 +3198,7 @@ function App() {
     if (format !== "mp3" && colorPolicy === "standardSdr") chips.push("Standard SDR");
     if (format !== "mp3" && hasNonSquarePixels(probe)) chips.push("Square pixels");
     if (format !== "mp3" && externalSubtitleActive) chips.push("External subtitles");
+    if (format !== "mp3" && thumbnail) chips.push(`Thumbnail (${thumbnail.fit})`);
     if (format !== "mp3" && sizeLimitEnabled && strictFit) chips.push("Strict Fit");
 
     return chips;
@@ -3191,6 +3231,7 @@ function App() {
     normalizeAudioApplies,
     colorPolicy,
     externalSubtitleActive,
+    thumbnail,
     sizeLimitEnabled,
     strictFit,
   ]);
@@ -3228,6 +3269,7 @@ function App() {
     queuePreparationBusy ||
     queueSnapshotApplying ||
     subtitleInspecting ||
+    thumbnailInspecting ||
     cropDetecting ||
     frameSaving ||
     updateBusy;
@@ -3766,6 +3808,14 @@ function App() {
       return;
     }
 
+    if (smokeConfig.thumbnailPath) {
+      if (thumbnailError) {
+        void reportSmokeFailure(`Packaged app smoke thumbnail validation failed: ${thumbnailError}`);
+        return;
+      }
+      if (thumbnailInspecting || thumbnail?.imagePath !== smokeConfig.thumbnailPath || !thumbnailInspection) return;
+    }
+
     if (smokeConfig.subtitlePath) {
       if (smokeConfig.format === "mp3") {
         void reportSmokeFailure("Packaged app smoke cannot combine external subtitles with MP3 output.");
@@ -3943,6 +3993,10 @@ function App() {
     subtitlePath,
     subtitleInspection,
     subtitleInspecting,
+    thumbnail,
+    thumbnailInspection,
+    thumbnailInspecting,
+    thumbnailError,
     subtitleError,
     encodeCapabilities,
     encodeCapabilitiesError,
@@ -4335,6 +4389,39 @@ function App() {
     };
   }, []);
 
+  function clearThumbnail() {
+    thumbnailTokenRef.current += 1;
+    setThumbnail(null);
+    setThumbnailInspection(null);
+    setThumbnailInspecting(false);
+    setThumbnailError(null);
+  }
+
+  async function pickThumbnail() {
+    if (encodeBusy || !inputPath || format === "mp3") return;
+    const sourcePath = inputPath;
+    const token = ++thumbnailTokenRef.current;
+    try {
+      const selected = await openDialog({
+        title: "Select a thumbnail image",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Images", extensions: ["jpg", "jpeg", "jpe", "png", "webp", "bmp", "tif", "tiff", "gif"] }],
+      });
+      if (typeof selected !== "string" || token !== thumbnailTokenRef.current || sourcePath !== inputPathRef.current) return;
+      setThumbnailInspecting(true);
+      setThumbnailError(null);
+      const inspection = await invoke<ThumbnailInspection>("inspect_thumbnail", { path: selected });
+      if (token !== thumbnailTokenRef.current || sourcePath !== inputPathRef.current) return;
+      setThumbnail({ imagePath: selected, fit: thumbnail?.fit ?? "fit", sourceIdentity: inspection.sourceIdentity });
+      setThumbnailInspection(inspection);
+    } catch (error) {
+      if (token === thumbnailTokenRef.current) setThumbnailError(String(error));
+    } finally {
+      if (token === thumbnailTokenRef.current) setThumbnailInspecting(false);
+    }
+  }
+
   async function pickInput() {
     if (
       jobIdRef.current !== null ||
@@ -4650,6 +4737,7 @@ function App() {
       audioSourceIdentity: null,
       // Same-settings batches intentionally exclude clip-scoped subtitles.
       subtitlePath: null,
+      thumbnail: null,
     };
   }
 
@@ -4659,6 +4747,9 @@ function App() {
     if (!inputPath) throw new Error("Pick an input file first.");
     if (!outputPath) throw new Error("Pick an output path first.");
     if (!probe) throw new Error("Probe not ready yet.");
+    if (thumbnailInspecting) throw new Error("Wait for thumbnail validation to finish.");
+    if (thumbnail && format === "mp3") throw new Error("Thumbnail images require MP4 or WebM video output.");
+    if (thumbnail && !thumbnailInspection) throw new Error("Validate the thumbnail image before exporting.");
     if (subtitleInspecting) throw new Error("Wait for external subtitle validation to finish.");
     if (format === "mp3" && !probe.hasAudio) throw new Error("Input has no audio stream (can't export MP3).");
     if (format === "mp3" && subtitlePath) throw new Error("External subtitles require MP4 or WebM video output.");
@@ -4724,6 +4815,7 @@ function App() {
       loopVideo: format === "mp3" ? false : loopVideo,
       strictFit: requestStrictFit,
       subtitlePath: subtitlePath || null,
+      thumbnail: thumbnail ? { ...thumbnail } : null,
     };
     return request;
   }
@@ -4867,6 +4959,7 @@ function App() {
     sourceProbe: VideoProbe,
     nextOutputPath: string,
     inspectedSubtitle: SubtitleInspection | null,
+    inspectedThumbnail: ThumbnailInspection | null,
   ) {
     const resize = request.resize ?? {
       mode: request.maxEdgePx ? "maxEdge" as const : "source" as const,
@@ -4877,6 +4970,11 @@ function App() {
     const advanced = request.advanced ?? {};
     const crop = request.crop ?? null;
     const color = request.color ?? null;
+    thumbnailTokenRef.current += 1;
+    setThumbnail(request.thumbnail ? { ...request.thumbnail } : null);
+    setThumbnailInspection(inspectedThumbnail);
+    setThumbnailInspecting(false);
+    setThumbnailError(null);
 
     audioProbeGeneration.current += 1;
     audioSelectionRef.current = { path: request.inputPath, audioStreamIndex: request.audioStreamIndex ?? null, audioSourceIdentity: request.audioSourceIdentity ?? sourceProbe.sourceIdentity };
@@ -5040,13 +5138,19 @@ function App() {
           throw new Error(subtitlePickerBlockingReason ?? "External subtitles are unavailable in the active FFmpeg build.");
         }
         const requestFingerprint = JSON.stringify(item.request);
-        const [sourceProbe, nextOutputPath, inspectedSubtitle] = await Promise.all([
+        const [sourceProbe, nextOutputPath, inspectedSubtitle, inspectedThumbnail] = await Promise.all([
           invoke<VideoProbe>("probe_video", { path: item.inputPath, audioStreamIndex: item.request.audioStreamIndex ?? null, audioSourceIdentity: item.request.audioSourceIdentity ?? null }),
           suggestedOutputForInput(item.inputPath, item.format, claimedOutputPathsForPreparation()),
           item.request.subtitlePath
             ? invoke<SubtitleInspection>("inspect_srt", { path: item.request.subtitlePath })
             : Promise.resolve(null),
+          item.request.thumbnail
+            ? invoke<ThumbnailInspection>("inspect_thumbnail", { path: item.request.thumbnail.imagePath })
+            : Promise.resolve(null),
         ]);
+        if (item.request.thumbnail && (item.format === "mp3" || inspectedThumbnail?.sourceIdentity !== item.request.thumbnail.sourceIdentity)) {
+          throw new Error("That queue snapshot's thumbnail changed or is incompatible with MP3. Choose the image again.");
+        }
         if (queueSnapshotApplyTokenRef.current !== token) return;
         if (item.format === "mp3" && !sourceProbe.hasAudio) {
           throw new Error("That queue snapshot requests MP3, but the source has no audio stream.");
@@ -5077,6 +5181,7 @@ function App() {
           sourceProbe,
           nextOutputPath,
           inspectedSubtitle,
+          inspectedThumbnail,
         );
         if (inputChanged) setInputPath(item.inputPath);
         setProbe(sourceProbe);
@@ -8272,6 +8377,25 @@ function App() {
               onRemoveCap={() => setAdvancedFrameRateCapFps("auto")}
               onStatus={setInterpolationStatus}
               onBusy={handleInterpolationBusy}
+            />
+          </RailCard>
+          <RailCard
+            title="Thumbnail"
+            summary={thumbnail ? `First frame • ${thumbnail.fit === "fit" ? "Fit" : "Fill"}` : "Off"}
+            open={openCards.thumbnail}
+            onToggle={() => toggleCard("thumbnail")}
+          >
+            <ThumbnailControl
+              value={thumbnail}
+              inspection={thumbnailInspection}
+              inspecting={thumbnailInspecting}
+              error={thumbnailError}
+              disabled={encodeBusy}
+              unavailable={!inputPath ? "Choose a video first." : format === "mp3" ? "Thumbnail images require MP4 or WebM video output." : describeMissingFeature("thumbnail", "Thumbnail images")}
+              outputAspect={plannedEncodeSummary?.w && plannedEncodeSummary.h ? plannedEncodeSummary.w / plannedEncodeSummary.h : 16 / 9}
+              onChoose={() => void pickThumbnail()}
+              onChange={setThumbnail}
+              onRemove={clearThumbnail}
             />
           </RailCard>
           <RailCard

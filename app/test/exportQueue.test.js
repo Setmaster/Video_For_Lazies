@@ -66,6 +66,18 @@ function beginNext(state) {
   );
 }
 
+test("thumbnail selection and fit remain immutable through queue snapshots and duplicates", () => {
+  const thumbnail = { imagePath: "/private/thumbnail.png", fit: "fit", sourceIdentity: "a".repeat(64) };
+  const original = request("thumbnail", { thumbnail });
+  let state = enqueue(createExportQueueState(), original);
+  thumbnail.fit = "fill";
+  thumbnail.imagePath = "/other.png";
+  original.thumbnail = null;
+  assert.deepEqual(state.items[0].request.thumbnail, { imagePath: "/private/thumbnail.png", fit: "fit", sourceIdentity: "a".repeat(64) });
+  state = reduceExportQueue(state, { type: "duplicate-prepared", sourceItemId: state.items[0].id, request: { ...state.items[0].request, outputPath: "/outputs/thumbnail-3.mp4" } });
+  assert.deepEqual(state.items[1].request.thumbnail, state.items[0].request.thumbnail);
+});
+
 test("queue state defaults to a bounded empty state", () => {
   const state = createExportQueueState();
 

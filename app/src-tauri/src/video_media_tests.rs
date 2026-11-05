@@ -2,6 +2,552 @@
 //! Run `cargo test --lib video::media_integration_tests -- --ignored` with
 //! VFL_FFMPEG_PATH and VFL_FFPROBE_PATH pointing to the bundled sidecars.
 use super::*;
+use base64::Engine;
+
+#[test]
+#[ignore = "requires the bundled FFmpeg and FFprobe"]
+fn bundled_thumbnail_decodes_formats_orientation_and_rejects_invalid_images() {
+    let temp = TempDir::new().unwrap();
+    for extension in ["jpg", "png", "bmp", "tiff", "gif"] {
+        ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:s=40x20:d=0.04",
+                "-frames:v",
+                "1",
+                &format!("image.{extension}"),
+            ],
+            temp.path(),
+        );
+    }
+    // A small alpha WebP fixture, so this test needs the decoder, not an
+    // optional WebP encoder in the shipped FFmpeg runtime.
+    fs::write(temp.path().join("image.webp"), base64::engine::general_purpose::STANDARD.decode("UklGRnIAAABXRUJQVlA4WAoAAAAQAAAAJwAAEwAAQUxQSAoAAAABB1DAiAhERP8DVlA4IEIAAACQAwCdASooABQAPm02l0ikIyIhJWgAgA2JZwDPkoB+AAAr98NwAP7wm0P/5BcsLrka//yA/5Af8gP/498Ql180AAA=").unwrap()).unwrap();
+    // EXIF orientation 6: a 40x20 JPEG displays as 20x40.
+    let jpeg = fs::read(temp.path().join("image.jpg")).unwrap();
+    let exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+    let mut oriented = jpeg[..2].to_vec();
+    oriented.extend([0xff, 0xe1]);
+    oriented.extend(((exif.len() + 2) as u16).to_be_bytes());
+    oriented.extend(exif);
+    oriented.extend(&jpeg[2..]);
+    fs::write(temp.path().join("oriented.jpg"), oriented).unwrap();
+    for name in [
+        "image.jpg",
+        "image.png",
+        "image.webp",
+        "image.bmp",
+        "image.tiff",
+        "image.gif",
+        "oriented.jpg",
+    ] {
+        let path = temp.path().join(name);
+        let inspection = inspect_thumbnail(path.to_string_lossy().into()).unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(
+                inspection
+                    .preview_data_url
+                    .strip_prefix("data:image/png;base64,")
+                    .unwrap(),
+            )
+            .unwrap();
+        let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+        assert_eq!(
+            (width, height),
+            if name == "oriented.jpg" {
+                (320, 640)
+            } else {
+                (640, 320)
+            },
+            "{name}"
+        );
+        let stage = TempDir::new().unwrap();
+        thumbnail::stage(
+            &default_ffmpeg(),
+            &ThumbnailSettings {
+                image_path: path.to_string_lossy().into(),
+                fit: thumbnail::ThumbnailFit::Fit,
+                source_identity: inspection.source_identity,
+            },
+            stage.path(),
+        )
+        .unwrap();
+        validate_frame_output(&stage.path().join(thumbnail::FILE_NAME)).unwrap();
+    }
+    fs::write(
+        temp.path().join("bad.png"),
+        b"\x89PNG\r\n\x1a\ninvalid-data",
+    )
+    .unwrap();
+    assert!(
+        inspect_thumbnail(temp.path().join("bad.png").to_string_lossy().into())
+            .unwrap_err()
+            .contains("decoded")
+    );
+}
+
+#[test]
+#[ignore = "requires the bundled FFmpeg and FFprobe"]
+fn bundled_thumbnail_replaces_only_first_frame_with_fit_fill_alpha_and_audio() {
+    let temp = TempDir::new().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:s=160x90:r=30:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "source.mp4",
+        ],
+        temp.path(),
+    );
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red@0.5:s=40x40:d=0.04,format=rgba",
+            "-frames:v",
+            "1",
+            "alpha.png",
+        ],
+        temp.path(),
+    );
+    let image = temp.path().join("alpha.png");
+    let inspection = inspect_thumbnail(image.to_string_lossy().into()).unwrap();
+    let mut req = request();
+    req.audio_enabled = true;
+    req.input_path = temp.path().join("source.mp4").to_string_lossy().into();
+    let probe = probe_video(req.input_path.clone()).unwrap();
+    let runtime = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+    for fit in [thumbnail::ThumbnailFit::Fit, thumbnail::ThumbnailFit::Fill] {
+        req.thumbnail = Some(ThumbnailSettings {
+            image_path: image.to_string_lossy().into(),
+            fit,
+            source_identity: inspection.source_identity.clone(),
+        });
+        let stage = TempDir::new().unwrap();
+        thumbnail::stage(
+            &default_ffmpeg(),
+            req.thumbnail.as_ref().unwrap(),
+            stage.path(),
+        )
+        .unwrap();
+        for temporal in [false, true] {
+            req.reverse = temporal;
+            req.loop_video = temporal;
+            req.speed = if temporal { 2.0 } else { 1.0 };
+            req.advanced.frame_rate_cap_fps = temporal.then_some(30);
+            let codecs =
+                select_codec_plan(req.format, &runtime.encoder_names, &req.advanced).unwrap();
+            let plan = build_encode_command_plan(&req, &probe, codecs, None).unwrap();
+            require_initial_encode_plan_capabilities(
+                &plan,
+                &ffmpeg_capability_contract().unwrap(),
+                &runtime,
+            )
+            .unwrap();
+            assert_eq!(plan.video_action, StreamAction::Encode);
+            if !temporal {
+                assert_eq!(plan.audio_action, StreamAction::Copy);
+            }
+            let path = temp.path().join(format!("{fit:?}-{temporal}.mp4"));
+            let mut args = build_single_pass_args(&req.input_path, &req, &plan).unwrap();
+            args.push(path.to_string_lossy().into());
+            ffmpeg(
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                stage.path(),
+            );
+            let pixels = ffmpeg(
+                &[
+                    "-i",
+                    &path.to_string_lossy(),
+                    "-frames:v",
+                    "3",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                temp.path(),
+            );
+            let pixel = |frame: usize, x: usize, y: usize| -> &[u8] {
+                let index = ((frame * 90 + y) * 160 + x) * 3;
+                &pixels[index..index + 3]
+            };
+            let center = pixel(0, 80, 45);
+            assert!(
+                (110..145).contains(&center[0]) && center[1] < 8 && center[2] < 8,
+                "{center:?}"
+            );
+            let side = pixel(0, 5, 45);
+            if fit == thumbnail::ThumbnailFit::Fit {
+                assert!(side.iter().all(|c| *c < 8));
+            } else {
+                assert!(side[0] > 110 && side[2] < 8);
+            }
+            for frame in [1, 2] {
+                let p = pixel(frame, 80, 45);
+                assert!(p[2] > 240 && p[0] < 8 && p[1] < 8, "{frame}: {p:?}");
+            }
+            let exported = probe_video(path.to_string_lossy().into()).unwrap();
+            assert!(exported.has_audio);
+            let expected =
+                estimate_output_duration_s(probe.duration_s, &req.trim, req.speed, req.loop_video)
+                    .unwrap();
+            assert!(
+                (exported.duration_s - expected).abs() < 0.06,
+                "{} vs {expected}",
+                exported.duration_s
+            );
+            if !temporal {
+                let source_audio = ffmpeg(
+                    &[
+                        "-i",
+                        &req.input_path,
+                        "-map",
+                        "0:a:0",
+                        "-c:a",
+                        "copy",
+                        "-f",
+                        "adts",
+                        "-",
+                    ],
+                    temp.path(),
+                );
+                let exported_audio = ffmpeg(
+                    &[
+                        "-i",
+                        &path.to_string_lossy(),
+                        "-map",
+                        "0:a:0",
+                        "-c:a",
+                        "copy",
+                        "-f",
+                        "adts",
+                        "-",
+                    ],
+                    temp.path(),
+                );
+                assert_eq!(source_audio, exported_audio);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the bundled FFmpeg and FFprobe"]
+fn bundled_thumbnail_preserves_later_pixels_and_main_color_metadata() {
+    let temp = TempDir::new().unwrap();
+    for (name, range, depth, tagged) in [
+        ("untagged", "tv", "yuv420p", false),
+        ("limited", "tv", "yuv420p", true),
+        ("full", "pc", "yuv420p", true),
+        ("tenbit", "tv", "yuv420p10le", true),
+    ] {
+        let mut args = vec!["-f", "lavfi", "-i", "testsrc=s=160x90:r=30:d=0.2", "-vf"];
+        let filter = if tagged {
+            format!(
+                "scale=out_range={range}:out_color_matrix=bt709,format={depth},setparams=range={range}:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+            )
+        } else {
+            format!("scale=out_range={range},format={depth}")
+        };
+        args.extend([&filter, "-c:v", "ffv1", "-color_range", range]);
+        if tagged {
+            args.extend([
+                "-colorspace",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+            ]);
+        }
+        let output = format!("{name}.mkv");
+        args.push(&output);
+        ffmpeg(&args, temp.path());
+    }
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red@0.5:s=40x40:d=0.04,format=rgba",
+            "-frames:v",
+            "1",
+            "alpha.png",
+        ],
+        temp.path(),
+    );
+    let image = temp.path().join("alpha.png");
+    let inspection = inspect_thumbnail(image.to_string_lossy().into()).unwrap();
+    let stage = TempDir::new().unwrap();
+    let settings = ThumbnailSettings {
+        image_path: image.to_string_lossy().into(),
+        fit: thumbnail::ThumbnailFit::Fit,
+        source_identity: inspection.source_identity,
+    };
+    thumbnail::stage(&default_ffmpeg(), &settings, stage.path()).unwrap();
+    let runtime = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+    for (name, source, range, standard_sdr) in [
+        (
+            "unknown-auto",
+            "untagged",
+            ColorRangePreference::Auto,
+            false,
+        ),
+        ("limited-auto", "limited", ColorRangePreference::Auto, false),
+        ("full-auto", "full", ColorRangePreference::Auto, false),
+        (
+            "forced-limited",
+            "full",
+            ColorRangePreference::Limited,
+            false,
+        ),
+        ("forced-full", "limited", ColorRangePreference::Full, false),
+        ("standard-sdr", "tenbit", ColorRangePreference::Auto, true),
+    ] {
+        let mut req = request();
+        req.input_path = temp
+            .path()
+            .join(format!("{source}.mkv"))
+            .to_string_lossy()
+            .into();
+        req.advanced.video_codec = Some(VideoCodecPreference::H264);
+        req.advanced.color_range = range;
+        req.color_policy = if standard_sdr {
+            ColorPolicy::StandardSdr
+        } else {
+            ColorPolicy::Auto
+        };
+        let source_probe = probe_video(req.input_path.clone()).unwrap();
+        let mut paths = Vec::new();
+        for enabled in [false, true] {
+            req.thumbnail = enabled.then(|| settings.clone());
+            let codecs =
+                select_codec_plan(req.format, &runtime.encoder_names, &req.advanced).unwrap();
+            let plan = build_encode_command_plan(&req, &source_probe, codecs, None).unwrap();
+            let path = temp.path().join(format!("{name}-{enabled}.mp4"));
+            let mut args = build_single_pass_args(&req.input_path, &req, &plan).unwrap();
+            // A lossless encoder isolates any filter round-trip or metadata
+            // regression from ordinary inter-frame compression differences.
+            let crf = args.iter().position(|arg| arg == "-crf").unwrap();
+            args[crf + 1] = "0".into();
+            args.push(path.to_string_lossy().into());
+            ffmpeg(
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                stage.path(),
+            );
+            paths.push(path);
+        }
+        let base = probe_video(paths[0].to_string_lossy().into()).unwrap();
+        let result = probe_video(paths[1].to_string_lossy().into()).unwrap();
+        assert_eq!(
+            (
+                &result.pixel_format,
+                &result.color_range,
+                &result.color_space,
+                &result.color_primaries,
+                &result.color_transfer
+            ),
+            (
+                &base.pixel_format,
+                &base.color_range,
+                &base.color_space,
+                &base.color_primaries,
+                &base.color_transfer
+            ),
+            "{name}"
+        );
+        if standard_sdr {
+            assert_eq!(result.color_space.as_deref(), Some("bt709"));
+            assert_eq!(result.color_range.as_deref(), Some("tv"));
+        }
+        let decoded = paths
+            .iter()
+            .map(|path| {
+                ffmpeg(
+                    &[
+                        "-i",
+                        &path.to_string_lossy(),
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "rawvideo",
+                        "-",
+                    ],
+                    temp.path(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let frame_size = 160 * 90 * 3 / 2;
+        assert_eq!(decoded[0].len(), decoded[1].len(), "{name} frame count");
+        assert_eq!(
+            &decoded[0][frame_size..],
+            &decoded[1][frame_size..],
+            "{name} later decoded pixels changed"
+        );
+        assert_ne!(
+            &decoded[0][..frame_size],
+            &decoded[1][..frame_size],
+            "{name} first frame was not replaced"
+        );
+        let first_rgb = ffmpeg(
+            &[
+                "-i",
+                &paths[1].to_string_lossy(),
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            temp.path(),
+        );
+        let side = &first_rgb[(45 * 160 + 5) * 3..(45 * 160 + 5) * 3 + 3];
+        let center = &first_rgb[(45 * 160 + 80) * 3..(45 * 160 + 80) * 3 + 3];
+        assert!(
+            side.iter().all(|pixel| *pixel < 3),
+            "{name} black bars: {side:?}"
+        );
+        assert!(
+            (124..130).contains(&center[0]) && center[1] < 3 && center[2] < 3,
+            "{name} alpha over black: {center:?}"
+        );
+        eprintln!(
+            "thumbnail color {name}: {:?}/{:?}/{:?}, later frames identical, black={side:?}, alpha={center:?}",
+            result.pixel_format, result.color_range, result.color_space
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the bundled FFmpeg and FFprobe"]
+fn bundled_thumbnail_preserves_vp9_richer_chroma_and_rgb_pixels() {
+    let temp = TempDir::new().unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red@0.5:s=40x40:d=0.04,format=rgba",
+            "-frames:v",
+            "1",
+            "alpha.png",
+        ],
+        temp.path(),
+    );
+    let image = temp.path().join("alpha.png");
+    let inspection = inspect_thumbnail(image.to_string_lossy().into()).unwrap();
+    let settings = ThumbnailSettings {
+        image_path: image.to_string_lossy().into(),
+        fit: thumbnail::ThumbnailFit::Fit,
+        source_identity: inspection.source_identity,
+    };
+    let stage = TempDir::new().unwrap();
+    thumbnail::stage(&default_ffmpeg(), &settings, stage.path()).unwrap();
+    let runtime = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+    for (pixel, bytes_per_pixel) in [("yuv444p", 3), ("yuv422p", 2), ("gbrp", 3)] {
+        let input = temp.path().join(format!("{pixel}.mkv"));
+        ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=160x90:r=30:d=0.2",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                pixel,
+                &input.to_string_lossy(),
+            ],
+            temp.path(),
+        );
+        let mut req = request();
+        req.format = OutputFormat::Webm;
+        req.advanced.video_codec = Some(VideoCodecPreference::Vp9);
+        req.input_path = input.to_string_lossy().into();
+        let source = probe_video(req.input_path.clone()).unwrap();
+        let mut paths = Vec::new();
+        for enabled in [false, true] {
+            req.thumbnail = enabled.then(|| settings.clone());
+            let codecs =
+                select_codec_plan(req.format, &runtime.encoder_names, &req.advanced).unwrap();
+            let plan = build_encode_command_plan(&req, &source, codecs, None).unwrap();
+            let path = temp.path().join(format!("{pixel}-{enabled}.webm"));
+            let mut args = build_single_pass_args(&req.input_path, &req, &plan).unwrap();
+            let crf = args.iter().position(|arg| arg == "-crf").unwrap();
+            args[crf + 1] = "0".into();
+            args.extend([
+                "-lossless".into(),
+                "1".into(),
+                path.to_string_lossy().into(),
+            ]);
+            ffmpeg(
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                stage.path(),
+            );
+            paths.push(path);
+        }
+        let baseline = probe_video(paths[0].to_string_lossy().into()).unwrap();
+        let thumbnail = probe_video(paths[1].to_string_lossy().into()).unwrap();
+        assert_eq!(
+            (
+                &thumbnail.pixel_format,
+                &thumbnail.color_range,
+                &thumbnail.color_space
+            ),
+            (
+                &baseline.pixel_format,
+                &baseline.color_range,
+                &baseline.color_space
+            ),
+            "{pixel} output domain"
+        );
+        let decoded = paths
+            .iter()
+            .map(|path| {
+                ffmpeg(
+                    &[
+                        "-i",
+                        &path.to_string_lossy(),
+                        "-pix_fmt",
+                        pixel,
+                        "-f",
+                        "rawvideo",
+                        "-",
+                    ],
+                    temp.path(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let frame_size = 160 * 90 * bytes_per_pixel;
+        assert_eq!(decoded[0].len(), decoded[1].len());
+        assert_eq!(
+            &decoded[0][frame_size..],
+            &decoded[1][frame_size..],
+            "{pixel} later pixels"
+        );
+        eprintln!(
+            "thumbnail VP9 {pixel}: {:?}/{:?}/{:?}, later frames identical",
+            thumbnail.pixel_format, thumbnail.color_range, thumbnail.color_space
+        );
+    }
+}
 
 fn ffmpeg(args: &[&str], cwd: &Path) -> Vec<u8> {
     let bin = default_ffmpeg();

@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, Window};
 use tempfile::{Builder as TempFileBuilder, TempDir, TempPath};
 
+#[path = "thumbnail.rs"]
+pub(crate) mod thumbnail;
+pub use thumbnail::{ThumbnailInspection, ThumbnailSettings, inspect_thumbnail};
+
 const MB_BYTES: u64 = 1_000_000;
 const JS_MAX_SAFE_INTEGER_BYTES: u64 = 9_007_199_254_740_991;
 const PROGRESS_EMIT_EVERY: Duration = Duration::from_millis(200);
@@ -344,6 +348,8 @@ pub struct InterpolationSettings {
 #[serde(rename_all = "camelCase")]
 pub struct EncodeRequest {
     #[serde(default)]
+    pub thumbnail: Option<ThumbnailSettings>,
+    #[serde(default)]
     pub audio_stream_index: Option<u32>,
     #[serde(default)]
     pub audio_source_identity: Option<String>,
@@ -618,6 +624,12 @@ fn safe_failure_diagnostic_reason(request: &EncodeRequest, reason: &str) -> Stri
         }
     }
 
+    if let Some(thumbnail) = &request.thumbnail {
+        add_path_redaction(&mut redactions, &thumbnail.image_path, "<thumbnail>");
+        if let Ok(path) = Path::new(&thumbnail.image_path).canonicalize() {
+            add_path_redaction(&mut redactions, path.to_string_lossy(), "<thumbnail>");
+        }
+    }
     if let Some(subtitle_path) = request
         .subtitle_path
         .as_deref()
@@ -2928,7 +2940,8 @@ fn video_transform_requires_encode(request: &EncodeRequest) -> Result<bool, Stri
         || !matches!(requested_resize(request)?, ResizePlan::Source)
         || !color_is_noop(&request.color)
         || request.perturb_first_frame
-        || request.subtitle_path.is_some())
+        || request.subtitle_path.is_some()
+        || request.thumbnail.is_some())
 }
 
 fn color_metadata_is_complete(probe: &VideoProbe) -> bool {
@@ -6015,7 +6028,9 @@ fn build_video_filters_with_policy(
     // enable='eq(n,0)' targets the first frame entering this filter, so this
     // lands on the true first output frame (the boomerang wrap below keeps the
     // forward segment first, so the first output frame is still this one).
-    if let Some(perturb) = first_frame_perturb_filter(req) {
+    if req.thumbnail.is_none()
+        && let Some(perturb) = first_frame_perturb_filter(req)
+    {
         filters.push(perturb);
     }
 
@@ -6033,7 +6048,26 @@ fn build_video_filters_with_policy(
     } else {
         Some(filters.join(","))
     };
-    Ok(apply_boomerang_video(linear, req))
+    let chain = apply_boomerang_video(linear, req);
+    if let Some(thumbnail) = &req.thumbnail {
+        let (width, height) = estimated_output_dimensions(req, probe)?;
+        let (overlay_format, image_format) = thumbnail::pixel_formats(req, probe, media_policy)?;
+        let mut graph = thumbnail::apply(
+            chain,
+            thumbnail,
+            width,
+            height,
+            overlay_format,
+            image_format,
+        );
+        if let Some(perturb) = first_frame_perturb_filter(req) {
+            graph.push(',');
+            graph.push_str(&perturb);
+        }
+        Ok(Some(graph))
+    } else {
+        Ok(chain)
+    }
 }
 
 /// Wraps a linear video chain so the clip plays forward then in reverse (a
@@ -6916,6 +6950,9 @@ pub fn run_encode_job(
     if request.format == OutputFormat::Mp3 && request.subtitle_path.is_some() {
         return Err("External subtitles require MP4 or WebM video output.".to_string());
     }
+    if request.format == OutputFormat::Mp3 && request.thumbnail.is_some() {
+        return Err("Thumbnail images require MP4 or WebM video output.".to_string());
+    }
     let target_bytes = if size_limit_enabled {
         target_bytes_from_size_limit_mb(request.size_limit_mb)
             .ok_or_else(|| "Size limit is too large to report in exact bytes.".to_string())?
@@ -6966,7 +7003,12 @@ pub fn run_encode_job(
         request.subtitle_path = None;
         None
     };
-    if prepared_subtitle.is_some() {
+    let thumbnail_dir = if request.thumbnail.is_some() && prepared_subtitle.is_none() {
+        Some(TempDir::new().map_err(|_| "Could not create thumbnail staging storage.")?)
+    } else {
+        None
+    };
+    if prepared_subtitle.is_some() || thumbnail_dir.is_some() {
         let binary_path = Path::new(&ffmpeg_bin);
         if binary_path.components().count() > 1 && binary_path.is_relative() {
             ffmpeg_bin = std::env::current_dir()
@@ -6980,7 +7022,15 @@ pub fn run_encode_job(
     }
     let subtitle_working_dir = prepared_subtitle
         .as_ref()
-        .map(PreparedSubtitle::working_dir);
+        .map(PreparedSubtitle::working_dir)
+        .or_else(|| thumbnail_dir.as_ref().map(TempDir::path));
+    if let Some(settings) = &request.thumbnail {
+        thumbnail::stage(
+            &ffmpeg_bin,
+            settings,
+            subtitle_working_dir.ok_or("Missing thumbnail staging storage.")?,
+        )?;
+    }
     let subtitle_inspection = prepared_subtitle
         .as_ref()
         .map(|prepared| prepared.inspection.clone());
@@ -8119,6 +8169,7 @@ mod tests {
 
     pub(super) fn base_request() -> EncodeRequest {
         EncodeRequest {
+            thumbnail: None,
             audio_stream_index: None,
             audio_source_identity: None,
             interpolation: None,

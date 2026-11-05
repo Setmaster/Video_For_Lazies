@@ -116,6 +116,7 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
     inputPath: "/private/input.mov",
     outputPath: "/private/output.mp4",
     subtitlePath,
+    thumbnail: { imagePath: "/private/thumbnail.png", fit: "fill", sourceIdentity: "secret-image-identity" },
     format: "mp4",
     title: "Secret",
     sizeLimitMb: 25,
@@ -175,6 +176,8 @@ test("EncodeRequest conversion keeps reusable output settings and excludes subti
   assert.equal(reusableRaw.includes(subtitlePath), false);
   assert.equal(reusableRaw.includes(JSON.stringify(subtitlePath).slice(1, -1)), false);
   assert.equal(reusableRaw.includes("subtitlePath"), false);
+  assert.equal(reusableRaw.includes("thumbnail"), false);
+  assert.equal(reusableRaw.includes("secret-image-identity"), false);
   assert.equal(reusableRaw.includes("strictFitAllowAudioRemoval"), false);
 });
 

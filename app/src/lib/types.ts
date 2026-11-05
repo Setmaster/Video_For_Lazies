@@ -129,7 +129,19 @@ export interface InterpolationInstallProgress {
   message: string;
 }
 
+export interface ThumbnailSettings {
+  imagePath: string;
+  fit: "fit" | "fill";
+  sourceIdentity: string;
+}
+
+export interface ThumbnailInspection {
+  previewDataUrl: string;
+  sourceIdentity: string;
+}
+
 export interface EncodeRequest {
+  thumbnail?: ThumbnailSettings | null;
   audioStreamIndex?: number | null;
   audioSourceIdentity?: string | null;
   inputPath: string;
@@ -281,6 +293,8 @@ export interface ExportDiagnostics {
 }
 
 export interface AppSmokeConfig {
+  thumbnailPath?: string | null;
+  thumbnailFit?: "fit" | "fill";
   interpolation?: InterpolationSettings | null;
   inputPath: string;
   outputPath: string;

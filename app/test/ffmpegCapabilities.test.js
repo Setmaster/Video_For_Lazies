@@ -59,6 +59,11 @@ const shippedContractExpectation = {
       encoders: [],
       filters: ["apad", "areverse", "asetnsamples", "asplit", "concat", "reverse", "split", "tpad"],
     },
+    thumbnail: {
+      releaseRequired: true,
+      encoders: ["png"],
+      filters: ["movie", "overlay", "null", "premultiply", "lutrgb", "format", "pad", "scale", "setsar", "setpts"],
+    },
     externalSubtitles: {
       releaseRequired: true,
       encoders: [],

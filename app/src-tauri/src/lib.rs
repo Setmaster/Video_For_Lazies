@@ -111,6 +111,8 @@ struct AppSmokeG7Evidence {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSmokeConfig {
+    thumbnail_path: Option<String>,
+    thumbnail_fit: String,
     interpolation: Option<video::InterpolationSettings>,
     input_path: String,
     output_path: String,
@@ -383,6 +385,18 @@ fn parse_smoke_config_from_env(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let thumbnail_path = env
+        .get("VFL_SMOKE_THUMBNAIL_PATH")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let thumbnail_fit = env
+        .get("VFL_SMOKE_THUMBNAIL_FIT")
+        .map(String::as_str)
+        .unwrap_or("fit");
+    if !matches!(thumbnail_fit, "fit" | "fill") {
+        return Err("VFL_SMOKE_THUMBNAIL_FIT must be fit or fill.".into());
+    }
     let color_policy = parse_smoke_color_policy(
         env.get("VFL_SMOKE_COLOR_POLICY")
             .map(String::as_str)
@@ -441,6 +455,9 @@ fn parse_smoke_config_from_env(
     if subtitle_path.is_some() && format == video::OutputFormat::Mp3 {
         return Err("VFL_SMOKE_SUBTITLE_PATH requires MP4 or WebM output.".to_string());
     }
+    if thumbnail_path.is_some() && format == video::OutputFormat::Mp3 {
+        return Err("VFL_SMOKE_THUMBNAIL_PATH requires MP4 or WebM output.".into());
+    }
     if g5_queue_target_miss && (!workflow_queue_export || size_limit_mb <= 0.0) {
         return Err(
             "VFL_SMOKE_G5_QUEUE_TARGET_MISS requires VFL_SMOKE_WORKFLOW_QUEUE and a positive size target."
@@ -485,6 +502,8 @@ fn parse_smoke_config_from_env(
     }
 
     Ok(Some(AppSmokeConfig {
+        thumbnail_path,
+        thumbnail_fit: thumbnail_fit.to_string(),
         interpolation,
         input_path: input_path.to_string(),
         output_path: output_path.to_string(),
@@ -660,6 +679,11 @@ async fn encode_capabilities() -> Result<video::EncodeCapabilities, String> {
 #[tauri::command]
 async fn inspect_srt(path: String) -> Result<video::SubtitleInspection, String> {
     command_dispatch::files(move || video::inspect_srt(path)).await
+}
+
+#[tauri::command]
+async fn inspect_thumbnail(path: String) -> Result<video::ThumbnailInspection, String> {
+    command_dispatch::media(move || video::inspect_thumbnail(path)).await
 }
 
 #[tauri::command]
@@ -951,6 +975,7 @@ pub fn run() {
             interpolation_commands::cancel_interpolation_install,
             interpolation_commands::remove_interpolation_model,
             inspect_srt,
+            inspect_thumbnail,
             extract_frame,
             allow_preview_path,
             read_smoke_config,
@@ -1147,6 +1172,8 @@ mod tests {
         assert_eq!(
             parse_smoke_config_from_env(&env).unwrap(),
             Some(AppSmokeConfig {
+                thumbnail_path: None,
+                thumbnail_fit: "fit".into(),
                 interpolation: None,
                 input_path: r"C:\tmp\input.mp4".to_string(),
                 output_path: r"C:\tmp\output.mp4".to_string(),
@@ -1210,6 +1237,8 @@ mod tests {
         assert_eq!(
             parse_smoke_config_from_env(&env).unwrap(),
             Some(AppSmokeConfig {
+                thumbnail_path: None,
+                thumbnail_fit: "fit".into(),
                 interpolation: None,
                 input_path: r"C:\tmp\input.mp4".to_string(),
                 output_path: r"C:\tmp\output.webm".to_string(),
