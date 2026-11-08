@@ -714,6 +714,13 @@ async fn step_source_frame(
 }
 
 #[tauri::command]
+async fn source_frame_index(
+    request: video::SourceFrameIndexRequest,
+) -> Result<video::SourceFrameIndexResult, String> {
+    command_dispatch::source_frame_index(move || video::source_frame_index(request)).await
+}
+
+#[tauri::command]
 #[allow(non_snake_case)]
 async fn extract_frame(inputPath: String, timeS: f64, outputPath: String) -> Result<(), String> {
     command_dispatch::media(move || video::extract_frame(inputPath, timeS, outputPath)).await
@@ -1004,6 +1011,7 @@ pub fn run() {
             inspect_srt,
             inspect_thumbnail,
             step_source_frame,
+            source_frame_index,
             extract_frame,
             allow_preview_path,
             read_smoke_config,

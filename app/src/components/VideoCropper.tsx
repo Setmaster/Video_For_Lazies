@@ -11,6 +11,7 @@ import {
 
 export type NormalizedRect = { x: number; y: number; w: number; h: number };
 export type VideoCropperHandle = {
+  getVideoElement: () => HTMLVideoElement | null;
   play: () => Promise<boolean>;
   pause: () => boolean;
   togglePlayback: () => Promise<boolean>;
@@ -634,6 +635,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   }, [cropInteractive]);
 
   useImperativeHandle(ref, () => ({
+    getVideoElement: () => videoRef.current,
     async play() {
       const v = videoRef.current;
       if (!v) return false;

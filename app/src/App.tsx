@@ -24,6 +24,7 @@ import { isRecordingActive } from "./lib/recordingState";
 import { useRecordingControls } from "./lib/recordingControls";
 import { WorkspaceTabs, type Workspace } from "./components/WorkspaceTabs";
 import { VideoCropper, type NormalizedRect, type VideoCropperHandle } from "./components/VideoCropper";
+import { FrameCounter } from "./components/FrameCounter";
 import type {
   AppSmokeConfig,
   AppSmokeG7Evidence,
@@ -921,6 +922,7 @@ function App() {
   const formatRef = useRef<OutputFormat>(format);
   const outputAutoRef = useRef<boolean>(outputAuto);
   const cropperRef = useRef<VideoCropperHandle | null>(null);
+  const getPreviewVideo = useCallback(() => cropperRef.current?.getVideoElement() ?? null, []);
   const cropDetectionRevisionRef = useRef(0);
   const trimTimelineTrackRef = useRef<HTMLDivElement | null>(null);
   const trimDragCleanupRef = useRef<(() => void) | null>(null);
@@ -3646,6 +3648,10 @@ function App() {
   const audioPreview = useAudioTrackPreview({ visible: activeWorkspace === "edit" && !ordinaryClosing, enabled: previewReady && !audioProbePending && probedInputPath.current === inputPath,
     path: inputPath, probe, unload: unloadAudioPreview, restore: restoreAudioPreview, onAdmissionBusyChange: handleAudioPreviewAdmission });
   audioPreviewControllerRef.current = audioPreview;
+  // A new input can render while the prior probe/preview is still retiring.
+  // Never pair that previous identity or media element with the new path.
+  const frameCounterSourceReady = probedInputPath.current === inputPath && !audioProbePending &&
+    Boolean(audioPreview.sourceToken) && (!audioPreview.asset || audioPreview.asset.sourceIdentity === probe?.sourceIdentity);
   const frameSourceKey = `${inputPath}|${probe?.sourceIdentity ?? ""}|${probe?.videoStreamIndex ?? ""}|${audioPreview.sourceToken}`;
   frameStepContextRef.current = probe && trimTimeline ? {
     key: frameSourceKey, path: inputPath, sourceIdentity: probe.sourceIdentity,
@@ -8105,7 +8111,12 @@ function App() {
                           </svg>
                         </button>
                         <div className="vfl-transport-time">
-                          {formatClock(clampedPreviewTimeS)} / {formatClock(previewDurationS)}
+                          {frameCounterSourceReady ? <FrameCounter key={`${inputPath}|${probe.sourceIdentity}|${probe.videoStreamIndex}`}
+                            path={inputPath} sourceIdentity={probe.sourceIdentity} videoStreamIndex={probe.videoStreamIndex}
+                            timeS={clampedPreviewTimeS} durationS={previewDurationS} getVideo={getPreviewVideo}
+                            sourceToken={audioPreview.sourceToken} timelineOffsetS={audioPreview.timelineOffsetS} />
+                            : <span id="vfl-frame-counter" className="vfl-frame-counter" title="Waiting for source preview…">Frame …</span>}
+                          <span>{formatClock(clampedPreviewTimeS)} / {formatClock(previewDurationS)}</span>
                         </div>
                       </div>
                       {frameExportBlockingReason ? (

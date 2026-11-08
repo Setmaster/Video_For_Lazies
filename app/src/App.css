@@ -949,12 +949,20 @@ button:focus-visible {
 }
 
 .vfl-transport-time {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px 12px;
   margin-left: auto;
   color: var(--text-secondary);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+
+.vfl-frame-counter { display: inline-flex; align-items: center; gap: 6px; }
+.vfl-frame-counter-retry { font-size: inherit; padding: 2px 5px; }
 
 /* ---------- range inputs ---------- */
 input[type="range"] {

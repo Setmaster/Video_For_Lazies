@@ -4,6 +4,8 @@ use super::*;
 const PACKET_LIMITS: [usize; 3] = [64, 256, 1024];
 const FRAME_LIMIT: usize = 2048;
 const COMMAND_BUDGET: Duration = Duration::from_secs(5);
+const INDEX_BUDGET: Duration = Duration::from_secs(30);
+const INDEX_FRAME_LIMIT: usize = 100_000;
 static CACHE: OnceLock<Mutex<Option<Cached>>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +29,21 @@ pub struct FrameStepResult {
     pub frame_end_s: f64,
     pub did_move: bool,
     pub at_limit: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceFrameIndexRequest {
+    pub path: String,
+    pub source_identity: String,
+    pub video_stream_index: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFrameIndexResult {
+    pub source_identity: String,
+    pub times_s: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -69,6 +86,7 @@ struct Stream {
     start_pts: Option<i64>,
     has_b_frames: Option<u32>,
     nb_read_packets: Option<String>,
+    nb_read_frames: Option<String>,
     #[serde(default)]
     disposition: FFProbeDisposition,
 }
@@ -293,6 +311,83 @@ fn picture_times(frames: Vec<Picture>, meta: &Metadata) -> Result<Vec<f64>, Stri
         previous = Some(pts);
     }
     Ok(times)
+}
+
+fn index_unavailable() -> String {
+    "Source frame numbers are unavailable: complete source timing could not be verified within 30 seconds, 100,000 frames and the bounded probe output limit.".into()
+}
+
+fn complete_index(result: Inspection, meta: &Metadata, stream: u32) -> Result<Vec<f64>, String> {
+    if result.frames.is_empty() || result.frames.len() > INDEX_FRAME_LIMIT {
+        return Err(index_unavailable());
+    }
+    let selected = result
+        .streams
+        .iter()
+        .find(|s| {
+            s.index == Some(stream)
+                && s.codec_type.as_deref() == Some("video")
+                && s.disposition.attached_pic == 0
+        })
+        .ok_or_else(index_unavailable)?;
+    let time_base = selected
+        .time_base
+        .as_deref()
+        .and_then(|s| s.split_once('/'))
+        .and_then(|(n, d)| Some((n.parse::<i64>().ok()?, d.parse::<i64>().ok()?)));
+    if selected.codec_name.as_deref() != Some(meta.codec.as_str())
+        || time_base != Some((meta.numerator, meta.denominator))
+        || selected
+            .nb_read_frames
+            .as_deref()
+            .and_then(|s| s.parse::<usize>().ok())
+            != Some(result.frames.len())
+    {
+        return Err(index_unavailable());
+    }
+    // No sorting, deduplication, offset clamping or FPS reconstruction. Ranks
+    // include every picture, including negative timestamps or delayed video.
+    picture_times(result.frames, meta).map_err(|_| index_unavailable())
+}
+
+pub fn source_frame_index(
+    request: SourceFrameIndexRequest,
+) -> Result<SourceFrameIndexResult, String> {
+    let deadline = Instant::now() + INDEX_BUDGET;
+    let identity =
+        crate::media_source::SourceIdentity::capture(Path::new(&request.path)).map_err(|_| {
+            "Source frame numbers are unavailable: the source file could not be opened.".to_string()
+        })?;
+    identity
+        .verify_expected(Some(&request.source_identity))
+        .map_err(|_| "The source changed. Reload it before indexing frames.".to_string())?;
+    let binary = default_ffprobe();
+    let meta = metadata(
+        identity.path(),
+        request.video_stream_index,
+        deadline,
+        &binary,
+    )
+    .map_err(|_| index_unavailable())?;
+    let mut command = command_no_window(&binary);
+    command.args([
+        "-v", "error", "-threads", "1", "-protocol_whitelist", "file,pipe",
+        "-select_streams", &request.video_stream_index.to_string(),
+        "-count_frames", "-show_frames", "-show_streams", "-show_entries",
+        "frame=pts,best_effort_timestamp:stream=index,codec_type,codec_name,time_base,nb_read_frames:stream_disposition=attached_pic",
+    ]).arg(identity.path());
+    // Deliberately no seek/read interval: successful EOF flushes B-frame tails.
+    // The shared reader kills/drains on timeout or its 8 MiB output cap; partial
+    // JSON, decode/demux stderr or missing read counts never becomes an index.
+    let result = inspect(command, deadline, &binary).map_err(|_| index_unavailable())?;
+    let times_s = complete_index(result, &meta, request.video_stream_index)?;
+    identity
+        .verify(identity.path())
+        .map_err(|_| "The source changed. Reload it before indexing frames.".to_string())?;
+    Ok(SourceFrameIndexResult {
+        source_identity: request.source_identity,
+        times_s,
+    })
 }
 
 fn select(cache: &Cached, request: &FrameStepRequest) -> Option<FrameStepResult> {
@@ -638,6 +733,223 @@ mod tests {
             step_source_frame(req)
                 .unwrap_err()
                 .contains("source changed")
+        );
+    }
+
+    fn inspection(pts: &[i64]) -> Inspection {
+        serde_json::from_value(serde_json::json!({
+            "frames":pts.iter().map(|p|serde_json::json!({"pts":p,"best_effort_timestamp":p})).collect::<Vec<_>>(),
+            "streams":[{"index":0,"codec_type":"video","codec_name":"h264","time_base":"1/30","nb_read_frames":pts.len().to_string(),"disposition":{"attached_pic":0}}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn complete_index_preserves_all_ranks_common_origin_and_vfr_gaps() {
+        let times = complete_index(inspection(&[-3, 0, 1, 4, 9]), &meta(), 0).unwrap();
+        assert_eq!(times, [-0.1, 0.0, 1.0 / 30.0, 4.0 / 30.0, 0.3]);
+        let shifted = Metadata {
+            origin_us: 10_500_000,
+            ..meta()
+        };
+        let result = complete_index(inspection(&[375, 376, 380]), &shifted, 0).unwrap();
+        assert_eq!(result, [2.0, 61.0 / 30.0, 13.0 / 6.0]);
+        assert_eq!(
+            serde_json::to_value(SourceFrameIndexResult {
+                source_identity: "test".into(),
+                times_s: times.clone()
+            })
+            .unwrap(),
+            serde_json::json!({"sourceIdentity":"test","timesS":times})
+        );
+    }
+
+    #[test]
+    fn complete_index_rejects_unproven_counts_streams_missing_or_invented_timing() {
+        assert!(complete_index(inspection(&[]), &meta(), 0).is_err());
+        for (field, value) in [
+            ("nb_read_frames", serde_json::Value::Null),
+            ("nb_read_frames", serde_json::json!("2")),
+            ("codec_name", serde_json::json!("hevc")),
+            ("time_base", serde_json::json!("1/1000")),
+            ("codec_type", serde_json::json!("audio")),
+            ("disposition", serde_json::json!({"attached_pic":1})),
+        ] {
+            let mut value_json=serde_json::to_value(serde_json::json!({"frames":[{"pts":0},{"pts":1},{"pts":4}],"streams":[{"index":0,"codec_type":"video","codec_name":"h264","time_base":"1/30","nb_read_frames":"3","disposition":{"attached_pic":0}}]})).unwrap();
+            value_json["streams"][0][field] = value;
+            assert!(
+                complete_index(serde_json::from_value(value_json).unwrap(), &meta(), 0).is_err(),
+                "{field}"
+            );
+        }
+        for values in [&[0, 0][..], &[1, 0][..]] {
+            assert!(complete_index(inspection(values), &meta(), 0).is_err());
+        }
+        let mut missing = inspection(&[0, 1]);
+        missing.frames[1].pts = None;
+        assert!(complete_index(missing, &meta(), 0).is_err());
+        let mut invented = inspection(&[0, 1]);
+        invented.frames[1].best_effort_timestamp = Some(2);
+        assert!(complete_index(invented, &meta(), 0).is_err());
+        assert!(complete_index(inspection(&[0, 1]), &meta(), 1).is_err());
+        let mut excessive = inspection(&[0]);
+        excessive.frames = (0..=INDEX_FRAME_LIMIT)
+            .map(|i| Picture {
+                pts: Some(i as i64),
+                best_effort_timestamp: Some(i as i64),
+            })
+            .collect();
+        excessive.streams[0].nb_read_frames = Some(excessive.frames.len().to_string());
+        assert!(complete_index(excessive, &meta(), 0).is_err());
+    }
+
+    #[test]
+    fn frame_index_rejects_changed_source_before_probing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.bin");
+        fs::write(&path, b"original").unwrap();
+        let identity = crate::media_source::SourceIdentity::capture(&path).unwrap();
+        let expected = identity.fingerprint().to_string();
+        drop(identity);
+        fs::write(&path, b"changed source bytes").unwrap();
+        assert!(
+            source_frame_index(SourceFrameIndexRequest {
+                path: path.to_string_lossy().into(),
+                source_identity: expected,
+                video_stream_index: 0
+            })
+            .unwrap_err()
+            .contains("source changed")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg/FFprobe; generated CFR/VFR/B-frame/common-origin inputs"]
+    fn native_source_frame_index_media() {
+        let temp = tempfile::tempdir().unwrap();
+        let encode = |name: &str, filter: &str| {
+            let binary = default_ffmpeg();
+            let mut command = command_no_window(&binary);
+            command
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=96x54:rate=30:duration=1",
+                    "-vf",
+                    filter,
+                    "-fps_mode",
+                    "vfr",
+                    "-c:v",
+                    "libx264",
+                    "-bf",
+                    "3",
+                    "-video_track_timescale",
+                    "30000",
+                ])
+                .arg(temp.path().join(name));
+            let result = run_command_output_with_timeout(
+                command,
+                "ffmpeg",
+                "VFL_FFMPEG_PATH",
+                &binary,
+                "Frame index fixture",
+                Duration::from_secs(10),
+            )
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        encode("cfr.mp4", "null");
+        encode("vfr.mp4", "setpts=if(lt(N\\,10)\\,N\\,N+3)/(30*TB)");
+        for (name, vfr) in [("cfr.mp4", false), ("vfr.mp4", true)] {
+            let path = temp.path().join(name);
+            let identity = crate::media_source::SourceIdentity::capture(&path).unwrap();
+            let result = source_frame_index(SourceFrameIndexRequest {
+                path: path.to_string_lossy().into(),
+                source_identity: identity.fingerprint().into(),
+                video_stream_index: 0,
+            })
+            .unwrap();
+            assert_eq!(result.source_identity, identity.fingerprint());
+            assert_eq!(result.times_s.len(), 30);
+            for (index, time) in result.times_s.iter().enumerate() {
+                assert_eq!(
+                    *time,
+                    (index + usize::from(vfr && index >= 10) * 3) as f64 / 30.0
+                );
+            }
+            assert_eq!(
+                result.times_s[29],
+                if vfr { 32.0 / 30.0 } else { 29.0 / 30.0 },
+                "EOF must retain all flushed B pictures"
+            );
+        }
+        // Video starts 2s after the common format origin, with audio first.
+        let binary = default_ffmpeg();
+        let mut command = command_no_window(&binary);
+        command
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=96x54:rate=30:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo:d=3",
+                "-vf",
+                "setpts=PTS+2/TB",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "pcm_s16le",
+                "-output_ts_offset",
+                "10.5",
+            ])
+            .arg(temp.path().join("offset.mkv"));
+        assert!(
+            run_command_output_with_timeout(
+                command,
+                "ffmpeg",
+                "VFL_FFMPEG_PATH",
+                &binary,
+                "Frame index offset fixture",
+                Duration::from_secs(10)
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        let path = temp.path().join("offset.mkv");
+        let identity = crate::media_source::SourceIdentity::capture(&path).unwrap();
+        let result = source_frame_index(SourceFrameIndexRequest {
+            path: path.to_string_lossy().into(),
+            source_identity: identity.fingerprint().into(),
+            video_stream_index: 0,
+        })
+        .unwrap();
+        assert_eq!(result.times_s.len(), 30);
+        assert_eq!(result.times_s[0], 2.0);
+        assert_eq!(result.times_s[29], 2.967);
+        assert!(
+            source_frame_index(SourceFrameIndexRequest {
+                path: path.to_string_lossy().into(),
+                source_identity: identity.fingerprint().into(),
+                video_stream_index: 1
+            })
+            .is_err(),
+            "audio is never an indexed video stream"
         );
     }
 }

@@ -7,6 +7,7 @@ use tauri::async_runtime::Mutex;
 static MEDIA: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 static FILES: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 static FRAME_TIMING: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+static SOURCE_FRAME_INDEX: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 async fn dispatch<T: Send + 'static>(
     lane: &OnceLock<Arc<Mutex<()>>>,
@@ -44,10 +45,80 @@ pub async fn frame_timing<T: Send + 'static>(
     dispatch(&FRAME_TIMING, work).await
 }
 
+async fn dispatch_index<T: Send + 'static>(
+    lane: &OnceLock<Arc<Mutex<()>>>,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    // A stale scan may run to its deadline, but new calls never queue behind
+    // it or occupy blocking-pool threads while waiting for an index permit.
+    let permit = lane
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| {
+            "Source frame indexing is busy. Retry when the current index finishes.".to_string()
+        })?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| "Source frame indexing could not finish. Retry indexing the source.".to_string())?
+}
+
+pub async fn source_frame_index<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    dispatch_index(&SOURCE_FRAME_INDEX, work).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn frame_index_lane_rejects_busy_calls_and_survives_abandoned_callers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let lane = Arc::new(OnceLock::new());
+        let first_lane = lane.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = tauri::async_runtime::spawn(async move {
+            dispatch_index(&first_lane, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        first.abort();
+        tauri::async_runtime::block_on(async {
+            assert!(
+                dispatch_index(&lane, || -> Result<(), String> {
+                    panic!("busy work must never queue or run")
+                })
+                .await
+                .unwrap_err()
+                .contains("busy")
+            );
+            // The independent existing frame-step lane remains available.
+            assert_eq!(frame_timing(|| Ok(42)).await.unwrap(), 42);
+        });
+        release_tx.send(()).unwrap();
+        // Waiting for this specific guard to be released is bounded; the call
+        // itself never waits or queues behind the old scan.
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while lane.get().unwrap().try_lock().is_err() {
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        tauri::async_runtime::block_on(async {
+            assert_eq!(dispatch_index(&lane, || Ok(7)).await.unwrap(), 7);
+        });
+    }
 
     #[test]
     fn abandoned_caller_keeps_lane_until_blocking_work_finishes() {
