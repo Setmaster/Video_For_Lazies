@@ -408,6 +408,20 @@ fn parse_smoke_config_from_env(
             .unwrap_or("auto"),
     )?;
     let anti_stutter = parse_smoke_bool(env, "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER")?;
+    let anti_stutter_strength = env.get("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH")
+        .map(|value| value.parse::<u8>().map_err(|_| "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH must be an integer from 0 to 100.".to_string()))
+        .transpose()?.unwrap_or(0);
+    if anti_stutter_strength > 100 {
+        return Err(
+            "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH must be an integer from 0 to 100."
+                .into(),
+        );
+    }
+    if env.contains_key("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH")
+        && !env.contains_key("VFL_SMOKE_INTERPOLATION_FPS")
+    {
+        return Err("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH requires Smooth motion and VFL_SMOKE_INTERPOLATION_FPS.".into());
+    }
     if anti_stutter && !env.contains_key("VFL_SMOKE_INTERPOLATION_FPS") {
         return Err("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER requires Smooth motion and VFL_SMOKE_INTERPOLATION_FPS.".into());
     }
@@ -431,6 +445,7 @@ fn parse_smoke_config_from_env(
             }
             Ok(video::InterpolationSettings {
                 anti_stutter,
+                anti_stutter_strength,
                 target_fps,
                 model_id: model_id.to_string(),
             })
@@ -1201,6 +1216,37 @@ mod tests {
             "not-a-bool".into(),
         );
         assert!(parse_smoke_config_from_env(&env).is_err());
+    }
+
+    #[test]
+    fn anti_stutter_smoke_strength_is_bounded_and_preserved_while_disabled() {
+        let status_path = temp_smoke_status_path("anti-strength");
+        let mut env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", "input.mp4"),
+            ("VFL_SMOKE_OUTPUT", "output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH", "75"),
+        ]);
+        assert!(
+            parse_smoke_config_from_env(&env)
+                .unwrap_err()
+                .contains("requires Smooth motion")
+        );
+        env.insert("VFL_SMOKE_INTERPOLATION_FPS".into(), "120".into());
+        let settings = parse_smoke_config_from_env(&env)
+            .unwrap()
+            .unwrap()
+            .interpolation
+            .unwrap();
+        assert!(!settings.anti_stutter);
+        assert_eq!(settings.anti_stutter_strength, 75);
+        for invalid in ["-1", "101", "0.5", "50.0", "true", ""] {
+            env.insert(
+                "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH".into(),
+                invalid.into(),
+            );
+            assert!(parse_smoke_config_from_env(&env).is_err(), "{invalid}");
+        }
     }
 
     #[test]

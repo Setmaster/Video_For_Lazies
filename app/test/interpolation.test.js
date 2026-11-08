@@ -83,6 +83,38 @@ test("Anti-stutter preserves unsupported model intent and blocks export instead 
   assert.match(interpolationConflict(unsupported, "mp3", null), /MP4 or WebM/);
 });
 
+test("repair strength keeps legacy defaults and admits only integer intent from 0 through 100", () => {
+  for (const strength of [undefined, null, false, "50", -1, 101, 0.5, NaN, Infinity, {}]) {
+    assert.deepEqual(normalizeInterpolation({ ...intent, antiStutterStrength: strength }), intent);
+  }
+  assert.deepEqual(normalizeInterpolation({ ...intent, antiStutterStrength: 0 }), intent);
+  for (const strength of [1, 50, 100]) {
+    const chosen = { ...intent, antiStutterStrength: strength };
+    assert.deepEqual(normalizeInterpolation(chosen), chosen);
+    assert.deepEqual(normalizeInterpolation({ ...chosen, antiStutter: false }), chosen);
+    assert.deepEqual(normalizeInterpolation({ ...chosen, antiStutter: true }), { ...chosen, antiStutter: true });
+  }
+});
+
+test("repair strength survives settings, recipes and isolated queue snapshots", () => {
+  const interpolation = { ...intent, antiStutter: true, antiStutterStrength: 73 };
+  const plan = { ...settings(), interpolation };
+  assert.deepEqual(parsePersistedSettings(serializePersistedSettings(plan)).interpolation, interpolation);
+  const created = createUserRecipe([], "Stronger repair", "Anti-stutter", plan, { id: "strength" });
+  assert.equal(created.ok, true);
+  const restored = parseUserRecipeStore(serializeUserRecipeStore(created.recipes)).recipes[0];
+  assert.deepEqual(restored.settings.interpolation, interpolation);
+  assert.equal(userRecipeMatchesSettings(restored, plan), true);
+  assert.equal(userRecipeMatchesSettings(restored, { ...plan, interpolation: { ...interpolation, antiStutterStrength: 0 } }), false);
+  let queue = reduceExportQueue(createExportQueueState(), { type: "enqueue-prepared", items: [{ request: { ...plan, inputPath: "/input.mp4", outputPath: "/output.mp4" }, durationS: 1 }] });
+  interpolation.antiStutterStrength = 12;
+  assert.equal(queue.items[0].request.interpolation.antiStutterStrength, 73);
+  assert.equal(reusableSettingsFromEncodeRequest(queue.items[0].request).interpolation.antiStutterStrength, 73);
+  queue = reduceExportQueue(queue, { type: "duplicate-prepared", sourceItemId: queue.items[0].id, request: { ...queue.items[0].request, outputPath: "/output-2.mp4" } });
+  queue.items[0].request.interpolation.antiStutterStrength = 25;
+  assert.equal(queue.items[1].request.interpolation.antiStutterStrength, 73);
+});
+
 test("Anti-stutter results distinguish no repairs from uncertain candidates and completed repairs", () => {
   assert.equal(antiStutterSummary(undefined), null);
   assert.equal(antiStutterSummary({ repairedRuns: 0, unchangedRuns: 0 }), "Anti-stutter: no short freezes repaired.");

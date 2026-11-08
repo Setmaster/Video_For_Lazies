@@ -10,6 +10,32 @@ const MAX_SPAN_NS: u64 = 250_000_000;
 const DETAIL_LIMIT: usize = 32;
 const TILES: usize = 48;
 
+// Strength changes confidence only. Similarity, source segmentation and all
+// discontinuity/resource guards remain identical to the conservative policy.
+#[derive(Clone, Copy, Debug, Default)]
+struct Policy {
+    strength: u8,
+}
+impl Policy {
+    fn minimum_matches(self) -> usize {
+        12 - usize::from(self.strength.min(100)) / 25
+    }
+    fn rate_factor(self) -> u128 {
+        400 - 2 * u128::from(self.strength.min(100))
+    }
+    fn accepts_rate(self, near: Evidence, context: Evidence) -> bool {
+        u128::from(near.mean) * u128::from(context.delta_ns) * self.rate_factor()
+            <= u128::from(context.mean) * u128::from(near.delta_ns) * 100
+    }
+    fn accepts_matches(self, textured: usize, matched: usize, coherent: usize) -> bool {
+        textured >= 12 && coherent >= self.minimum_matches() && coherent * 3 >= matched * 2
+    }
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Interval {
@@ -24,6 +50,8 @@ pub struct Interval {
 #[serde(rename_all = "camelCase")]
 pub struct AntiStutterDiagnostics {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub strength: u8,
     pub analyzed_frames: u64,
     pub candidate_runs: u64,
     pub repaired_runs: u64,
@@ -205,7 +233,13 @@ impl Luma {
 // A bounded correspondence check, not an estimate of the missing true motion.
 // Textured patches must have a distinct match and agree spatially. Repetitive
 // texture, flat areas and unrelated same-histogram images may be unqualified.
-fn continuous(a: &[u8], b: &[u8], width: usize, height: usize) -> Result<bool, String> {
+fn continuous(
+    a: &[u8],
+    b: &[u8],
+    width: usize,
+    height: usize,
+    policy: Policy,
+) -> Result<bool, String> {
     let a = Luma::new(a, width, height)?;
     let b = Luma::new(b, width, height)?;
     if a.width < 16 || a.height < 12 {
@@ -300,10 +334,28 @@ fn continuous(a: &[u8], b: &[u8], width: usize, height: usize) -> Result<bool, S
             }
         }
     }
+    let coherent = coherent_matches(&matches);
+
+    #[cfg(test)]
+    if std::env::var_os("VFL_ANTI_MATCH_TRACE").is_some() {
+        eprintln!(
+            "correspondence textured={textured} matched={} spread_nonzero_cluster={coherent} quality={} separated={} scores={match_scores:?}",
+            matches.len(),
+            match_scores.iter().filter(|s| s.0 <= 250).count(),
+            match_scores
+                .iter()
+                .filter(|s| s.1 >= s.0 + 25 && s.0 * 4 <= s.1 * 3)
+                .count()
+        );
+    }
+    Ok(policy.accepts_matches(textured, matches.len(), coherent))
+}
+
+fn coherent_matches(matches: &[(usize, usize, i32, i32)]) -> usize {
     // Static HUD/background matches cannot establish continuity for unrelated
     // moving content. Require spatially distributed matched displacement.
     let moving: Vec<_> = matches.iter().filter(|m| m.2 != 0 || m.3 != 0).collect();
-    let coherent = moving
+    moving
         .iter()
         .map(|center| {
             let cluster: Vec<_> = moving
@@ -319,21 +371,7 @@ fn continuous(a: &[u8], b: &[u8], width: usize, height: usize) -> Result<bool, S
             }
         })
         .max()
-        .unwrap_or(0);
-
-    #[cfg(test)]
-    if std::env::var_os("VFL_ANTI_MATCH_TRACE").is_some() {
-        eprintln!(
-            "correspondence textured={textured} matched={} spread_nonzero_cluster={coherent} quality={} separated={} scores={match_scores:?}",
-            matches.len(),
-            match_scores.iter().filter(|s| s.0 <= 250).count(),
-            match_scores
-                .iter()
-                .filter(|s| s.1 >= s.0 + 25 && s.0 * 4 <= s.1 * 3)
-                .count()
-        );
-    }
-    Ok(textured >= 12 && coherent >= 12 && coherent * 3 >= matches.len() * 2)
+        .unwrap_or(0)
 }
 
 struct Picture {
@@ -358,6 +396,7 @@ pub(super) struct Span {
 }
 
 pub(super) struct Window {
+    policy: Policy,
     pictures: VecDeque<Picture>,
     pool: Vec<Vec<u8>>,
     width: usize,
@@ -382,9 +421,11 @@ impl Window {
         height: usize,
         duration_ns: u64,
         real_first: bool,
+        strength: u8,
     ) -> Self {
         let frame_bytes = pixels.len();
         Self {
+            policy: Policy { strength },
             pictures: VecDeque::from([Picture {
                 pixels,
                 pts,
@@ -404,6 +445,7 @@ impl Window {
             allocated_high_water: 1,
             diagnostics: AntiStutterDiagnostics {
                 version: 2,
+                strength,
                 analyzed_frames: u64::from(real_first),
                 candidate_runs: 0,
                 repaired_runs: 0,
@@ -595,9 +637,7 @@ impl Window {
             // Rates use actual elapsed source time, including recurring holds
             // on each side. They do not assume a nominal CFR frame count.
             for context in [before, after] {
-                if u128::from(near.mean) * u128::from(context.delta_ns) * 4
-                    > u128::from(context.mean) * u128::from(near.delta_ns)
-                {
+                if !self.policy.accepts_rate(near, context) {
                     return Ok(Some("uncertainMotion"));
                 }
             }
@@ -611,7 +651,13 @@ impl Window {
                 self.pts(post)
             );
         }
-        if !continuous(self.pixels(0), self.pixels(right), self.width, self.height)? {
+        if !continuous(
+            self.pixels(0),
+            self.pixels(right),
+            self.width,
+            self.height,
+            self.policy,
+        )? {
             return Ok(Some("unreliableCorrespondence"));
         }
         Ok(None)
@@ -783,6 +829,15 @@ mod tests {
             .collect()
     }
     fn run(input: &[(Vec<u8>, u64)], fps: u32, speed: f64) -> RunResult {
+        let result = run_at_strength(input, fps, speed, 0);
+        // Every existing full-window negative also remains a negative at the
+        // strongest setting, including first-anchor/cut/resource boundaries.
+        if result.0.repaired_runs == 0 {
+            assert_eq!(run_at_strength(input, fps, speed, 100).0.repaired_runs, 0);
+        }
+        result
+    }
+    fn run_at_strength(input: &[(Vec<u8>, u64)], fps: u32, speed: f64, strength: u8) -> RunResult {
         let duration =
             input.last().unwrap().1 + input.get(1).map_or(33_333_333, |p| p.1 - input[0].1);
         let mut window = Window::new(
@@ -792,6 +847,7 @@ mod tests {
             HEIGHT,
             duration,
             true,
+            strength,
         );
         let mut index = 1;
         let mut read = |pixels: &mut [u8]| {
@@ -824,6 +880,169 @@ mod tests {
         assert_eq!(window.diagnostics.analyzed_frames, input.len() as u64);
         assert!(window.allocated_high_water <= MAX_PICTURES);
         (window.diagnostics, window.allocated_high_water, spans)
+    }
+
+    #[test]
+    fn anti_stutter_strength_has_nested_confidence_limits_and_fixed_coverage() {
+        for (strength, minimum, factor) in [
+            (0, 12, 400),
+            (25, 11, 350),
+            (50, 10, 300),
+            (75, 9, 250),
+            (100, 8, 200),
+        ] {
+            let policy = Policy { strength };
+            assert_eq!(policy.minimum_matches(), minimum);
+            assert_eq!(policy.rate_factor(), factor);
+        }
+        let context = Evidence {
+            delta_ns: 100,
+            ..compare(&picture(0), &picture(1), WIDTH, HEIGHT).unwrap()
+        };
+        let near = Evidence {
+            mean: 300,
+            delta_ns: 100,
+            ..context
+        };
+        let context = Evidence {
+            mean: 1_000,
+            ..context
+        };
+        assert!(!Policy { strength: 0 }.accepts_rate(near, context));
+        assert!(Policy { strength: 50 }.accepts_rate(near, context));
+        assert!(Policy { strength: 100 }.accepts_rate(near, context));
+        assert!(Policy { strength: 0 }.accepts_rate(Evidence { mean: 250, ..near }, context));
+        assert!(!Policy { strength: 0 }.accepts_rate(Evidence { mean: 251, ..near }, context));
+        assert!(Policy { strength: 100 }.accepts_rate(Evidence { mean: 500, ..near }, context));
+        assert!(!Policy { strength: 100 }.accepts_rate(Evidence { mean: 501, ..near }, context));
+        for mean in 0..=1_000 {
+            let mut accepted = false;
+            for strength in 0..=100 {
+                let next = Policy { strength }.accepts_rate(Evidence { mean, ..near }, context);
+                assert!(!accepted || next);
+                accepted = next;
+            }
+        }
+        let mut patches = vec![
+            (0, 0, 4, 2),
+            (1, 0, 4, 2),
+            (2, 1, 4, 2),
+            (3, 1, 4, 2),
+            (0, 2, 4, 2),
+            (1, 2, 4, 2),
+            (2, 2, 4, 2),
+        ];
+        assert_eq!(coherent_matches(&patches), 7);
+        assert!(coherent_matches(&patches) < Policy { strength: 100 }.minimum_matches());
+        patches.push((3, 2, 4, 2));
+        assert_eq!(coherent_matches(&patches), 8);
+        assert!(coherent_matches(&patches) >= Policy { strength: 100 }.minimum_matches());
+        assert!(coherent_matches(&patches) < Policy { strength: 0 }.minimum_matches());
+        assert!(!Policy { strength: 100 }.accepts_matches(12, 8, 7));
+        assert!(Policy { strength: 100 }.accepts_matches(12, 8, 8));
+        assert!(!Policy { strength: 0 }.accepts_matches(12, 8, 8));
+        assert!(!Policy { strength: 100 }.accepts_matches(11, 8, 8));
+        assert!(Policy { strength: 100 }.accepts_matches(12, 12, 8));
+        assert!(!Policy { strength: 100 }.accepts_matches(13, 13, 8));
+        for patch in &mut patches {
+            patch.0 %= 3;
+        }
+        assert_eq!(
+            coherent_matches(&patches),
+            0,
+            "eight matches in only three columns are insufficient"
+        );
+        for patch in &mut patches {
+            patch.2 = 0;
+            patch.3 = 0;
+        }
+        assert_eq!(
+            coherent_matches(&patches),
+            0,
+            "zero-motion support never qualifies"
+        );
+    }
+
+    #[test]
+    fn anti_stutter_strength_does_not_override_ambiguous_partial_occlusion() {
+        let positions = [0, 1, 2, 3, 3, 3, 6, 7, 8, 9];
+        let patches = [
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (6, 1),
+            (1, 3),
+            (2, 3),
+            (4, 4),
+            (6, 4),
+            (4, 3),
+            (6, 3),
+        ];
+        let input: Vec<_> = positions
+            .iter()
+            .enumerate()
+            .map(|(frame, position)| {
+                let original = picture(*position);
+                let mut pixels = original.clone();
+                if frame >= 6 {
+                    for y in 0..HEIGHT {
+                        for x in 0..WIDTH {
+                            let value = (112.0
+                                + 12.0
+                                    * (x as f64 * 0.08 + y as f64 * 0.05 + *position as f64 * 0.3)
+                                        .sin())
+                            .round() as u8;
+                            pixels[(y * WIDTH + x) * 3..(y * WIDTH + x + 1) * 3].fill(value);
+                        }
+                    }
+                    for (tx, ty) in patches {
+                        let cx = (2 * tx + 1) * WIDTH / 16 - (*position - 3) * 2;
+                        let cy = (2 * ty + 1) * HEIGHT / 12;
+                        for y in cy - 3..=cy + 3 {
+                            for x in cx - 3..=cx + 3 {
+                                let offset = (y * WIDTH + x) * 3;
+                                pixels[offset..offset + 3]
+                                    .copy_from_slice(&original[offset..offset + 3]);
+                            }
+                        }
+                    }
+                }
+                (pixels, frame as u64 * 33_333_333)
+            })
+            .collect();
+        let conservative = run_at_strength(&input, 120, 1.0, 0);
+        let aggressive = run_at_strength(&input, 120, 1.0, 100);
+        assert_eq!(conservative.0.repaired_runs, 0, "{:?}", conservative.0);
+        assert_eq!(aggressive.0.repaired_runs, 0, "{:?}", aggressive.0);
+        assert_eq!(aggressive.0.intervals[0].reason, "unreliableCorrespondence");
+    }
+
+    #[test]
+    fn anti_stutter_strength_can_admit_compressed_single_holds_with_weaker_rate_separation() {
+        let positions = [0, 1, 2, 3, 3, 5, 6, 7];
+        let times = [0, 33, 66, 166, 176, 186, 286, 319];
+        let mut input: Vec<_> = positions
+            .iter()
+            .zip(times)
+            .map(|(position, time)| (picture(*position), time * 1_000_000))
+            .collect();
+        for (index, byte) in input[4].0.iter_mut().step_by(3).enumerate() {
+            *byte = if index % 2 == 0 {
+                byte.saturating_add(1)
+            } else {
+                byte.saturating_sub(1)
+            };
+        }
+        let conservative = run_at_strength(&input, 120, 1.0, 0);
+        let aggressive = run_at_strength(&input, 120, 1.0, 100);
+        assert_eq!(conservative.0.repaired_runs, 0, "{:?}", conservative.0);
+        assert_eq!(conservative.0.intervals[0].reason, "uncertainMotion");
+        assert_eq!(aggressive.0.repaired_runs, 1, "{:?}", aggressive.0);
+        assert!(
+            aggressive
+                .2
+                .contains(&(166_000_000, Some(186_000_000), true))
+        );
     }
 
     #[test]
@@ -941,7 +1160,7 @@ mod tests {
             *pts += 4_000_000;
         }
         assert_eq!(run(&source, 60, 1.0).0.repaired_runs, 1);
-        let mut window = Window::new(picture(0), 20, WIDTH, HEIGHT, 100, true);
+        let mut window = Window::new(picture(0), 20, WIDTH, HEIGHT, 100, true, 100);
         assert!(
             window
                 .next(&mut |pixels| {
@@ -1025,7 +1244,7 @@ mod tests {
             diagnostics.repaired_runs + diagnostics.unchanged_runs
         );
         assert_eq!(diagnostics.intervals.len(), DETAIL_LIMIT);
-        let mut window = Window::new(vec![0; 3], 0, 1, 1, 1, true);
+        let mut window = Window::new(vec![0; 3], 0, 1, 1, 1, true, 100);
         window.frame_bytes = MAX_BUFFER_BYTES / 9 + 1;
         assert!(
             !window
@@ -1039,7 +1258,7 @@ mod tests {
             cancel,
             child: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         });
-        let mut window = Window::new(picture(0), 0, WIDTH, HEIGHT, 100, true);
+        let mut window = Window::new(picture(0), 0, WIDTH, HEIGHT, 100, true, 100);
         assert!(
             window
                 .next(&mut |_| panic!("cancelled input must not read"))
@@ -1190,168 +1409,199 @@ mod tests {
 
     #[test]
     fn anti_stutter_near_lighting_cut_retires_history_before_later_hold() {
-        let mut input = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 7, 9, 10, 11], 33_333_333);
-        for (pixels, _) in input.iter_mut().take(6).skip(4) {
-            for pixel in pixels.chunks_exact_mut(3) {
-                pixel[0] += 1;
+        for strength in [0, 100] {
+            let mut input = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 7, 9, 10, 11], 33_333_333);
+            for (pixels, _) in input.iter_mut().take(6).skip(4) {
+                for pixel in pixels.chunks_exact_mut(3) {
+                    pixel[0] += 1;
+                }
             }
+            let (cut_at, changed_at, later_at) = (input[4].1, input[6].1, input[7].1);
+            let mut window = Window::new(
+                input[0].0.clone(),
+                0,
+                WIDTH,
+                HEIGHT,
+                400_000_000,
+                true,
+                strength,
+            );
+            let mut index = 1;
+            let mut read = |pixels: &mut [u8]| {
+                if index == input.len() {
+                    return Ok(None);
+                }
+                pixels.copy_from_slice(&input[index].0);
+                let pts = input[index].1;
+                index += 1;
+                Ok(Some(pts))
+            };
+            let (mut saw_cut, mut saw_later) = (false, false);
+            while let Some(span) = window.next(&mut read).unwrap() {
+                let left = window.pts(0);
+                let right = span.right.map(|i| window.pts(i));
+                let repaired = span.repaired;
+                window.advance(span, u64::from(repaired));
+                if right == Some(cut_at) {
+                    saw_cut = true;
+                    assert!(window.previous_motion.is_none());
+                    assert!(window.hold_started.is_none());
+                }
+                if right == Some(changed_at) {
+                    assert_eq!(
+                        window.previous_motion.unwrap().0.delta_ns,
+                        changed_at - cut_at
+                    );
+                }
+                if left == later_at && repaired {
+                    saw_later = true;
+                }
+            }
+            assert!(
+                saw_cut && saw_later,
+                "retired context must not block a later supported hold"
+            );
         }
-        let (cut_at, changed_at, later_at) = (input[4].1, input[6].1, input[7].1);
-        let mut window = Window::new(input[0].0.clone(), 0, WIDTH, HEIGHT, 400_000_000, true);
-        let mut index = 1;
-        let mut read = |pixels: &mut [u8]| {
-            if index == input.len() {
-                return Ok(None);
-            }
-            pixels.copy_from_slice(&input[index].0);
-            let pts = input[index].1;
-            index += 1;
-            Ok(Some(pts))
-        };
-        let (mut saw_cut, mut saw_later) = (false, false);
-        while let Some(span) = window.next(&mut read).unwrap() {
-            let left = window.pts(0);
-            let right = span.right.map(|i| window.pts(i));
-            let repaired = span.repaired;
-            window.advance(span, u64::from(repaired));
-            if right == Some(cut_at) {
-                saw_cut = true;
-                assert!(window.previous_motion.is_none());
-                assert!(window.hold_started.is_none());
-            }
-            if right == Some(changed_at) {
-                assert_eq!(
-                    window.previous_motion.unwrap().0.delta_ns,
-                    changed_at - cut_at
-                );
-            }
-            if left == later_at && repaired {
-                saw_later = true;
-            }
-        }
-        assert!(
-            saw_cut && saw_later,
-            "retired context must not block a later supported hold"
-        );
     }
 
     #[test]
     fn anti_stutter_rejected_lighting_keeps_ordinary_smooth_spans() {
-        let mut input = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 8, 9], 33_333_333);
-        for (pixels, _) in input.iter_mut().take(6).skip(4) {
-            for pixel in pixels.chunks_exact_mut(3) {
-                pixel[0] += 1;
-            }
-        }
-        let mut window = Window::new(input[0].0.clone(), 0, WIDTH, HEIGHT, 333_333_330, true);
-        let mut index = 1;
-        let mut read = |pixels: &mut [u8]| {
-            if index == input.len() {
-                return Ok(None);
-            }
-            pixels.copy_from_slice(&input[index].0);
-            let pts = input[index].1;
-            index += 1;
-            Ok(Some(pts))
-        };
-        let rate = Rate::for_playback(120, 1.0).unwrap();
-        let mut checked_lighting = false;
-        let mut source_index = 0;
-        let mut actual = Vec::new();
-        let mut output = 0;
-        let count = rate.frame_count(333_333_330).unwrap();
-        while let Some(span) = window.next(&mut read).unwrap() {
-            assert!(!span.repaired);
-            assert_eq!(
-                span.right,
-                if source_index + 1 < input.len() {
-                    Some(1)
-                } else {
-                    None
+        for strength in [0, 100] {
+            let mut input = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 8, 9], 33_333_333);
+            for (pixels, _) in input.iter_mut().take(6).skip(4) {
+                for pixel in pixels.chunks_exact_mut(3) {
+                    pixel[0] += 1;
                 }
+            }
+            let mut window = Window::new(
+                input[0].0.clone(),
+                0,
+                WIDTH,
+                HEIGHT,
+                333_333_330,
+                true,
+                strength,
             );
-            assert_eq!(window.pixels(0), &input[source_index].0);
-            let next = span.right.map(|i| window.pts(i));
-            while output < count && next.is_none_or(|pts| rate.sample_before(output, pts)) {
-                let alpha = next
-                    .map(|r| rate.alpha(output, window.pts(0), r).unwrap())
-                    .unwrap_or(0.0);
-                let infer = alpha > 0.0
-                    && alpha < 1.0
-                    && !span.cut
-                    && window.pixels(0) != window.pixels(span.right.unwrap_or(0));
-                actual.push((window.pts(0), next, alpha.to_bits(), infer));
-                output += 1;
-            }
-            if let Some(right) = span.right {
-                let (left, right) = (window.pixels(0), window.pixels(right));
-                let baseline_cut = is_scene_cut(left, right);
-                assert_eq!(
-                    span.cut, baseline_cut,
-                    "a qualification-only veto must not change execution"
-                );
-                let evidence = compare(left, right, WIDTH, HEIGHT).unwrap();
-                checked_lighting |= evidence.lighting && !baseline_cut;
-            }
-            window.advance(span, 0);
-            source_index += 1;
-        }
-        let mut expected = Vec::new();
-        let mut index = 0;
-        for frame in 0..count {
-            while index + 1 < input.len() && !rate.sample_before(frame, input[index + 1].1) {
+            let mut index = 1;
+            let mut read = |pixels: &mut [u8]| {
+                if index == input.len() {
+                    return Ok(None);
+                }
+                pixels.copy_from_slice(&input[index].0);
+                let pts = input[index].1;
                 index += 1;
+                Ok(Some(pts))
+            };
+            let rate = Rate::for_playback(120, 1.0).unwrap();
+            let mut checked_lighting = false;
+            let mut source_index = 0;
+            let mut actual = Vec::new();
+            let mut output = 0;
+            let count = rate.frame_count(333_333_330).unwrap();
+            while let Some(span) = window.next(&mut read).unwrap() {
+                assert!(!span.repaired);
+                assert_eq!(
+                    span.right,
+                    if source_index + 1 < input.len() {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(window.pixels(0), &input[source_index].0);
+                let next = span.right.map(|i| window.pts(i));
+                while output < count && next.is_none_or(|pts| rate.sample_before(output, pts)) {
+                    let alpha = next
+                        .map(|r| rate.alpha(output, window.pts(0), r).unwrap())
+                        .unwrap_or(0.0);
+                    let infer = alpha > 0.0
+                        && alpha < 1.0
+                        && !span.cut
+                        && window.pixels(0) != window.pixels(span.right.unwrap_or(0));
+                    actual.push((window.pts(0), next, alpha.to_bits(), infer));
+                    output += 1;
+                }
+                if let Some(right) = span.right {
+                    let (left, right) = (window.pixels(0), window.pixels(right));
+                    let baseline_cut = is_scene_cut(left, right);
+                    assert_eq!(
+                        span.cut, baseline_cut,
+                        "a qualification-only veto must not change execution"
+                    );
+                    let evidence = compare(left, right, WIDTH, HEIGHT).unwrap();
+                    checked_lighting |= evidence.lighting && !baseline_cut;
+                }
+                window.advance(span, 0);
+                source_index += 1;
             }
-            let next = input.get(index + 1);
-            let alpha = next
-                .map(|r| rate.alpha(frame, input[index].1, r.1).unwrap())
-                .unwrap_or(0.0);
-            let infer = next.is_some_and(|r| {
-                alpha > 0.0
-                    && alpha < 1.0
-                    && !is_scene_cut(&input[index].0, &r.0)
-                    && input[index].0 != r.0
-            });
-            expected.push((input[index].1, next.map(|r| r.1), alpha.to_bits(), infer));
+            let mut expected = Vec::new();
+            let mut index = 0;
+            for frame in 0..count {
+                while index + 1 < input.len() && !rate.sample_before(frame, input[index + 1].1) {
+                    index += 1;
+                }
+                let next = input.get(index + 1);
+                let alpha = next
+                    .map(|r| rate.alpha(frame, input[index].1, r.1).unwrap())
+                    .unwrap_or(0.0);
+                let infer = next.is_some_and(|r| {
+                    alpha > 0.0
+                        && alpha < 1.0
+                        && !is_scene_cut(&input[index].0, &r.0)
+                        && input[index].0 != r.0
+                });
+                expected.push((input[index].1, next.map(|r| r.1), alpha.to_bits(), infer));
+            }
+            assert_eq!(
+                actual, expected,
+                "worker inputs/alpha and holds must match the ordinary adjacent-pair schedule"
+            );
+            assert!(checked_lighting);
+            assert_eq!(window.diagnostics.repaired_runs, 0);
+            assert_eq!(window.cut_pairs, 0);
         }
-        assert_eq!(
-            actual, expected,
-            "worker inputs/alpha and holds must match the ordinary adjacent-pair schedule"
-        );
-        assert!(checked_lighting);
-        assert_eq!(window.diagnostics.repaired_runs, 0);
-        assert_eq!(window.cut_pairs, 0);
     }
 
     #[test]
     fn anti_stutter_correspondence_rejects_flat_flash_and_ambiguous_periodic_matches() {
-        let a = picture(3);
-        for amount in [1, 4, 12] {
-            let mut flash = a.clone();
-            for p in &mut flash {
-                *p = p.saturating_add(amount);
+        for strength in [0, 100] {
+            let a = picture(3);
+            for amount in [1, 4, 12] {
+                let mut flash = a.clone();
+                for p in &mut flash {
+                    *p = p.saturating_add(amount);
+                }
+                assert!(compare(&a, &flash, WIDTH, HEIGHT).unwrap().discontinuity());
             }
-            assert!(compare(&a, &flash, WIDTH, HEIGHT).unwrap().discontinuity());
-        }
-        let mut color = a.clone();
-        for pixel in color.chunks_exact_mut(3) {
-            pixel[2] = pixel[2].saturating_add(2);
-        }
-        assert!(compare(&a, &color, WIDTH, HEIGHT).unwrap().discontinuity());
-        assert!(!continuous(&vec![80; a.len()], &vec![85; a.len()], WIDTH, HEIGHT).unwrap());
-        let mut periodic = vec![0; a.len()];
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                periodic[(y * WIDTH + x) * 3..(y * WIDTH + x + 1) * 3]
-                    .fill(if (x / 2 + y / 2) % 2 == 0 { 40 } else { 180 });
+            let mut color = a.clone();
+            for pixel in color.chunks_exact_mut(3) {
+                pixel[2] = pixel[2].saturating_add(2);
             }
+            assert!(compare(&a, &color, WIDTH, HEIGHT).unwrap().discontinuity());
+            assert!(
+                !continuous(
+                    &vec![80; a.len()],
+                    &vec![85; a.len()],
+                    WIDTH,
+                    HEIGHT,
+                    Policy { strength }
+                )
+                .unwrap()
+            );
+            let mut periodic = vec![0; a.len()];
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    periodic[(y * WIDTH + x) * 3..(y * WIDTH + x + 1) * 3]
+                        .fill(if (x / 2 + y / 2) % 2 == 0 { 40 } else { 180 });
+                }
+            }
+            assert!(!continuous(&periodic, &periodic, WIDTH, HEIGHT, Policy { strength }).unwrap());
+            let mut shifted = periodic.clone();
+            for row in shifted.chunks_exact_mut(WIDTH * 3) {
+                row.rotate_left(3);
+            }
+            assert!(!continuous(&periodic, &shifted, WIDTH, HEIGHT, Policy { strength }).unwrap());
         }
-        assert!(!continuous(&periodic, &periodic, WIDTH, HEIGHT).unwrap());
-        let mut shifted = periodic.clone();
-        for row in shifted.chunks_exact_mut(WIDTH * 3) {
-            row.rotate_left(3);
-        }
-        assert!(!continuous(&periodic, &shifted, WIDTH, HEIGHT).unwrap());
     }
 
     #[test]
@@ -1399,7 +1649,16 @@ mod tests {
             bridge.moving(),
             "the background changes broadly despite the fixed overlay"
         );
-        assert!(!continuous(&source[3].0, &source[6].0, WIDTH, HEIGHT).unwrap());
+        assert!(
+            !continuous(
+                &source[3].0,
+                &source[6].0,
+                WIDTH,
+                HEIGHT,
+                Policy { strength: 100 }
+            )
+            .unwrap()
+        );
         assert_eq!(run(&source, 120, 1.0).0.repaired_runs, 0);
     }
 
@@ -1449,6 +1708,10 @@ mod tests {
             height,
             (duration * 1e9).round() as u64,
             true,
+            std::env::var("VFL_ANTI_STRENGTH")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap(),
         );
         let mut index = 1;
         let mut read = |pixels: &mut [u8]| {

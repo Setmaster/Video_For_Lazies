@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import type { InterpolationSettings, OutputFormat } from "../lib/types";
 import { antiStutterConflict } from "../lib/interpolation";
 
@@ -9,6 +10,7 @@ export function AntiStutterControl({ value, format, disabled, onChange }: {
   onChange: (value: InterpolationSettings) => void;
 }) {
   const enabled = value?.antiStutter === true;
+  const strength = value?.antiStutterStrength ?? 0;
   const unavailable = !value
     ? "Enable Smooth motion above to generate replacement frames."
     : format === "mp3"
@@ -30,9 +32,28 @@ export function AntiStutterControl({ value, format, disabled, onChange }: {
       <div className="vfl-inline-hint" id="vfl-anti-stutter-description">
         {unavailable ?? "Attempts to smooth short held-frame pauses, including compressed gameplay. Keeps duration and audio in sync."}
       </div>
-      {enabled && !antiStutterConflict(value) ? <div className="vfl-inline-hint">
-        May change intentional pauses, animation timing or small moving overlays. Review an exact sample with motion before and after the pause. Long holds and uncertain motion stay unchanged.
-      </div> : null}
+      {enabled && !antiStutterConflict(value) ? <>
+        <div className="vfl-field vfl-slider-field">
+          <div className="vfl-slider-top">
+            <label htmlFor="vfl-anti-stutter-strength">Repair strength</label>
+            <output className="vfl-slider-value" htmlFor="vfl-anti-stutter-strength">{strength}</output>
+          </div>
+          <input id="vfl-anti-stutter-strength" type="range" min={0} max={100} step={1}
+            value={strength} disabled={disabled || unavailable !== null}
+            style={{ "--fill": `${strength}%` } as CSSProperties}
+            aria-describedby="vfl-anti-stutter-strength-help"
+            aria-valuetext={`${strength} of 100${strength === 0 ? ", Conservative" : strength === 100 ? ", Aggressive" : ""}`}
+            onChange={(event) => {
+              if (value) onChange({ ...value, antiStutterStrength: Number(event.currentTarget.value) });
+            }} />
+          <div className="vfl-slider-top vfl-inline-hint" aria-hidden="true">
+            <span>Conservative</span><span>Aggressive</span>
+          </div>
+        </div>
+        <div className="vfl-inline-hint" id="vfl-anti-stutter-strength-help">
+          Allows repair of less certain holds at higher strength. May change intentional pauses, animation or small moving details. Check an exact sample first.
+        </div>
+      </> : null}
       {enabled ? <div className="vfl-inline-hint">Turning Smooth motion off also turns Anti-stutter off.</div> : null}
     </section>
   );

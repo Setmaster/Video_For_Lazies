@@ -345,8 +345,30 @@ pub struct ResizeSettings {
 pub struct InterpolationSettings {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub anti_stutter: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "anti_stutter_strength_is_zero",
+        deserialize_with = "deserialize_anti_stutter_strength"
+    )]
+    pub anti_stutter_strength: u8,
     pub target_fps: u32,
     pub model_id: String,
+}
+
+fn anti_stutter_strength_is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+fn deserialize_anti_stutter_strength<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u8, D::Error> {
+    let value = u8::deserialize(deserializer)?;
+    if value > 100 {
+        return Err(serde::de::Error::custom(
+            "Anti-stutter strength must be an integer from 0 to 100.",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4414,6 +4436,9 @@ fn validate_interpolation_request(
     let Some(settings) = &request.interpolation else {
         return Ok(());
     };
+    if settings.anti_stutter_strength > 100 {
+        return Err("Anti-stutter strength must be an integer from 0 to 100.".into());
+    }
     if settings.anti_stutter && settings.model_id == "ldf-vfi" {
         return Err("Anti-stutter needs RIFE, GMFSS or GIMM. Choose one of those models or turn Anti-stutter off.".into());
     }
@@ -8217,6 +8242,7 @@ mod tests {
         let mut probe = probe_10s_1920x1080_audio();
         req.interpolation = Some(InterpolationSettings {
             anti_stutter: false,
+            anti_stutter_strength: 0,
             target_fps: 60,
             model_id: "rife-v4.25".into(),
         });
@@ -8288,6 +8314,7 @@ mod tests {
         let mut request = base_request();
         request.interpolation = Some(InterpolationSettings {
             anti_stutter: true,
+            anti_stutter_strength: 0,
             target_fps: 60,
             model_id: "ldf-vfi".into(),
         });
@@ -8295,6 +8322,54 @@ mod tests {
             validate_interpolation_request(&request, &probe_10s_1920x1080_audio())
                 .unwrap_err()
                 .contains("Anti-stutter")
+        );
+    }
+
+    #[test]
+    fn anti_stutter_strength_is_legacy_defaulted_bounded_and_independent_of_enablement() {
+        for enabled in [false, true] {
+            for strength in [0, 25, 50, 75, 100] {
+                let value = serde_json::json!({"targetFps":120,"modelId":"rife-v4.25","antiStutter":enabled,"antiStutterStrength":strength});
+                let settings: InterpolationSettings = serde_json::from_value(value).unwrap();
+                assert_eq!(settings.anti_stutter_strength, strength);
+                assert_eq!(settings.anti_stutter, enabled);
+                let encoded = serde_json::to_value(&settings).unwrap();
+                assert_eq!(
+                    encoded.get("antiStutterStrength"),
+                    (strength != 0).then_some(&serde_json::json!(strength))
+                );
+                assert_eq!(
+                    serde_json::from_value::<InterpolationSettings>(encoded).unwrap(),
+                    settings
+                );
+            }
+        }
+        for value in [
+            "-1", "101", "256", "0.5", "50.0", "null", "true", "\"50\"", "{}",
+        ] {
+            let json = format!(
+                r#"{{"targetFps":60,"modelId":"rife-v4.25","antiStutterStrength":{value}}}"#
+            );
+            assert!(
+                serde_json::from_str::<InterpolationSettings>(&json).is_err(),
+                "{value}"
+            );
+        }
+        let legacy: InterpolationSettings =
+            serde_json::from_str(r#"{"targetFps":60,"modelId":"rife-v4.25","antiStutter":true}"#)
+                .unwrap();
+        assert_eq!(legacy.anti_stutter_strength, 0);
+        let mut request = base_request();
+        request.interpolation = Some(InterpolationSettings {
+            anti_stutter: false,
+            anti_stutter_strength: 101,
+            target_fps: 60,
+            model_id: "rife-v4.25".into(),
+        });
+        assert!(
+            validate_interpolation_request(&request, &probe_10s_1920x1080_audio())
+                .unwrap_err()
+                .contains("strength")
         );
     }
 

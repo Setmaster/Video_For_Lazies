@@ -390,6 +390,7 @@ mod tests {
         req.thumbnail = Some(settings());
         req.interpolation = Some(InterpolationSettings {
             anti_stutter: false,
+            anti_stutter_strength: 0,
             target_fps: 60,
             model_id: "rife-v4.25".into(),
         });

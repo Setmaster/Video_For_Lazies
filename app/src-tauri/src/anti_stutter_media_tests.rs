@@ -84,6 +84,7 @@ fn bundled_anti_stutter_preserves_clock_off_bytes_audio_and_prepared_reuse() {
     req.audio_enabled = true;
     req.interpolation = Some(InterpolationSettings {
         anti_stutter: false,
+        anti_stutter_strength: 0,
         target_fps: 60,
         model_id: "rife-v4.25".into(),
     });

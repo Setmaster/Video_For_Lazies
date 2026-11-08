@@ -13,7 +13,13 @@ export function interpolationModelLabel(modelId) {
 export function normalizeInterpolation(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!INTERPOLATION_TARGETS.includes(value.targetFps) || !INTERPOLATION_MODELS.includes(value.modelId)) return null;
-  return { targetFps: value.targetFps, modelId: value.modelId, ...(value.antiStutter === true ? { antiStutter: true } : {}) };
+  const strength = value.antiStutterStrength;
+  return {
+    targetFps: value.targetFps,
+    modelId: value.modelId,
+    ...(value.antiStutter === true ? { antiStutter: true } : {}),
+    ...(Number.isInteger(strength) && strength > 0 && strength <= 100 ? { antiStutterStrength: strength } : {}),
+  };
 }
 
 export function antiStutterConflict(value) {

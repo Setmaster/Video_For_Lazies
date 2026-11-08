@@ -146,6 +146,8 @@ Interpolation currently accepts supported 8-bit SDR video with known frame timin
 
 Anti-stutter preserves the existing Smooth motion output duration and audio timing. It looks for short held-frame intervals with surrounding motion, including compressed repeats and recurring low-frame-rate gameplay cadence. It uses the original presentation times to interpolate across qualified holds, including variable-frame-rate video. Long holds, scene changes, insufficient context and intervals beyond the bounded analysis window stay with ordinary Smooth motion processing. It can also change deliberate pauses, animation timing or small moving overlays. Generated motion is an estimate; this does not repair player performance problems or recover what actually happened during missing footage.
 
+**Repair strength** runs from **Conservative** (0, the default) to **Aggressive** (100). Higher values allow repairs with less certain surrounding-motion evidence. Scene-change protections and hold-duration limits still apply. Stronger settings may change intentional motion or small details and do not guarantee a better result. The selected strength is saved with settings, recipes and queued exports; older saved settings use 0.
+
 Use **Export exact sample** with motion before and after the suspected freeze, and inspect the result. A sample or trim boundary can remove context needed to qualify a repair, so an interval near that boundary can differ from the full export. Export results report repaired and unchanged candidates, with a bounded list of intervals. Anti-stutter is off by default and never removes time from the clip.
 
 ## From Source

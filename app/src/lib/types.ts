@@ -110,6 +110,7 @@ export interface InterpolationSettings {
   targetFps: 60 | 120;
   modelId: InterpolationModelId;
   antiStutter?: boolean;
+  antiStutterStrength?: number;
 }
 export interface InterpolationStatus {
   state: "missing" | "ready" | "unavailable" | "failed";
@@ -298,6 +299,7 @@ export interface ExportDiagnostics {
 
 export interface AntiStutterDiagnostics {
   version: number;
+  strength?: number;
   analyzedFrames: number;
   candidateRuns: number;
   repairedRuns: number;

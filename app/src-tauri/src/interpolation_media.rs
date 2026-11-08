@@ -754,6 +754,7 @@ pub(crate) fn prepare(
             probe.height as usize,
             duration_ns,
             first_pts.is_some(),
+            settings.anti_stutter_strength,
         );
         while let Some(span) = window.next(&mut read_next)? {
             let next = span.right.map(|index| window.pts(index));
