@@ -252,6 +252,29 @@ impl Luma {
             height: h,
         })
     }
+    fn half(&self) -> Result<Self, String> {
+        let (width, height) = (self.width.div_ceil(2), self.height.div_ceil(2));
+        let mut pixels = Vec::with_capacity(width * height);
+        for y in 0..height {
+            crate::process::check_cancelled().map_err(|_| "Canceled.".to_string())?;
+            for x in 0..width {
+                let mut total = 0u32;
+                let mut count = 0u32;
+                for sy in y * 2..((y + 1) * 2).min(self.height) {
+                    for sx in x * 2..((x + 1) * 2).min(self.width) {
+                        total += u32::from(self.pixels[sy * self.width + sx]);
+                        count += 1;
+                    }
+                }
+                pixels.push(((total + count / 2) / count) as u8);
+            }
+        }
+        Ok(Self {
+            pixels,
+            width,
+            height,
+        })
+    }
     fn patch(&self, x: usize, y: usize) -> [u8; 25] {
         let mut patch = [0; 25];
         for py in 0..5 {
@@ -293,6 +316,23 @@ fn continuous(
 ) -> Result<bool, String> {
     let a = Luma::new(a, width, height)?;
     let b = Luma::new(b, width, height)?;
+    Ok(correspondence(&a, &b)?.continuous(policy))
+}
+
+// Removing an already-qualified hold needs continuity across the deletion
+// seam, but need not reconstruct its long missing trajectory. One fixed larger
+// spatial support can retain scene correspondence despite fine occlusion or
+// parallax. Descriptor-space gates stay the same; their source-space support
+// and tolerance double. This evidence never enables retained-time Fill.
+fn removable_continuous(
+    a: &[u8],
+    b: &[u8],
+    width: usize,
+    height: usize,
+    policy: Policy,
+) -> Result<bool, String> {
+    let a = Luma::new(a, width, height)?.half()?;
+    let b = Luma::new(b, width, height)?.half()?;
     Ok(correspondence(&a, &b)?.continuous(policy))
 }
 
@@ -670,6 +710,10 @@ impl Window {
     }
 
     fn detail(&mut self, start: u64, end: u64, repeated: u64, reason: &str) -> Option<usize> {
+        #[cfg(test)]
+        if std::env::var_os("VFL_ANTI_FULL_TRACE").is_some() {
+            eprintln!("decision {start} {end} repeats={repeated} reason={reason}");
+        }
         if self.diagnostics.intervals.len() == DETAIL_LIMIT {
             return None;
         }
@@ -960,14 +1004,30 @@ impl Window {
             }
             right += 1;
         }
-        if let Some(reason) = self.qualify(right, residual, read)? {
-            return Ok(Some(self.unchanged(reason)));
-        }
+        let coarse_removal = match self.qualify(right, residual, read)? {
+            None => false,
+            Some("unreliableCorrespondence")
+                if self.mode == AntiStutterMode::Remove
+                    && removable_continuous(
+                        self.pixels(0),
+                        self.pixels(right),
+                        self.width,
+                        self.height,
+                        self.policy,
+                    )? =>
+            {
+                true
+            }
+            Some(reason) => return Ok(Some(self.unchanged(reason))),
+        };
         // Cadence protects source time, not the unwanted held-picture motion.
         // A fully qualified hold can still use the existing Fill interpolation
         // when its time must be retained or cadence evidence is incomplete.
         let (remove_start, reason) = if self.mode == AntiStutterMode::Remove {
             match self.cadence_verdict(right, read)? {
+                CadenceVerdict::Regular | CadenceVerdict::Unknown if coarse_removal => {
+                    return Ok(Some(self.unchanged("unreliableCorrespondence")));
+                }
                 CadenceVerdict::Regular => (None, "regularCadence"),
                 CadenceVerdict::Unknown => (None, "insufficientCadence"),
                 CadenceVerdict::Irregular => (Some(self.pts(1)), "removed"),
@@ -1135,15 +1195,23 @@ mod tests {
     }
 
     fn remove(input: &[(Vec<u8>, u64)]) -> (AntiStutterDiagnostics, super::super::RemovalMap) {
+        remove_sized(input, WIDTH, HEIGHT, 75)
+    }
+    fn remove_sized(
+        input: &[(Vec<u8>, u64)],
+        width: usize,
+        height: usize,
+        strength: u8,
+    ) -> (AntiStutterDiagnostics, super::super::RemovalMap) {
         let duration = input.last().unwrap().1 + 33_333_333;
         let mut window = Window::new(
             input[0].0.clone(),
             input[0].1,
-            WIDTH,
-            HEIGHT,
+            width,
+            height,
             duration,
             true,
-            75,
+            strength,
         )
         .at_source_beginning(input[0].1 == 0)
         .with_mode(AntiStutterMode::Remove);
@@ -1185,6 +1253,226 @@ mod tests {
             Some(map.removed_duration_ns() as f64 / 1e9)
         );
         (window.diagnostics, map)
+    }
+
+    fn broad_texture(
+        width: usize,
+        height: usize,
+        position: f64,
+        zoom: f64,
+        parallax: bool,
+    ) -> Vec<u8> {
+        let node = |x: i32, y: i32| {
+            let mut v = (x as u32).wrapping_mul(747796405)
+                ^ (y as u32).wrapping_mul(2891336453)
+                ^ 0x1542_9361;
+            v ^= v >> 16;
+            v = v.wrapping_mul(2246822519);
+            (32 + (v % 192)) as f64
+        };
+        let mut pixels = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let depth = if parallax && y > height / 2 {
+                    1.12
+                } else {
+                    1.0
+                };
+                let sx = (x as f64 * zoom + position * depth) / 12.0;
+                let sy = (y as f64 + (zoom - 1.0) * x as f64 * 0.2) / 12.0;
+                let (ix, iy) = (sx.floor() as i32, sy.floor() as i32);
+                let (fx, fy) = (sx - sx.floor(), sy - sy.floor());
+                let value = ((node(ix, iy) * (1.0 - fx) + node(ix + 1, iy) * fx) * (1.0 - fy)
+                    + (node(ix, iy + 1) * (1.0 - fx) + node(ix + 1, iy + 1) * fx) * fy)
+                    .round() as u8;
+                pixels.extend([value; 3]);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn remove_coarse_correspondence_supports_broad_motion_without_changing_fill() {
+        let (width, height) = (512, 288);
+        for (zoom, parallax) in [(1.0, false), (1.03, false), (1.0, true)] {
+            let a = broad_texture(width, height, 6.0, 1.0, false);
+            let b = broad_texture(width, height, 86.0, zoom, parallax);
+            assert!(
+                !continuous(&a, &b, width, height, Policy { strength: 75 }).unwrap(),
+                "fixture must exercise fine-scale failure"
+            );
+            assert!(
+                removable_continuous(&a, &b, width, height, Policy { strength: 75 }).unwrap(),
+                "zoom={zoom},parallax={parallax}"
+            );
+        }
+        let positions = [0., 2., 4., 6., 6., 86., 88., 90., 92., 94., 96., 98., 100.];
+        let source: Vec<_> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    broad_texture(width, height, *p, 1., false),
+                    i as u64 * 33_333_333,
+                )
+            })
+            .collect();
+        assert_eq!(
+            run_sized(&source, 120, 1., 75, (width, height), false)
+                .0
+                .repaired_runs,
+            0
+        );
+        let (d, map) = remove_sized(&source, width, height, 75);
+        assert_eq!(map.cuts().len(), 1, "{d:?}");
+        assert_eq!(
+            (map.cuts()[0].start_ns, map.cuts()[0].end_ns),
+            (source[4].1, source[5].1)
+        );
+        for regular in [false, true] {
+            let positions: Vec<_> = if regular {
+                (0..16)
+                    .flat_map(|i| [i as f64 * 80., i as f64 * 80.])
+                    .collect()
+            } else {
+                vec![0., 2., 4., 6., 6., 86., 88.]
+            };
+            let source: Vec<_> = positions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    (
+                        broad_texture(width, height, *p, 1., false),
+                        i as u64 * 33_333_333,
+                    )
+                })
+                .collect();
+            let (d, map) = remove_sized(&source, width, height, 75);
+            assert_eq!(
+                map.removed_duration_ns(),
+                0,
+                "coarse-only evidence cannot enable retained Fill: {d:?}"
+            );
+            assert_eq!(
+                d.repaired_runs, 0,
+                "coarse-only evidence cannot enable retained Fill: {d:?}"
+            );
+        }
+        for (width, height) in [(16, 12), (30, 20)] {
+            assert!(
+                !removable_continuous(
+                    &broad_texture(width, height, 0., 1., false),
+                    &broad_texture(width, height, 8., 1., false),
+                    width,
+                    height,
+                    Policy { strength: 100 }
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn remove_coarse_correspondence_rejects_unrelated_repetitive_and_lighting_controls() {
+        let (width, height) = (512, 288);
+        let a = broad_texture(width, height, 6., 1., false);
+        let mut unrelated = a.clone();
+        for row in unrelated.chunks_exact_mut(width * 3) {
+            row.reverse();
+        }
+        assert!(!is_scene_cut(&a, &unrelated));
+        assert!(
+            !removable_continuous(&a, &unrelated, width, height, Policy { strength: 100 }).unwrap()
+        );
+        let mut source: Vec<_> = [0., 2., 4., 6., 6., 86., 88., 90., 92., 94., 96., 98.]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    broad_texture(width, height, *p, 1., false),
+                    i as u64 * 33_333_333,
+                )
+            })
+            .collect();
+        for (pixels, _) in source.iter_mut().skip(5) {
+            for row in pixels.chunks_exact_mut(width * 3) {
+                row.reverse();
+            }
+        }
+        let (d, map) = remove_sized(&source, width, height, 100);
+        assert_eq!(map.removed_duration_ns(), 0, "{d:?}");
+        assert!(
+            d.intervals
+                .iter()
+                .any(|i| i.reason == "unreliableCorrespondence"),
+            "{d:?}"
+        );
+        let mut periodic = vec![0; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                periodic[(y * width + x) * 3..(y * width + x + 1) * 3]
+                    .fill(if (x / 8 + y / 8) % 2 == 0 { 40 } else { 180 });
+            }
+        }
+        let mut shifted = periodic.clone();
+        for row in shifted.chunks_exact_mut(width * 3) {
+            row.rotate_left(3 * 3);
+        }
+        assert!(
+            !removable_continuous(&periodic, &shifted, width, height, Policy { strength: 100 })
+                .unwrap()
+        );
+        // Start from the genuine coarse-positive family, not the unrelated
+        // control, so the discontinuity veto itself is necessary here.
+        for color_only in [false, true] {
+            let mut lit: Vec<_> = [0., 2., 4., 6., 6., 86., 88., 90., 92., 94., 96., 98.]
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    (
+                        broad_texture(width, height, *p, 1., false),
+                        i as u64 * 33_333_333,
+                    )
+                })
+                .collect();
+            assert!(
+                removable_continuous(
+                    &lit[3].0,
+                    &lit[5].0,
+                    width,
+                    height,
+                    Policy { strength: 100 }
+                )
+                .unwrap()
+            );
+            for pixel in lit[4].0.chunks_exact_mut(3) {
+                if color_only {
+                    pixel[0] = pixel[0].saturating_add(1);
+                } else {
+                    for channel in pixel {
+                        *channel = channel.saturating_add(12);
+                    }
+                }
+            }
+            assert!(
+                compare(&lit[3].0, &lit[4].0, width, height)
+                    .unwrap()
+                    .lighting
+            );
+            let (d, map) = remove_sized(&lit, width, height, 100);
+            assert_eq!(map.removed_duration_ns(), 0, "{d:?}");
+            assert_eq!(d.repaired_runs, 0, "{d:?}");
+            if color_only {
+                assert!(
+                    compare(&lit[3].0, &lit[4].0, width, height)
+                        .unwrap()
+                        .plateau()
+                );
+                assert!(d.intervals.iter().any(|i| i.reason == "sceneCut"), "{d:?}");
+            } else {
+                assert_eq!(d.candidate_runs, 0, "{d:?}");
+            }
+        }
     }
 
     #[test]
@@ -1543,6 +1831,16 @@ mod tests {
                 assert_eq!(
                     diagnostics.repaired_runs, 0,
                     "chroma={chroma_only}: {diagnostics:?}"
+                );
+                let (removed, map) = remove_sized(&source, width, height, strength);
+                assert_eq!(
+                    map.removed_duration_ns(),
+                    0,
+                    "chroma={chroma_only}: {removed:?}"
+                );
+                assert_eq!(
+                    removed.repaired_runs, 0,
+                    "chroma={chroma_only}: {removed:?}"
                 );
             }
         }
@@ -2386,6 +2684,19 @@ mod tests {
             )
             .unwrap()
         );
+        assert!(
+            !removable_continuous(
+                &source[3].0,
+                &source[6].0,
+                WIDTH,
+                HEIGHT,
+                Policy { strength: 100 }
+            )
+            .unwrap(),
+            "fixed overlay must not validate an unrelated background at coarse support"
+        );
+        let (removed, map) = remove_sized(&source, WIDTH, HEIGHT, 100);
+        assert_eq!(map.removed_duration_ns(), 0, "{removed:?}");
         assert_eq!(run(&source, 120, 1.0).0.repaired_runs, 0);
     }
 
@@ -2402,6 +2713,9 @@ mod tests {
                 (pixels, i as u64 * 33_333_333)
             })
             .collect();
+        let (removed, map) = remove_sized(&source, WIDTH, HEIGHT, 100);
+        assert_eq!(map.removed_duration_ns(), 0, "{removed:?}");
+        assert_eq!(removed.repaired_runs, 0, "{removed:?}");
         assert_eq!(run(&source, 120, 1.0).0.repaired_runs, 0);
     }
 
@@ -2462,6 +2776,7 @@ mod tests {
         let mut count = rate.frame_count((duration * 1e9).round() as u64).unwrap();
         let mut map = super::super::RemovalMap::new((duration * 1e9).round() as u64);
         let mut output = 0;
+        let mut spans = Vec::new();
         while let Some(span) = window.next(&mut read).unwrap() {
             if let Some(start) = span.remove_start {
                 map.push(start, window.pts(span.right.unwrap())).unwrap();
@@ -2470,6 +2785,7 @@ mod tests {
             let left = map.map_ns(window.pts(0));
             let right = span.right.map(|i| map.map_ns(window.pts(i)));
             let mut repaired = 0;
+            let first_output = output;
             while output < count && right.is_none_or(|r| rate.sample_before(output, r)) {
                 let alpha = right
                     .map(|r| rate.alpha(output, left, r).unwrap())
@@ -2479,10 +2795,14 @@ mod tests {
                 );
                 output += 1;
             }
+            spans.push(serde_json::json!({"sourceStartNs":window.pts(0),"sourceEndNs":span.right.map(|i|window.pts(i)),"outputStartNs":left,"outputEndNs":right,"firstOutputIndex0":first_output,"endOutputIndex0Exclusive":output,"filled":span.repaired&&span.remove_start.is_none(),"removeStartNs":span.remove_start}));
             window.advance(span, repaired);
         }
         assert_eq!(output, count);
         assert!(window.allocated_high_water <= MAX_PICTURES);
+        if let Ok(path) = std::env::var("VFL_ANTI_SPAN_REPORT") {
+            serde_json::to_writer_pretty(std::fs::File::create(path).unwrap(), &spans).unwrap();
+        }
         if let Ok(path) = std::env::var("VFL_ANTI_CUT_MAP_REPORT") {
             serde_json::to_writer_pretty(std::fs::File::create(path).unwrap(),&serde_json::json!({"sourceDurationNs":map.source_duration_ns(),"outputDurationNs":map.output_duration_ns(),"removedDurationNs":map.removed_duration_ns(),"cuts":map.cuts().iter().map(|c|serde_json::json!({"startNs":c.start_ns,"endNs":c.end_ns})).collect::<Vec<_>>(),"outputFrames":output,"pictureHighWater":window.allocated_high_water})).unwrap();
         }
@@ -2491,5 +2811,45 @@ mod tests {
                 .unwrap();
         }
         eprintln!("{}", serde_json::to_string(&window.diagnostics).unwrap());
+    }
+
+    #[test]
+    #[ignore = "local raw RGB diagnostic only; no user data in repository"]
+    fn anti_stutter_local_pair_metrics() {
+        use std::io::{Read, Seek, SeekFrom};
+        let width: usize = std::env::var("VFL_ANTI_WIDTH").unwrap().parse().unwrap();
+        let height: usize = std::env::var("VFL_ANTI_HEIGHT").unwrap().parse().unwrap();
+        let pairs: Vec<(usize, usize)> = serde_json::from_reader(
+            std::fs::File::open(std::env::var("VFL_ANTI_PAIRS").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let size = width * height * 3;
+        let mut file = std::fs::File::open(std::env::var("VFL_ANTI_RAW").unwrap()).unwrap();
+        let mut rows = Vec::new();
+        for (a, b) in pairs {
+            let mut left = vec![0; size];
+            let mut right = vec![0; size];
+            file.seek(SeekFrom::Start(((a - 1) * size) as u64)).unwrap();
+            file.read_exact(&mut left).unwrap();
+            file.seek(SeekFrom::Start(((b - 1) * size) as u64)).unwrap();
+            file.read_exact(&mut right).unwrap();
+            let evidence = compare(&left, &right, width, height).unwrap();
+            let matched = correspondence(
+                &Luma::new(&left, width, height).unwrap(),
+                &Luma::new(&right, width, height).unwrap(),
+            )
+            .unwrap();
+            let coarse = correspondence(
+                &Luma::new(&left, width, height).unwrap().half().unwrap(),
+                &Luma::new(&right, width, height).unwrap().half().unwrap(),
+            )
+            .unwrap();
+            rows.push(serde_json::json!({"coarseLevel":{"textured":coarse.textured,"reliableMatches":coarse.matches.len(),"coherentNonzeroCluster":coarse.coherent,"continuous75":coarse.continuous(Policy{strength:75}),"matches":coarse.matches},"leftSourceFrame1Based":a,"rightSourceFrame1Based":b,"exact":evidence.exact,"near":evidence.near,"cut":evidence.cut,"lighting":evidence.lighting,"ambiguous":evidence.ambiguous,"moving":evidence.moving(),"rgbMeanMilli":evidence.mean,"coarseMeanMilli":evidence.coarse_mean,"textured":matched.textured,"reliableMatches":matched.matches.len(),"coherentNonzeroCluster":matched.coherent,"held":matched.held(),"matches":matched.matches,"continuous75":matched.continuous(Policy{strength:75}),"continuous100":matched.continuous(Policy{strength:100})}));
+        }
+        serde_json::to_writer_pretty(
+            std::fs::File::create(std::env::var("VFL_ANTI_PAIR_REPORT").unwrap()).unwrap(),
+            &rows,
+        )
+        .unwrap();
     }
 }
