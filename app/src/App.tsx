@@ -7,6 +7,8 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { confirm as nativeConfirmDialog, open as nativeOpenDialog, save as nativeSaveDialog, type OpenDialogOptions } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { SmoothMotionControl } from "./components/SmoothMotionControl";
+import { AntiStutterControl } from "./components/AntiStutterControl";
+import { AntiStutterResult } from "./components/AntiStutterResult";
 import { ThumbnailControl } from "./components/ThumbnailControl";
 import { normalizeInterpolation, interpolationConflict, interpolationModelLabel } from "./lib/interpolation";
 import { CropPixelFields } from "./components/CropPixelFields";
@@ -588,6 +590,7 @@ function QueueDiagnosticsDetails({
       {diagnostics.copyFallbackReason ? (
         <div className="vfl-export-result-note">Copy fallback: {diagnostics.copyFallbackReason}</div>
       ) : null}
+      <AntiStutterResult value={diagnostics.interpolation?.antiStutter} />
       {diagnostics.colorAction ? (
         <div className="vfl-export-result-note">Color: {diagnostics.colorAction}</div>
       ) : null}
@@ -3191,6 +3194,7 @@ function App() {
     if (advancedVideoQuality !== "auto" && format !== "mp3") chips.push(VIDEO_QUALITY_LABELS[advancedVideoQuality]);
     if (advancedEncodeSpeed !== "auto" && format !== "mp3") chips.push(`${ENCODE_SPEED_LABELS[advancedEncodeSpeed]} encode`);
     if (interpolation && format !== "mp3") chips.push(`Smooth motion ${interpolation.targetFps} fps`);
+    if (interpolation?.antiStutter && format !== "mp3") chips.push("Anti-stutter");
     if (advancedFrameRateCapRequest !== null && format !== "mp3") chips.push(`${advancedFrameRateCapRequest} fps cap`);
     if (advancedAudioBitrateRequest !== null) chips.push(`Audio ${advancedAudioBitrateRequest}k`);
     if (advancedAudioChannels !== "auto") chips.push(AUDIO_CHANNEL_LABELS[advancedAudioChannels]);
@@ -3840,6 +3844,7 @@ function App() {
       if (
         interpolation?.modelId !== smokeInterpolation.modelId ||
         interpolation.targetFps !== smokeInterpolation.targetFps ||
+        Boolean(interpolation.antiStutter) !== Boolean(smokeInterpolation.antiStutter) ||
         interpolationInstalling ||
         !interpolationStatus ||
         interpolationStatus.modelId !== smokeInterpolation.modelId
@@ -8361,8 +8366,8 @@ function App() {
           </RailCard>
 
           <RailCard
-            title="Smooth motion"
-            summary={interpolation ? `${interpolation.targetFps} fps${interpolationInstalling ? " • Checking / installing" : ""}` : "Off"}
+            title="Smooth"
+            summary={interpolation ? `${interpolation.targetFps} fps${interpolation.antiStutter ? " • Anti-stutter" : ""}${interpolationInstalling ? " • Checking / installing" : ""}` : "Off"}
             open={openCards.smoothMotion}
             onToggle={() => toggleCard("smoothMotion")}
             keepMounted
@@ -8377,6 +8382,12 @@ function App() {
               onRemoveCap={() => setAdvancedFrameRateCapFps("auto")}
               onStatus={setInterpolationStatus}
               onBusy={handleInterpolationBusy}
+            />
+            <AntiStutterControl
+              value={interpolation}
+              format={format}
+              disabled={exportWorkBusy || !updateStartupReady || interpolationInstalling}
+              onChange={setInterpolation}
             />
           </RailCard>
           <RailCard
@@ -9223,6 +9234,10 @@ function App() {
                       <div className="vfl-summary-label">Frame rate</div>
                       <div className="vfl-summary-value">{interpolation ? `Smooth motion: ${interpolation.targetFps} fps (${interpolationModelLabel(interpolation.modelId)})` : advancedFrameRateSummary}</div>
                     </div>
+                    {interpolation?.antiStutter ? <div className="vfl-summary-row">
+                      <div className="vfl-summary-label">Anti-stutter</div>
+                      <div className="vfl-summary-value">Repair brief freezes, preserve timing</div>
+                    </div> : null}
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Audio bitrate</div>
                       <div className="vfl-summary-value">{advancedAudioSummary}</div>
@@ -9357,6 +9372,7 @@ function App() {
                         {new Date(lastExport.completedAtMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </div>
                       {lastExport.message ? <div className="vfl-export-result-note">{lastExport.message}</div> : null}
+                      <AntiStutterResult value={lastExport.diagnostics?.interpolation?.antiStutter} />
                       <div className="vfl-export-result-path">{formatPathForDisplay(lastExport.outputPath)}</div>
                       {lastExport.targetResult ? <TargetResultDetails targetResult={lastExport.targetResult} /> : null}
                       {lastExport.diagnostics ? (
@@ -9597,6 +9613,7 @@ function App() {
                         </div>
                       ) : null}
                       {outcome?.targetResult ? <TargetResultDetails targetResult={outcome.targetResult} /> : null}
+                      {item.request.interpolation?.antiStutter ? <div className="vfl-queue-item-meta">Anti-stutter enabled</div> : null}
                       {outcome ? <QueueDiagnosticsDetails outcome={outcome} summary="Latest diagnostics" /> : null}
                       {item.history.length > 1 ? (
                         <details className="vfl-queue-history">

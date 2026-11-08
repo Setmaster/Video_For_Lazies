@@ -389,6 +389,7 @@ mod tests {
         req.format = OutputFormat::Webm;
         req.thumbnail = Some(settings());
         req.interpolation = Some(InterpolationSettings {
+            anti_stutter: false,
             target_fps: 60,
             model_id: "rife-v4.25".into(),
         });

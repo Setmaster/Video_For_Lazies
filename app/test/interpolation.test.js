@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { INTERPOLATION_MODELS, interpolationModelLabel, beginInterpolationInstall, bindInterpolationInstall, createInterpolationInstall, interpolationConflict, interpolationInstallActive, interpolationPublicMessage, normalizeInterpolation, reduceInterpolationInstall } from "../src/lib/interpolation.mjs";
+import { INTERPOLATION_MODELS, antiStutterSummary, interpolationModelLabel, beginInterpolationInstall, bindInterpolationInstall, createInterpolationInstall, interpolationConflict, interpolationInstallActive, interpolationPublicMessage, normalizeInterpolation, reduceInterpolationInstall } from "../src/lib/interpolation.mjs";
 import { parsePersistedSettings, serializePersistedSettings } from "../src/lib/settings.mjs";
 import { EXPORT_RECIPES, recipeMatchesSettings } from "../src/lib/exportRecipes.mjs";
 import { createExportQueueState, reduceExportQueue } from "../src/lib/exportQueue.mjs";
@@ -46,6 +46,48 @@ test("cap conflicts and MP3 cannot silently discard requested interpolation", ()
   assert.match(interpolationConflict(intent, "mp3", null), /MP4 or WebM/);
   assert.equal(interpolationConflict(intent, "webm", 120), null);
   assert.equal(interpolationConflict(null, "mp3", 24), null);
+});
+
+test("Anti-stutter is opt-in, survives reusable intent and remains distinct in recipes", () => {
+  for (const antiStutter of [undefined, false, "true", 1, {}]) {
+    assert.deepEqual(normalizeInterpolation({ ...intent, antiStutter }), intent);
+  }
+  const repair = { ...intent, antiStutter: true };
+  assert.deepEqual(normalizeInterpolation(repair), repair);
+  assert.deepEqual(parsePersistedSettings(serializePersistedSettings({ interpolation: repair })).interpolation, repair);
+  const plan = { ...settings(), interpolation: repair };
+  const created = createUserRecipe([], "Repair freezes", "Anti-stutter", plan, { id: "repair" });
+  assert.equal(created.ok, true);
+  const restored = parseUserRecipeStore(serializeUserRecipeStore(created.recipes)).recipes[0];
+  assert.deepEqual(restored.settings.interpolation, repair);
+  assert.equal(userRecipeMatchesSettings(restored, plan), true);
+  assert.equal(userRecipeMatchesSettings(restored, settings()), false);
+  let queue = reduceExportQueue(createExportQueueState(), { type: "enqueue-prepared", items: [{ request: { ...plan, inputPath: "/input.mp4", outputPath: "/output.mp4" }, durationS: 1 }] });
+  repair.antiStutter = false;
+  assert.equal(queue.items[0].request.interpolation.antiStutter, true);
+  const applied = reusableSettingsFromEncodeRequest(queue.items[0].request);
+  assert.equal(applied.interpolation.antiStutter, true);
+  queue = reduceExportQueue(queue, { type: "duplicate-prepared", sourceItemId: queue.items[0].id, request: { ...queue.items[0].request, outputPath: "/output-2.mp4" } });
+  queue.items[0].request.interpolation.antiStutter = false;
+  assert.equal(queue.items[1].request.interpolation.antiStutter, true);
+});
+
+test("Anti-stutter preserves unsupported model intent and blocks export instead of ignoring it", () => {
+  const unsupported = { targetFps: 60, modelId: "ldf-vfi", antiStutter: true };
+  assert.deepEqual(normalizeInterpolation(unsupported), unsupported);
+  assert.match(interpolationConflict(unsupported, "mp4", null), /Anti-stutter needs RIFE, GMFSS or GIMM/);
+  assert.equal(interpolationConflict({ ...unsupported, antiStutter: false }, "mp4", null), null);
+  for (const modelId of INTERPOLATION_MODELS.filter((id) => id !== "ldf-vfi")) {
+    assert.equal(interpolationConflict({ ...unsupported, modelId }, "webm", null), null);
+  }
+  assert.match(interpolationConflict(unsupported, "mp3", null), /MP4 or WebM/);
+});
+
+test("Anti-stutter results distinguish no repairs from uncertain candidates and completed repairs", () => {
+  assert.equal(antiStutterSummary(undefined), null);
+  assert.equal(antiStutterSummary({ repairedRuns: 0, unchangedRuns: 0 }), "Anti-stutter: no short freezes repaired.");
+  assert.equal(antiStutterSummary({ repairedRuns: 0, unchangedRuns: 4 }), "Anti-stutter: no short freezes repaired. 4 candidates left unchanged.");
+  assert.equal(antiStutterSummary({ repairedRuns: 1, unchangedRuns: 1 }), "Anti-stutter: 1 suspected freeze repaired. 1 candidate left unchanged.");
 });
 
 test("early events bind only to returned operation ID and terminal outcomes settle once", () => {

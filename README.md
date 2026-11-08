@@ -130,7 +130,7 @@ Start, Pause, Resume and Stop can each have an optional global shortcut. All fou
 
 Use **Stop and save** or your assigned Stop shortcut. Wait for **Recording saved**, then open the MP4 or choose **Edit video**. Closing during recording offers **Stop and save** or **Keep open**. Interrupted recordings appear under **Unfinished recordings** for recovery; an unfinished ending may be lost, including the last unsealed fragment before a pause. Temporary files can be larger than the saved MP4, especially with audio. Keep extra free space. Existing output files are preserved.
 
-### Smooth motion
+### Smooth
 
 Turn on **Smooth motion**, choose 60 or 120 fps, and export MP4 or WebM. The ordinary preview shows your source; **Export exact sample** in Advanced runs the interpolation pipeline for a short output you can inspect first. The setting is saved in recipes and queue snapshots.
 
@@ -141,6 +141,12 @@ RIFE uses a hardware Vulkan GPU and its vendor driver. GMFSS, GIMM and LDF requi
 Downloads show progress and support cancellation and retry. The app verifies source, model and runtime sizes and SHA256 hashes and runs a local inference test before activating a download. Video frames stay on your device. Unsupported devices and incompatible model timing show an explanation instead of silently switching models or using the CPU.
 
 Interpolation currently accepts supported 8-bit SDR video with known frame timing. The app rejects incompatible media before export. A frame-rate cap below the chosen target must be removed or raised. Generated frames are cached once per export and reused by size-target attempts; allow temporary disk space for the lossless video cache. Interpolation can take substantially longer than an ordinary export, especially at high resolutions. Inspect a sample for artifacts around cuts, fine details and fast motion.
+
+**Anti-stutter** is a separate, optional control in **Smooth**. Enable Smooth motion first, then Anti-stutter to attempt repair of brief repeated-frame freezes using the selected RIFE, GMFSS or GIMM model. No extra download is needed beyond that model. LDF does not support Anti-stutter. Turning Smooth motion off also turns Anti-stutter off. Both settings are saved in recipes and queue snapshots.
+
+Anti-stutter preserves the existing Smooth motion output duration and audio timing. It attempts only short, isolated runs of identical decoded pictures with moving context on both sides. Compression can make repeated pictures differ slightly, so some visible freezes remain unchanged. Long holds, scene changes, ordinary repeated-frame cadence, uncertain near-duplicates and freezes at trim boundaries are left to ordinary Smooth motion processing. A deliberate brief pause can look identical to an accidental freeze; generated motion is an estimate. This does not repair player performance problems or recover what actually happened during missing footage.
+
+Use **Export exact sample** with motion before and after the suspected freeze, and inspect the result. A sample or trim boundary can remove context needed to qualify a repair, so an interval near that boundary can differ from the full export. Export results report repaired and unchanged candidates, with a bounded list of intervals. Anti-stutter is off by default and never removes time from the clip.
 
 ## From Source
 

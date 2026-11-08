@@ -2025,6 +2025,13 @@ input[type="range"]:focus-visible {
   display: grid;
   gap: 0.65rem;
 }
+.vfl-anti-stutter {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
 .vfl-smooth-motion-actions {
   display: flex;
   flex-wrap: wrap;

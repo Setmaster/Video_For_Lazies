@@ -3,8 +3,11 @@ mod sequence;
 
 use crate::interpolation_components::{ModelExecution, ResolvedModel};
 use crate::interpolation_timeline::{Rate, is_scene_cut};
+#[path = "anti_stutter.rs"]
+mod anti_stutter;
 use crate::process::{self, ManagedChild, ProcessGroup};
 use crate::video::{EncodeRequest, VideoProbe};
+pub use anti_stutter::AntiStutterDiagnostics;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -23,6 +26,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InterpolationDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anti_stutter: Option<AntiStutterDiagnostics>,
     pub target_fps: u32,
     pub model_id: String,
     pub model_digest: String,
@@ -513,6 +518,12 @@ pub(crate) fn prepare(
         .interpolation
         .as_ref()
         .ok_or("Missing interpolation settings.")?;
+    if settings.anti_stutter && matches!(model.execution, ModelExecution::TorchSequence { .. }) {
+        return Err(
+            "Anti-stutter needs RIFE, GMFSS or GIMM. Choose one of those models or turn Anti-stutter off."
+                .into(),
+        );
+    }
     let identity = SourceIdentity::capture(source)?;
     let start_s = request
         .trim
@@ -694,7 +705,6 @@ pub(crate) fn prepare(
             .ok_or("Missing lossless storage output.")?,
     ));
     let mut left = vec![0u8; frame_bytes];
-    let mut right = vec![0u8; frame_bytes];
     let mut output = vec![0u8; frame_bytes];
     let mut input_frames = 0u64;
     let mut output_frames = 0u64;
@@ -732,66 +742,138 @@ pub(crate) fn prepare(
         ((probe.video_start_s - start_s).max(0.0) * 1_000_000_000.0).round() as u64;
     let video_end_ns =
         ((probe.video_end_s.unwrap_or(end_s) - start_s).max(0.0) * 1_000_000_000.0).round() as u64;
-    loop {
-        let next = read_next(&mut right)?;
-        if let Some(right_pts) = next
-            && right_pts <= left_pts
-        {
-            return Err(
-                "AI interpolation requires strictly increasing presentation timestamps.".into(),
-            );
+    let mut anti_stutter_diagnostics = None;
+    if settings.anti_stutter {
+        // Historical motion lives in compact summaries, not retained pictures.
+        // The first buffer transfers ownership into this bounded window; there
+        // is no unused original right-frame buffer on the enabled path.
+        let mut window = anti_stutter::Window::new(
+            left,
+            left_pts,
+            probe.width as usize,
+            probe.height as usize,
+            duration_ns,
+            first_pts.is_some(),
+        );
+        while let Some(span) = window.next(&mut read_next)? {
+            let next = span.right.map(|index| window.pts(index));
+            let left_pts = window.pts(0);
+            let left = window.pixels(0);
+            let right = window.pixels(span.right.unwrap_or(0));
+            let mut repaired_frames = 0;
+            while output_frames < count
+                && next.is_none_or(|pts| rate.sample_before(output_frames, pts))
+            {
+                process::check_cancelled().map_err(|_| "Canceled.".to_string())?;
+                if timed_out.load(Ordering::Relaxed) {
+                    return Err("Interpolation stopped because a stage stalled or exceeded its scratch quota.".into());
+                }
+                let alpha = next
+                    .map(|pts| rate.alpha(output_frames, left_pts, pts))
+                    .transpose()?
+                    .unwrap_or(0.0);
+                let pad_black = rate.sample_before(output_frames, leading_gap_ns)
+                    || !rate.sample_before(output_frames, video_end_ns);
+                let pixels = if pad_black {
+                    output.fill(0);
+                    held_frames += 1;
+                    &output[..]
+                } else if alpha > 0.0 && alpha < 1.0 && !span.cut && left != right {
+                    worker_input
+                        .write_all(&alpha.to_le_bytes())
+                        .and_then(|_| worker_input.write_all(left))
+                        .and_then(|_| worker_input.write_all(right))
+                        .and_then(|_| worker_input.flush())
+                        .map_err(|_| {
+                            "Native interpolation stopped while receiving a picture.".to_string()
+                        })?;
+                    read_picture(&mut worker_output, &mut output)?;
+                    inferred_frames += 1;
+                    repaired_frames += u64::from(span.repaired);
+                    &output[..]
+                } else {
+                    held_frames += 1;
+                    left
+                };
+                assembled.write_all(pixels).map_err(|_| {
+                    "Lossless interpolation storage failed. Free scratch space and retry."
+                        .to_string()
+                })?;
+                output_frames += 1;
+                last_progress.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+                progress(output_frames as f64 / count as f64);
+            }
+            window.advance(span, repaired_frames);
         }
-        let cut = next.is_some() && is_scene_cut(&left, &right);
-        if cut {
-            cut_pairs += 1;
-        }
-        while output_frames < count && next.is_none_or(|pts| rate.sample_before(output_frames, pts))
-        {
-            process::check_cancelled().map_err(|_| "Canceled.".to_string())?;
-            if timed_out.load(Ordering::Relaxed) {
+        debug_assert!(window.allocated_high_water <= 10);
+        cut_pairs = window.cut_pairs;
+        anti_stutter_diagnostics = Some(window.diagnostics);
+    } else {
+        // Keep the legacy adjacent-pair path unchanged when Anti-stutter is off.
+        let mut right = vec![0u8; frame_bytes];
+        loop {
+            let next = read_next(&mut right)?;
+            if let Some(right_pts) = next
+                && right_pts <= left_pts
+            {
                 return Err(
-                    "Interpolation stopped because a stage stalled or exceeded its scratch quota."
-                        .into(),
+                    "AI interpolation requires strictly increasing presentation timestamps.".into(),
                 );
             }
-            let alpha = next
-                .map(|pts| rate.alpha(output_frames, left_pts, pts))
-                .transpose()?
-                .unwrap_or(0.0);
-            let pad_black = rate.sample_before(output_frames, leading_gap_ns)
-                || !rate.sample_before(output_frames, video_end_ns);
-            let pixels: &[u8] = if pad_black {
-                output.fill(0);
-                held_frames += 1;
-                &output
-            } else if alpha > 0.0 && alpha < 1.0 && !cut && left != right {
-                worker_input
-                    .write_all(&alpha.to_le_bytes())
-                    .and_then(|_| worker_input.write_all(&left))
-                    .and_then(|_| worker_input.write_all(&right))
-                    .and_then(|_| worker_input.flush())
-                    .map_err(|_| {
-                        "Native interpolation stopped while receiving a picture.".to_string()
-                    })?;
-                read_picture(&mut worker_output, &mut output)?;
-                inferred_frames += 1;
-                &output
+            let cut = next.is_some() && is_scene_cut(&left, &right);
+            if cut {
+                cut_pairs += 1;
+            }
+            while output_frames < count
+                && next.is_none_or(|pts| rate.sample_before(output_frames, pts))
+            {
+                process::check_cancelled().map_err(|_| "Canceled.".to_string())?;
+                if timed_out.load(Ordering::Relaxed) {
+                    return Err(
+                        "Interpolation stopped because a stage stalled or exceeded its scratch quota."
+                            .into(),
+                    );
+                }
+                let alpha = next
+                    .map(|pts| rate.alpha(output_frames, left_pts, pts))
+                    .transpose()?
+                    .unwrap_or(0.0);
+                let pad_black = rate.sample_before(output_frames, leading_gap_ns)
+                    || !rate.sample_before(output_frames, video_end_ns);
+                let pixels: &[u8] = if pad_black {
+                    output.fill(0);
+                    held_frames += 1;
+                    &output
+                } else if alpha > 0.0 && alpha < 1.0 && !cut && left != right {
+                    worker_input
+                        .write_all(&alpha.to_le_bytes())
+                        .and_then(|_| worker_input.write_all(&left))
+                        .and_then(|_| worker_input.write_all(&right))
+                        .and_then(|_| worker_input.flush())
+                        .map_err(|_| {
+                            "Native interpolation stopped while receiving a picture.".to_string()
+                        })?;
+                    read_picture(&mut worker_output, &mut output)?;
+                    inferred_frames += 1;
+                    &output
+                } else {
+                    held_frames += 1;
+                    &left
+                };
+                assembled.write_all(pixels).map_err(|_| {
+                    "Lossless interpolation storage failed. Free scratch space and retry."
+                        .to_string()
+                })?;
+                output_frames += 1;
+                last_progress.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+                progress(output_frames as f64 / count as f64);
+            }
+            if let Some(pts) = next {
+                std::mem::swap(&mut left, &mut right);
+                left_pts = pts;
             } else {
-                held_frames += 1;
-                &left
-            };
-            assembled.write_all(pixels).map_err(|_| {
-                "Lossless interpolation storage failed. Free scratch space and retry.".to_string()
-            })?;
-            output_frames += 1;
-            last_progress.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
-            progress(output_frames as f64 / count as f64);
-        }
-        if let Some(pts) = next {
-            std::mem::swap(&mut left, &mut right);
-            left_pts = pts;
-        } else {
-            break;
+                break;
+            }
         }
     }
     // Every metadata record was paired with exactly one RGB picture. Any tail
@@ -854,6 +936,7 @@ pub(crate) fn prepare(
         range: range.into(),
         color_tags,
         diagnostics: InterpolationDiagnostics {
+            anti_stutter: anti_stutter_diagnostics,
             target_fps: settings.target_fps,
             model_id: model.model_id.clone(),
             model_digest: model.model_digest.clone(),
@@ -1181,6 +1264,7 @@ mod tests {
             start_s: 0.0,
             rate: Rate::for_playback(60, 1.0).unwrap(),
             diagnostics: InterpolationDiagnostics {
+                anti_stutter: None,
                 target_fps: 60,
                 model_id: "fixture".into(),
                 model_digest: String::new(),

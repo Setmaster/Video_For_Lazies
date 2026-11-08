@@ -685,6 +685,7 @@ pub(super) fn prepare(
         range: color.range.into(),
         color_tags: color.color_tags,
         diagnostics: InterpolationDiagnostics {
+            anti_stutter: None,
             target_fps: job
                 .request
                 .interpolation

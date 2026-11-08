@@ -340,6 +340,8 @@ pub struct ResizeSettings {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InterpolationSettings {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anti_stutter: bool,
     pub target_fps: u32,
     pub model_id: String,
 }
@@ -4409,6 +4411,9 @@ fn validate_interpolation_request(
     let Some(settings) = &request.interpolation else {
         return Ok(());
     };
+    if settings.anti_stutter && settings.model_id == "ldf-vfi" {
+        return Err("Anti-stutter needs RIFE, GMFSS or GIMM. Choose one of those models or turn Anti-stutter off.".into());
+    }
     if !matches!(settings.target_fps, 60 | 120)
         || !matches!(
             settings.model_id.as_str(),
@@ -8160,6 +8165,10 @@ pub fn run_encode_job(
 mod selected_audio_tests;
 
 #[cfg(test)]
+#[path = "anti_stutter_media_tests.rs"]
+mod anti_stutter_media_tests;
+
+#[cfg(test)]
 #[path = "video_media_tests.rs"]
 mod media_integration_tests;
 
@@ -8204,6 +8213,7 @@ mod tests {
         let mut req = base_request();
         let mut probe = probe_10s_1920x1080_audio();
         req.interpolation = Some(InterpolationSettings {
+            anti_stutter: false,
             target_fps: 60,
             model_id: "rife-v4.25".into(),
         });
@@ -8250,6 +8260,39 @@ mod tests {
         probe.pixel_format = Some("yuv420p".into());
         req.format = OutputFormat::Mp3;
         assert!(validate_interpolation_request(&req, &probe).is_err());
+    }
+
+    #[test]
+    fn anti_stutter_settings_are_backward_compatible_and_ldf_fails_before_resolution() {
+        let original = r#"{"targetFps":60,"modelId":"rife-v4.25"}"#;
+        let absent: InterpolationSettings = serde_json::from_str(original).unwrap();
+        let disabled: InterpolationSettings =
+            serde_json::from_str(r#"{"targetFps":60,"modelId":"rife-v4.25","antiStutter":false}"#)
+                .unwrap();
+        assert_eq!(absent, disabled);
+        assert_eq!(
+            serde_json::to_value(&absent).unwrap(),
+            serde_json::from_str::<serde_json::Value>(original).unwrap()
+        );
+        for value in ["1", "null", "\"true\"", "{}"] {
+            assert!(
+                serde_json::from_str::<InterpolationSettings>(&format!(
+                    "{{\"targetFps\":60,\"modelId\":\"rife-v4.25\",\"antiStutter\":{value}}}"
+                ))
+                .is_err()
+            );
+        }
+        let mut request = base_request();
+        request.interpolation = Some(InterpolationSettings {
+            anti_stutter: true,
+            target_fps: 60,
+            model_id: "ldf-vfi".into(),
+        });
+        assert!(
+            validate_interpolation_request(&request, &probe_10s_1920x1080_audio())
+                .unwrap_err()
+                .contains("Anti-stutter")
+        );
     }
 
     #[test]

@@ -109,6 +109,7 @@ export type InterpolationModelId = "rife-v4.25" | "rife-v4.26" | "gmfss-fortuna-
 export interface InterpolationSettings {
   targetFps: 60 | 120;
   modelId: InterpolationModelId;
+  antiStutter?: boolean;
 }
 export interface InterpolationStatus {
   state: "missing" | "ready" | "unavailable" | "failed";
@@ -266,6 +267,9 @@ export interface SubtitleInspection {
 }
 
 export interface ExportDiagnostics {
+  interpolation?: {
+    antiStutter?: AntiStutterDiagnostics | null;
+  } | null;
   mode: string;
   videoAction?: StreamAction | null;
   audioAction?: StreamAction | null;
@@ -290,6 +294,22 @@ export interface ExportDiagnostics {
   failureStage?: string | null;
   failureReason?: string | null;
   commandPreview: string;
+}
+
+export interface AntiStutterDiagnostics {
+  version: number;
+  analyzedFrames: number;
+  candidateRuns: number;
+  repairedRuns: number;
+  repairedFrames: number;
+  unchangedRuns: number;
+  intervals: {
+    startS: number;
+    endS: number;
+    sourceRepeatedFrames: number;
+    repairedFrames: number;
+    reason: string;
+  }[];
 }
 
 export interface AppSmokeConfig {

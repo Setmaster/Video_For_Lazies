@@ -13,13 +13,28 @@ export function interpolationModelLabel(modelId) {
 export function normalizeInterpolation(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!INTERPOLATION_TARGETS.includes(value.targetFps) || !INTERPOLATION_MODELS.includes(value.modelId)) return null;
-  return { targetFps: value.targetFps, modelId: value.modelId };
+  return { targetFps: value.targetFps, modelId: value.modelId, ...(value.antiStutter === true ? { antiStutter: true } : {}) };
+}
+
+export function antiStutterConflict(value) {
+  return value?.antiStutter === true && value.modelId === "ldf-vfi"
+    ? "Anti-stutter needs RIFE, GMFSS or GIMM. Choose one of those models or turn Anti-stutter off."
+    : null;
+}
+
+export function antiStutterSummary(value) {
+  if (!value) return null;
+  const repaired = value.repairedRuns;
+  const unchanged = value.unchangedRuns;
+  return `Anti-stutter: ${repaired === 0 ? "no short freezes repaired" : `${repaired} suspected freeze${repaired === 1 ? "" : "s"} repaired`}.${unchanged > 0 ? ` ${unchanged} candidate${unchanged === 1 ? "" : "s"} left unchanged.` : ""}`;
 }
 
 export function interpolationConflict(value, format, cap) {
   const intent = normalizeInterpolation(value);
   if (!intent) return null;
   if (format === "mp3") return "Smooth motion needs MP4 or WebM video output. Turn it off to export MP3.";
+  const repairConflict = antiStutterConflict(intent);
+  if (repairConflict) return repairConflict;
   if (cap !== null && cap !== undefined && Number(cap) > 0 && Number(cap) < intent.targetFps) {
     return `The ${cap} fps cap is below Smooth motion's ${intent.targetFps} fps target. Remove the cap or turn Smooth motion off.`;
   }

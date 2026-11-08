@@ -407,6 +407,10 @@ fn parse_smoke_config_from_env(
             .map(String::as_str)
             .unwrap_or("auto"),
     )?;
+    let anti_stutter = parse_smoke_bool(env, "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER")?;
+    if anti_stutter && !env.contains_key("VFL_SMOKE_INTERPOLATION_FPS") {
+        return Err("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER requires Smooth motion and VFL_SMOKE_INTERPOLATION_FPS.".into());
+    }
     let interpolation = env
         .get("VFL_SMOKE_INTERPOLATION_FPS")
         .map(|value| {
@@ -426,6 +430,7 @@ fn parse_smoke_config_from_env(
                 return Err("VFL_SMOKE_INTERPOLATION_MODEL is not supported.".to_string());
             }
             Ok(video::InterpolationSettings {
+                anti_stutter,
                 target_fps,
                 model_id: model_id.to_string(),
             })
@@ -1158,6 +1163,36 @@ mod tests {
                 .unwrap_err()
                 .contains("VFL_SMOKE_COLOR_RANGE")
         );
+    }
+
+    #[test]
+    fn anti_stutter_smoke_requires_smooth_motion_and_preserves_the_bool() {
+        let status_path = temp_smoke_status_path("anti-stutter");
+        let mut env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", "input.mp4"),
+            ("VFL_SMOKE_OUTPUT", "output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER", "1"),
+        ]);
+        assert!(
+            parse_smoke_config_from_env(&env)
+                .unwrap_err()
+                .contains("requires Smooth motion")
+        );
+        env.insert("VFL_SMOKE_INTERPOLATION_FPS".into(), "60".into());
+        assert!(
+            parse_smoke_config_from_env(&env)
+                .unwrap()
+                .unwrap()
+                .interpolation
+                .unwrap()
+                .anti_stutter
+        );
+        env.insert(
+            "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER".into(),
+            "not-a-bool".into(),
+        );
+        assert!(parse_smoke_config_from_env(&env).is_err());
     }
 
     #[test]

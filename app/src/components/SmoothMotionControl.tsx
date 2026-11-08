@@ -257,7 +257,7 @@ export function SmoothMotionControl({ value, format, frameRateCap, disabled, sta
           {status && !status.bundled && (status.state === "ready" || status.installedBytes > 0) ? <button type="button" onClick={() => void removeModel()} disabled={disabled || checking}>Remove downloaded model</button> : null}
         </div>}
         {notice ? <div className={install.state === "failed" ? "vfl-error" : "vfl-inline-hint"} role="status">{notice}</div> : null}
-        {conflict ? <div className="vfl-error" role="alert">{conflict}{format !== "mp3" ? <button type="button" onClick={onRemoveCap} disabled={disabled || busy}>Remove frame-rate cap</button> : null}</div> : null}
+        {conflict ? <div className="vfl-error" role="alert">{conflict}{format !== "mp3" && frameRateCap !== null && frameRateCap < value.targetFps ? <button type="button" onClick={onRemoveCap} disabled={disabled || busy}>Remove frame-rate cap</button> : null}</div> : null}
         <div className="vfl-inline-hint">Use Export exact sample in Advanced to render a short result. Source playback does not show AI frames.</div>
       </> : null}
     </section>
