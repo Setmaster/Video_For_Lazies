@@ -2,6 +2,14 @@
 
 Rust and Tauri desktop app for focused local video exports through FFmpeg. The workbench accepts `mp4`, `mov`, `mkv`, `avi`, `webm`, and `m4v` input and exports `mp4`, `webm`, or audio-only `mp3`.
 
+## Frame navigation
+
+In Edit, enable **Frame step** beside **Drag snap (s)** to make Left/Right move one source picture, or ten with Shift. Focused trim handles use the same frame mode; Home/End retain their existing limits. Navigation pauses playback. The toggle starts off, and drag snapping remains a separate seconds setting.
+
+Frame navigation reads actual source presentation timestamps, including variable-rate gaps. From a time between pictures, the displayed picture is the preceding source timestamp and stepping starts from that picture. Trim values retain full timestamp precision. The clip duration is an exclusive end boundary: a picture whose timestamp equals the duration is excluded, and Left from the End sentinel selects the final picture before it. Trim constraints can stop navigation before the requested number of pictures.
+
+Timing is read only when stepping, in bounded nearby windows with a small source-validated cache. If timing cannot be proved within the window or the preview cannot verify the requested picture, an explicit unavailable message appears. No seconds approximation is substituted. Particularly long GOPs, unsupported partial timing windows and timestamps too close for the preview can be unavailable. A small seek bias inside the known picture interval helps the preview display the selected picture; the trim boundary remains its exact source timestamp.
+
 ## Requirements
 
 - Windows x64 and Linux x64 release builds stage pinned `ffmpeg` and `ffprobe` sidecars automatically.

@@ -692,6 +692,13 @@ async fn inspect_thumbnail(path: String) -> Result<video::ThumbnailInspection, S
 }
 
 #[tauri::command]
+async fn step_source_frame(
+    request: video::FrameStepRequest,
+) -> Result<video::FrameStepResult, String> {
+    command_dispatch::frame_timing(move || video::step_source_frame(request)).await
+}
+
+#[tauri::command]
 #[allow(non_snake_case)]
 async fn extract_frame(inputPath: String, timeS: f64, outputPath: String) -> Result<(), String> {
     command_dispatch::media(move || video::extract_frame(inputPath, timeS, outputPath)).await
@@ -981,6 +988,7 @@ pub fn run() {
             interpolation_commands::remove_interpolation_model,
             inspect_srt,
             inspect_thumbnail,
+            step_source_frame,
             extract_frame,
             allow_preview_path,
             read_smoke_config,

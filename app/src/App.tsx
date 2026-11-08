@@ -14,6 +14,7 @@ import { normalizeInterpolation, interpolationConflict, interpolationModelLabel 
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
+import { createFrameStepper, type FrameStepContext, type FrameStepResult, type FrameStepStatus } from "./lib/frameStep";
 import { UserRecipeDialog, type UserRecipeDialogState } from "./components/UserRecipeDialog";
 import { useAudioTrackPreview } from "./lib/audioTrackPreview";
 import { audioTrackLabel } from "./lib/audioTrackState";
@@ -784,6 +785,11 @@ function App() {
   const [trimStart, setTrimStart] = useState("0");
   const [trimEnd, setTrimEnd] = useState("");
   const [trimDragSnapS, setTrimDragSnapS] = useState("0");
+  const [frameStepEnabled, setFrameStepEnabled] = useState(false);
+  const frameStepEnabledRef = useRef(false);
+  const [frameStepStatus, setFrameStepStatus] = useState<FrameStepStatus>({ pending: false, error: false, message: null });
+  const frameStepContextRef = useRef<FrameStepContext | null>(null);
+  const frameStepperRef = useRef<ReturnType<typeof createFrameStepper> | null>(null);
   const [reverse, setReverse] = useState(false);
   const [loopVideo, setLoopVideo] = useState(false);
   const [speed, setSpeed] = useState("1.0");
@@ -1619,6 +1625,7 @@ function App() {
       interpolationInstallingRef.current
     ) return;
     supersedeQueueSnapshotApply();
+    frameStepperRef.current?.reset();
     setOutputAuto(true);
     setOutputPath("");
     setColorPolicy("auto");
@@ -1653,6 +1660,9 @@ function App() {
     }
     setResetConfirmationOpen(false);
     supersedeQueueSnapshotApply();
+    frameStepperRef.current?.reset();
+    frameStepEnabledRef.current = false;
+    setFrameStepEnabled(false);
     cropDetectionRevisionRef.current += 1;
     setCropDetecting(false);
     setFormat(DEFAULT_OUTPUT_FORMAT);
@@ -3636,6 +3646,45 @@ function App() {
   const audioPreview = useAudioTrackPreview({ visible: activeWorkspace === "edit" && !ordinaryClosing, enabled: previewReady && !audioProbePending && probedInputPath.current === inputPath,
     path: inputPath, probe, unload: unloadAudioPreview, restore: restoreAudioPreview, onAdmissionBusyChange: handleAudioPreviewAdmission });
   audioPreviewControllerRef.current = audioPreview;
+  const frameSourceKey = `${inputPath}|${probe?.sourceIdentity ?? ""}|${probe?.videoStreamIndex ?? ""}|${audioPreview.sourceToken}`;
+  frameStepContextRef.current = probe && trimTimeline ? {
+    key: frameSourceKey, path: inputPath, sourceIdentity: probe.sourceIdentity,
+    videoStreamIndex: probe.videoStreamIndex, durationS: probe.durationS,
+    enabled: frameStepEnabled, blocked: encodeBusy || modalOpen || nativeDialogDepth > 0 || ordinaryClosing || updateBusy || queueSnapshotApplying || !previewReady || activeWorkspace !== "edit",
+    activeTarget: activeTrimTarget, values: { preview: clampedPreviewTimeS, start: trimTimeline.start, end: trimTimeline.end },
+    limits: { preview: { min: 0, max: probe.durationS }, start: { min: 0, max: Math.max(0, trimTimeline.end - trimTimeline.minGap) }, end: { min: Math.min(probe.durationS, trimTimeline.start + trimTimeline.minGap), max: probe.durationS } },
+  } : null;
+  if (!frameStepperRef.current) frameStepperRef.current = createFrameStepper({
+    read: () => {
+      const state = frameStepContextRef.current;
+      const timeline = trimTimelineRef.current;
+      if (!state || !timeline) return null;
+      return { ...state, enabled: frameStepEnabledRef.current, activeTarget: activeTrimTargetRef.current,
+        blocked: state.blocked || modalOpenRef.current || ordinaryClosingRef.current || updateBusyRef.current || nativeDialogDepthRef.current > 0 || activeWorkspaceRef.current !== "edit" || queueSnapshotApplyingRef.current || jobIdRef.current !== null || pendingEncodeRef.current !== null,
+        values: { preview: clamp(previewTimeRef.current, 0, state.durationS), start: timeline.start, end: timeline.end },
+        limits: { preview: { min: 0, max: state.durationS }, start: { min: 0, max: Math.max(0, timeline.end - timeline.minGap) }, end: { min: Math.min(state.durationS, timeline.start + timeline.minGap), max: state.durationS } },
+      };
+    },
+    fetchStep: request => invoke<FrameStepResult>("step_source_frame", { request }),
+    pause: () => { cropperRef.current?.pause(); previewPlayingRef.current = false; setPreviewPlaying(false); },
+    seek: (time, end) => cropperRef.current?.seekFrame(time, end) ?? Promise.reject(new Error("The preview is not ready.")),
+    apply: (target, time) => {
+      activeTrimTargetRef.current = target; setActiveTrimTarget(target);
+      previewTimeRef.current = time; setPreviewTimeS(time);
+      if (target === "preview") previewSelectionTimeRef.current = time;
+      else if (target === "start") setTrimStart(String(time));
+      else setTrimEnd(String(time));
+    },
+    status: setFrameStepStatus,
+    cancelSeek: () => cropperRef.current?.cancelFrameSeek(),
+  });
+  useEffect(() => { frameStepperRef.current?.reset(); }, [frameSourceKey, frameStepEnabled, encodeBusy, modalOpen, nativeDialogDepth, activeWorkspace, ordinaryClosing, updateBusy, queueSnapshotApplying]);
+  const invalidateFrameStep = useCallback(() => frameStepperRef.current?.reset(), []);
+  const previewPlaybackChanged = useCallback((playing: boolean) => {
+    if (playing) frameStepperRef.current?.reset();
+    previewPlayingRef.current = playing;
+    setPreviewPlaying(playing);
+  }, []);
   useEffect(() => {
     // Keep probe admission through the prepare handoff, before its effect can
     // submit native work. No render/microtask gap may claim a queue item.
@@ -4966,6 +5015,7 @@ function App() {
     inspectedSubtitle: SubtitleInspection | null,
     inspectedThumbnail: ThumbnailInspection | null,
   ) {
+    frameStepperRef.current?.reset();
     const resize = request.resize ?? {
       mode: request.maxEdgePx ? "maxEdge" as const : "source" as const,
       maxEdgePx: request.maxEdgePx ?? null,
@@ -5799,6 +5849,7 @@ function App() {
   }
 
   function syncPreviewToTime(nextTimeS: number, target: TrimFocusTarget, opts?: { pause?: boolean }) {
+    frameStepperRef.current?.reset();
     activeTrimTargetRef.current = target;
     setActiveTrimTarget(target);
     if (opts?.pause) {
@@ -5900,27 +5951,37 @@ function App() {
     syncPreviewToTime(previewTimeRef.current + deltaS, "preview", opts);
   }
 
-  function setTrimStartValue(nextTimeS: number) {
+  function setTrimStartValue(nextTimeS: number, precise = false) {
+    frameStepperRef.current?.reset();
     const timeline = trimTimelineRef.current;
     if (!probe || !timeline) return;
     const maxStart = Math.max(0, timeline.end - timeline.minGap);
+    if (precise && (nextTimeS < 0 || nextTimeS > maxStart)) {
+      setFrameStepStatus({ pending: false, error: false, message: "At the trim limit." });
+      return;
+    }
     const next = clamp(nextTimeS, 0, maxStart);
-    setTrimStart(formatNumberInput(next));
+    setTrimStart(precise ? String(next) : formatNumberInput(next));
     return next;
   }
 
-  function setTrimEndValue(nextTimeS: number, opts?: { preferEmptyAtEnd?: boolean }) {
+  function setTrimEndValue(nextTimeS: number, opts?: { preferEmptyAtEnd?: boolean; precise?: boolean }) {
+    frameStepperRef.current?.reset();
     const timeline = trimTimelineRef.current;
     if (!probe || !timeline) return;
     const minEnd = Math.min(probe.durationS, timeline.start + timeline.minGap);
+    if (opts?.precise && (nextTimeS < minEnd || nextTimeS > probe.durationS)) {
+      setFrameStepStatus({ pending: false, error: false, message: "At the trim limit." });
+      return;
+    }
     const next = clamp(nextTimeS, minEnd, probe.durationS);
 
-    if (opts?.preferEmptyAtEnd && next >= probe.durationS - 0.001) {
+    if (opts?.preferEmptyAtEnd && (opts.precise ? next === probe.durationS : next >= probe.durationS - 0.001)) {
       setTrimEnd("");
       return probe.durationS;
     }
 
-    setTrimEnd(formatNumberInput(next));
+    setTrimEnd(opts?.precise ? String(next) : formatNumberInput(next));
     return next;
   }
 
@@ -5938,11 +5999,13 @@ function App() {
   }
 
   function applyTrimStartFromCurrent() {
-    updateTrimTarget("start", previewSelectionTimeRef.current, { pause: true });
+    const value = setTrimStartValue(previewSelectionTimeRef.current, frameStepEnabledRef.current);
+    if (typeof value === "number") syncPreviewToTime(value, "start", { pause: true });
   }
 
   function applyTrimEndFromCurrent() {
-    updateTrimTarget("end", previewSelectionTimeRef.current, { pause: true });
+    const value = setTrimEndValue(previewSelectionTimeRef.current, { preferEmptyAtEnd: true, precise: frameStepEnabledRef.current });
+    if (typeof value === "number") syncPreviewToTime(value, "end", { pause: true });
   }
 
   function focusTrimTarget(target: Exclude<TrimFocusTarget, "preview">) {
@@ -5979,7 +6042,9 @@ function App() {
   const handleComposeShortcutKeydown = useEffectEvent((event: KeyboardEvent) => {
     if (activeWorkspaceRef.current !== "edit" || !inputPath || modalOpen) return;
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
-    if (blocksComposeShortcutTarget(event.target)) return;
+    const frameToggleArrow = event.target instanceof HTMLInputElement && event.target.id === "trim-frame-step" &&
+      (event.code === "ArrowLeft" || event.code === "ArrowRight");
+    if (blocksComposeShortcutTarget(event.target) && !frameToggleArrow) return;
 
     let action: ComposeShortcutAction | null = null;
 
@@ -5995,9 +6060,17 @@ function App() {
         action = { kind: "apply-trim-end" };
         break;
       case "ArrowLeft":
+        if (frameStepEnabledRef.current) {
+          if (frameStepperRef.current?.enqueue(activeTrimTargetRef.current, event.shiftKey ? -10 : -1)) event.preventDefault();
+          return;
+        }
         action = { kind: "nudge-timeline", deltaS: event.shiftKey ? -TRIM_COARSE_NUDGE_S : -TRIM_FINE_NUDGE_S };
         break;
       case "ArrowRight":
+        if (frameStepEnabledRef.current) {
+          if (frameStepperRef.current?.enqueue(activeTrimTargetRef.current, event.shiftKey ? 10 : 1)) event.preventDefault();
+          return;
+        }
         action = { kind: "nudge-timeline", deltaS: event.shiftKey ? TRIM_COARSE_NUDGE_S : TRIM_FINE_NUDGE_S };
         break;
       default:
@@ -7497,6 +7570,7 @@ function App() {
   }
 
   async function togglePreviewPlayback() {
+    frameStepperRef.current?.reset();
     if (recordingBusyRef.current) return;
     if (!previewReady || jobId !== null || pendingEncodeRef.current !== null) return;
     const nextPlaying = await cropperRef.current?.togglePlayback();
@@ -7511,6 +7585,7 @@ function App() {
   }
 
   function resetTrim() {
+    frameStepperRef.current?.reset();
     setTrimStart("0");
     setTrimEnd("");
   }
@@ -7985,7 +8060,8 @@ function App() {
                           disabled={encodeBusy || activeWorkspace !== "edit"}
                           colorFilter={previewColorFilter}
                           onTimeUpdate={setPreviewTimeS}
-                          onPlaybackChange={setPreviewPlaying}
+                          onPlaybackChange={previewPlaybackChanged}
+                          onFrameSeekInterrupted={invalidateFrameStep}
                           onSourceReadyChange={handlePreviewSourceReady}
                           onSourceError={handlePreviewSourceError}
                         />
@@ -8069,6 +8145,7 @@ function App() {
                               onPointerDown={(event) => beginTrimHandleDrag("start", event)}
                               onFocus={() => focusTrimTarget("start")}
                               onChange={(value) => updateTrimTarget("start", value, { pause: true })}
+                              onFrameStep={frameStepEnabled ? (step) => { frameStepperRef.current?.enqueue("start", step); } : undefined}
                               disabled={encodeBusy || !previewReady || !probe || previewDurationS <= 0}
                             />
                             <TrimSliderHandle
@@ -8083,6 +8160,7 @@ function App() {
                               onPointerDown={(event) => beginTrimHandleDrag("end", event)}
                               onFocus={() => focusTrimTarget("end")}
                               onChange={(value) => updateTrimTarget("end", value, { pause: true })}
+                              onFrameStep={frameStepEnabled ? (step) => { frameStepperRef.current?.enqueue("end", step); } : undefined}
                               disabled={encodeBusy || !previewReady || !probe || previewDurationS <= 0}
                             />
                           </div>
@@ -8093,7 +8171,7 @@ function App() {
                                 id="vfl-trim-start"
                                 value={trimStart}
                                 onFocus={() => focusTrimTarget("start")}
-                                onChange={(e) => setTrimStart(e.currentTarget.value)}
+                                onChange={(e) => { invalidateFrameStep(); setTrimStart(e.currentTarget.value); }}
                                 disabled={encodeBusy}
                                 inputMode="decimal"
                               />
@@ -8112,7 +8190,7 @@ function App() {
                                 id="vfl-trim-end"
                                 value={trimEnd}
                                 onFocus={() => focusTrimTarget("end")}
-                                onChange={(e) => setTrimEnd(e.currentTarget.value)}
+                                onChange={(e) => { invalidateFrameStep(); setTrimEnd(e.currentTarget.value); }}
                                 disabled={encodeBusy}
                                 placeholder="(end)"
                                 inputMode="decimal"
@@ -8125,7 +8203,7 @@ function App() {
                               >
                                 Set
                               </button>
-                              <button type="button" onClick={() => setTrimEnd("")} disabled={encodeBusy || trimEnd.trim() === ""}>
+                              <button type="button" onClick={() => { invalidateFrameStep(); setTrimEnd(""); }} disabled={encodeBusy || trimEnd.trim() === ""}>
                                 Clear
                               </button>
                             </div>
@@ -8150,6 +8228,16 @@ function App() {
                                 inputMode="numeric"
                               />
                             </div>
+                            <label className="vfl-frame-step" title="Use actual source frames for arrow keys. Drag snapping stays in seconds.">
+                              <input id="trim-frame-step" type="checkbox" checked={frameStepEnabled}
+                                onChange={(event) => {
+                                  invalidateFrameStep();
+                                  frameStepEnabledRef.current = event.currentTarget.checked;
+                                  setFrameStepEnabled(event.currentTarget.checked);
+                                }}
+                                disabled={encodeBusy || !probe || !previewReady} />
+                              Frame step
+                            </label>
                             <button
                               type="button"
                               className="vfl-trim-reset"
@@ -8160,7 +8248,8 @@ function App() {
                               Reset trim
                             </button>
                           </div>
-                          <div className="vfl-kbd-hint">{trimShortcutHint}</div>
+                          <div className="vfl-kbd-hint">{frameStepEnabled ? "←/→ step one source frame. Shift steps 10. Trim handle arrows use the same mode. Drag snap stays in seconds." : trimShortcutHint}</div>
+                          {frameStepStatus.message ? <div id="trim-frame-step-status" className={frameStepStatus.error ? "vfl-error" : "vfl-inline-hint"} role={frameStepStatus.error ? "alert" : "status"} aria-live="polite" aria-busy={frameStepStatus.pending}>{frameStepStatus.message}</div> : null}
                         </div>
                       ) : null}
                     </div>

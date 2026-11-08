@@ -14,6 +14,7 @@ type TrimSliderHandleProps = {
   onFocus: () => void;
   onPointerDown: (event: PointerEvent<HTMLButtonElement>) => void;
   onChange: (value: number) => void;
+  onFrameStep?: (step: number) => void;
 };
 
 export function TrimSliderHandle({
@@ -29,8 +30,16 @@ export function TrimSliderHandle({
   onFocus,
   onPointerDown,
   onChange,
+  onFrameStep,
 }: TrimSliderHandleProps) {
   function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || disabled) return;
+    if (onFrameStep && ["ArrowLeft", "ArrowDown", "ArrowRight", "ArrowUp", "PageDown", "PageUp"].includes(event.key)) {
+      event.preventDefault(); event.stopPropagation();
+      const direction = ["ArrowLeft", "ArrowDown", "PageDown"].includes(event.key) ? -1 : 1;
+      onFrameStep(direction * (event.shiftKey || event.key.startsWith("Page") ? 10 : 1));
+      return;
+    }
     const next = resolveTrimSliderKey({
       key: event.key,
       shiftKey: event.shiftKey,

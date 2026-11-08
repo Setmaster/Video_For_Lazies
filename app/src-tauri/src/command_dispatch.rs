@@ -6,6 +6,7 @@ use tauri::async_runtime::Mutex;
 // Short filesystem requests must not queue behind a long media probe.
 static MEDIA: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 static FILES: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+static FRAME_TIMING: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 async fn dispatch<T: Send + 'static>(
     lane: &OnceLock<Arc<Mutex<()>>>,
@@ -35,6 +36,12 @@ pub async fn files<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     dispatch(&FILES, work).await
+}
+
+pub async fn frame_timing<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    dispatch(&FRAME_TIMING, work).await
 }
 
 #[cfg(test)]

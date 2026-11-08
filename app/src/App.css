@@ -2135,3 +2135,12 @@ input[type="range"]:focus-visible {
     display: none;
   }
 }
+
+.vfl-frame-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.vfl-frame-step input { margin: 0; }

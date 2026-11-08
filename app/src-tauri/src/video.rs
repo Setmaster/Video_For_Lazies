@@ -21,6 +21,9 @@ use tempfile::{Builder as TempFileBuilder, TempDir, TempPath};
 #[path = "thumbnail.rs"]
 pub(crate) mod thumbnail;
 pub use thumbnail::{ThumbnailInspection, ThumbnailSettings, inspect_thumbnail};
+#[path = "frame_step.rs"]
+mod frame_step;
+pub use frame_step::{FrameStepRequest, FrameStepResult, step_source_frame};
 
 const MB_BYTES: u64 = 1_000_000;
 const JS_MAX_SAFE_INTEGER_BYTES: u64 = 9_007_199_254_740_991;

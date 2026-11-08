@@ -54,8 +54,8 @@ test("set start and set end use the remembered preview selection instead of the 
   assert.match(raw, /const previewSelectionTimeRef = useRef\(0\);/);
   assert.match(raw, /if \(activeTrimTargetRef\.current === "preview" \|\| previewPlayingRef\.current\) \{\s*previewSelectionTimeRef\.current = previewTimeS;\s*\}/s);
   assert.match(raw, /if \(target === "preview"\) \{\s*previewSelectionTimeRef\.current = safeTimeS;\s*\}/s);
-  assert.match(raw, /function applyTrimStartFromCurrent\(\) \{\s*updateTrimTarget\("start", previewSelectionTimeRef\.current, \{ pause: true \}\);\s*\}/s);
-  assert.match(raw, /function applyTrimEndFromCurrent\(\) \{\s*updateTrimTarget\("end", previewSelectionTimeRef\.current, \{ pause: true \}\);\s*\}/s);
+  assert.match(raw, /function applyTrimStartFromCurrent\(\) \{\s*const value = setTrimStartValue\(previewSelectionTimeRef\.current, frameStepEnabledRef\.current\);/s);
+  assert.match(raw, /function applyTrimEndFromCurrent\(\) \{\s*const value = setTrimEndValue\(previewSelectionTimeRef\.current, \{ preferEmptyAtEnd: true, precise: frameStepEnabledRef\.current \}\);/s);
   assert.match(raw, /function focusTrimTarget\(target: Exclude<TrimFocusTarget, "preview">\) \{\s*const timeline = trimTimelineRef\.current;\s*if \(!timeline\) return;\s*const nextTimeS = target === "start" \? timeline\.start : timeline\.end;\s*syncPreviewToTime\(nextTimeS, target, \{ pause: true \}\);\s*\}/s);
 });
 
@@ -63,9 +63,9 @@ test("trim mutations read the current timeline after asynchronous interaction ch
   const appPath = path.resolve(__dirname, "../src/App.tsx");
   const raw = await fs.readFile(appPath, "utf8");
 
-  assert.match(raw, /function setTrimStartValue\(nextTimeS: number\) \{\s*const timeline = trimTimelineRef\.current;\s*if \(!probe \|\| !timeline\) return;\s*const maxStart = Math\.max\(0, timeline\.end - timeline\.minGap\);/s);
-  assert.match(raw, /function setTrimEndValue\(nextTimeS: number, opts\?: \{ preferEmptyAtEnd\?: boolean \}\) \{\s*const timeline = trimTimelineRef\.current;\s*if \(!probe \|\| !timeline\) return;\s*const minEnd = Math\.min\(probe\.durationS, timeline\.start \+ timeline\.minGap\);/s);
-  assert.match(raw, /function syncPreviewToTime\(nextTimeS: number, target: TrimFocusTarget, opts\?: \{ pause\?: boolean \}\) \{\s*activeTrimTargetRef\.current = target;\s*setActiveTrimTarget\(target\);/s);
+  assert.match(raw, /function setTrimStartValue\(nextTimeS: number, precise = false\) \{\s*frameStepperRef\.current\?\.reset\(\);\s*const timeline = trimTimelineRef\.current;\s*if \(!probe \|\| !timeline\) return;\s*const maxStart = Math\.max\(0, timeline\.end - timeline\.minGap\);/s);
+  assert.match(raw, /function setTrimEndValue\(nextTimeS: number, opts\?: \{ preferEmptyAtEnd\?: boolean; precise\?: boolean \}\) \{\s*frameStepperRef\.current\?\.reset\(\);\s*const timeline = trimTimelineRef\.current;\s*if \(!probe \|\| !timeline\) return;\s*const minEnd = Math\.min\(probe\.durationS, timeline\.start \+ timeline\.minGap\);/s);
+  assert.match(raw, /function syncPreviewToTime\(nextTimeS: number, target: TrimFocusTarget, opts\?: \{ pause\?: boolean \}\) \{\s*frameStepperRef\.current\?\.reset\(\);\s*activeTrimTargetRef\.current = target;\s*setActiveTrimTarget\(target\);/s);
   assert.match(raw, /const trimResetCommitted = await waitForSmokeCondition/);
   assert.match(raw, /const startShortcutCommitted = await waitForSmokeCondition/);
   assert.match(raw, /const endShortcutCommitted = await waitForSmokeCondition/);
