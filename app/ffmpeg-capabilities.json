@@ -31,6 +31,18 @@
         "trim"
       ]
     },
+    "antiStutterRemoval": {
+      "releaseRequired": true,
+      "encoders": [
+        "pcm_f64le"
+      ],
+      "filters": [
+        "atrim",
+        "asetpts",
+        "aresample",
+        "apad"
+      ]
+    },
     "hdrToSdr": {
       "releaseRequired": true,
       "encoders": [

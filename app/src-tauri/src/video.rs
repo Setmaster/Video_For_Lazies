@@ -200,6 +200,8 @@ pub struct VideoProbe {
     pub selected_video_dispositions: StreamDispositions,
     pub audio_sample_rate: Option<u32>,
     pub audio_channels: Option<u32>,
+    #[serde(skip)]
+    pub(crate) audio_channel_layout: Option<String>,
     pub audio_sample_format: Option<String>,
     pub decoded_video_bytes_per_pixel: Option<f64>,
     pub decoded_audio_bytes_per_sample: Option<u8>,
@@ -343,11 +345,21 @@ pub struct ResizeSettings {
     pub height_px: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AntiStutterMode {
+    #[default]
+    Repair,
+    Remove,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InterpolationSettings {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub anti_stutter: bool,
+    #[serde(default)]
+    pub anti_stutter_mode: AntiStutterMode,
     #[serde(
         default = "default_anti_stutter_strength",
         skip_serializing_if = "anti_stutter_strength_is_default",
@@ -519,6 +531,9 @@ pub struct SubtitleInspection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportDiagnostics {
+    /// Final output timeline after cleanup, speed and looping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_duration_s: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpolation: Option<InterpolationDiagnostics>,
     pub mode: String,
@@ -565,6 +580,7 @@ pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> Expor
     let requested_size_bytes = target_bytes_from_size_limit_mb(request.size_limit_mb);
     let redacted_reason = safe_failure_diagnostic_reason(request, reason);
     ExportDiagnostics {
+        output_duration_s: None,
         interpolation: None,
         mode: "failed".to_string(),
         video_action: None,
@@ -956,6 +972,66 @@ fn prepare_external_subtitle(path: &Path) -> Result<PreparedSubtitle, String> {
         temp_dir,
         inspection: validated.inspection,
     })
+}
+
+/// Retimes only the validated private SRT copy. Source subtitles stay untouched.
+fn remap_subtitles_for_removal(
+    text: &str,
+    source_start_ns: u64,
+    map: &crate::interpolation_media::RemovalMap,
+) -> Result<Option<ValidatedSubtitle>, String> {
+    let validated = validate_external_srt_text(text)?;
+    let mut output = String::new();
+    let mut cue_number = 0;
+    let timestamp = |ms: u64| {
+        format!(
+            "{:02}:{:02}:{:02},{:03}",
+            ms / 3_600_000,
+            ms / 60_000 % 60,
+            ms / 1_000 % 60,
+            ms % 1_000
+        )
+    };
+    let subtitle_lines: Vec<_> = validated.normalized_text.lines().collect();
+    for lines in subtitle_lines.split(|line| line.trim().is_empty()) {
+        process::check_cancelled().map_err(|_| "Canceled.".to_string())?;
+        let Some(timing_index) = lines.iter().position(|line| line.contains("-->")) else {
+            continue;
+        };
+        let (start, end) = lines[timing_index]
+            .split_once("-->")
+            .ok_or("Invalid staged subtitle timing.")?;
+        let map_timestamp = |value: &str| -> Result<u64, String> {
+            let ns = parse_srt_timestamp_ms(value)
+                .ok_or("Invalid staged subtitle timestamp.")?
+                .saturating_mul(1_000_000);
+            let relative = ns
+                .saturating_sub(source_start_ns)
+                .min(map.source_duration_ns());
+            Ok(map.map_ns(relative).saturating_add(500_000) / 1_000_000)
+        };
+        let start_ms = map_timestamp(start)?;
+        let end_ms = map_timestamp(end)?;
+        if end_ms <= start_ms {
+            continue;
+        }
+        cue_number += 1;
+        output.push_str(&format!(
+            "{cue_number}\n{} --> {}\n",
+            timestamp(start_ms),
+            timestamp(end_ms)
+        ));
+        for line in &lines[timing_index + 1..] {
+            output.push_str(line);
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    if cue_number == 0 {
+        Ok(None)
+    } else {
+        validate_external_srt_text(&output).map(Some)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3559,12 +3635,7 @@ fn build_encode_command_plan(
                 }
             )
         })?;
-        let output_duration_s = estimate_output_duration_s(
-            probe.duration_s,
-            &request.trim,
-            request.speed,
-            request.loop_video,
-        )?;
+        let output_duration_s = planned_output_duration_s(request, probe)?;
         let include_audio = request.audio_enabled && probe.audio_stream_index.is_some();
         let size_contract = build_size_limited_encode_contract(
             request,
@@ -3714,12 +3785,7 @@ fn build_size_reencode_fallback_plan(
         "Compatible stream copy could not satisfy the size target, and the active FFmpeg build has no compatible video encoder fallback."
             .to_string()
     })?;
-    let output_duration_s = estimate_output_duration_s(
-        probe.duration_s,
-        &request.trim,
-        request.speed,
-        request.loop_video,
-    )?;
+    let output_duration_s = planned_output_duration_s(request, probe)?;
     let include_audio = request.audio_enabled && probe.audio_stream_index.is_some();
     let size_contract = build_size_limited_encode_contract(
         request,
@@ -4042,12 +4108,7 @@ fn planned_size_copy_audio_action(
         .ok_or_else(|| {
             "Could not identify the compatible source video codec for size planning.".to_string()
         })?;
-    let output_duration_s = estimate_output_duration_s(
-        probe.duration_s,
-        &request.trim,
-        request.speed,
-        request.loop_video,
-    )?;
+    let output_duration_s = planned_output_duration_s(request, probe)?;
     let min_video_kbps = minimum_video_bitrate_kbps(
         planning_codec,
         probe.width.max(2),
@@ -4398,6 +4459,7 @@ struct FFProbeStream {
     display_aspect_ratio: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u32>,
+    channel_layout: Option<String>,
     sample_fmt: Option<String>,
     codec_tag_string: Option<String>,
     profile: Option<String>,
@@ -5487,6 +5549,11 @@ fn parse_probe_output_selected(
         .filter(|value| *value > 0);
     let audio_sample_format =
         selected_audio.and_then(|stream| normalized_probe_field(stream.sample_fmt.as_deref()));
+    let audio_channel_layout = selected_audio
+        .and_then(|stream| stream.channel_layout.as_deref())
+        .map(str::trim)
+        .filter(|layout| !layout.is_empty() && *layout != "unknown")
+        .map(str::to_string);
     let decoded_audio_bytes_per_sample =
         decoded_audio_bytes_per_sample(audio_sample_format.as_deref());
     let attached_picture_count = parsed
@@ -5550,6 +5617,7 @@ fn parse_probe_output_selected(
         selected_video_dispositions: stream_dispositions(&selected_video.disposition),
         audio_sample_rate,
         audio_channels,
+        audio_channel_layout,
         audio_sample_format,
         decoded_video_bytes_per_pixel,
         decoded_audio_bytes_per_sample,
@@ -5722,6 +5790,27 @@ fn crop_detect_command_args(input_path: &Path, video_stream_index: u32) -> Vec<O
     ]
     .into_iter()
     .collect()
+}
+
+/// Budget every interpolation retry from the same admitted CFR frame count
+/// used by preparation, including a fractional final source-frame interval.
+fn planned_output_duration_s(request: &EncodeRequest, probe: &VideoProbe) -> Result<f64, String> {
+    if let Some(settings) = &request.interpolation {
+        let duration_ns =
+            (retained_source_duration_s(request, probe)? * 1_000_000_000.0).round() as u64;
+        let rate =
+            crate::interpolation_timeline::Rate::for_playback(settings.target_fps, request.speed)?;
+        let frames = rate.frame_count(duration_ns)?;
+        Ok(frames as f64 / f64::from(settings.target_fps)
+            * if request.loop_video { 2.0 } else { 1.0 })
+    } else {
+        estimate_output_duration_s(
+            probe.duration_s,
+            &request.trim,
+            request.speed,
+            request.loop_video && request.format != OutputFormat::Mp3,
+        )
+    }
 }
 
 fn estimate_output_duration_s(
@@ -6816,6 +6905,12 @@ fn prepared_ffmpeg_command_preview(
         let path = prepared.path.to_string_lossy();
         let mut replacements = replacements.to_vec();
         replacements.push((&path, "<interpolation-cache>"));
+        let audio_path = prepared
+            .removal_audio()
+            .map(|audio| audio.path.to_string_lossy());
+        if let Some(path) = &audio_path {
+            replacements.push((path.as_ref(), "<cleanup-audio>"));
+        }
         ffmpeg_command_preview(&args, &replacements)
     } else {
         ffmpeg_command_preview(args, replacements)
@@ -6963,6 +7058,35 @@ fn build_mutated_size_reencode_plan(
     }
 }
 
+/// Rebuild downstream filters against compacted inputs, while keeping stream
+/// indices bound to the original input for PreparedVideo's explicit remapping.
+fn apply_compacted_timeline(
+    request: &mut EncodeRequest,
+    probe: &mut VideoProbe,
+    duration_s: f64,
+    audio: Option<(u32, u32)>,
+) -> Result<(), String> {
+    if !duration_s.is_finite() || duration_s <= 0.0 {
+        return Err("Cleanup produced an invalid output duration.".into());
+    }
+    request.trim = None;
+    probe.duration_s = duration_s;
+    probe.video_start_s = 0.0;
+    probe.video_end_s = Some(duration_s);
+    probe.input_origin_s = 0.0;
+    if let Some((sample_rate, channels)) = audio {
+        probe.audio_start_s = Some(0.0);
+        probe.audio_end_s = Some(duration_s);
+        probe.audio_sample_rate = Some(sample_rate);
+        probe.audio_channels = Some(channels);
+        probe.audio_sample_format = Some("dbl".into());
+        probe.decoded_audio_bytes_per_sample = Some(8);
+        // The effective input is now PCM, even if the original track was AAC.
+        probe.audio_codec = Some("pcm_f64le".into());
+    }
+    Ok(())
+}
+
 pub fn run_encode_job(
     window: &Window,
     attempt_id: u64,
@@ -7071,7 +7195,7 @@ pub fn run_encode_job(
             subtitle_working_dir.ok_or("Missing thumbnail staging storage.")?,
         )?;
     }
-    let subtitle_inspection = prepared_subtitle
+    let mut subtitle_inspection = prepared_subtitle
         .as_ref()
         .map(|prepared| prepared.inspection.clone());
     let codec_selection = select_codec_plan(
@@ -7082,8 +7206,22 @@ pub fn run_encode_job(
     let resolved_perturb_seed = request
         .perturb_first_frame
         .then(|| request.perturb_seed.unwrap_or_else(random_perturb_seed));
-    let mut command_plan =
-        build_encode_command_plan(&request, &probe, codec_selection, resolved_perturb_seed)?;
+    let removal_requested = request.interpolation.as_ref().is_some_and(|settings| {
+        settings.anti_stutter && settings.anti_stutter_mode == AntiStutterMode::Remove
+    });
+    // Removal duration is not known yet. Validate encoding capabilities now,
+    // but defer size feasibility until cleanup has established the real clock.
+    let mut preflight_request = request.clone();
+    if removal_requested {
+        preflight_request.size_limit_mb = 0.0;
+        preflight_request.strict_fit = false;
+    }
+    let mut command_plan = build_encode_command_plan(
+        &preflight_request,
+        &probe,
+        codec_selection,
+        resolved_perturb_seed,
+    )?;
     require_initial_encode_plan_capabilities(
         &command_plan,
         &capability_contract,
@@ -7092,6 +7230,17 @@ pub fn run_encode_job(
 
     let resolved_model = if let Some(settings) = &request.interpolation {
         validate_interpolation_request(&request, &probe)?;
+        if settings.anti_stutter
+            && settings.anti_stutter_mode == AntiStutterMode::Remove
+            && request.audio_enabled
+            && probe.has_audio
+        {
+            require_ffmpeg_feature(
+                "antiStutterRemoval",
+                &capability_contract,
+                &runtime_capabilities,
+            )?;
+        }
         require_ffmpeg_capability_subset(
             "AI interpolation",
             ["ffv1", "rawvideo"],
@@ -7168,12 +7317,63 @@ pub fn run_encode_job(
         None
     };
 
-    let output_duration_s = estimate_output_duration_s(
-        probe.duration_s,
-        &request.trim,
-        request.speed,
-        request.loop_video && !matches!(request.format, OutputFormat::Mp3),
-    )?;
+    // Preserve source facts for diagnostics while planning from the materialized
+    // compacted streams. Never reapply the original source trim to these streams.
+    let original_probe = probe.clone();
+    if let Some(prepared) = &prepared_video
+        && let Some(map) = prepared.removal_map()
+    {
+        if request.audio_enabled && probe.has_audio && prepared.removal_audio().is_none() {
+            return Err(
+                "Cleanup could not prepare the requested audio on the shortened timeline.".into(),
+            );
+        }
+        if let Some(staged) = &prepared_subtitle {
+            let path = staged.working_dir().join(EXTERNAL_SUBTITLE_FILE_NAME);
+            let text = fs::read_to_string(&path)
+                .map_err(|_| "Could not read staged subtitles for cleanup.")?;
+            let mapped = remap_subtitles_for_removal(
+                &text,
+                (prepared.start_s * 1_000_000_000.0).round() as u64,
+                map,
+            )?;
+            if let Some(mapped) = mapped {
+                fs::write(path, mapped.normalized_text)
+                    .map_err(|_| "Could not stage retimed subtitles.")?;
+                subtitle_inspection = Some(mapped.inspection);
+            } else {
+                request.subtitle_path = None;
+                subtitle_inspection = None;
+            }
+        }
+        apply_compacted_timeline(
+            &mut request,
+            &mut probe,
+            prepared.effective_source_duration_s(),
+            prepared
+                .removal_audio()
+                .map(|audio| (audio.sample_rate, audio.channels)),
+        )?;
+    }
+    if removal_requested {
+        command_plan =
+            build_encode_command_plan(&request, &probe, codec_selection, resolved_perturb_seed)?;
+        require_initial_encode_plan_capabilities(
+            &command_plan,
+            &capability_contract,
+            &runtime_capabilities,
+        )?;
+    }
+    let output_duration_s = if let Some(prepared) = &prepared_video {
+        prepared.output_duration_s()
+    } else {
+        estimate_output_duration_s(
+            probe.duration_s,
+            &request.trim,
+            request.speed,
+            request.loop_video && !matches!(request.format, OutputFormat::Mp3),
+        )?
+    };
     let duration_us = (output_duration_s * 1_000_000.0).max(1.0) as u64;
 
     if matches!(request.format, OutputFormat::Mp3) {
@@ -7289,15 +7489,16 @@ pub fn run_encode_job(
                 .as_ref()
                 .map(|result| exact_target_message(result.status, out_size, target_bytes)),
             diagnostics: Some(ExportDiagnostics {
+                output_duration_s: Some(output_duration_s),
                 interpolation: prepared_video
                     .as_ref()
                     .map(|video| video.diagnostics.clone()),
                 mode: command_plan.mode.label().to_string(),
                 video_action: None,
                 audio_action: Some(StreamAction::Encode),
-                source_format: probe.source_format.clone(),
-                source_video_codec: probe.video_codec.clone(),
-                source_audio_codec: probe.audio_codec.clone(),
+                source_format: original_probe.source_format.clone(),
+                source_video_codec: original_probe.video_codec.clone(),
+                source_audio_codec: original_probe.audio_codec.clone(),
                 video_codec: None,
                 audio_codec: command_plan.output_audio_codec.clone(),
                 video_bitrate_kbps: None,
@@ -7439,15 +7640,16 @@ pub fn run_encode_job(
                             target_result: Some(target_result),
                             message: Some("Fit confirmed by exact output bytes.".to_string()),
                             diagnostics: Some(ExportDiagnostics {
+                                output_duration_s: Some(output_duration_s),
                                 interpolation: prepared_video
                                     .as_ref()
                                     .map(|video| video.diagnostics.clone()),
                                 mode: EncodeMode::Remux.label().to_string(),
                                 video_action: Some(StreamAction::Copy),
                                 audio_action: Some(candidate.audio_action),
-                                source_format: probe.source_format.clone(),
-                                source_video_codec: probe.video_codec.clone(),
-                                source_audio_codec: probe.audio_codec.clone(),
+                                source_format: original_probe.source_format.clone(),
+                                source_video_codec: original_probe.video_codec.clone(),
+                                source_audio_codec: original_probe.audio_codec.clone(),
                                 video_codec: probe.video_codec.clone(),
                                 audio_codec: (candidate.audio_action == StreamAction::Copy)
                                     .then(|| probe.audio_codec.clone())
@@ -7626,15 +7828,23 @@ pub fn run_encode_job(
                         target_result: None,
                         message: None,
                         diagnostics: Some(ExportDiagnostics {
+                            output_duration_s: Some(output_duration_s),
                             interpolation: prepared_video
                                 .as_ref()
                                 .map(|video| video.diagnostics.clone()),
                             mode: executed_plan.mode.label().to_string(),
                             video_action: Some(executed_plan.video_action),
                             audio_action: Some(executed_plan.audio_action),
-                            source_format: probe.source_format.clone(),
+                            source_format: original_probe.source_format.clone(),
                             source_video_codec: executed_plan.source_video_codec.clone(),
-                            source_audio_codec: executed_plan.source_audio_codec.clone(),
+                            source_audio_codec: if prepared_video
+                                .as_ref()
+                                .is_some_and(|video| video.removal_map().is_some())
+                            {
+                                original_probe.audio_codec.clone()
+                            } else {
+                                executed_plan.source_audio_codec.clone()
+                            },
                             video_codec: executed_plan.output_video_codec.clone(),
                             audio_codec: executed_plan.output_audio_codec.clone(),
                             video_bitrate_kbps: None,
@@ -8128,15 +8338,16 @@ pub fn run_encode_job(
         .map(|encoder| encoder.as_codec_name().to_string());
     let message = exact_target_message(final_status, selected.actual_size_bytes, target_bytes);
     let diagnostics = ExportDiagnostics {
+        output_duration_s: Some(output_duration_s),
         interpolation: prepared_video
             .as_ref()
             .map(|video| video.diagnostics.clone()),
         mode: selected.command_plan.mode.label().to_string(),
         video_action: Some(selected.command_plan.video_action),
         audio_action: Some(selected.audio_action),
-        source_format: probe.source_format.clone(),
-        source_video_codec: probe.video_codec.clone(),
-        source_audio_codec: probe.audio_codec.clone(),
+        source_format: original_probe.source_format.clone(),
+        source_video_codec: original_probe.video_codec.clone(),
+        source_audio_codec: original_probe.audio_codec.clone(),
         video_codec: selected.command_plan.output_video_codec.clone(),
         audio_codec: match selected.audio_action {
             StreamAction::Copy => probe.audio_codec.clone(),
@@ -8248,6 +8459,7 @@ mod tests {
         let mut req = base_request();
         let mut probe = probe_10s_1920x1080_audio();
         req.interpolation = Some(InterpolationSettings {
+            anti_stutter_mode: crate::video::AntiStutterMode::Repair,
             anti_stutter: false,
             anti_stutter_strength: 0,
             target_fps: 60,
@@ -8308,7 +8520,7 @@ mod tests {
         assert_eq!(absent, disabled);
         assert_eq!(
             serde_json::to_value(&absent).unwrap(),
-            serde_json::from_str::<serde_json::Value>(original).unwrap()
+            serde_json::json!({"targetFps":60,"modelId":"rife-v4.25","antiStutterMode":"repair"})
         );
         for value in ["1", "null", "\"true\"", "{}"] {
             assert!(
@@ -8320,6 +8532,7 @@ mod tests {
         }
         let mut request = base_request();
         request.interpolation = Some(InterpolationSettings {
+            anti_stutter_mode: crate::video::AntiStutterMode::Repair,
             anti_stutter: true,
             anti_stutter_strength: 0,
             target_fps: 60,
@@ -8330,6 +8543,47 @@ mod tests {
                 .unwrap_err()
                 .contains("Anti-stutter")
         );
+    }
+
+    #[test]
+    fn anti_stutter_mode_keeps_legacy_repair_and_roundtrips_explicit_choices() {
+        let legacy: InterpolationSettings = serde_json::from_value(serde_json::json!({
+            "targetFps": 60, "modelId": "rife-v4.25", "antiStutter": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.anti_stutter_mode, AntiStutterMode::Repair);
+        for (mode, expected) in [
+            ("repair", AntiStutterMode::Repair),
+            ("remove", AntiStutterMode::Remove),
+        ] {
+            for enabled in [false, true] {
+                let settings: InterpolationSettings = serde_json::from_value(serde_json::json!({
+                    "targetFps":60, "modelId":"rife-v4.25", "antiStutter": enabled, "antiStutterMode":mode
+                })).unwrap();
+                assert_eq!(settings.anti_stutter_mode, expected);
+                assert_eq!(
+                    serde_json::from_value::<InterpolationSettings>(
+                        serde_json::to_value(&settings).unwrap()
+                    )
+                    .unwrap(),
+                    settings
+                );
+            }
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(1),
+            serde_json::json!("REMOVE"),
+            serde_json::json!("other"),
+        ] {
+            assert!(
+                serde_json::from_value::<InterpolationSettings>(serde_json::json!({
+                    "targetFps":60,"modelId":"rife-v4.25","antiStutterMode":invalid
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -8368,6 +8622,7 @@ mod tests {
         assert_eq!(legacy.anti_stutter_strength, 75);
         let mut request = base_request();
         request.interpolation = Some(InterpolationSettings {
+            anti_stutter_mode: crate::video::AntiStutterMode::Repair,
             anti_stutter: false,
             anti_stutter_strength: 101,
             target_fps: 60,
@@ -8670,6 +8925,7 @@ mod tests {
             },
             audio_sample_rate: Some(48_000),
             audio_channels: Some(2),
+            audio_channel_layout: Some("stereo".into()),
             audio_sample_format: Some("fltp".to_string()),
             decoded_video_bytes_per_pixel: Some(1.5),
             decoded_audio_bytes_per_sample: Some(4),
@@ -9703,6 +9959,153 @@ Encoders:
         assert_eq!(atempo_chain(1.0).unwrap(), "atempo=1.000000");
         assert_eq!(atempo_chain(4.0).unwrap(), "atempo=2.0,atempo=2.000000");
         assert_eq!(atempo_chain(0.25).unwrap(), "atempo=0.5,atempo=0.500000");
+    }
+
+    #[test]
+    fn removal_subtitles_follow_the_shared_map_and_drop_deleted_cues() {
+        let mut map = crate::interpolation_media::RemovalMap::new(4_000_000_000);
+        map.push(1_000_000_000, 2_000_000_000).unwrap();
+        map.push(3_000_000_000, 3_500_000_000).unwrap();
+        let source = "1\n00:00:00,000 --> 00:00:01,000\nOutside\n \n2\n00:00:06,100 --> 00:00:06,900\nDeleted\n\n3\n00:00:05,500 --> 00:00:07,500\nSpanning\n\n4\n00:00:08,500 --> 00:00:09,500\nAfter\n\n5\n00:00:04,900 --> 00:00:05,200\nClipped\n";
+        let retimed = remap_subtitles_for_removal(source, 5_000_000_000, &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retimed.inspection.cue_count, 3);
+        assert_eq!(retimed.inspection.first_cue_start_s, 0.0);
+        assert_eq!(retimed.inspection.last_cue_end_s, 2.5);
+        assert!(!retimed.normalized_text.contains("Deleted"));
+        assert!(!retimed.normalized_text.contains("Outside"));
+        assert!(
+            retimed
+                .normalized_text
+                .contains("00:00:00,500 --> 00:00:01,500\nSpanning")
+        );
+        assert!(
+            retimed
+                .normalized_text
+                .contains("00:00:02,000 --> 00:00:02,500\nAfter")
+        );
+        assert!(
+            retimed
+                .normalized_text
+                .contains("00:00:00,000 --> 00:00:00,200\nClipped")
+        );
+        assert!(
+            remap_subtitles_for_removal(
+                "1\n00:00:06,100 --> 00:00:06,900\nDeleted\n",
+                5_000_000_000,
+                &map
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn compacted_input_replans_trim_audio_speed_loop_and_size_budget() {
+        let mut request = base_request();
+        request.trim = Some(Trim {
+            start_s: 2.0,
+            end_s: Some(8.0),
+        });
+        request.speed = 2.0;
+        request.loop_video = true;
+        request.interpolation = Some(
+            serde_json::from_value(serde_json::json!({
+                "targetFps":60,"modelId":"rife-v4.25","antiStutter":true,"antiStutterMode":"remove"
+            }))
+            .unwrap(),
+        );
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.width = 64;
+        probe.height = 64;
+        probe.coded_width = 64;
+        probe.coded_height = 64;
+        let before = test_command_plan(&request, &probe, 1_000_000);
+        apply_compacted_timeline(&mut request, &mut probe, 4.0, Some((48_000, 2))).unwrap();
+        let after = test_command_plan(&request, &probe, 1_000_000);
+        assert!(request.trim.is_none());
+        assert_eq!(after.audio_action, StreamAction::Encode);
+        assert_eq!(probe.audio_channel_layout.as_deref(), Some("stereo"));
+        assert_eq!(probe.decoded_audio_bytes_per_sample, Some(8));
+        assert_eq!(
+            estimate_output_duration_s(
+                probe.duration_s,
+                &request.trim,
+                request.speed,
+                request.loop_video
+            )
+            .unwrap(),
+            4.0
+        );
+        let vf = after.video_filters.as_deref().unwrap();
+        assert!(!vf.contains("trim=start=2"));
+        let af = after.audio_filters.as_deref().unwrap();
+        assert!(!af.contains("atrim=start=2"));
+        assert!(af.contains("apad=whole_dur=4"));
+        assert!(af.contains("apad=whole_dur=2"));
+        assert!(af.contains("concat=n=2:v=0:a=1"));
+        if let (Some(before), Some(after)) = (before.size_contract, after.size_contract) {
+            assert!(after.plan.video_bitrate_kbps > before.plan.video_bitrate_kbps);
+        } else {
+            panic!("Expected both size-target plans");
+        }
+        for duration in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(apply_compacted_timeline(&mut request, &mut probe, duration, None).is_err());
+        }
+    }
+
+    #[test]
+    fn interpolation_size_plans_use_the_admitted_fractional_frame_duration() {
+        let mut request = base_request();
+        request.speed = 2.0;
+        request.loop_video = true;
+        request.interpolation = Some(
+            serde_json::from_value(serde_json::json!({
+                "targetFps":60,"modelId":"rife-v4.25","antiStutter":true,"antiStutterMode":"remove"
+            }))
+            .unwrap(),
+        );
+        let mut probe = probe_10s_1920x1080_audio();
+        probe.duration_s = 0.101;
+        probe.width = 64;
+        probe.height = 64;
+        probe.coded_width = 64;
+        probe.coded_height = 64;
+        let admitted_duration = 8.0 / 60.0; // Four forward samples, then loop.
+        assert_eq!(
+            planned_output_duration_s(&request, &probe).unwrap(),
+            admitted_duration
+        );
+        let plan = test_command_plan(&request, &probe, 1_000_000);
+        let contract = plan.size_contract.unwrap();
+        let expected = build_size_limited_encode_contract(
+            &request,
+            &probe,
+            plan.video_encoder.unwrap(),
+            admitted_duration,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            contract.plan.video_bitrate_kbps,
+            expected.plan.video_bitrate_kbps
+        );
+        let fallback = build_mutated_size_reencode_plan(
+            &request,
+            &probe,
+            CodecSelection {
+                video_codec: plan.video_encoder,
+                audio_codec: plan.audio_encoder,
+                quality_mode: plan.quality_mode,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fallback.size_contract.unwrap().plan.video_bitrate_kbps,
+            expected.plan.video_bitrate_kbps
+        );
     }
 
     #[test]

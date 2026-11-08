@@ -44,6 +44,11 @@ const shippedContractExpectation = {
       encoders: ["aac", "libmp3lame", "libopus", "libvorbis", "libvpx", "libvpx-vp9", "libx264", "mpeg4", "png"],
       filters: ["aresample", "asetpts", "atempo", "atrim", "crop", "cropdetect", "eq", "fps", "loudnorm", "noise", "scale", "setpts", "transpose", "trim"],
     },
+    antiStutterRemoval: {
+      releaseRequired: true,
+      encoders: ["pcm_f64le"],
+      filters: ["atrim", "asetpts", "aresample", "apad"],
+    },
     hdrToSdr: {
       releaseRequired: true,
       encoders: ["libx264"],

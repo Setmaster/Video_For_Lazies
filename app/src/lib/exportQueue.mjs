@@ -1,3 +1,5 @@
+import { antiStutterRemovesTime } from "./interpolation.mjs";
+
 export const MAX_EXPORT_QUEUE_ITEMS = 100;
 export const MAX_EXPORT_QUEUE_OUTCOMES_PER_ITEM = 10;
 
@@ -155,7 +157,7 @@ function queueItemFromRequest(id, request, durationS) {
     inputPath: snapshot.inputPath,
     outputPath: snapshot.outputPath,
     format: snapshot.format,
-    durationS: normalizeDuration(durationS),
+    durationS: antiStutterRemovesTime(snapshot.interpolation) ? null : normalizeDuration(durationS),
     request: snapshot,
     status: "queued",
     history: [],

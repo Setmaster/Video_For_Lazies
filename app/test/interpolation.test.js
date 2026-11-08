@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { INTERPOLATION_MODELS, antiStutterSummary, interpolationModelLabel, beginInterpolationInstall, bindInterpolationInstall, createInterpolationInstall, interpolationConflict, interpolationInstallActive, interpolationPublicMessage, normalizeInterpolation, reduceInterpolationInstall } from "../src/lib/interpolation.mjs";
+import { INTERPOLATION_MODELS, antiStutterMode, antiStutterRemovesTime, antiStutterPlanSummary, resolvedOutputDuration, setAntiStutterEnabled, antiStutterSummary, interpolationModelLabel, beginInterpolationInstall, bindInterpolationInstall, createInterpolationInstall, interpolationConflict, interpolationInstallActive, interpolationPublicMessage, normalizeInterpolation, reduceInterpolationInstall } from "../src/lib/interpolation.mjs";
 import { parsePersistedSettings, serializePersistedSettings } from "../src/lib/settings.mjs";
 import { EXPORT_RECIPES, recipeMatchesSettings } from "../src/lib/exportRecipes.mjs";
 import { createExportQueueState, reduceExportQueue } from "../src/lib/exportQueue.mjs";
@@ -230,4 +230,75 @@ test("public command failure messages retain recovery guidance without exposing 
   assert.equal(interpolationPublicMessage(" A model check is already running. ", "Try again."), "A model check is already running.");
   assert.equal(interpolationPublicMessage(new Error("/private/model/file"), "Try again."), "Try again.");
   assert.equal(interpolationPublicMessage("x".repeat(2000), "Try again.").length, 1000);
+});
+
+
+test("legacy enabled Anti-stutter stays repair while a new enable selects removal", () => {
+  const legacy = { ...intent, antiStutter: true };
+  assert.deepEqual(normalizeInterpolation(legacy), legacy);
+  assert.equal(antiStutterMode(legacy), "repair");
+  assert.equal(antiStutterRemovesTime(legacy), false);
+  assert.equal(setAntiStutterEnabled(intent, true).antiStutterMode, "remove");
+  const disabledLegacy = normalizeInterpolation(setAntiStutterEnabled(legacy, false));
+  assert.equal(disabledLegacy.antiStutterMode, "repair");
+  assert.equal(setAntiStutterEnabled(disabledLegacy, true).antiStutterMode, "repair");
+  for (const mode of ["remove", "repair"]) {
+    const chosen = { ...intent, antiStutter: true, antiStutterMode: mode };
+    assert.equal(setAntiStutterEnabled(setAntiStutterEnabled(chosen, false), true).antiStutterMode, mode);
+    assert.deepEqual(normalizeInterpolation(chosen), chosen);
+  }
+});
+
+test("mode allowlist preserves explicit repair and drops malformed mode without enabling removal", () => {
+  for (const mode of [undefined, null, false, 1, "Remove", "drop", {}, []]) {
+    const normalized = normalizeInterpolation({ ...intent, antiStutter: true, antiStutterMode: mode });
+    assert.deepEqual(normalized, { ...intent, antiStutter: true });
+    assert.equal(antiStutterRemovesTime(normalized), false);
+  }
+  assert.deepEqual(normalizeInterpolation({ ...intent, antiStutterMode: "repair" }), { ...intent, antiStutterMode: "repair" });
+  assert.equal(antiStutterRemovesTime({ ...intent, antiStutterMode: "remove" }), false);
+});
+
+for (const mode of ["remove", "repair"]) test(`${mode} mode survives settings recipes and isolated queue snapshots`, () => {
+  const interpolation = { ...intent, antiStutter: true, antiStutterStrength: 0, antiStutterMode: mode };
+  const plan = { ...settings(), interpolation };
+  assert.deepEqual(parsePersistedSettings(serializePersistedSettings(plan)).interpolation, interpolation);
+  const created = createUserRecipe([], `Mode ${mode}`, "Anti-stutter", plan, { id: mode });
+  assert.equal(created.ok, true);
+  const restored = parseUserRecipeStore(serializeUserRecipeStore(created.recipes)).recipes[0];
+  assert.deepEqual(restored.settings.interpolation, interpolation);
+  assert.equal(userRecipeMatchesSettings(restored, plan), true);
+  assert.equal(userRecipeMatchesSettings(restored, { ...plan, interpolation: { ...interpolation, antiStutterMode: mode === "remove" ? "repair" : "remove" } }), false);
+  let queue = reduceExportQueue(createExportQueueState(), { type: "enqueue-prepared", items: [{ request: { ...plan, inputPath: "/input.mp4", outputPath: "/output.mp4" }, durationS: 3 }] });
+  interpolation.antiStutterMode = "changed";
+  assert.equal(queue.items[0].request.interpolation.antiStutterMode, mode);
+  assert.equal(queue.items[0].durationS, mode === "remove" ? null : 3);
+  assert.equal(reusableSettingsFromEncodeRequest(queue.items[0].request).interpolation.antiStutterMode, mode);
+  queue = reduceExportQueue(queue, { type: "duplicate-prepared", sourceItemId: queue.items[0].id, request: { ...queue.items[0].request, outputPath: "/output-2.mp4" } });
+  queue.items[0].request.interpolation.antiStutterMode = "changed";
+  assert.equal(queue.items[1].request.interpolation.antiStutterMode, mode);
+});
+
+test("mode summaries do not promise preserved timing for removal or removal for legacy repair", () => {
+  const legacy = { ...intent, antiStutter: true };
+  assert.match(antiStutterPlanSummary(legacy), /Fill pauses.*preserve duration/);
+  assert.match(antiStutterPlanSummary({ ...legacy, antiStutterMode: "remove" }), /shorten output.*audio cuts/);
+  assert.equal(antiStutterPlanSummary(intent), null);
+  assert.equal(antiStutterSummary({ mode: "remove", removedRuns: 0, removedDurationS: 0, unchangedRuns: 1 }), "Anti-stutter: no repeated time removed. 1 candidate left unchanged.");
+  assert.equal(antiStutterSummary({ mode: "remove", removedRuns: 2, removedDurationS: .4, unchangedRuns: 0 }), "Anti-stutter: 0.400 s of repeated source time removed from 2 holds.");
+  assert.equal(antiStutterSummary({ mode: "remove", removedRuns: 1, removedDurationS: .4, repairedRuns: 2, unchangedRuns: 1 }), "Anti-stutter: 0.400 s of repeated source time removed from 1 hold. 2 pauses filled without removing time. 1 candidate left unchanged.");
+  assert.equal(antiStutterSummary({ mode: "remove", removedRuns: 0, removedDurationS: 0, repairedRuns: 1, unchangedRuns: 0 }), "Anti-stutter: no repeated time removed. 1 pause filled without removing time.");
+  assert.match(antiStutterSummary({ mode: "remove", removedRuns: 1, removedDurationS: .0001 }), /<0.001 s/);
+});
+
+
+test("completed output uses native final duration without source-time speed or loop rescaling", () => {
+  const diagnostics = { outputDurationS: 7.25, interpolation: { antiStutter: { mode: "remove", removedDurationS: 2 } } };
+  assert.equal(resolvedOutputDuration(diagnostics, 10), 7.25);
+  for (const outputDurationS of [undefined, null, 0, -1, NaN, Infinity]) {
+    assert.equal(resolvedOutputDuration({ ...diagnostics, outputDurationS }, 10), null);
+  }
+  assert.equal(resolvedOutputDuration(null, 10), 10);
+  assert.equal(resolvedOutputDuration({ interpolation: { antiStutter: { mode: "repair" } } }, 10), 10);
+  assert.equal(resolvedOutputDuration(undefined), null);
 });

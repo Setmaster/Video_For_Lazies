@@ -10,7 +10,7 @@ import { SmoothMotionControl } from "./components/SmoothMotionControl";
 import { AntiStutterControl } from "./components/AntiStutterControl";
 import { AntiStutterResult } from "./components/AntiStutterResult";
 import { ThumbnailControl } from "./components/ThumbnailControl";
-import { normalizeInterpolation, interpolationConflict, interpolationModelLabel } from "./lib/interpolation";
+import { normalizeInterpolation, interpolationConflict, interpolationModelLabel, ANTI_STUTTER_DEFAULT_STRENGTH, antiStutterMode, antiStutterRemovesTime, antiStutterPlanSummary, resolvedOutputDuration } from "./lib/interpolation";
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
 import { TrimSliderHandle } from "./components/TrimSliderHandle";
@@ -2124,13 +2124,15 @@ function App() {
     const baseDurationS = Math.max(0.001, (endS - startS) / speedNum);
     const durationS = format !== "mp3" && loopVideo ? baseDurationS * 2 : baseDurationS;
     const sizeLimitEnabled = sizeMb > 0;
-    const totalKbps = sizeLimitEnabled
+    const durationUnknown = format !== "mp3" && antiStutterRemovesTime(interpolation);
+    const totalKbps = sizeLimitEnabled && !durationUnknown
       ? Math.max(1, Math.floor((sizeMb * 1_000_000 * 8 * 0.95) / durationS / 1000))
       : null;
 
     if (format === "mp3") {
       return {
         durationS,
+        durationUnknown,
         totalKbps,
         sizeLimitEnabled,
         audioIncluded: Boolean(probe.hasAudio),
@@ -2240,7 +2242,7 @@ function App() {
       h = audioFallbackDimensions.height;
     }
 
-    return { durationS, totalKbps, sizeLimitEnabled, audioIncluded, w, h, videoCodec: planningVideoCodec };
+    return { durationS, durationUnknown, totalKbps, sizeLimitEnabled, audioIncluded, w, h, videoCodec: planningVideoCodec };
   }, [
     probe,
     sizeLimitMb,
@@ -3064,15 +3066,18 @@ function App() {
     outputPath && exportQueueClaimsOutputPath(exportQueueState, outputPath)
       ? "That output path is already reserved by an item in the export queue. Choose another destination or remove the queued item."
       : null;
-  const currentPlannedDurationS = plannedEncodeSummary?.durationS ?? null;
+  const currentPlannedDurationS = plannedEncodeSummary?.durationUnknown ? null : plannedEncodeSummary?.durationS ?? null;
   const planSummaryText = useMemo(() => {
     if (!plannedEncodeSummary) return null;
     const shape =
       plannedEncodeSummary.w !== null && plannedEncodeSummary.h !== null
         ? `${plannedEncodeSummary.w}x${plannedEncodeSummary.h}`
         : "audio only";
-    const bitrate = plannedEncodeSummary.totalKbps !== null ? `~${plannedEncodeSummary.totalKbps} kbps` : "no size limit";
-    return `${shape}${interpolation && format !== "mp3" ? ` • ${interpolation.targetFps} fps` : ""} • ${formatClock(currentPlannedDurationS ?? plannedEncodeSummary.durationS)} • ${bitrate}`;
+    const bitrate = plannedEncodeSummary.durationUnknown && plannedEncodeSummary.sizeLimitEnabled
+      ? "bitrate calculated after cleanup"
+      : plannedEncodeSummary.totalKbps !== null ? `~${plannedEncodeSummary.totalKbps} kbps` : "no size limit";
+    const duration = plannedEncodeSummary.durationUnknown ? "duration calculated after cleanup" : formatClock(currentPlannedDurationS ?? plannedEncodeSummary.durationS);
+    return `${shape}${interpolation && format !== "mp3" ? ` • ${interpolation.targetFps} fps` : ""} • ${duration} • ${bitrate}`;
   }, [plannedEncodeSummary, currentPlannedDurationS, interpolation, format]);
   const trimAccuracySummary = !trimIsActive
     ? "No active trim"
@@ -3206,7 +3211,7 @@ function App() {
     if (advancedVideoQuality !== "auto" && format !== "mp3") chips.push(VIDEO_QUALITY_LABELS[advancedVideoQuality]);
     if (advancedEncodeSpeed !== "auto" && format !== "mp3") chips.push(`${ENCODE_SPEED_LABELS[advancedEncodeSpeed]} encode`);
     if (interpolation && format !== "mp3") chips.push(`Smooth motion ${interpolation.targetFps} fps`);
-    if (interpolation?.antiStutter && format !== "mp3") chips.push("Anti-stutter");
+    if (interpolation?.antiStutter && format !== "mp3") chips.push(antiStutterRemovesTime(interpolation) ? "Remove repeated time" : "Fill pauses");
     if (advancedFrameRateCapRequest !== null && format !== "mp3") chips.push(`${advancedFrameRateCapRequest} fps cap`);
     if (advancedAudioBitrateRequest !== null) chips.push(`Audio ${advancedAudioBitrateRequest}k`);
     if (advancedAudioChannels !== "auto") chips.push(AUDIO_CHANNEL_LABELS[advancedAudioChannels]);
@@ -3900,6 +3905,8 @@ function App() {
         interpolation?.modelId !== smokeInterpolation.modelId ||
         interpolation.targetFps !== smokeInterpolation.targetFps ||
         Boolean(interpolation.antiStutter) !== Boolean(smokeInterpolation.antiStutter) ||
+        antiStutterMode(interpolation) !== antiStutterMode(smokeInterpolation) ||
+        (interpolation.antiStutterStrength ?? ANTI_STUTTER_DEFAULT_STRENGTH) !== (smokeInterpolation.antiStutterStrength ?? ANTI_STUTTER_DEFAULT_STRENGTH) ||
         interpolationInstalling ||
         !interpolationStatus ||
         interpolationStatus.modelId !== smokeInterpolation.modelId
@@ -4233,6 +4240,7 @@ function App() {
         );
         if (!settlement.accepted || !settlement.context) return;
         const completedContext = settlement.context;
+        const completedOutputDurationS = resolvedOutputDuration(p.diagnostics, completedContext.durationS);
         const completedQueueItemId = completedContext.queueItemId;
         const completedQueueRunId = completedContext.queueRunId;
         updateLatestAttempt(settlement.state);
@@ -4313,7 +4321,7 @@ function App() {
               outputSizeBytes: p.outputSizeBytes ?? null,
               trimStartS: smokeMetrics?.trimStartS ?? null,
               trimEndS: smokeMetrics?.trimEndS ?? null,
-              expectedDurationS: smokeMetrics?.expectedDurationS ?? completedContext.durationS,
+              expectedDurationS: resolvedOutputDuration(p.diagnostics, completedContext.durationS === null ? null : smokeMetrics?.expectedDurationS ?? completedContext.durationS),
               targetResult: p.targetResult ?? null,
               diagnostics: p.diagnostics ?? null,
               queueOutcomeKind: p.targetResult?.status === "missed" ? "target-missed" : "done",
@@ -4384,7 +4392,7 @@ function App() {
         setLastExport({
           outputPath: p.outputPath ?? completedContext.outputPath,
           outputSizeBytes: p.outputSizeBytes ?? null,
-          durationS: completedContext.durationS,
+          durationS: completedOutputDurationS,
           format: completedContext.format,
           message: p.message ?? null,
           diagnostics: p.diagnostics ?? null,
@@ -5587,7 +5595,7 @@ function App() {
         jobId: null,
         cancelRequested: false,
         outputPath: request.outputPath,
-        durationS: options?.durationS ?? currentPlannedDurationS,
+        durationS: antiStutterRemovesTime(request.interpolation) ? null : options?.durationS ?? currentPlannedDurationS,
         format: request.format,
         queueItemId: options?.queueItemId ?? null,
         queueRunId: options?.queueRunId ?? null,
@@ -5685,7 +5693,7 @@ function App() {
       const sampleStart = clamp(anchorTime - sampleSourceDuration / 2, sourceStart, latestStart);
       const sampleEnd = Math.min(sourceEnd, sampleStart + sampleSourceDuration);
       const outputSampleDuration = Math.max(0.1, (sampleEnd - sampleStart) / request.speed) * (request.loopVideo ? 2 : 1);
-      const fullOutputDuration = plannedSummary?.durationS ?? null;
+      const fullOutputDuration = antiStutterRemovesTime(request.interpolation) ? null : plannedSummary?.durationS ?? null;
 
       if (request.sizeLimitMb > 0 && fullOutputDuration && fullOutputDuration > 0) {
         request.sizeLimitMb = Math.max(0.1, request.sizeLimitMb * (outputSampleDuration / fullOutputDuration));
@@ -8467,7 +8475,7 @@ function App() {
 
           <RailCard
             title="Smooth"
-            summary={interpolation ? `${interpolation.targetFps} fps${interpolation.antiStutter ? " • Anti-stutter" : ""}${interpolationInstalling ? " • Checking / installing" : ""}` : "Off"}
+            summary={interpolation ? `${interpolation.targetFps} fps${interpolation.antiStutter ? antiStutterRemovesTime(interpolation) ? " • Remove repeated time" : " • Fill pauses" : ""}${interpolationInstalling ? " • Checking / installing" : ""}` : "Off"}
             open={openCards.smoothMotion}
             onToggle={() => toggleCard("smoothMotion")}
             keepMounted
@@ -9262,7 +9270,9 @@ function App() {
                           ? `Sample ${formatByteSize(sampleEstimate.sampleBytes)}${
                               sampleEstimate.estimateBytes ? ` -> full export ~ ${formatByteSize(sampleEstimate.estimateBytes)}` : ""
                             }`
-                          : "Encodes a short slice around the preview position with exact trim boundaries."}
+                          : antiStutterRemovesTime(interpolation)
+                            ? "Selects source time around the preview; cleanup may shorten it. Sample size is not extrapolated to the full export."
+                            : "Encodes a short slice around the preview position with exact trim boundaries."}
                       </div>
                     </div>
 
@@ -9336,7 +9346,7 @@ function App() {
                     </div>
                     {interpolation?.antiStutter ? <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Anti-stutter</div>
-                      <div className="vfl-summary-value">Repair brief freezes, preserve timing</div>
+                      <div className="vfl-summary-value">{antiStutterPlanSummary(interpolation)}</div>
                     </div> : null}
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Audio bitrate</div>
@@ -9348,7 +9358,7 @@ function App() {
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Size target</div>
-                      <div className="vfl-summary-value">{sizeLimitEnabled ? "Bitrate planned from target size" : "Quality mode with no size cap"}</div>
+                      <div className="vfl-summary-value">{sizeLimitEnabled ? plannedEncodeSummary?.durationUnknown ? "Bitrate calculated after cleanup from target size" : "Bitrate planned from target size" : "Quality mode with no size cap"}</div>
                     </div>
                   </div>
                   {planWarnings.length ? (
@@ -9670,6 +9680,7 @@ function App() {
                 {exportQueue.map((item) => {
                   const outcome = item.lastOutcome;
                   const outcomeHasArtifact = outcome?.kind === "done" || outcome?.kind === "target-missed";
+                  const outcomeDurationS = outcomeHasArtifact ? resolvedOutputDuration(outcome?.diagnostics) : null;
                   const doneOutputPath = outcome?.kind === "done" ? outcome.outputPath : null;
                   const actualOutputPath = doneOutputPath ??
                     (outcome?.kind === "target-missed" ? outcome.outputPath : null);
@@ -9713,7 +9724,7 @@ function App() {
                         </div>
                       ) : null}
                       {outcome?.targetResult ? <TargetResultDetails targetResult={outcome.targetResult} /> : null}
-                      {item.request.interpolation?.antiStutter ? <div className="vfl-queue-item-meta">Anti-stutter enabled</div> : null}
+                      {item.request.interpolation?.antiStutter ? <div className="vfl-queue-item-meta">{antiStutterPlanSummary(item.request.interpolation)}{antiStutterRemovesTime(item.request.interpolation) ? outcomeDurationS === null ? ". Duration calculated after cleanup." : `. ${formatClock(outcomeDurationS)} output.` : ""}</div> : null}
                       {outcome ? <QueueDiagnosticsDetails outcome={outcome} summary="Latest diagnostics" /> : null}
                       {item.history.length > 1 ? (
                         <details className="vfl-queue-history">

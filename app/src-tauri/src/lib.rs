@@ -408,6 +408,24 @@ fn parse_smoke_config_from_env(
             .unwrap_or("auto"),
     )?;
     let anti_stutter = parse_smoke_bool(env, "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER")?;
+    let anti_stutter_mode = match env
+        .get("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_MODE")
+        .map(String::as_str)
+        .unwrap_or("repair")
+    {
+        "repair" => video::AntiStutterMode::Repair,
+        "remove" => video::AntiStutterMode::Remove,
+        _ => {
+            return Err(
+                "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_MODE must be repair or remove.".into(),
+            );
+        }
+    };
+    if env.contains_key("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_MODE")
+        && !env.contains_key("VFL_SMOKE_INTERPOLATION_FPS")
+    {
+        return Err("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_MODE requires Smooth motion and VFL_SMOKE_INTERPOLATION_FPS.".into());
+    }
     let anti_stutter_strength = env.get("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH")
         .map(|value| value.parse::<u8>().map_err(|_| "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH must be an integer from 0 to 100.".to_string()))
         .transpose()?.unwrap_or_else(video::default_anti_stutter_strength);
@@ -445,6 +463,7 @@ fn parse_smoke_config_from_env(
             }
             Ok(video::InterpolationSettings {
                 anti_stutter,
+                anti_stutter_mode,
                 anti_stutter_strength,
                 target_fps,
                 model_id: model_id.to_string(),
@@ -1223,6 +1242,50 @@ mod tests {
             "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER".into(),
             "not-a-bool".into(),
         );
+        assert!(parse_smoke_config_from_env(&env).is_err());
+    }
+
+    #[test]
+    fn anti_stutter_smoke_mode_validates_and_defaults_to_repair() {
+        let status_path = temp_smoke_status_path("anti-stutter-mode");
+        let mut env = smoke_env(&[
+            ("VFL_SMOKE_INPUT", "input.mp4"),
+            ("VFL_SMOKE_OUTPUT", "output.mp4"),
+            ("VFL_SMOKE_STATUS", &status_path),
+            ("VFL_SMOKE_INTERPOLATION_FPS", "60"),
+        ]);
+        assert_eq!(
+            parse_smoke_config_from_env(&env)
+                .unwrap()
+                .unwrap()
+                .interpolation
+                .unwrap()
+                .anti_stutter_mode,
+            video::AntiStutterMode::Repair
+        );
+        env.insert(
+            "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_MODE".into(),
+            "remove".into(),
+        );
+        assert_eq!(
+            parse_smoke_config_from_env(&env)
+                .unwrap()
+                .unwrap()
+                .interpolation
+                .unwrap()
+                .anti_stutter_mode,
+            video::AntiStutterMode::Remove
+        );
+        env.insert(
+            "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_MODE".into(),
+            "invalid".into(),
+        );
+        assert!(parse_smoke_config_from_env(&env).is_err());
+        env.insert(
+            "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_MODE".into(),
+            "remove".into(),
+        );
+        env.remove("VFL_SMOKE_INTERPOLATION_FPS");
         assert!(parse_smoke_config_from_env(&env).is_err());
     }
 

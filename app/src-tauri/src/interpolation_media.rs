@@ -1,5 +1,7 @@
 //! Persistent RGB8 inference with one decoded-presentation clock and lossless replay.
+mod repeat_timeline;
 mod sequence;
+pub(crate) use repeat_timeline::{PreparedAudio, RemovalMap};
 
 use crate::interpolation_components::{ModelExecution, ResolvedModel};
 use crate::interpolation_timeline::{Rate, is_scene_cut};
@@ -54,12 +56,31 @@ pub(crate) struct PreparedVideo {
     pub video_stream_index: u32,
     pub format_mp4: bool,
     pub loop_video: bool,
+    source_duration_ns: u64,
+    removal: Option<RemovalMap>,
+    audio: Option<PreparedAudio>,
     worker_path: PathBuf,
     matrix: String,
     range: String,
     color_tags: Vec<(String, String)>,
 }
 impl PreparedVideo {
+    pub fn removal_map(&self) -> Option<&RemovalMap> {
+        self.removal.as_ref().filter(|map| !map.cuts().is_empty())
+    }
+    pub fn removal_audio(&self) -> Option<&PreparedAudio> {
+        self.audio.as_ref()
+    }
+    pub fn effective_source_duration_s(&self) -> f64 {
+        self.removal
+            .as_ref()
+            .map_or(self.source_duration_ns, RemovalMap::output_duration_ns) as f64
+            / 1e9
+    }
+    pub fn output_duration_s(&self) -> f64 {
+        self.diagnostics.output_frames as f64 / self.diagnostics.target_fps as f64
+            * if self.loop_video { 2.0 } else { 1.0 }
+    }
     pub fn output_budget_for(&self, output: &Path) -> Result<u64, String> {
         let parent = output
             .parent()
@@ -85,19 +106,41 @@ impl PreparedVideo {
             .position(|pair| pair[0] == "-i")
             .map(|i| i + 2)
             .unwrap_or(0);
-        result.splice(
-            input_end..input_end,
-            ["-i".to_string(), self.path.to_string_lossy().into_owned()],
-        );
+        let mut prepared_inputs = vec!["-i".to_string(), self.path.to_string_lossy().into_owned()];
+        if let Some(audio) = &self.audio {
+            prepared_inputs.extend([
+                "-f".into(),
+                "f64le".into(),
+                "-ar".into(),
+                audio.sample_rate.to_string(),
+                "-ac".into(),
+                audio.channels.to_string(),
+                "-channel_layout".into(),
+                audio.channel_layout.clone(),
+                "-i".into(),
+                audio.path.to_string_lossy().into_owned(),
+            ]);
+        }
+        result.splice(input_end..input_end, prepared_inputs);
         for i in 0..result.len().saturating_sub(1) {
             if result[i] == "-map" && result[i + 1] == format!("0:{video_index}") {
                 result[i + 1] = "1:0".into();
+            } else if result[i] == "-map"
+                && self.audio.as_ref().is_some_and(|audio| {
+                    result[i + 1] == format!("0:{}", audio.source_stream_index)
+                })
+            {
+                result[i + 1] = "2:0".into();
             }
         }
         // 1/target clock is representable before source trim/speed. The raw
         // lossless Matroska spool's millisecond timestamps are never reused as
         // the scheduling clock. Reconstruct each ideal timestamp from N.
-        let start_ns = (self.start_s * 1_000_000_000.0).round() as u64;
+        let start_ns = if self.removal_map().is_some() {
+            0
+        } else {
+            (self.start_s * 1_000_000_000.0).round() as u64
+        };
         let prefix = format!(
             "settb=expr=1/1000000000,setpts=round(N*1000000000*{}/{})+{start_ns},scale=in_range=pc:out_range={}:out_color_matrix={},format=yuv444p",
             self.rate.denominator, self.rate.numerator, self.range, self.matrix
@@ -537,7 +580,10 @@ pub(crate) fn prepare(
         .min(probe.duration_s);
     let duration_ns = ((end_s - start_s) * 1_000_000_000.0).round() as u64;
     let rate = Rate::for_playback(settings.target_fps, request.speed)?;
-    let count = rate.frame_count(duration_ns)?;
+    let mut count = rate.frame_count(duration_ns)?;
+    let removing = settings.anti_stutter
+        && settings.anti_stutter_mode == crate::video::AntiStutterMode::Remove;
+    let mut removal = removing.then(|| RemovalMap::new(duration_ns));
     let pixels = u64::from(probe.width) * u64::from(probe.height);
     if pixels == 0 || pixels > MAX_PIXELS || probe.width > 8192 || probe.height > 8192 {
         return Err("AI interpolation supports up to 3840×2160 pixels per picture. Trim/crop the source into a smaller video first.".into());
@@ -758,10 +804,25 @@ pub(crate) fn prepare(
         )
         .at_source_beginning(
             start_s <= probe.video_start_s && leading_gap_ns == 0 && first_pts == Some(0),
-        );
+        )
+        .with_mode(settings.anti_stutter_mode);
         while let Some(span) = window.next(&mut read_next)? {
-            let next = span.right.map(|index| window.pts(index));
-            let left_pts = window.pts(0);
+            let original_next = span.right.map(|index| window.pts(index));
+            if let Some(start) = span.remove_start {
+                let map = removal
+                    .as_mut()
+                    .ok_or("Missing repeated-time removal map.")?;
+                map.push(
+                    start,
+                    original_next.ok_or("Removed hold has no changed endpoint.")?,
+                )?;
+                count = rate.frame_count(map.output_duration_ns())?;
+            }
+            let map_time = |pts| removal.as_ref().map_or(pts, |map| map.map_ns(pts));
+            let next = original_next.map(map_time);
+            let left_pts = map_time(window.pts(0));
+            let active_leading_gap = map_time(leading_gap_ns);
+            let active_video_end = map_time(video_end_ns);
             let left = window.pixels(0);
             let right = window.pixels(span.right.unwrap_or(0));
             let mut repaired_frames = 0;
@@ -776,8 +837,8 @@ pub(crate) fn prepare(
                     .map(|pts| rate.alpha(output_frames, left_pts, pts))
                     .transpose()?
                     .unwrap_or(0.0);
-                let pad_black = rate.sample_before(output_frames, leading_gap_ns)
-                    || !rate.sample_before(output_frames, video_end_ns);
+                let pad_black = rate.sample_before(output_frames, active_leading_gap)
+                    || !rate.sample_before(output_frames, active_video_end);
                 let pixels = if pad_black {
                     output.fill(0);
                     held_frames += 1;
@@ -793,7 +854,7 @@ pub(crate) fn prepare(
                         })?;
                     read_picture(&mut worker_output, &mut output)?;
                     inferred_frames += 1;
-                    repaired_frames += u64::from(span.repaired);
+                    repaired_frames += u64::from(span.repaired && span.remove_start.is_none());
                     &output[..]
                 } else {
                     held_frames += 1;
@@ -805,7 +866,11 @@ pub(crate) fn prepare(
                 })?;
                 output_frames += 1;
                 last_progress.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
-                progress(output_frames as f64 / count as f64);
+                progress(if removing {
+                    0.9 * original_next.unwrap_or(duration_ns) as f64 / duration_ns as f64
+                } else {
+                    output_frames as f64 / count as f64
+                });
             }
             window.advance(span, repaired_frames);
         }
@@ -911,11 +976,64 @@ pub(crate) fn prepare(
             });
         }
     }
+    if output_frames != count {
+        return Err(
+            "Interpolation output clock did not match the complete retained timeline.".into(),
+        );
+    }
+    let audio = if request.audio_enabled {
+        if let Some(map) = removal.as_ref().filter(|map| !map.cuts().is_empty()) {
+            repeat_timeline::prepare_audio(
+                ffmpeg,
+                source,
+                probe,
+                start_s,
+                map,
+                directory.path(),
+                quota,
+                || {
+                    if timed_out.load(Ordering::Relaxed) {
+                        return Err(
+                            "Repeated-time audio stopped after a timeout or scratch quota limit."
+                                .into(),
+                        );
+                    }
+                    last_progress.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    Ok(())
+                },
+            )?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(audio) = &audio {
+        let duration = removal
+            .as_ref()
+            .ok_or("Compacted audio has no shared removal timeline.")?
+            .output_duration_ns();
+        let rounded_samples =
+            (u128::from(duration) * u128::from(audio.sample_rate) + 500_000_000) / 1_000_000_000;
+        // Cumulative cut rounding can differ from rounding the final duration
+        // once by one sample, but must never accumulate an unbounded offset.
+        if audio.sample_count == 0 || rounded_samples.abs_diff(u128::from(audio.sample_count)) > 1 {
+            return Err("Compacted audio does not match the shortened video timeline.".into());
+        }
+    }
+    if removing {
+        progress(1.0);
+    }
     identity.verify(source)?;
-    let scratch_bytes = fs::metadata(&path)
+    let video_scratch_bytes = fs::metadata(&path)
         .map_err(|_| "Lossless interpolation storage was not created.".to_string())?
         .len();
-    if scratch_bytes == 0 || scratch_bytes > quota {
+    let scratch_bytes = if audio.is_some() {
+        scratch_size(directory.path())?
+    } else {
+        video_scratch_bytes
+    };
+    if video_scratch_bytes == 0 || scratch_bytes > quota {
         return Err("Interpolation scratch quota was exceeded or no frames were stored.".into());
     }
     let remaining = MAX_SCRATCH_BYTES
@@ -935,6 +1053,9 @@ pub(crate) fn prepare(
         video_stream_index: probe.video_stream_index,
         format_mp4: false,
         loop_video: request.loop_video,
+        source_duration_ns: duration_ns,
+        removal,
+        audio,
         worker_path: model.worker_path.clone(),
         matrix: matrix.into(),
         range: range.into(),
@@ -1284,6 +1405,9 @@ mod tests {
             video_stream_index: 0,
             format_mp4: true,
             loop_video: false,
+            source_duration_ns: 1_000_000_000,
+            removal: None,
+            audio: None,
             worker_path: PathBuf::new(),
             matrix: "bt709".into(),
             range: "tv".into(),

@@ -389,6 +389,7 @@ mod tests {
         req.format = OutputFormat::Webm;
         req.thumbnail = Some(settings());
         req.interpolation = Some(InterpolationSettings {
+            anti_stutter_mode: crate::video::AntiStutterMode::Repair,
             anti_stutter: false,
             anti_stutter_strength: 0,
             target_fps: 60,

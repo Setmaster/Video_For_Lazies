@@ -1743,6 +1743,7 @@ fn bundled_interpolation_composes_trim_subtitles_geometry_speed_reverse_loop() {
             max_edge_px: None,
         });
         req.interpolation = Some(InterpolationSettings {
+            anti_stutter_mode: crate::video::AntiStutterMode::Repair,
             anti_stutter: false,
             anti_stutter_strength: 0,
             target_fps: 60,
@@ -1969,6 +1970,7 @@ fn bundled_interpolation_retains_real_video_gaps_through_temporal_transforms() {
         req.loop_video = loop_video;
         req.speed = speed;
         req.interpolation = Some(InterpolationSettings {
+            anti_stutter_mode: crate::video::AntiStutterMode::Repair,
             anti_stutter: false,
             anti_stutter_strength: 0,
             target_fps: 60,
@@ -2088,6 +2090,7 @@ fn bundled_interpolation_saturated_bt709_roundtrip_matches_existing_encoder() {
         .to_string_lossy()
         .into_owned();
     req.interpolation = Some(InterpolationSettings {
+        anti_stutter_mode: crate::video::AntiStutterMode::Repair,
         anti_stutter: false,
         anti_stutter_strength: 0,
         target_fps: 60,
@@ -2193,6 +2196,7 @@ fn bundled_interpolation_cuts_never_infer_excluded_picture_mixtures_and_cancel_q
         .to_string_lossy()
         .into_owned();
     req.interpolation = Some(InterpolationSettings {
+        anti_stutter_mode: crate::video::AntiStutterMode::Repair,
         anti_stutter: false,
         anti_stutter_strength: 0,
         target_fps: 60,
@@ -2343,6 +2347,7 @@ fn bundled_interpolation_reuses_one_lossless_spool_for_four_two_pass_candidates(
     req.input_path = source.to_string_lossy().into_owned();
     req.audio_enabled = true;
     req.interpolation = Some(InterpolationSettings {
+        anti_stutter_mode: crate::video::AntiStutterMode::Repair,
         anti_stutter: false,
         anti_stutter_strength: 0,
         target_fps: 60,
@@ -2475,6 +2480,7 @@ fn bundled_interpolation_vfr_clock_and_excluded_trim_context_are_exact() {
     let mut req = request();
     req.input_path = source.to_string_lossy().into_owned();
     req.interpolation = Some(InterpolationSettings {
+        anti_stutter_mode: crate::video::AntiStutterMode::Repair,
         anti_stutter: false,
         anti_stutter_strength: 0,
         target_fps: 60,
@@ -2564,6 +2570,7 @@ fn bundled_interpolation_source_epoch_subtitle_pixels_survive_point123_trim() {
     });
     req.subtitle_path = Some(srt.to_string_lossy().into_owned());
     req.interpolation = Some(InterpolationSettings {
+        anti_stutter_mode: crate::video::AntiStutterMode::Repair,
         anti_stutter: false,
         anti_stutter_strength: 0,
         target_fps: 60,
@@ -2651,6 +2658,7 @@ fn bundled_interpolation_nut_endpoint_probe_preserves_normal_export_gaps() {
         .to_string_lossy()
         .into_owned();
     req.interpolation = Some(InterpolationSettings {
+        anti_stutter_mode: crate::video::AntiStutterMode::Repair,
         anti_stutter: false,
         anti_stutter_strength: 0,
         target_fps: 60,

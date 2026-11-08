@@ -1,5 +1,6 @@
 //! Conservative, opt-in source-anchor selection. This module never owns a clock.
 use crate::interpolation_timeline::is_scene_cut;
+use crate::video::AntiStutterMode;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -51,6 +52,14 @@ pub struct AntiStutterDiagnostics {
     pub version: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub strength: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AntiStutterMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_duration_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_frames: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_runs: Option<u64>,
     pub analyzed_frames: u64,
     pub candidate_runs: u64,
     pub repaired_runs: u64,
@@ -467,12 +476,50 @@ pub(super) struct Span {
     pub right: Option<usize>,
     pub repaired: bool,
     pub cut: bool,
+    pub remove_start: Option<u64>,
     detail: Option<usize>,
     motion: Option<Evidence>,
 }
 
+#[derive(Clone, Copy)]
+struct Cadence {
+    duration_ns: u64,
+    source_steps: usize,
+}
+impl Cadence {
+    fn matches(self, other: Self) -> bool {
+        self.source_steps == other.source_steps
+            && (self.duration_ns.abs_diff(other.duration_ns) <= 2
+                || u128::from(self.duration_ns.abs_diff(other.duration_ns)) * 100
+                    <= u128::from(self.duration_ns.max(other.duration_ns)) * 5)
+    }
+}
+
+enum CadenceVerdict {
+    Regular,
+    Irregular,
+    Unknown,
+}
+
+fn regular_cadence(values: &[Cadence], current: usize) -> bool {
+    (1..=4).any(|period| {
+        let needed = period * 2 + 1;
+        values.len() >= needed
+            && (0..=values.len() - needed).any(|start| {
+                start <= current
+                    && current < start + needed
+                    && (start + period..start + needed)
+                        .all(|i| values[i].matches(values[i - period]))
+            })
+    })
+}
+
 pub(super) struct Window {
     policy: Policy,
+    mode: AntiStutterMode,
+    cadence_history: VecDeque<Cadence>,
+    cadence_open_steps: usize,
+    removed_ns: u64,
     pictures: VecDeque<Picture>,
     pool: Vec<Vec<u8>>,
     width: usize,
@@ -503,6 +550,10 @@ impl Window {
         let frame_bytes = pixels.len();
         Self {
             policy: Policy { strength },
+            mode: AntiStutterMode::Repair,
+            cadence_history: VecDeque::new(),
+            cadence_open_steps: 0,
+            removed_ns: 0,
             pictures: VecDeque::from([Picture {
                 pixels,
                 pts,
@@ -524,6 +575,10 @@ impl Window {
             diagnostics: AntiStutterDiagnostics {
                 version: 3,
                 strength,
+                mode: None,
+                removed_duration_s: None,
+                removed_frames: None,
+                removed_runs: None,
                 analyzed_frames: u64::from(real_first),
                 candidate_runs: 0,
                 repaired_runs: 0,
@@ -536,6 +591,18 @@ impl Window {
 
     pub fn at_source_beginning(mut self, verified: bool) -> Self {
         self.at_source_beginning = verified;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: AntiStutterMode) -> Self {
+        self.mode = mode;
+        if mode == AntiStutterMode::Remove {
+            self.diagnostics.version = 4;
+            self.diagnostics.mode = Some(mode);
+            self.diagnostics.removed_duration_s = Some(0.0);
+            self.diagnostics.removed_frames = Some(0);
+            self.diagnostics.removed_runs = Some(0);
+        }
         self
     }
 
@@ -640,6 +707,7 @@ impl Window {
                 right: None,
                 repaired: false,
                 cut: false,
+                remove_start: None,
                 detail: None,
                 motion: None,
             };
@@ -658,6 +726,7 @@ impl Window {
             right: Some(1),
             repaired: false,
             cut: incoming.cut,
+            remove_start: None,
             detail: None,
             motion: None,
         }
@@ -757,6 +826,73 @@ impl Window {
         Ok(None)
     }
 
+    fn cadence_verdict(
+        &mut self,
+        right: usize,
+        read: &mut impl FnMut(&mut [u8]) -> Result<Option<u64>, String>,
+    ) -> Result<CadenceVerdict, String> {
+        let mut signatures: Vec<_> = self.cadence_history.iter().copied().collect();
+        let current = signatures.len();
+        signatures.push(Cadence {
+            duration_ns: self.pts(right) - self.pts(0),
+            source_steps: right,
+        });
+        let mut start = right;
+        loop {
+            if regular_cadence(&signatures, current) {
+                return Ok(CadenceVerdict::Regular);
+            }
+            let forward = &signatures[current..];
+            if (1..=4).all(|period| {
+                forward.len() > period
+                    && (period..forward.len()).any(|i| !forward[i].matches(forward[i - period]))
+            }) {
+                return Ok(CadenceVerdict::Irregular);
+            }
+            if signatures.len() - current > 8 {
+                return Ok(CadenceVerdict::Unknown);
+            }
+            let mut next = start + 1;
+            loop {
+                if !self.ensure(next + 1, read)? || self.pts(next) - self.pts(right) > MAX_SPAN_NS {
+                    return Ok(CadenceVerdict::Unknown);
+                }
+                let incoming = self.pictures[next].incoming.expect("cadence source edge");
+                let first = if next == start + 1 {
+                    incoming
+                } else {
+                    compare(
+                        self.pixels(start),
+                        self.pixels(next),
+                        self.width,
+                        self.height,
+                    )?
+                };
+                if incoming.discontinuity() || first.discontinuity() {
+                    return Ok(CadenceVerdict::Unknown);
+                }
+                if !incoming.plateau() {
+                    if !first.moving() {
+                        return Ok(CadenceVerdict::Unknown);
+                    }
+                    signatures.push(Cadence {
+                        duration_ns: self.pts(next) - self.pts(start),
+                        source_steps: next - start,
+                    });
+                    start = next;
+                    break;
+                }
+                if !first.plateau()
+                    || (next > start + 1
+                        && drifting(self.pixels(start), self.pixels(next - 1), self.pixels(next))?)
+                {
+                    return Ok(CadenceVerdict::Unknown);
+                }
+                next += 1;
+            }
+        }
+    }
+
     pub fn next(
         &mut self,
         read: &mut impl FnMut(&mut [u8]) -> Result<Option<u64>, String>,
@@ -827,11 +963,29 @@ impl Window {
         if let Some(reason) = self.qualify(right, residual, read)? {
             return Ok(Some(self.unchanged(reason)));
         }
-        let detail = self.detail(self.pts(0), self.pts(right), (right - 1) as u64, "repaired");
+        // Cadence protects source time, not the unwanted held-picture motion.
+        // A fully qualified hold can still use the existing Fill interpolation
+        // when its time must be retained or cadence evidence is incomplete.
+        let (remove_start, reason) = if self.mode == AntiStutterMode::Remove {
+            match self.cadence_verdict(right, read)? {
+                CadenceVerdict::Regular => (None, "regularCadence"),
+                CadenceVerdict::Unknown => (None, "insufficientCadence"),
+                CadenceVerdict::Irregular => (Some(self.pts(1)), "removed"),
+            }
+        } else {
+            (None, "repaired")
+        };
+        let detail = self.detail(
+            remove_start.unwrap_or(self.pts(0)),
+            self.pts(right),
+            (right - 1) as u64,
+            reason,
+        );
         Ok(Some(Span {
             right: Some(right),
             repaired: true,
             cut: false,
+            remove_start,
             detail,
             motion: Some(compare(
                 self.pixels(0),
@@ -843,7 +997,21 @@ impl Window {
     }
 
     pub fn advance(&mut self, span: Span, repaired_frames: u64) {
-        if span.repaired {
+        if let Some(start) = span.remove_start {
+            let right = span.right.expect("removed hold has changed endpoint");
+            self.removed_ns += self.pts(right) - start;
+            self.diagnostics.removed_duration_s = Some(self.removed_ns as f64 / 1e9);
+            *self
+                .diagnostics
+                .removed_runs
+                .as_mut()
+                .expect("remove mode counters") += 1;
+            *self
+                .diagnostics
+                .removed_frames
+                .as_mut()
+                .expect("remove mode counters") += (right - 1) as u64;
+        } else if span.repaired {
             if repaired_frames > 0 {
                 self.diagnostics.repaired_runs += 1;
             } else {
@@ -869,14 +1037,33 @@ impl Window {
                 // always retires history before any new plateau is timed.
                 self.previous_motion = None;
                 self.hold_started = None;
+                self.cadence_history.clear();
+                self.cadence_open_steps = 0;
             } else if !span.repaired && evidence.plateau() {
+                self.cadence_open_steps += right;
                 let start = *self.hold_started.get_or_insert(left_pts);
                 if right_pts - start > MAX_SPAN_NS {
                     self.previous_motion = None;
+                    self.cadence_history.clear();
                 }
             } else {
                 let start = self.hold_started.take().unwrap_or(left_pts);
                 evidence.delta_ns = right_pts - start;
+                if self.mode == AntiStutterMode::Remove
+                    && evidence.moving()
+                    && evidence.delta_ns <= MAX_SPAN_NS
+                {
+                    self.cadence_history.push_back(Cadence {
+                        duration_ns: evidence.delta_ns,
+                        source_steps: self.cadence_open_steps + right,
+                    });
+                    if self.cadence_history.len() > 8 {
+                        self.cadence_history.pop_front();
+                    }
+                } else {
+                    self.cadence_history.clear();
+                }
+                self.cadence_open_steps = 0;
                 self.previous_motion = if evidence.moving() && evidence.delta_ns <= MAX_SPAN_NS {
                     Some((evidence, right_pts))
                 } else {
@@ -886,6 +1073,8 @@ impl Window {
         } else {
             self.previous_motion = None;
             self.hold_started = None;
+            self.cadence_history.clear();
+            self.cadence_open_steps = 0;
         }
         let count = span.right.unwrap_or(self.pictures.len());
         for _ in 0..count {
@@ -943,6 +1132,178 @@ mod tests {
     }
     fn run_at_strength(input: &[(Vec<u8>, u64)], fps: u32, speed: f64, strength: u8) -> RunResult {
         run_sized(input, fps, speed, strength, (WIDTH, HEIGHT), false)
+    }
+
+    fn remove(input: &[(Vec<u8>, u64)]) -> (AntiStutterDiagnostics, super::super::RemovalMap) {
+        let duration = input.last().unwrap().1 + 33_333_333;
+        let mut window = Window::new(
+            input[0].0.clone(),
+            input[0].1,
+            WIDTH,
+            HEIGHT,
+            duration,
+            true,
+            75,
+        )
+        .at_source_beginning(input[0].1 == 0)
+        .with_mode(AntiStutterMode::Remove);
+        let mut map = super::super::RemovalMap::new(duration);
+        let mut next = 1;
+        let mut read = |pixels: &mut [u8]| {
+            if next == input.len() {
+                return Ok(None);
+            }
+            pixels.copy_from_slice(&input[next].0);
+            let pts = input[next].1;
+            next += 1;
+            Ok(Some(pts))
+        };
+        let rate = Rate::for_playback(120, 1.0).unwrap();
+        let mut output = 0;
+        while let Some(span) = window.next(&mut read).unwrap() {
+            if let Some(start) = span.remove_start {
+                map.push(start, window.pts(span.right.unwrap())).unwrap();
+            }
+            let left = map.map_ns(window.pts(0));
+            let right = span.right.map(|i| map.map_ns(window.pts(i)));
+            let count = rate.frame_count(map.output_duration_ns()).unwrap();
+            let mut filled = 0;
+            while output < count && right.is_none_or(|r| rate.sample_before(output, r)) {
+                let alpha = right
+                    .map(|r| rate.alpha(output, left, r).unwrap())
+                    .unwrap_or(0.0);
+                filled += u64::from(
+                    span.repaired && span.remove_start.is_none() && alpha > 0.0 && alpha < 1.0,
+                );
+                output += 1;
+            }
+            window.advance(span, filled);
+        }
+        assert!(window.allocated_high_water <= MAX_PICTURES);
+        assert_eq!(
+            window.diagnostics.removed_duration_s,
+            Some(map.removed_duration_ns() as f64 / 1e9)
+        );
+        (window.diagnostics, map)
+    }
+
+    #[test]
+    fn remove_retains_first_actual_vfr_interval_and_changed_endpoint() {
+        let mut input = frames(&[0, 1, 2, 3, 3, 5, 6, 7, 8, 9, 10, 11, 12], 33_333_333);
+        input[4].1 = 150_000_000;
+        let (diagnostics, map) = remove(&input);
+        assert_eq!(diagnostics.mode, Some(AntiStutterMode::Remove));
+        assert_eq!(diagnostics.removed_runs, Some(1));
+        assert_eq!(diagnostics.removed_frames, Some(1));
+        assert_eq!(map.cuts().len(), 1);
+        assert_eq!(map.cuts()[0].start_ns, input[4].1);
+        assert_eq!(map.cuts()[0].end_ns, input[5].1);
+        assert_eq!(map.map_ns(input[3].1), input[3].1);
+        assert_eq!(map.map_ns(input[5].1), input[4].1);
+        assert_eq!(diagnostics.repaired_runs, 0);
+        assert_eq!(diagnostics.repaired_frames, 0);
+        assert_eq!(diagnostics.intervals[0].start_s, input[4].1 as f64 / 1e9);
+    }
+
+    #[test]
+    fn remove_preserves_ordinary_cadence_from_first_hold_and_across_transitions() {
+        for pattern in [vec![2], vec![3], vec![2, 3], vec![1, 1, 1, 2]] {
+            let positions: Vec<_> = (0..24)
+                .flat_map(|i| std::iter::repeat_n(i, pattern[i % pattern.len()]))
+                .collect();
+            let (diagnostics, map) = remove(&frames(&positions, 33_333_333));
+            assert_eq!(
+                map.removed_duration_ns(),
+                0,
+                "pattern{pattern:?}: {diagnostics:?}"
+            );
+            assert_eq!(diagnostics.removed_runs, Some(0));
+            assert!(
+                diagnostics.repaired_runs > 0,
+                "retained cadence must still be filled: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .intervals
+                    .iter()
+                    .filter(|i| i.reason == "regularCadence")
+                    .any(|i| i.repaired_frames > 0)
+            );
+            assert!(
+                diagnostics
+                    .intervals
+                    .iter()
+                    .any(|i| i.reason == "regularCadence")
+            );
+        }
+        let positions: Vec<_> = (0..20)
+            .flat_map(|i| std::iter::repeat_n(i, if i < 9 { 2 } else { 3 }))
+            .collect();
+        assert_eq!(
+            remove(&frames(&positions, 33_333_333))
+                .1
+                .removed_duration_ns(),
+            0
+        );
+    }
+
+    #[test]
+    fn remove_keeps_static_tail_and_resource_uncertainty_but_removes_irregular_short_holds() {
+        let (incomplete, map) = remove(&frames(&[0, 1, 2, 3, 3, 5, 6], 33_333_333));
+        assert_eq!(map.removed_duration_ns(), 0);
+        assert_eq!(incomplete.repaired_runs, 1);
+        assert!(incomplete.intervals.iter().any(|interval| interval.reason
+            == "insufficientCadence"
+            && interval.repaired_frames > 0));
+        for positions in [vec![3; 20], vec![0, 1, 2, 3, 3, 3, 3], vec![3, 3, 3, 6]] {
+            assert_eq!(
+                remove(&frames(&positions, 33_333_333))
+                    .1
+                    .removed_duration_ns(),
+                0
+            );
+        }
+        let source = frames(
+            &[0, 1, 2, 3, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            33_333_333,
+        );
+        let (diagnostics, map) = remove(&source);
+        assert_eq!(diagnostics.removed_runs, Some(1));
+        assert_eq!(map.removed_duration_ns(), 33_333_333);
+        assert_eq!(
+            map.output_duration_ns(),
+            map.source_duration_ns() - 33_333_333
+        );
+    }
+
+    #[test]
+    fn cadence_proof_uses_counts_and_real_time_without_average_fps() {
+        let c = |steps, duration_ns| Cadence {
+            source_steps: steps,
+            duration_ns,
+        };
+        assert!(regular_cadence(
+            &[c(2, 66_666_667), c(2, 66_666_666), c(2, 66_666_667)],
+            0
+        ));
+        assert!(!regular_cadence(
+            &[c(2, 66_666_667), c(2, 100_000_000), c(2, 133_333_333)],
+            0
+        ));
+        assert!(!regular_cadence(
+            &[c(2, 66_666_667), c(3, 66_666_667), c(4, 66_666_667)],
+            0
+        ));
+        assert!(regular_cadence(
+            &[
+                c(2, 66_666_667),
+                c(3, 100_000_000),
+                c(2, 66_666_667),
+                c(3, 100_000_000),
+                c(2, 66_666_667)
+            ],
+            0
+        ));
     }
     fn run_sized(
         input: &[(Vec<u8>, u64)],
@@ -2079,7 +2440,14 @@ mod tests {
                 .parse()
                 .unwrap(),
         )
-        .at_source_beginning(std::env::var("VFL_ANTI_AT_SOURCE_BEGINNING").as_deref() == Ok("1"));
+        .at_source_beginning(std::env::var("VFL_ANTI_AT_SOURCE_BEGINNING").as_deref() == Ok("1"))
+        .with_mode(
+            if std::env::var("VFL_ANTI_MODE").as_deref() == Ok("remove") {
+                AntiStutterMode::Remove
+            } else {
+                AntiStutterMode::Repair
+            },
+        );
         let mut index = 1;
         let mut read = |pixels: &mut [u8]| {
             if index == pts.len() {
@@ -2091,23 +2459,33 @@ mod tests {
             Ok(Some(t))
         };
         let rate = Rate::for_playback(120, 1.0).unwrap();
-        let count = rate.frame_count((duration * 1e9).round() as u64).unwrap();
+        let mut count = rate.frame_count((duration * 1e9).round() as u64).unwrap();
+        let mut map = super::super::RemovalMap::new((duration * 1e9).round() as u64);
         let mut output = 0;
         while let Some(span) = window.next(&mut read).unwrap() {
-            let left = window.pts(0);
-            let right = span.right.map(|i| window.pts(i));
+            if let Some(start) = span.remove_start {
+                map.push(start, window.pts(span.right.unwrap())).unwrap();
+                count = rate.frame_count(map.output_duration_ns()).unwrap();
+            }
+            let left = map.map_ns(window.pts(0));
+            let right = span.right.map(|i| map.map_ns(window.pts(i)));
             let mut repaired = 0;
             while output < count && right.is_none_or(|r| rate.sample_before(output, r)) {
                 let alpha = right
                     .map(|r| rate.alpha(output, left, r).unwrap())
                     .unwrap_or(0.0);
-                repaired += u64::from(span.repaired && alpha > 0.0 && alpha < 1.0);
+                repaired += u64::from(
+                    span.remove_start.is_none() && span.repaired && alpha > 0.0 && alpha < 1.0,
+                );
                 output += 1;
             }
             window.advance(span, repaired);
         }
         assert_eq!(output, count);
         assert!(window.allocated_high_water <= MAX_PICTURES);
+        if let Ok(path) = std::env::var("VFL_ANTI_CUT_MAP_REPORT") {
+            serde_json::to_writer_pretty(std::fs::File::create(path).unwrap(),&serde_json::json!({"sourceDurationNs":map.source_duration_ns(),"outputDurationNs":map.output_duration_ns(),"removedDurationNs":map.removed_duration_ns(),"cuts":map.cuts().iter().map(|c|serde_json::json!({"startNs":c.start_ns,"endNs":c.end_ns})).collect::<Vec<_>>(),"outputFrames":output,"pictureHighWater":window.allocated_high_water})).unwrap();
+        }
         if let Ok(path) = std::env::var("VFL_ANTI_REPORT") {
             serde_json::to_writer_pretty(std::fs::File::create(path).unwrap(), &window.diagnostics)
                 .unwrap();

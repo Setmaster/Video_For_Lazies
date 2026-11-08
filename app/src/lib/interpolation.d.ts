@@ -1,9 +1,14 @@
-import type { AntiStutterDiagnostics, InterpolationSettings, InterpolationOperationId, InterpolationInstallProgress, InterpolationModelId, OutputFormat } from "./types";
+import type { ExportDiagnostics, AntiStutterDiagnostics, InterpolationSettings, InterpolationOperationId, InterpolationInstallProgress, InterpolationModelId, OutputFormat } from "./types";
 export const INTERPOLATION_MODELS: readonly InterpolationModelId[];
 export const INTERPOLATION_TARGETS: readonly (60 | 120)[];
 export const ANTI_STUTTER_DEFAULT_STRENGTH: number;
 export function interpolationModelLabel(modelId: InterpolationModelId): string;
 export function normalizeInterpolation(value: unknown): InterpolationSettings | null;
+export function antiStutterMode(value: InterpolationSettings | null | undefined): "remove" | "repair";
+export function antiStutterRemovesTime(value: InterpolationSettings | null | undefined): boolean;
+export function setAntiStutterEnabled(value: InterpolationSettings, enabled: boolean): InterpolationSettings;
+export function antiStutterPlanSummary(value: InterpolationSettings | null | undefined): string | null;
+export function resolvedOutputDuration(diagnostics: ExportDiagnostics | null | undefined, fallback?: number | null): number | null;
 export function antiStutterConflict(value: InterpolationSettings | null): string | null;
 export function antiStutterSummary(value: AntiStutterDiagnostics | null | undefined): string | null;
 export function interpolationConflict(value: unknown, format: OutputFormat, cap: number | string | null | undefined): string | null;

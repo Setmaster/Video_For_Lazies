@@ -83,6 +83,7 @@ fn bundled_anti_stutter_preserves_clock_off_bytes_audio_and_prepared_reuse() {
     req.input_path = temp.path().join("source.mp4").to_string_lossy().into();
     req.audio_enabled = true;
     req.interpolation = Some(InterpolationSettings {
+        anti_stutter_mode: crate::video::AntiStutterMode::Repair,
         anti_stutter: false,
         anti_stutter_strength: 0,
         target_fps: 60,
@@ -270,5 +271,206 @@ fn bundled_anti_stutter_preserves_clock_off_bytes_audio_and_prepared_reuse() {
             assert!(first[offset] < 10 && first[offset + 1] < 10 && first[offset + 2] > 230);
         }
         assert_eq!(fs::metadata(&prepared.path).unwrap().len(), size);
+    }
+}
+
+#[test]
+#[ignore = "requires pinned FFmpeg and bundled RIFE; explicit CPU qualification is supported"]
+fn bundled_remove_compacts_video_audio_then_speed_reverse_loop_and_thumbnail() {
+    let temp = TempDir::new().unwrap();
+    let (width, height) = (96, 54);
+    let mut raw = Vec::new();
+    for frame in 0..24 {
+        let position = if (10..12).contains(&frame) { 9 } else { frame };
+        for y in 0..height {
+            for x in 0..width {
+                let x = x as f64 + position as f64 * 2.0;
+                let y = y as f64;
+                let value = (112.0
+                    + 36.0 * (0.19 * x + 0.035 * y).sin()
+                    + 24.0 * (0.071 * x - 0.139 * y).cos()
+                    + 20.0 * (0.041 * x + 0.273 * y).sin())
+                .round()
+                .clamp(0.0, 255.0) as u8;
+                raw.extend([value; 3]);
+            }
+        }
+    }
+    fs::write(temp.path().join("source.rgb"), raw).unwrap();
+    ffmpeg(
+        &[
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgb24",
+            "-video_size",
+            "96x54",
+            "-framerate",
+            "30",
+            "-i",
+            "source.rgb",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.8",
+            "-vf",
+            "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            "-video_track_timescale",
+            "30000",
+            "-c:a",
+            "aac",
+            "source.mp4",
+        ],
+        temp.path(),
+    );
+
+    let input = temp.path().join("source.mp4");
+    let source_probe = probe_video(input.to_string_lossy().into()).unwrap();
+    let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let group = Arc::new(Mutex::new(Vec::new()));
+    let _scope = JobScope::enter(JobContext {
+        cancel: cancel.clone(),
+        child: group.clone(),
+    });
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:s=40x40:d=0.04",
+            "-frames:v",
+            "1",
+            "remove-thumbnail.png",
+        ],
+        temp.path(),
+    );
+    let image = temp.path().join("remove-thumbnail.png");
+    let settings = ThumbnailSettings {
+        image_path: image.to_string_lossy().into(),
+        fit: thumbnail::ThumbnailFit::Fit,
+        source_identity: inspect_thumbnail(image.to_string_lossy().into())
+            .unwrap()
+            .source_identity,
+    };
+    let stage = TempDir::new().unwrap();
+    thumbnail::stage(&default_ffmpeg(), &settings, stage.path()).unwrap();
+    for transformed in [false, true] {
+        let mut req = super::tests::base_request();
+        req.size_limit_mb = 0.0;
+        req.input_path = input.to_string_lossy().into();
+        req.audio_enabled = true;
+        req.trim = Some(Trim {
+            start_s: 0.0,
+            end_s: Some(0.8),
+        });
+        req.reverse = transformed;
+        req.loop_video = transformed;
+        req.speed = if transformed { 2.0 } else { 1.0 };
+        req.thumbnail = transformed.then(|| settings.clone());
+        req.interpolation = Some(InterpolationSettings {
+            anti_stutter_mode: AntiStutterMode::Remove,
+            anti_stutter: true,
+            anti_stutter_strength: 75,
+            target_fps: 60,
+            model_id: "rife-v4.25".into(),
+        });
+        let mut progress = Vec::new();
+        let prepared = crate::interpolation_media::prepare(
+            &default_ffmpeg(),
+            &input,
+            &source_probe,
+            &req,
+            &model,
+            &cancel,
+            &group,
+            |value| progress.push(value),
+        )
+        .unwrap();
+        assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+        assert_eq!(progress.last(), Some(&1.0));
+        let map = prepared
+            .removal_map()
+            .expect("isolated irregular hold must be removed");
+        assert_eq!(map.cuts().len(), 1);
+        assert!((map.cuts()[0].start_ns as i64 - 333_333_333).abs() <= 1);
+        assert_eq!(map.cuts()[0].end_ns, 400_000_000);
+        let anti = prepared.diagnostics.anti_stutter.as_ref().unwrap();
+        assert_eq!((anti.removed_runs, anti.removed_frames), (Some(1), Some(2)));
+        assert_eq!(anti.repaired_runs, 0);
+        let audio = prepared.removal_audio().unwrap();
+        assert_eq!(audio.sample_count, 35_200);
+        assert_eq!(
+            fs::metadata(&audio.path).unwrap().len(),
+            35_200 * u64::from(audio.channels) * 8
+        );
+        assert_eq!(
+            prepared.diagnostics.output_frames,
+            if transformed { 22 } else { 44 }
+        );
+        assert!((prepared.output_duration_s() - 44.0 / 60.0).abs() < 1e-9);
+        let mut effective = source_probe.clone();
+        apply_compacted_timeline(
+            &mut req,
+            &mut effective,
+            prepared.effective_source_duration_s(),
+            Some((audio.sample_rate, audio.channels)),
+        )
+        .unwrap();
+        let runtime = cached_ffmpeg_capabilities(&default_ffmpeg()).unwrap();
+        let codecs = select_codec_plan(req.format, &runtime.encoder_names, &req.advanced).unwrap();
+        let plan = build_encode_command_plan(&req, &effective, codecs, None).unwrap();
+        assert_eq!(plan.audio_action, StreamAction::Encode);
+        let output = temp.path().join(format!("removed-{transformed}.mp4"));
+        let mut args = build_single_pass_args(&req.input_path, &req, &plan).unwrap();
+        args.push(output.to_string_lossy().into());
+        run_ffmpeg_with_progress(
+            None,
+            1,
+            1,
+            &default_ffmpeg(),
+            &args,
+            Some(stage.path()),
+            EncodeProgressStep::single(EncodeProgressPhase::Encoding),
+            733_333,
+            true,
+            ffmpeg_run_limits(transformed).with_output_activity(&output),
+            &cancel,
+            &group,
+            Some(&prepared),
+        )
+        .unwrap();
+        let result = probe_video(output.to_string_lossy().into()).unwrap();
+        assert!(result.has_audio);
+        assert!(
+            (result.duration_s - prepared.output_duration_s()).abs() < 0.025,
+            "{result:?}"
+        );
+        let pixels = ffmpeg(
+            &[
+                "-i",
+                &output.to_string_lossy(),
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            temp.path(),
+        );
+        assert_eq!(pixels.len(), 44 * width * height * 3);
+        if transformed {
+            let offset = (height / 2 * width + width / 2) * 3;
+            assert!(pixels[offset] < 10 && pixels[offset + 1] < 10 && pixels[offset + 2] > 230);
+        }
+        assert!(group.lock().unwrap().is_empty());
+        eprintln!(
+            "Remove integration transformed={transformed}: {}",
+            serde_json::to_string(anti).unwrap()
+        );
     }
 }

@@ -111,6 +111,7 @@ export interface InterpolationSettings {
   modelId: InterpolationModelId;
   antiStutter?: boolean;
   antiStutterStrength?: number;
+  antiStutterMode?: "remove" | "repair";
 }
 export interface InterpolationStatus {
   state: "missing" | "ready" | "unavailable" | "failed";
@@ -268,6 +269,8 @@ export interface SubtitleInspection {
 }
 
 export interface ExportDiagnostics {
+  // Final output clock after cleanup, speed and loop; absent in older results.
+  outputDurationS?: number | null;
   interpolation?: {
     antiStutter?: AntiStutterDiagnostics | null;
   } | null;
@@ -299,6 +302,11 @@ export interface ExportDiagnostics {
 
 export interface AntiStutterDiagnostics {
   version: number;
+  mode?: "remove" | "repair";
+  removedRuns?: number;
+  removedFrames?: number;
+  // Source/trim-relative seconds, before speed or loop.
+  removedDurationS?: number;
   strength?: number;
   analyzedFrames: number;
   candidateRuns: number;

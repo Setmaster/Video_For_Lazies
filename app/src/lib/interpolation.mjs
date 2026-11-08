@@ -19,8 +19,33 @@ export function normalizeInterpolation(value) {
     targetFps: value.targetFps,
     modelId: value.modelId,
     ...(value.antiStutter === true ? { antiStutter: true } : {}),
+    ...(["remove", "repair"].includes(value.antiStutterMode) ? { antiStutterMode: value.antiStutterMode } : {}),
     ...(Number.isInteger(strength) && strength >= 0 && strength <= 100 && strength !== ANTI_STUTTER_DEFAULT_STRENGTH ? { antiStutterStrength: strength } : {}),
   };
+}
+
+// Missing mode belongs to older duration-preserving settings. Only a new enable
+// chooses removal; reading saved intent must never silently shorten a clip.
+export function antiStutterMode(value) {
+  return value?.antiStutterMode === "remove" ? "remove" : "repair";
+}
+export function antiStutterRemovesTime(value) {
+  return value?.antiStutter === true && antiStutterMode(value) === "remove";
+}
+export function setAntiStutterEnabled(value, enabled) {
+  return { ...value, antiStutter: enabled,
+    antiStutterMode: value.antiStutterMode ?? (value.antiStutter === true ? "repair" : "remove") };
+}
+export function antiStutterPlanSummary(value) {
+  if (!value?.antiStutter) return null;
+  return antiStutterRemovesTime(value)
+    ? "Remove repeated time; qualifying holds shorten output with matching audio cuts"
+    : "Fill pauses; preserve duration and audio timing";
+}
+export function resolvedOutputDuration(diagnostics, fallback = null) {
+  const duration = diagnostics?.outputDurationS;
+  if (Number.isFinite(duration) && duration > 0) return duration;
+  return diagnostics?.interpolation?.antiStutter?.mode === "remove" ? null : fallback;
 }
 
 export function antiStutterConflict(value) {
@@ -33,6 +58,12 @@ export function antiStutterSummary(value) {
   if (!value) return null;
   const repaired = value.repairedRuns;
   const unchanged = value.unchangedRuns;
+  if (value.mode === "remove") {
+    const runs = value.removedRuns ?? 0;
+    const seconds = value.removedDurationS ?? 0;
+    const duration = seconds > 0 && seconds < .001 ? "<0.001" : seconds.toFixed(3);
+    return `Anti-stutter: ${runs === 0 ? "no repeated time removed" : `${duration} s of repeated source time removed from ${runs} hold${runs === 1 ? "" : "s"}`}.${repaired > 0 ? ` ${repaired} pause${repaired === 1 ? "" : "s"} filled without removing time.` : ""}${unchanged > 0 ? ` ${unchanged} candidate${unchanged === 1 ? "" : "s"} left unchanged.` : ""}`;
+  }
   return `Anti-stutter: ${repaired === 0 ? "no short freezes repaired" : `${repaired} suspected freeze${repaired === 1 ? "" : "s"} repaired`}.${unchanged > 0 ? ` ${unchanged} candidate${unchanged === 1 ? "" : "s"} left unchanged.` : ""}`;
 }
 
