@@ -28,10 +28,10 @@ export function AntiStutterControl({ value, format, disabled, onChange }: {
         <span>Enable Anti-stutter</span>
       </label>
       <div className="vfl-inline-hint" id="vfl-anti-stutter-description">
-        {unavailable ?? "Attempts to repair brief repeated-frame freezes. Keeps duration and audio in sync."}
+        {unavailable ?? "Attempts to smooth short held-frame pauses, including compressed gameplay. Keeps duration and audio in sync."}
       </div>
       {enabled && !antiStutterConflict(value) ? <div className="vfl-inline-hint">
-        May also change intentional short pauses. Review an exact sample with motion before and after the freeze. Long holds and uncertain compressed frames stay unchanged.
+        May change intentional pauses, animation timing or small moving overlays. Review an exact sample with motion before and after the pause. Long holds and uncertain motion stay unchanged.
       </div> : null}
       {enabled ? <div className="vfl-inline-hint">Turning Smooth motion off also turns Anti-stutter off.</div> : null}
     </section>
