@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
 import type { InterpolationSettings, OutputFormat } from "../lib/types";
-import { antiStutterConflict } from "../lib/interpolation";
+import { ANTI_STUTTER_DEFAULT_STRENGTH, antiStutterConflict } from "../lib/interpolation";
 
 /** A separate feature which shares Smooth motion's selected frame generator. */
 export function AntiStutterControl({ value, format, disabled, onChange }: {
@@ -10,7 +10,7 @@ export function AntiStutterControl({ value, format, disabled, onChange }: {
   onChange: (value: InterpolationSettings) => void;
 }) {
   const enabled = value?.antiStutter === true;
-  const strength = value?.antiStutterStrength ?? 0;
+  const strength = value?.antiStutterStrength ?? ANTI_STUTTER_DEFAULT_STRENGTH;
   const unavailable = !value
     ? "Enable Smooth motion above to generate replacement frames."
     : format === "mp3"

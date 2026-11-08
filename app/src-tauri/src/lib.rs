@@ -410,7 +410,7 @@ fn parse_smoke_config_from_env(
     let anti_stutter = parse_smoke_bool(env, "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER")?;
     let anti_stutter_strength = env.get("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH")
         .map(|value| value.parse::<u8>().map_err(|_| "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH must be an integer from 0 to 100.".to_string()))
-        .transpose()?.unwrap_or(0);
+        .transpose()?.unwrap_or_else(video::default_anti_stutter_strength);
     if anti_stutter_strength > 100 {
         return Err(
             "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH must be an integer from 0 to 100."
@@ -1255,6 +1255,29 @@ mod tests {
             );
             assert!(parse_smoke_config_from_env(&env).is_err(), "{invalid}");
         }
+        env.remove("VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH");
+        assert_eq!(
+            parse_smoke_config_from_env(&env)
+                .unwrap()
+                .unwrap()
+                .interpolation
+                .unwrap()
+                .anti_stutter_strength,
+            75
+        );
+        env.insert(
+            "VFL_SMOKE_INTERPOLATION_ANTI_STUTTER_STRENGTH".into(),
+            "0".into(),
+        );
+        assert_eq!(
+            parse_smoke_config_from_env(&env)
+                .unwrap()
+                .unwrap()
+                .interpolation
+                .unwrap()
+                .anti_stutter_strength,
+            0
+        );
     }
 
     #[test]

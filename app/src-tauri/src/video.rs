@@ -349,8 +349,8 @@ pub struct InterpolationSettings {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub anti_stutter: bool,
     #[serde(
-        default,
-        skip_serializing_if = "anti_stutter_strength_is_zero",
+        default = "default_anti_stutter_strength",
+        skip_serializing_if = "anti_stutter_strength_is_default",
         deserialize_with = "deserialize_anti_stutter_strength"
     )]
     pub anti_stutter_strength: u8,
@@ -358,8 +358,12 @@ pub struct InterpolationSettings {
     pub model_id: String,
 }
 
-fn anti_stutter_strength_is_zero(value: &u8) -> bool {
-    *value == 0
+pub(crate) fn default_anti_stutter_strength() -> u8 {
+    75
+}
+
+fn anti_stutter_strength_is_default(value: &u8) -> bool {
+    *value == default_anti_stutter_strength()
 }
 
 fn deserialize_anti_stutter_strength<'de, D: serde::Deserializer<'de>>(
@@ -8329,7 +8333,7 @@ mod tests {
     }
 
     #[test]
-    fn anti_stutter_strength_is_legacy_defaulted_bounded_and_independent_of_enablement() {
+    fn anti_stutter_strength_defaults_to_75_and_preserves_explicit_zero() {
         for enabled in [false, true] {
             for strength in [0, 25, 50, 75, 100] {
                 let value = serde_json::json!({"targetFps":120,"modelId":"rife-v4.25","antiStutter":enabled,"antiStutterStrength":strength});
@@ -8339,7 +8343,7 @@ mod tests {
                 let encoded = serde_json::to_value(&settings).unwrap();
                 assert_eq!(
                     encoded.get("antiStutterStrength"),
-                    (strength != 0).then_some(&serde_json::json!(strength))
+                    (strength != 75).then_some(&serde_json::json!(strength))
                 );
                 assert_eq!(
                     serde_json::from_value::<InterpolationSettings>(encoded).unwrap(),
@@ -8361,7 +8365,7 @@ mod tests {
         let legacy: InterpolationSettings =
             serde_json::from_str(r#"{"targetFps":60,"modelId":"rife-v4.25","antiStutter":true}"#)
                 .unwrap();
-        assert_eq!(legacy.anti_stutter_strength, 0);
+        assert_eq!(legacy.anti_stutter_strength, 75);
         let mut request = base_request();
         request.interpolation = Some(InterpolationSettings {
             anti_stutter: false,

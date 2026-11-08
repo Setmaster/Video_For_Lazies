@@ -1,6 +1,7 @@
 import type { AntiStutterDiagnostics, InterpolationSettings, InterpolationOperationId, InterpolationInstallProgress, InterpolationModelId, OutputFormat } from "./types";
 export const INTERPOLATION_MODELS: readonly InterpolationModelId[];
 export const INTERPOLATION_TARGETS: readonly (60 | 120)[];
+export const ANTI_STUTTER_DEFAULT_STRENGTH: number;
 export function interpolationModelLabel(modelId: InterpolationModelId): string;
 export function normalizeInterpolation(value: unknown): InterpolationSettings | null;
 export function antiStutterConflict(value: InterpolationSettings | null): string | null;

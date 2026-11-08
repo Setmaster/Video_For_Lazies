@@ -1,5 +1,6 @@
 export const INTERPOLATION_MODELS = Object.freeze(["rife-v4.25", "rife-v4.26", "gmfss-fortuna-union", "gimm-vfi-r-p", "ldf-vfi"]);
 export const INTERPOLATION_TARGETS = Object.freeze([60, 120]);
+export const ANTI_STUTTER_DEFAULT_STRENGTH = 75;
 
 const MODEL_LABELS = Object.freeze({
   "rife-v4.25": "RIFE 4.25", "rife-v4.26": "RIFE 4.26",
@@ -18,7 +19,7 @@ export function normalizeInterpolation(value) {
     targetFps: value.targetFps,
     modelId: value.modelId,
     ...(value.antiStutter === true ? { antiStutter: true } : {}),
-    ...(Number.isInteger(strength) && strength > 0 && strength <= 100 ? { antiStutterStrength: strength } : {}),
+    ...(Number.isInteger(strength) && strength >= 0 && strength <= 100 && strength !== ANTI_STUTTER_DEFAULT_STRENGTH ? { antiStutterStrength: strength } : {}),
   };
 }
 

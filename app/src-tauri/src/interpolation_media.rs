@@ -755,6 +755,9 @@ pub(crate) fn prepare(
             duration_ns,
             first_pts.is_some(),
             settings.anti_stutter_strength,
+        )
+        .at_source_beginning(
+            start_s <= probe.video_start_s && leading_gap_ns == 0 && first_pts == Some(0),
         );
         while let Some(span) = window.next(&mut read_next)? {
             let next = span.right.map(|index| window.pts(index));
@@ -806,7 +809,7 @@ pub(crate) fn prepare(
             }
             window.advance(span, repaired_frames);
         }
-        debug_assert!(window.allocated_high_water <= 10);
+        debug_assert!(window.allocated_high_water <= anti_stutter::MAX_PICTURES);
         cut_pairs = window.cut_pairs;
         anti_stutter_diagnostics = Some(window.diagnostics);
     } else {
