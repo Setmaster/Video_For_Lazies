@@ -36,6 +36,9 @@ export function createFrameStepper({ read, fetchStep, pause, seek, apply, status
             status({ pending: false, error: false, message: entry.target === "preview" ? "At the source frame limit." : "At the trim limit." });
             continue;
           }
+          if (entry.step > 0 ? result.timeS <= timeS : result.timeS >= timeS) {
+            throw new Error("The source frame did not advance. Reload the video and try again.");
+          }
           const limits = read().limits[entry.target];
           if (result.timeS < limits.min || result.timeS > limits.max || result.timeS >= state.durationS || result.frameEndS <= result.timeS) {
             throw new Error("The next source frame is outside the current trim range.");

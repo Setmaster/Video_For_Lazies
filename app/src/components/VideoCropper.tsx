@@ -1,6 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import { pixelAspectToNormalizedRatio } from "../lib/accessibility";
-import { frameDisplaySeek } from "../lib/frameStep";
+import { beginVerifiedFrameSeek, takeFrameProof, type VerifiedFrameProof } from "../lib/verifiedFrameSeek";
 import {
   displayPointToSourcePoint,
   normalizeQuarterTurn,
@@ -253,10 +253,14 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const framePinRef = useRef<{ logicalS: number; mediaS: number; verified: boolean } | null>(null);
+  const frameSourceKey = JSON.stringify([src, sourceToken, timelineOffsetS]);
+  const frameSourceKeyRef = useRef(frameSourceKey);
+  frameSourceKeyRef.current = frameSourceKey;
+  const framePinRef = useRef<{ logicalS: number; mediaS: number; verified: boolean; proof: VerifiedFrameProof | null } | null>(null);
   const cancelFrameSeekRef = useRef<(() => void) | null>(null);
   function cancelFrameSeek() {
     cancelFrameSeekRef.current?.();
+    framePinRef.current?.proof?.dispose();
     framePinRef.current = null;
     if (videoRef.current) {
       delete videoRef.current.dataset.frameStepLogicalTime;
@@ -265,7 +269,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
   }
   function sourceTime(video: HTMLVideoElement) {
     const pin = framePinRef.current;
-    return pin?.verified && video.paused && Math.abs(video.currentTime - pin.mediaS) <= 0.000001
+    return pin?.verified && video.paused && Math.abs(video.currentTime - pin.mediaS) <= (pin.proof?.clockToleranceS ?? 0.000001)
       ? pin.logicalS : Math.max(0, (video.currentTime || 0) - timelineOffsetS);
   }
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
@@ -599,8 +603,11 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     const video = videoRef.current;
     if (!video) return;
     const interrupted = () => {
+      // The active verifier tracks its own target clock. This handler
+      // only invalidates an already committed pin after external navigation.
+      if (cancelFrameSeekRef.current) return;
       const pin = framePinRef.current;
-      if (pin && (!video.paused || Math.abs(video.currentTime - pin.mediaS) > 0.000001)) {
+      if (pin && (!video.paused || Math.abs(video.currentTime - pin.mediaS) > (pin.proof?.clockToleranceS ?? 0.000001))) {
         cancelFrameSeek();
         onFrameSeekInterrupted?.();
       }
@@ -676,71 +683,50 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
     },
     cancelFrameSeek,
     async seekFrame(timeS: number, endS: number) {
+      // Capture eligibility before replacing the previous operation's owner.
+      // Taking the proof also releases its listeners, including on the fast path.
+      const previousProof = takeFrameProof(framePinRef.current?.proof ?? null);
       cancelFrameSeek();
       const video = videoRef.current;
-      if (!video || video.readyState < 1 || typeof video.requestVideoFrameCallback !== "function") {
-        throw new Error("This preview cannot verify individual source frames.");
+      if (!video) throw new Error("The preview is not ready.");
+      const key = frameSourceKeyRef.current;
+      const pin = { logicalS: timeS, mediaS: timeS + timelineOffsetS, verified: false, proof: null as VerifiedFrameProof | null };
+      const isCurrent = () => framePinRef.current === pin && videoRef.current === video && frameSourceKeyRef.current === key;
+      let cancelOperation = () => {};
+      const cancel = () => cancelOperation();
+      framePinRef.current = pin;
+      cancelFrameSeekRef.current = cancel;
+      try {
+        const operation = beginVerifiedFrameSeek({
+          video, sourceKey: key, timeS, endS, timelineOffsetS, previousProof, isCurrent,
+          onPosition: mediaS => { if (isCurrent()) pin.mediaS = mediaS; },
+          onInterrupted: onFrameSeekInterrupted,
+        });
+        cancelOperation = operation.cancel;
+        const proof = await operation.promise;
+        if (!isCurrent()) {
+          proof.dispose();
+          throw Object.assign(new Error("Frame navigation was superseded."), { name: "AbortError" });
+        }
+        pin.proof = proof;
+        pin.mediaS = proof.mediaS;
+        pin.verified = true;
+        video.dataset.frameStepLogicalTime = String(timeS);
+        video.dataset.frameStepMediaTime = String(proof.presentedMediaS - timelineOffsetS);
+        onTimeUpdate?.(timeS);
+      } catch (error) {
+        if (framePinRef.current === pin) {
+          pin.proof?.dispose();
+          const reportFailure = isCurrent() && !(error instanceof Error && error.name === "AbortError");
+          framePinRef.current = null;
+          delete video.dataset.frameStepLogicalTime;
+          delete video.dataset.frameStepMediaTime;
+          if (reportFailure) onTimeUpdate?.(Math.max(0, video.currentTime - timelineOffsetS));
+        }
+        throw error;
+      } finally {
+        if (cancelFrameSeekRef.current === cancel) cancelFrameSeekRef.current = null;
       }
-      const { seekS, toleranceS } = frameDisplaySeek(timeS, endS);
-      const mediaS = seekS + timelineOffsetS;
-      const expected = timeS + timelineOffsetS;
-      if (mediaS < 0 || Number.isFinite(video.duration) && mediaS >= video.duration) {
-        throw new Error("This source frame is outside the available preview.");
-      }
-      video.pause();
-      await new Promise<void>((resolve, reject) => {
-        let presented = false;
-        let presentedTime = 0;
-        let seeked = false;
-        let settled = false;
-        let callback = 0;
-        const pin = { logicalS: timeS, mediaS, verified: false };
-        const finish = (error?: Error, superseded = false) => {
-          if (settled) return;
-          settled = true;
-          window.clearTimeout(timeout);
-          video.cancelVideoFrameCallback(callback);
-          video.removeEventListener("seeked", onSeeked);
-          video.removeEventListener("error", onError);
-          if (cancelFrameSeekRef.current === cancel) cancelFrameSeekRef.current = null;
-          const ownsPin = framePinRef.current === pin;
-          if (error) {
-            if (ownsPin) {
-              framePinRef.current = null;
-              if (!superseded) onTimeUpdate?.(Math.max(0, video.currentTime - timelineOffsetS));
-            }
-            reject(error);
-          } else {
-            if (ownsPin) {
-              pin.verified = true;
-              video.dataset.frameStepLogicalTime = String(timeS);
-              video.dataset.frameStepMediaTime = String(presentedTime - timelineOffsetS);
-              onTimeUpdate?.(timeS);
-            }
-            resolve();
-          }
-        };
-        const check = () => { if (presented && seeked) finish(); };
-        const onSeeked = () => { seeked = true; check(); };
-        const onError = () => finish(new Error("The preview could not display this source frame."));
-        const cancel = () => finish(new Error("Frame navigation was superseded."), true);
-        const onFrame = (_now: number, metadata: VideoFrameCallbackMetadata) => {
-          if (settled) return;
-          if (Math.abs(metadata.mediaTime - expected) <= toleranceS) {
-            presented = true;
-            presentedTime = metadata.mediaTime;
-            check();
-          } else callback = video.requestVideoFrameCallback(onFrame);
-        };
-        const timeout = window.setTimeout(() => finish(new Error("The preview could not verify the requested source frame.")), 2500);
-        cancelFrameSeekRef.current = cancel;
-        framePinRef.current = pin;
-        video.addEventListener("seeked", onSeeked);
-        video.addEventListener("error", onError);
-        callback = video.requestVideoFrameCallback(onFrame);
-        try { video.currentTime = mediaS; }
-        catch { onError(); }
-      });
     },
     getPlaybackState() {
       const v = videoRef.current;
@@ -752,7 +738,7 @@ export const VideoCropper = forwardRef<VideoCropperHandle, {
       if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
       onSourceReadyChange?.(false, sourceToken);
     },
-  }), [onTimeUpdate, onSourceReadyChange, sourceToken, timelineOffsetS]);
+  }), [onTimeUpdate, onSourceReadyChange, onFrameSeekInterrupted, sourceToken, timelineOffsetS]);
 
   const handleStyle = (corner: "nw" | "ne" | "sw" | "se") => {
     const x = corner.includes("w") ? rectPx.left : rectPx.left + rectPx.width;

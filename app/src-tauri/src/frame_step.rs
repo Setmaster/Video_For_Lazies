@@ -556,6 +556,82 @@ mod tests {
         }
     }
 
+    fn wire_request(request: &FrameStepRequest) -> FrameStepRequest {
+        // Exercise the JSON number path used by desktop IPC, not only direct
+        // Rust calls. A one-ULP change can put a known PTS in the previous rank.
+        let value: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&serde_json::json!({
+                "path": request.path,
+                "sourceIdentity": request.source_identity,
+                "videoStreamIndex": request.video_stream_index,
+                "timeS": request.time_s,
+                "step": request.step,
+                "minS": request.min_s,
+                "maxS": request.max_s,
+                "durationS": request.duration_s,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn ipc_number_roundtrip_preserves_fractional_pts_and_source_rank() {
+        let cache = cached((0..90).map(|n| n as f64 / 30.0).collect());
+        for step in [-10, -1, 1, 10] {
+            for index in 10..80 {
+                let original = request(cache.times[index], step);
+                let received = wire_request(&original);
+                assert_eq!(received.time_s.to_bits(), original.time_s.to_bits());
+                let result = select(&cache, &received).unwrap();
+                assert!(result.did_move);
+                assert_eq!(result.time_s, cache.times[(index as i32 + step) as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn ipc_number_roundtrip_keeps_dense_pts_and_exact_trim_limits() {
+        let cache = cached((0..20).map(|n| 0.9 + n as f64 * 0.000025).collect());
+        let mut original = request(cache.times[9], 10);
+        original.min_s = cache.times[4];
+        original.max_s = cache.times[14];
+        original.duration_s = cache.times[19];
+        let received = wire_request(&original);
+        assert_eq!(received.min_s.to_bits(), original.min_s.to_bits());
+        assert_eq!(received.max_s.to_bits(), original.max_s.to_bits());
+        assert_eq!(received.duration_s.to_bits(), original.duration_s.to_bits());
+        let result = select(&cache, &received).unwrap();
+        assert_eq!(result.time_s, cache.times[14]);
+        assert!(result.at_limit);
+        original.step = -10;
+        assert_eq!(
+            select(&cache, &wire_request(&original)).unwrap().time_s,
+            cache.times[4]
+        );
+    }
+
+    #[test]
+    fn ipc_precision_does_not_snap_off_grid_or_include_exclusive_end() {
+        let pts = 14.0_f64 / 15.0;
+        let cache = cached(vec![0.0, pts, 29.0 / 30.0, 1.0]);
+        let just_before = f64::from_bits(pts.to_bits() - 1);
+        let req = wire_request(&request(just_before, 1));
+        assert_eq!(req.time_s.to_bits(), just_before.to_bits());
+        assert_eq!(select(&cache, &req).unwrap().time_s, pts);
+        let mut req = request(29.0 / 30.0, 1);
+        req.duration_s = 1.0;
+        req.max_s = 1.0;
+        assert!(!select(&cache, &wire_request(&req)).unwrap().did_move);
+        req.time_s = 1.0;
+        req.step = -1;
+        assert_eq!(
+            select(&cache, &wire_request(&req)).unwrap().time_s,
+            29.0 / 30.0
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn successful_probe_with_decode_error_stderr_is_rejected() {

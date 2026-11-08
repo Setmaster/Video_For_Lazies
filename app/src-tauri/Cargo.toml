@@ -24,7 +24,9 @@ tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Desktop IPC parses into Value before typed requests. Preserve source PTS bits
+# through that round trip so frame navigation never reselects the same picture.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 base64 = "0.22"
 minisign-verify = "0.2"
 semver = "1"

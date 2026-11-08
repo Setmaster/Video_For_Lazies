@@ -79,3 +79,13 @@ test("display seek bias is inside the known interval and leaves exact boundary u
   assert.equal(frameDisplaySeek(1, 2).seekS, 1.001);
   assert.throws(() => frameDisplaySeek(1, 1.000001), /cannot distinguish/);
 });
+
+test("native didMove responses must advance in the requested direction before preview verification", async () => {
+  for (const [step, target] of [[1, .5], [1, .4], [-1, .5], [-1, .6]]) {
+    const h = harness({ fetchStep: async () => ({ sourceIdentity: "identity", timeS: target, frameEndS: target + .03, didMove: true, atLimit: false }) });
+    h.state.values.preview = .5;
+    h.stepper.enqueue("preview", step); await tick();
+    assert.deepEqual(h.seeks, []); assert.deepEqual(h.applied, []);
+    assert.equal(h.statuses.at(-1).error, true); assert.match(h.statuses.at(-1).message, /did not advance/);
+  }
+});
