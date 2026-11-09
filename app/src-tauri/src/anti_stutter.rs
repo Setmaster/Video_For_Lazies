@@ -44,6 +44,11 @@ pub struct Interval {
     pub source_repeated_frames: u64,
     pub repaired_frames: u64,
     pub reason: String,
+    /// Total surviving source A-to-B time, present only for an extended bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_duration_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -57,9 +62,16 @@ pub struct AntiStutterDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed_duration_s: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Repeated source picture timestamps inside deleted suffixes. A partial
+    /// interval deletion can be positive even when no picture timestamp falls in it.
     pub removed_frames: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed_runs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridged_runs: Option<u64>,
+    /// Extra retained time beyond the first actual source display interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_bridge_duration_s: Option<f64>,
     pub analyzed_frames: u64,
     pub candidate_runs: u64,
     pub repaired_runs: u64,
@@ -346,6 +358,51 @@ impl Correspondence {
     fn continuous(&self, policy: Policy) -> bool {
         policy.accepts_matches(self.textured, self.matches.len(), self.coherent)
     }
+    fn stable_vector(&self, policy: Policy) -> Option<MotionVector> {
+        if !self.continuous(policy) {
+            return None;
+        }
+        let moving: Vec<_> = self
+            .matches
+            .iter()
+            .filter(|m| m.2 != 0 || m.3 != 0)
+            .collect();
+        let cluster = moving
+            .iter()
+            .map(|center| {
+                moving
+                    .iter()
+                    .copied()
+                    .filter(|m| (center.2 - m.2).abs() <= 6 && (center.3 - m.3).abs() <= 6)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|c| spread(c))
+            .max_by_key(Vec::len)?;
+        let vector = MotionVector {
+            x: median(cluster.iter().map(|m| m.2 as f64).collect()),
+            y: median(cluster.iter().map(|m| m.3 as f64).collect()),
+        };
+        let magnitude = vector.magnitude();
+        let deviation = median(
+            cluster
+                .iter()
+                .map(|m| (m.2 as f64 - vector.x).hypot(m.3 as f64 - vector.y))
+                .collect(),
+        );
+        let aligned = cluster
+            .iter()
+            .filter(|m| {
+                vector.agrees(MotionVector {
+                    x: m.2 as f64,
+                    y: m.3 as f64,
+                })
+            })
+            .count();
+        (magnitude >= 2.0
+            && deviation <= 1.0f64.max(magnitude * 0.5)
+            && aligned * 3 >= cluster.len() * 2)
+            .then_some(vector)
+    }
     fn held(&self) -> bool {
         let zero: Vec<_> = self
             .matches
@@ -499,6 +556,98 @@ fn coherent_matches(matches: &[(usize, usize, i32, i32)]) -> usize {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MotionVector {
+    x: f64,
+    y: f64,
+}
+impl MotionVector {
+    fn magnitude(self) -> f64 {
+        self.x.hypot(self.y)
+    }
+    fn agrees(self, other: Self) -> bool {
+        self.x * other.x + self.y * other.y >= 0.5 * self.magnitude() * other.magnitude()
+    }
+}
+#[derive(Clone, Copy)]
+struct MotionSample {
+    vector: MotionVector,
+    duration_ns: u64,
+}
+struct MotionAnchor {
+    image: Luma,
+    start_ns: u64,
+    end_ns: u64,
+    first_ns: u64,
+    source_steps: usize,
+}
+fn reference_interval(duration: u64, first: u64, steps: usize) -> bool {
+    duration > 0
+        && duration <= 100_000_002
+        && first > 0
+        && first <= duration
+        && first.saturating_mul(2).saturating_add(2) >= duration
+        && (1..=2).contains(&steps)
+}
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_unstable_by(f64::total_cmp);
+    (values[(values.len() - 1) / 2] + values[values.len() / 2]) * 0.5
+}
+fn bridge_duration(
+    first: u64,
+    span: u64,
+    bridge: Option<MotionVector>,
+    before: &[MotionSample],
+    after: &[MotionSample],
+) -> (u64, &'static str) {
+    let Some(bridge) = bridge else {
+        return (first, "insufficientMotionContext");
+    };
+    let both = !before.is_empty() && !after.is_empty();
+    if !both && before.len().max(after.len()) < 2 {
+        return (first, "insufficientMotionContext");
+    }
+    let samples: Vec<_> = before.iter().chain(after).collect();
+    let mut fastest = 0.0f64;
+    let mut slowest = f64::INFINITY;
+    for (i, sample) in samples.iter().enumerate() {
+        if sample.duration_ns == 0
+            || !sample.vector.agrees(bridge)
+            || samples[..i]
+                .iter()
+                .any(|other| !sample.vector.agrees(other.vector))
+        {
+            return (first, "conflictingMotion");
+        }
+        let speed = sample.vector.magnitude() / sample.duration_ns as f64;
+        if !speed.is_finite() || speed <= 0.0 {
+            return (first, "insufficientMotionContext");
+        }
+        fastest = fastest.max(speed);
+        slowest = slowest.min(speed);
+    }
+    if fastest > slowest * 2.0 {
+        return (first, "conflictingMotion");
+    }
+    let mut maximum = 250_000_000.min(span / 2).max(first);
+    if !both {
+        maximum = maximum.min(first.saturating_mul(2));
+    }
+    let estimated = (bridge.magnitude() / fastest).round();
+    if !estimated.is_finite() || estimated <= 0.0 {
+        return (first, "insufficientMotionContext");
+    }
+    let retained = (estimated as u64).clamp(first, maximum);
+    (
+        retained,
+        if retained > first {
+            "motionEstimate"
+        } else {
+            "boundedMinimum"
+        },
+    )
+}
+
 struct Picture {
     pixels: Vec<u8>,
     pts: u64,
@@ -560,6 +709,10 @@ pub(super) struct Window {
     cadence_history: VecDeque<Cadence>,
     cadence_open_steps: usize,
     removed_ns: u64,
+    retained_bridge_ns: u64,
+    motion_history: VecDeque<MotionAnchor>,
+    current_descriptor: Option<Luma>,
+    motion_first_ns: Option<u64>,
     pictures: VecDeque<Picture>,
     pool: Vec<Vec<u8>>,
     width: usize,
@@ -594,6 +747,10 @@ impl Window {
             cadence_history: VecDeque::new(),
             cadence_open_steps: 0,
             removed_ns: 0,
+            retained_bridge_ns: 0,
+            motion_history: VecDeque::new(),
+            current_descriptor: None,
+            motion_first_ns: None,
             pictures: VecDeque::from([Picture {
                 pixels,
                 pts,
@@ -619,6 +776,8 @@ impl Window {
                 removed_duration_s: None,
                 removed_frames: None,
                 removed_runs: None,
+                bridged_runs: None,
+                retained_bridge_duration_s: None,
                 analyzed_frames: u64::from(real_first),
                 candidate_runs: 0,
                 repaired_runs: 0,
@@ -637,11 +796,13 @@ impl Window {
     pub fn with_mode(mut self, mode: AntiStutterMode) -> Self {
         self.mode = mode;
         if mode == AntiStutterMode::Remove {
-            self.diagnostics.version = 4;
+            self.diagnostics.version = 5;
             self.diagnostics.mode = Some(mode);
             self.diagnostics.removed_duration_s = Some(0.0);
             self.diagnostics.removed_frames = Some(0);
             self.diagnostics.removed_runs = Some(0);
+            self.diagnostics.bridged_runs = Some(0);
+            self.diagnostics.retained_bridge_duration_s = Some(0.0);
         }
         self
     }
@@ -724,6 +885,8 @@ impl Window {
             source_repeated_frames: repeated,
             repaired_frames: 0,
             reason: reason.into(),
+            bridge_duration_s: None,
+            bridge_reason: None,
         });
         Some(index)
     }
@@ -735,6 +898,16 @@ impl Window {
     }
 
     fn unchanged(&mut self, reason: &'static str) -> Span {
+        if self.mode == AntiStutterMode::Remove
+            && matches!(
+                reason,
+                "sceneCut" | "gradualDrift" | "resourceLimit" | "excessiveHold" | "uncertainMotion"
+            )
+        {
+            self.motion_history.clear();
+            self.current_descriptor = None;
+            self.motion_first_ns = None;
+        }
         self.diagnostics.unchanged_runs += 1;
         self.skipped = Some(Skipped {
             start: self.pts(0),
@@ -937,12 +1110,143 @@ impl Window {
         }
     }
 
+    fn adaptive_bridge(
+        &mut self,
+        right: usize,
+        read: &mut impl FnMut(&mut [u8]) -> Result<Option<u64>, String>,
+    ) -> Result<(u64, &'static str), String> {
+        let first = self.pts(1) - self.pts(0);
+        let span = self.pts(right) - self.pts(0);
+        if 250_000_000.min(span / 2).max(first) == first {
+            return Ok((first, "boundedMinimum"));
+        }
+        let left = self
+            .current_descriptor
+            .as_ref()
+            .expect("Remove descriptor prepared");
+        let right_image = Luma::new(self.pixels(right), self.width, self.height)?.half()?;
+        let bridge = correspondence(left, &right_image)?.stable_vector(self.policy);
+        let mut before = Vec::new();
+        for (i, anchor) in self.motion_history.iter().enumerate() {
+            let endpoint = if let Some(next) = self.motion_history.get(i + 1) {
+                if anchor.end_ns != next.start_ns {
+                    continue;
+                }
+                &next.image
+            } else {
+                if anchor.end_ns != self.pts(0) {
+                    continue;
+                }
+                left
+            };
+            if reference_interval(
+                anchor.end_ns - anchor.start_ns,
+                anchor.first_ns,
+                anchor.source_steps,
+            ) && let Some(vector) =
+                correspondence(&anchor.image, endpoint)?.stable_vector(self.policy)
+            {
+                before.push(MotionSample {
+                    vector,
+                    duration_ns: anchor.end_ns - anchor.start_ns,
+                });
+            }
+        }
+        let after = self.future_motion(right, read)?;
+        let result = bridge_duration(
+            first,
+            self.pts(right) - self.pts(0),
+            bridge,
+            &before,
+            &after,
+        );
+        #[cfg(test)]
+        if std::env::var_os("VFL_ANTI_FULL_TRACE").is_some() {
+            eprintln!(
+                "bridge {} {} first={first} retained={} reason={} before={} after={} displacement={bridge:?}",
+                self.pts(0),
+                self.pts(right),
+                result.0,
+                result.1,
+                before.len(),
+                after.len()
+            );
+        }
+        Ok(result)
+    }
+
+    fn future_motion(
+        &mut self,
+        right: usize,
+        read: &mut impl FnMut(&mut [u8]) -> Result<Option<u64>, String>,
+    ) -> Result<Vec<MotionSample>, String> {
+        let mut after = Vec::new();
+        let mut start = right;
+        for _ in 0..2 {
+            let mut next = start + 1;
+            let endpoint = loop {
+                if !self.ensure(next + 1, read)? || self.pts(next) - self.pts(right) > MAX_SPAN_NS {
+                    break None;
+                }
+                let evidence = compare(
+                    self.pixels(start),
+                    self.pixels(next),
+                    self.width,
+                    self.height,
+                )?;
+                if evidence.discontinuity()
+                    || evidence.ambiguous
+                    || self.pictures[next]
+                        .incoming
+                        .is_some_and(|e| e.discontinuity() || e.ambiguous)
+                {
+                    break None;
+                }
+                if evidence.moving() {
+                    break Some(next);
+                }
+                if !evidence.plateau()
+                    || (next > start + 1
+                        && drifting(self.pixels(start), self.pixels(next - 1), self.pixels(next))?)
+                {
+                    break None;
+                }
+                next += 1;
+            };
+            let Some(end) = endpoint else {
+                break;
+            };
+            let duration = self.pts(end) - self.pts(start);
+            if reference_interval(duration, self.pts(start + 1) - self.pts(start), end - start) {
+                let a = Luma::new(self.pixels(start), self.width, self.height)?.half()?;
+                let b = Luma::new(self.pixels(end), self.width, self.height)?.half()?;
+                if let Some(vector) = correspondence(&a, &b)?.stable_vector(self.policy) {
+                    after.push(MotionSample {
+                        vector,
+                        duration_ns: duration,
+                    });
+                }
+            } else {
+                break;
+            }
+            start = end;
+        }
+        Ok(after)
+    }
+
     pub fn next(
         &mut self,
         read: &mut impl FnMut(&mut [u8]) -> Result<Option<u64>, String>,
     ) -> Result<Option<Span>, String> {
         if self.pictures.is_empty() {
             return Ok(None);
+        }
+        if self.mode == AntiStutterMode::Remove
+            && self.current_descriptor.is_none()
+            && self.skipped.is_none()
+        {
+            self.current_descriptor =
+                Some(Luma::new(self.pixels(0), self.width, self.height)?.half()?);
         }
         if !self.ensure(2, read)? {
             return Ok(Some(self.ordinary()));
@@ -1023,7 +1327,7 @@ impl Window {
         // Cadence protects source time, not the unwanted held-picture motion.
         // A fully qualified hold can still use the existing Fill interpolation
         // when its time must be retained or cadence evidence is incomplete.
-        let (remove_start, reason) = if self.mode == AntiStutterMode::Remove {
+        let (mut remove_start, reason) = if self.mode == AntiStutterMode::Remove {
             match self.cadence_verdict(right, read)? {
                 CadenceVerdict::Regular | CadenceVerdict::Unknown if coarse_removal => {
                     return Ok(Some(self.unchanged("unreliableCorrespondence")));
@@ -1035,12 +1339,24 @@ impl Window {
         } else {
             (None, "repaired")
         };
+        let mut bridge_info = None;
+        if remove_start.is_some() {
+            let (duration, why) = self.adaptive_bridge(right, read)?;
+            remove_start = Some(self.pts(0) + duration);
+            bridge_info = Some((duration, why));
+        }
         let detail = self.detail(
             remove_start.unwrap_or(self.pts(0)),
             self.pts(right),
             (right - 1) as u64,
             reason,
         );
+        if let (Some(detail), Some((duration, why))) = (detail, bridge_info) {
+            self.diagnostics.intervals[detail].bridge_reason = Some(why.into());
+            if duration > self.pts(1) - self.pts(0) {
+                self.diagnostics.intervals[detail].bridge_duration_s = Some(duration as f64 / 1e9);
+            }
+        }
         Ok(Some(Span {
             right: Some(right),
             repaired: true,
@@ -1070,7 +1386,19 @@ impl Window {
                 .diagnostics
                 .removed_frames
                 .as_mut()
-                .expect("remove mode counters") += (right - 1) as u64;
+                .expect("remove mode counters") +=
+                (1..right).filter(|i| self.pts(*i) >= start).count() as u64;
+            let extra = start - self.pts(1);
+            if extra > 0 {
+                self.retained_bridge_ns += extra;
+                *self
+                    .diagnostics
+                    .bridged_runs
+                    .as_mut()
+                    .expect("remove mode counters") += 1;
+                self.diagnostics.retained_bridge_duration_s =
+                    Some(self.retained_bridge_ns as f64 / 1e9);
+            }
         } else if span.repaired {
             if repaired_frames > 0 {
                 self.diagnostics.repaired_runs += 1;
@@ -1092,6 +1420,44 @@ impl Window {
             let mut evidence = span
                 .motion
                 .unwrap_or_else(|| self.pictures[right].incoming.expect("source edge"));
+            if self.mode == AntiStutterMode::Remove {
+                if evidence.discontinuity() || evidence.ambiguous || span.remove_start.is_some() {
+                    self.motion_history.clear();
+                    self.current_descriptor = None;
+                    self.motion_first_ns = None;
+                } else if !span.repaired && evidence.plateau() {
+                    self.motion_first_ns.get_or_insert(right_pts - left_pts);
+                    if right_pts - self.hold_started.unwrap_or(left_pts) > MAX_SPAN_NS {
+                        self.motion_history.clear();
+                        self.current_descriptor = None;
+                        self.motion_first_ns = None;
+                    }
+                } else {
+                    let start = self.hold_started.unwrap_or(left_pts);
+                    let first = self
+                        .motion_first_ns
+                        .take()
+                        .unwrap_or_else(|| self.pts(1) - left_pts);
+                    let steps = self.cadence_open_steps + right;
+                    if evidence.moving() && reference_interval(right_pts - start, first, steps) {
+                        if let Some(image) = self.current_descriptor.take() {
+                            self.motion_history.push_back(MotionAnchor {
+                                image,
+                                start_ns: start,
+                                end_ns: right_pts,
+                                first_ns: first,
+                                source_steps: steps,
+                            });
+                            if self.motion_history.len() > 2 {
+                                self.motion_history.pop_front();
+                            }
+                        }
+                    } else {
+                        self.motion_history.clear();
+                    }
+                    self.current_descriptor = None;
+                }
+            }
             if evidence.discontinuity() {
                 // Near similarity and a lighting/cut flag can coexist. A cut
                 // always retires history before any new plateau is timed.
@@ -1131,6 +1497,9 @@ impl Window {
                 };
             }
         } else {
+            self.motion_history.clear();
+            self.current_descriptor = None;
+            self.motion_first_ns = None;
             self.previous_motion = None;
             self.hold_started = None;
             self.cadence_history.clear();
@@ -1253,6 +1622,239 @@ mod tests {
             Some(map.removed_duration_ns() as f64 / 1e9)
         );
         (window.diagnostics, map)
+    }
+
+    fn motion(x: f64, y: f64, duration_ns: u64) -> MotionSample {
+        MotionSample {
+            vector: MotionVector { x, y },
+            duration_ns,
+        }
+    }
+    #[test]
+    fn adaptive_bridge_uses_real_motion_time_and_bounded_consistent_context() {
+        let first = 66_666_667;
+        let bridge = Some(MotionVector { x: 8., y: 0. });
+        let before = [motion(3.5, 1., 100_000_000), motion(4., 0., 66_666_667)];
+        assert_eq!(
+            bridge_duration(first, 600_000_000, bridge, &before, &[]),
+            (133_333_334, "motionEstimate")
+        );
+        assert_eq!(
+            bridge_duration(first, 600_000_000, bridge, &before[..1], &[]),
+            (first, "insufficientMotionContext")
+        );
+        assert_eq!(
+            bridge_duration(
+                first,
+                600_000_000,
+                bridge,
+                &[motion(4., 0., 50_000_000)],
+                &[motion(4., 0., 50_000_000)]
+            ),
+            (100_000_000, "motionEstimate")
+        );
+        assert_eq!(
+            bridge_duration(
+                first,
+                600_000_000,
+                bridge,
+                &[motion(4., 0., 50_000_000)],
+                &[motion(-4., 0., 50_000_000)]
+            ),
+            (first, "conflictingMotion")
+        );
+        assert_eq!(
+            bridge_duration(
+                first,
+                600_000_000,
+                bridge,
+                &[motion(4., 0., 50_000_000)],
+                &[motion(4., 0., 150_000_000)]
+            ),
+            (first, "conflictingMotion")
+        );
+        let both = [motion(4., 0., 50_000_000)];
+        assert_eq!(
+            bridge_duration(
+                20_000_000,
+                750_000_000,
+                Some(MotionVector { x: 40., y: 0. }),
+                &both,
+                &both
+            ),
+            (250_000_000, "motionEstimate")
+        );
+        assert_eq!(
+            bridge_duration(
+                20_000_000,
+                200_000_000,
+                Some(MotionVector { x: 40., y: 0. }),
+                &both,
+                &both
+            ),
+            (100_000_000, "motionEstimate")
+        );
+        assert_eq!(
+            bridge_duration(120_000_000, 180_000_000, bridge, &both, &both),
+            (120_000_000, "boundedMinimum")
+        );
+        assert_eq!(
+            bridge_duration(
+                40_000_000,
+                400_000_000,
+                Some(MotionVector { x: 12., y: 0. }),
+                &[motion(4., 0., 50_000_000)],
+                &[motion(4., 0., 50_000_000)]
+            ),
+            (150_000_000, "motionEstimate")
+        );
+        assert!(reference_interval(66_666_667, 33_333_333, 2));
+        assert!(!reference_interval(100_000_000, 30_000_000, 2));
+        assert!(!reference_interval(166_666_667, 133_333_333, 2));
+        assert!(!reference_interval(90_000_000, 45_000_000, 3));
+    }
+    #[test]
+    fn adaptive_motion_requires_directional_support_not_boolean_continuity() {
+        let field = |kind| {
+            let matches: Vec<_> = (0..6)
+                .flat_map(|y| {
+                    (0..8).map(move |x| match kind {
+                        0 => (x, y, 4, 0),
+                        1 => (x, y, 4 + y as i32 / 3, x as i32 / 3 - 1),
+                        2 => (x, y, 1, 0),
+                        _ => (
+                            x,
+                            y,
+                            if (x + y) % 3 == 0 { -2 } else { 4 },
+                            if (x + y) % 2 == 0 { 4 } else { -4 },
+                        ),
+                    })
+                })
+                .collect();
+            let coherent = coherent_matches(&matches);
+            Correspondence {
+                textured: 48,
+                matches,
+                coherent,
+            }
+        };
+        for kind in [0, 1] {
+            assert!(field(kind).stable_vector(Policy { strength: 75 }).is_some());
+        }
+        assert!(field(2).continuous(Policy { strength: 75 }));
+        assert!(
+            field(2).stable_vector(Policy { strength: 75 }).is_none(),
+            "one half-pixel is quantization weak despite continuity"
+        );
+        assert!(
+            field(3).stable_vector(Policy { strength: 75 }).is_none(),
+            "mixed directions cannot silently become speed"
+        );
+    }
+    #[test]
+    fn adaptive_future_context_stops_at_contaminated_or_ambiguous_intervals() {
+        for kind in 0..4 {
+            let mut input = if kind == 2 {
+                frames(&[0, 0, 0, 3, 5, 7], 33_333_333)
+            } else {
+                frames(&[0, 2, 4, 6], 33_333_333)
+            };
+            if kind == 1 {
+                for (_, pts) in input.iter_mut().skip(1) {
+                    *pts += 100_000_000;
+                }
+            }
+            let mut window =
+                Window::new(input[0].0.clone(), 0, WIDTH, HEIGHT, 500_000_000, true, 75)
+                    .with_mode(AntiStutterMode::Remove);
+            let mut i = 1;
+            let mut read = |pixels: &mut [u8]| {
+                if i == input.len() {
+                    return Ok(None);
+                }
+                pixels.copy_from_slice(&input[i].0);
+                let t = input[i].1;
+                i += 1;
+                Ok(Some(t))
+            };
+            if kind == 3 {
+                window.ensure(2, &mut read).unwrap();
+                window.pictures[1].incoming.as_mut().unwrap().ambiguous = true;
+            }
+            let samples = window.future_motion(0, &mut read).unwrap();
+            if kind == 0 {
+                assert_eq!(samples.len(), 2);
+            } else {
+                assert_eq!(samples.len(), 0, "kind={kind}");
+            }
+        }
+        let input = frames(&[0, 0, 2, 4], 33_333_333);
+        let mut window = Window::new(input[0].0.clone(), 0, WIDTH, HEIGHT, 200_000_000, true, 75)
+            .with_mode(AntiStutterMode::Remove);
+        let mut i = 1;
+        window
+            .ensure(2, &mut |pixels| {
+                pixels.copy_from_slice(&input[i].0);
+                let t = input[i].1;
+                i += 1;
+                Ok(Some(t))
+            })
+            .unwrap();
+        window.current_descriptor = Some(
+            Luma::new(&input[0].0, WIDTH, HEIGHT)
+                .unwrap()
+                .half()
+                .unwrap(),
+        );
+        window.motion_history.push_back(MotionAnchor {
+            image: Luma::new(&input[0].0, WIDTH, HEIGHT)
+                .unwrap()
+                .half()
+                .unwrap(),
+            start_ns: 0,
+            end_ns: 33_333_333,
+            first_ns: 33_333_333,
+            source_steps: 1,
+        });
+        let span = window.unchanged("gradualDrift");
+        assert!(window.current_descriptor.is_none() && window.motion_history.is_empty());
+        window.advance(span, 0);
+        assert!(window.current_descriptor.is_none() && window.motion_history.is_empty());
+    }
+
+    #[test]
+    fn adaptive_partial_repeat_cut_counts_deleted_timestamps_and_legacy_serde() {
+        let input = frames(&[0, 0, 0, 4], 20_000_000);
+        let mut window = Window::new(input[0].0.clone(), 0, WIDTH, HEIGHT, 120_000_000, true, 75)
+            .with_mode(AntiStutterMode::Remove);
+        let mut i = 1;
+        window
+            .ensure(4, &mut |pixels| {
+                pixels.copy_from_slice(&input[i].0);
+                let t = if i == 3 { 100_000_000 } else { input[i].1 };
+                i += 1;
+                Ok(Some(t))
+            })
+            .unwrap();
+        window.advance(
+            Span {
+                right: Some(3),
+                repaired: true,
+                cut: false,
+                remove_start: Some(50_000_000),
+                detail: None,
+                motion: None,
+            },
+            0,
+        );
+        assert_eq!(window.diagnostics.removed_runs, Some(1));
+        assert_eq!(window.diagnostics.removed_frames, Some(0));
+        assert_eq!(window.diagnostics.bridged_runs, Some(1));
+        assert_eq!(window.diagnostics.retained_bridge_duration_s, Some(0.03));
+        let old = serde_json::json!({"version":3,"analyzedFrames":0,"candidateRuns":0,"repairedRuns":0,"repairedFrames":0,"unchangedRuns":0,"intervals":[{"startS":0.,"endS":1.,"sourceRepeatedFrames":1,"repairedFrames":0,"reason":"repaired"}]});
+        let decoded: AntiStutterDiagnostics = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.bridged_runs, None);
+        assert_eq!(decoded.intervals[0].bridge_duration_s, None);
     }
 
     fn broad_texture(

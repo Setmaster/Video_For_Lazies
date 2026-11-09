@@ -302,3 +302,16 @@ test("completed output uses native final duration without source-time speed or l
   assert.equal(resolvedOutputDuration({ interpolation: { antiStutter: { mode: "repair" } } }, 10), 10);
   assert.equal(resolvedOutputDuration(undefined), null);
 });
+
+test("adaptive bridge results distinguish retained transition time from time removed", () => {
+  const result = { mode: "remove", removedRuns: 2, removedDurationS: .4, repairedRuns: 0,
+    unchangedRuns: 0, bridgedRuns: 1, retainedBridgeDurationS: .125 };
+  assert.equal(antiStutterSummary(result), "Anti-stutter: 0.400 s of repeated source time removed from 2 holds. 0.125 s extra retained for smoother motion across 1 transition.");
+  assert.match(antiStutterSummary({ ...result, bridgedRuns: 2, retainedBridgeDurationS: .0005 }), /<0.001 s extra retained.*2 transitions/);
+  for (const retainedBridgeDurationS of [undefined, null, 0, -1, NaN, Infinity]) {
+    assert.doesNotMatch(antiStutterSummary({ ...result, retainedBridgeDurationS }), /retained/);
+  }
+  assert.doesNotMatch(antiStutterSummary({ ...result, bridgedRuns: 0 }), /retained/);
+  assert.doesNotMatch(antiStutterSummary({ ...result, mode: "repair" }), /retained/);
+  assert.equal(resolvedOutputDuration({ outputDurationS: 1.725, interpolation: { antiStutter: result } }), 1.725);
+});

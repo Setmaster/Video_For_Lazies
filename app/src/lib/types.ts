@@ -307,6 +307,9 @@ export interface AntiStutterDiagnostics {
   removedFrames?: number;
   // Source/trim-relative seconds, before speed or loop.
   removedDurationS?: number;
+  bridgedRuns?: number;
+  // Extra source time retained for motion beyond the first-copy interval.
+  retainedBridgeDurationS?: number;
   strength?: number;
   analyzedFrames: number;
   candidateRuns: number;
@@ -318,6 +321,9 @@ export interface AntiStutterDiagnostics {
     endS: number;
     sourceRepeatedFrames: number;
     repairedFrames: number;
+    // Total retained transition duration, before speed or loop.
+    bridgeDurationS?: number;
+    bridgeReason?: string;
     reason: string;
   }[];
 }

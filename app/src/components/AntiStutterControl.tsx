@@ -47,7 +47,7 @@ export function AntiStutterControl({ value, format, disabled, onChange }: {
         </div>
         <div className="vfl-inline-hint" id="vfl-anti-stutter-mode-help">
           {mode === "remove"
-            ? "Shortens qualifying holds before Smooth motion; included audio is cut at the same times. Duration is calculated after cleanup."
+            ? "Shortens qualifying holds, retaining time to bridge motion when reliable. Included audio follows the same cuts. Duration is calculated after cleanup."
             : "Generates motion across suspected pauses while preserving duration and audio timing."}
         </div>
         <div className="vfl-field vfl-slider-field">

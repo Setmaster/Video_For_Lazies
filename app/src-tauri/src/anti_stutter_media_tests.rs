@@ -312,7 +312,7 @@ fn bundled_remove_compacts_video_audio_then_speed_reverse_loop_and_thumbnail() {
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:sample_rate=48000:duration=0.8",
+            "aevalsrc=0.2*sin(2*PI*(220*t+170*t*t))+0.1*sin(2*PI*997*t):s=48000:d=0.8",
             "-vf",
             "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
             "-c:v",
@@ -330,6 +330,33 @@ fn bundled_remove_compacts_video_audio_then_speed_reverse_loop_and_thumbnail() {
 
     let input = temp.path().join("source.mp4");
     let source_probe = probe_video(input.to_string_lossy().into()).unwrap();
+    assert_eq!(source_probe.audio_sample_rate, Some(48_000));
+    assert_eq!(source_probe.audio_channels, Some(1));
+    // Decode the original clock independently of the removal helper. The
+    // predeclared adaptive bridge keeps [0.300,0.350) and removes only
+    // [0.350,0.400), including precisely the matching source audio suffix.
+    let source_audio = ffmpeg(
+        &[
+            "-i",
+            &input.to_string_lossy(),
+            "-map",
+            "0:a:0",
+            "-af",
+            "atrim=start=0:end=0.8,asetpts=PTS-0/TB,aresample=async=1:first_pts=0:osr=48000:osf=dbl,apad=whole_len=38400,atrim=end_sample=38400",
+            "-ar",
+            "48000",
+            "-channel_layout",
+            "mono",
+            "-c:a",
+            "pcm_f64le",
+            "-f",
+            "f64le",
+            "-",
+        ],
+        temp.path(),
+    );
+    assert_eq!(source_audio.len(), 38_400 * 8);
+    let expected_audio = [&source_audio[..16_800 * 8], &source_audio[19_200 * 8..]].concat();
     let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let group = Arc::new(Mutex::new(Vec::new()));
@@ -397,22 +424,71 @@ fn bundled_remove_compacts_video_audio_then_speed_reverse_loop_and_thumbnail() {
             .removal_map()
             .expect("isolated irregular hold must be removed");
         assert_eq!(map.cuts().len(), 1);
-        assert!((map.cuts()[0].start_ns as i64 - 333_333_333).abs() <= 1);
+        assert!((map.cuts()[0].start_ns as i64 - 350_000_000).abs() <= 1);
         assert_eq!(map.cuts()[0].end_ns, 400_000_000);
         let anti = prepared.diagnostics.anti_stutter.as_ref().unwrap();
-        assert_eq!((anti.removed_runs, anti.removed_frames), (Some(1), Some(2)));
+        assert_eq!((anti.removed_runs, anti.removed_frames), (Some(1), Some(1)));
         assert_eq!(anti.repaired_runs, 0);
+        let diagnostic = serde_json::to_value(anti).unwrap();
+        assert_eq!(diagnostic["bridgedRuns"].as_u64(), Some(1), "{anti:?}");
+        assert!(
+            diagnostic["retainedBridgeDurationS"].as_f64().unwrap() > 0.,
+            "{anti:?}"
+        );
+        let bridge_s = diagnostic["intervals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|interval| interval["bridgeDurationS"].as_f64())
+            .expect("adaptive bridge interval");
+        assert!((bridge_s - 0.05).abs() < 1e-9, "{anti:?}");
+        assert!(bridge_s > 1.0 / 30.0);
         let audio = prepared.removal_audio().unwrap();
-        assert_eq!(audio.sample_count, 35_200);
+        assert_eq!(audio.sample_count, 36_000);
         assert_eq!(
             fs::metadata(&audio.path).unwrap().len(),
-            35_200 * u64::from(audio.channels) * 8
+            36_000 * u64::from(audio.channels) * 8
+        );
+        let compacted_audio = fs::read(&audio.path).unwrap();
+        assert_eq!(compacted_audio.len(), expected_audio.len());
+        let first_difference = compacted_audio
+            .iter()
+            .zip(&expected_audio)
+            .position(|(a, b)| a != b);
+        assert!(
+            first_difference.is_none(),
+            "retained source sample mismatch at output sample {:?}",
+            first_difference.map(|byte| byte / 8)
         );
         assert_eq!(
             prepared.diagnostics.output_frames,
-            if transformed { 22 } else { 44 }
+            if transformed { 23 } else { 45 }
         );
-        assert!((prepared.output_duration_s() - 44.0 / 60.0).abs() < 1e-9);
+        assert!((prepared.effective_source_duration_s() - 0.75).abs() < 1e-9);
+        let output_frames = if transformed { 46 } else { 45 };
+        assert!((prepared.output_duration_s() - output_frames as f64 / 60.).abs() < 1e-9);
+        if !transformed {
+            let bridge_pixels = ffmpeg(
+                &[
+                    "-i",
+                    &prepared.path.to_string_lossy(),
+                    "-pix_fmt",
+                    "rgb24",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                temp.path(),
+            );
+            let size = width * height * 3;
+            for frame in 18..21 {
+                assert!(
+                    bridge_pixels[frame * size..(frame + 1) * size]
+                        != bridge_pixels[(frame + 1) * size..(frame + 2) * size],
+                    "retained bridge must progress through actual interpolated frames"
+                );
+            }
+        }
         let mut effective = source_probe.clone();
         apply_compacted_timeline(
             &mut req,
@@ -436,7 +512,7 @@ fn bundled_remove_compacts_video_audio_then_speed_reverse_loop_and_thumbnail() {
             &args,
             Some(stage.path()),
             EncodeProgressStep::single(EncodeProgressPhase::Encoding),
-            733_333,
+            if transformed { 766_667 } else { 750_000 },
             true,
             ffmpeg_run_limits(transformed).with_output_activity(&output),
             &cancel,
@@ -462,7 +538,7 @@ fn bundled_remove_compacts_video_audio_then_speed_reverse_loop_and_thumbnail() {
             ],
             temp.path(),
         );
-        assert_eq!(pixels.len(), 44 * width * height * 3);
+        assert_eq!(pixels.len(), output_frames * width * height * 3);
         if transformed {
             let offset = (height / 2 * width + width / 2) * 3;
             assert!(pixels[offset] < 10 && pixels[offset + 1] < 10 && pixels[offset + 2] > 230);

@@ -39,7 +39,7 @@ export function setAntiStutterEnabled(value, enabled) {
 export function antiStutterPlanSummary(value) {
   if (!value?.antiStutter) return null;
   return antiStutterRemovesTime(value)
-    ? "Remove repeated time; qualifying holds shorten output with matching audio cuts"
+    ? "Remove repeated time; bridge motion where reliable and shorten output with matching audio cuts"
     : "Fill pauses; preserve duration and audio timing";
 }
 export function resolvedOutputDuration(diagnostics, fallback = null) {
@@ -62,7 +62,12 @@ export function antiStutterSummary(value) {
     const runs = value.removedRuns ?? 0;
     const seconds = value.removedDurationS ?? 0;
     const duration = seconds > 0 && seconds < .001 ? "<0.001" : seconds.toFixed(3);
-    return `Anti-stutter: ${runs === 0 ? "no repeated time removed" : `${duration} s of repeated source time removed from ${runs} hold${runs === 1 ? "" : "s"}`}.${repaired > 0 ? ` ${repaired} pause${repaired === 1 ? "" : "s"} filled without removing time.` : ""}${unchanged > 0 ? ` ${unchanged} candidate${unchanged === 1 ? "" : "s"} left unchanged.` : ""}`;
+    const bridged = value.bridgedRuns ?? 0;
+    const retained = value.retainedBridgeDurationS ?? 0;
+    const bridge = bridged > 0 && Number.isFinite(retained) && retained > 0
+      ? ` ${retained < .001 ? "<0.001" : retained.toFixed(3)} s extra retained for smoother motion across ${bridged} transition${bridged === 1 ? "" : "s"}.`
+      : "";
+    return `Anti-stutter: ${runs === 0 ? "no repeated time removed" : `${duration} s of repeated source time removed from ${runs} hold${runs === 1 ? "" : "s"}`}.${bridge}${repaired > 0 ? ` ${repaired} pause${repaired === 1 ? "" : "s"} filled without removing time.` : ""}${unchanged > 0 ? ` ${unchanged} candidate${unchanged === 1 ? "" : "s"} left unchanged.` : ""}`;
   }
   return `Anti-stutter: ${repaired === 0 ? "no short freezes repaired" : `${repaired} suspected freeze${repaired === 1 ? "" : "s"} repaired`}.${unchanged > 0 ? ` ${unchanged} candidate${unchanged === 1 ? "" : "s"} left unchanged.` : ""}`;
 }
