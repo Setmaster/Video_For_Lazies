@@ -105,8 +105,10 @@ fn original_pcm(input: &Path, directory: &Path) -> Vec<u8> {
 fn samples(bytes: &[u8]) -> Vec<f64> {
     assert_eq!(bytes.len() % 8, 0);
     bytes
-        .chunks_exact(8)
-        .map(|sample| f64::from_le_bytes(sample.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|sample| f64::from_le_bytes(*sample))
         .collect()
 }
 
@@ -340,7 +342,9 @@ fn bundled_target_duration_uses_cleanup_then_fast_and_slow_inference_grids_with_
         } else {
             assert!(prepared.removal_map().is_none());
             source_pcm[4_800 * 8..33_600 * 8]
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .rev()
                 .flat_map(|sample| sample.iter().copied())
                 .collect()

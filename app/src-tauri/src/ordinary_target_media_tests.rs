@@ -270,8 +270,10 @@ fn audio_seam(input: &Path, video_seam_s: f64, directory: &Path) -> f64 {
         directory,
     );
     let samples: Vec<_> = raw
-        .chunks_exact(8)
-        .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| f64::from_le_bytes(*b))
         .collect();
     let expected = (video_seam_s * 48000.).round() as isize;
     let mut best = (-1., 0isize);

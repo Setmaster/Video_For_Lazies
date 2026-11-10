@@ -2047,7 +2047,7 @@ mod tests {
                 )
                 .unwrap()
             );
-            for pixel in lit[4].0.chunks_exact_mut(3) {
+            for pixel in lit[4].0.as_chunks_mut::<3>().0 {
                 if color_only {
                     pixel[0] = pixel[0].saturating_add(1);
                 } else {
@@ -2413,7 +2413,8 @@ mod tests {
                     // disappear merely because the luma descriptor is stable.
                     pixels = picture_sized(width, height, 3.0);
                     let amount = (index - 3) as u8;
-                    for (pixel_index, pixel) in pixels.chunks_exact_mut(3).enumerate() {
+                    for (pixel_index, pixel) in pixels.as_chunks_mut::<3>().0.iter_mut().enumerate()
+                    {
                         if pixel_index % 2 == 0 {
                             pixel[0] = pixel[0].saturating_add(amount * 3);
                             pixel[1] = pixel[1].saturating_sub(amount);
@@ -2735,7 +2736,7 @@ mod tests {
     fn anti_stutter_preserves_color_drift_and_lacks_context_for_static_hud() {
         let mut near = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 8, 9], 16_666_667);
         for (i, (pixels, _)) in near.iter_mut().enumerate().take(6).skip(4) {
-            for pixel in pixels.chunks_exact_mut(3) {
+            for pixel in pixels.as_chunks_mut::<3>().0 {
                 pixel[0] = pixel[0].saturating_add((i - 3) as u8);
             }
         }
@@ -2832,7 +2833,7 @@ mod tests {
     fn anti_stutter_same_histogram_cuts_and_decorrelated_context_are_unchanged() {
         let mut source = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 8, 9], 16_666_667);
         for (pixels, _) in source.iter_mut().skip(6) {
-            for row in pixels.chunks_exact_mut(WIDTH * 3) {
+            for row in pixels.as_chunks_mut::<{ WIDTH * 3 }>().0 {
                 row.rotate_left(WIDTH / 2 * 3);
             }
         }
@@ -3015,7 +3016,7 @@ mod tests {
         for channel in 0..3 {
             let mut source = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 8, 9], 33_333_333);
             for (pixels, _) in source.iter_mut().take(6).skip(4) {
-                for pixel in pixels.chunks_exact_mut(3) {
+                for pixel in pixels.as_chunks_mut::<3>().0 {
                     pixel[channel] = pixel[channel].saturating_add(1);
                 }
             }
@@ -3027,7 +3028,7 @@ mod tests {
         let mut source = frames(&[0, 1, 2, 3, 3, 3, 3, 3, 3, 6, 7, 8], 33_333_333);
         for (i, (pixels, _)) in source.iter_mut().enumerate().take(9).skip(4) {
             let count = WIDTH * HEIGHT * (i - 3) / 5;
-            for pixel in pixels.chunks_exact_mut(3).take(count) {
+            for pixel in pixels.as_chunks_mut::<3>().0.iter_mut().take(count) {
                 pixel[0] += 1;
             }
         }
@@ -3039,7 +3040,7 @@ mod tests {
         for strength in [0, 100] {
             let mut input = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 7, 9, 10, 11], 33_333_333);
             for (pixels, _) in input.iter_mut().take(6).skip(4) {
-                for pixel in pixels.chunks_exact_mut(3) {
+                for pixel in pixels.as_chunks_mut::<3>().0 {
                     pixel[0] += 1;
                 }
             }
@@ -3096,7 +3097,7 @@ mod tests {
         for strength in [0, 100] {
             let mut input = frames(&[0, 1, 2, 3, 3, 3, 6, 7, 8, 9], 33_333_333);
             for (pixels, _) in input.iter_mut().take(6).skip(4) {
-                for pixel in pixels.chunks_exact_mut(3) {
+                for pixel in pixels.as_chunks_mut::<3>().0 {
                     pixel[0] += 1;
                 }
             }
@@ -3201,7 +3202,7 @@ mod tests {
                 assert!(compare(&a, &flash, WIDTH, HEIGHT).unwrap().discontinuity());
             }
             let mut color = a.clone();
-            for pixel in color.chunks_exact_mut(3) {
+            for pixel in color.as_chunks_mut::<3>().0 {
                 pixel[2] = pixel[2].saturating_add(2);
             }
             assert!(compare(&a, &color, WIDTH, HEIGHT).unwrap().discontinuity());
@@ -3224,7 +3225,7 @@ mod tests {
             }
             assert!(!continuous(&periodic, &periodic, WIDTH, HEIGHT, Policy { strength }).unwrap());
             let mut shifted = periodic.clone();
-            for row in shifted.chunks_exact_mut(WIDTH * 3) {
+            for row in shifted.as_chunks_mut::<{ WIDTH * 3 }>().0 {
                 row.rotate_left(3);
             }
             assert!(!continuous(&periodic, &shifted, WIDTH, HEIGHT, Policy { strength }).unwrap());

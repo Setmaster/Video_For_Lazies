@@ -552,8 +552,10 @@ mod tests {
         })
         .unwrap();
         let values: Vec<f64> = output
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
             .collect();
         assert_eq!(
             values,
