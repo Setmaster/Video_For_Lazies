@@ -104,6 +104,7 @@ The targeted smoke commands expect an already assembled portable folder and are 
 - Trim sliders expose labelled keyboard semantics and 0.1-second or 1-second nudges. Requested boundaries use decoded frames and samples; there is no alternate widened-boundary trim mode.
 - Crop uses labelled source-pixel inputs plus pointer drawing. Quarter-turn rotation keeps preview geometry and crop coordinates aligned.
 - Speed is applied before the optional frame-rate cap, and the current plan reports the post-speed rate and whether the cap applies.
+- Transform's optional Target duration derives playback speed from the selected timeline and boomerang multiplier, within 0.05×–16×. Disabling it restores the manual speed. Anti-stutter removal resolves the retained timeline before choosing speed; requested audio uses the same timing. Results remain subject to frame rounding and the speed limits. Target duration is clip-scoped and travels with queued request snapshots, not recipes or same-settings batches. Exact samples use the full export's speed. They are unavailable for target duration with Anti-stutter removal or NUT input, because those timelines require further analysis.
 - One UTF-8 SRT can be burned into MP4 or WebM using source timing, a fixed embedded DejaVu Sans style, and private temporary staging. It forces video re-encoding and rejects inline styling/position overrides.
 
 ### Planning and publication

@@ -163,6 +163,11 @@ export interface EncodeRequest {
   crop?: Crop | null;
   reverse: boolean;
   speed: number;
+  targetDurationS?: number | null;
+  // Transient exact-sample marker; not reusable settings or ordinary queue intent.
+  isSample?: boolean;
+  // Preserve target-derived cadence after freezing sample speed and clearing target.
+  targetDurationSample?: boolean;
   rotateDeg: number;
   resize?: ResizeSettings | null;
   maxEdgePx?: number | null;
@@ -269,6 +274,15 @@ export interface SubtitleInspection {
 }
 
 export interface ExportDiagnostics {
+  targetDuration?: {
+    requestedDurationS: number;
+    retainedDurationS: number;
+    calculatedSpeed: number | null;
+    effectiveSpeed: number;
+    estimatedOutputDurationS: number;
+    speedLimited: boolean;
+    frameRounded: boolean;
+  } | null;
   // Final output clock after cleanup, speed and loop; absent in older results.
   outputDurationS?: number | null;
   interpolation?: {

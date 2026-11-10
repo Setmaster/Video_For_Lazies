@@ -1,4 +1,6 @@
 //! Persistent RGB8 inference with one decoded-presentation clock and lossless replay.
+mod removal_plan;
+pub(crate) use removal_plan::{RemovalPlan, analyze_removal};
 mod repeat_timeline;
 mod sequence;
 pub(crate) use repeat_timeline::{PreparedAudio, RemovalMap};
@@ -555,8 +557,28 @@ pub(crate) fn prepare(
     model: &ResolvedModel,
     cancel: &Arc<AtomicBool>,
     group: &ProcessGroup,
+    progress: impl FnMut(f64),
+) -> Result<PreparedVideo, String> {
+    prepare_planned(
+        ffmpeg, source, probe, request, model, cancel, group, None, progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_planned(
+    ffmpeg: &str,
+    source: &Path,
+    probe: &VideoProbe,
+    request: &EncodeRequest,
+    model: &ResolvedModel,
+    cancel: &Arc<AtomicBool>,
+    group: &ProcessGroup,
+    plan: Option<&RemovalPlan>,
     mut progress: impl FnMut(f64),
 ) -> Result<PreparedVideo, String> {
+    if let Some(plan) = plan {
+        plan.verify(source, probe, request)?;
+    }
     let settings = request
         .interpolation
         .as_ref()
@@ -568,22 +590,32 @@ pub(crate) fn prepare(
         );
     }
     let identity = SourceIdentity::capture(source)?;
-    let start_s = request
+    let mut start_s = request
         .trim
         .as_ref()
         .map_or(0.0, |trim| trim.start_s.max(0.0));
-    let end_s = request
+    let mut end_s = request
         .trim
         .as_ref()
         .and_then(|trim| trim.end_s)
         .unwrap_or(probe.duration_s)
         .min(probe.duration_s);
-    let duration_ns = ((end_s - start_s) * 1_000_000_000.0).round() as u64;
+    if let Some(plan) = plan {
+        (start_s, end_s) = plan.interval_s();
+    }
+    let duration_ns = plan.map_or_else(
+        || ((end_s - start_s) * 1e9).round() as u64,
+        |p| p.map.source_duration_ns(),
+    );
     let rate = Rate::for_playback(settings.target_fps, request.speed)?;
-    let mut count = rate.frame_count(duration_ns)?;
+    let mut count = rate.frame_count(plan.map_or(duration_ns, |p| p.map.output_duration_ns()))?;
     let removing = settings.anti_stutter
         && settings.anti_stutter_mode == crate::video::AntiStutterMode::Remove;
-    let mut removal = removing.then(|| RemovalMap::new(duration_ns));
+    let mut removal = if let Some(plan) = plan {
+        Some(plan.map.clone())
+    } else {
+        removing.then(|| RemovalMap::new(duration_ns))
+    };
     let pixels = u64::from(probe.width) * u64::from(probe.height);
     if pixels == 0 || pixels > MAX_PIXELS || probe.width > 8192 || probe.height > 8192 {
         return Err("AI interpolation supports up to 3840×2160 pixels per picture. Trim/crop the source into a smaller video first.".into());
@@ -650,7 +682,8 @@ pub(crate) fn prepare(
             });
             let mut last_space_check = Instant::now();
             while !stop.load(Ordering::Relaxed) {
-                let idle = clock.elapsed().as_millis() as u64 - last.load(Ordering::Relaxed);
+                let idle = (clock.elapsed().as_millis() as u64)
+                    .saturating_sub(last.load(Ordering::Relaxed));
                 let too_large = scratch_size(&scratch).map_or(true, |size| size > quota);
                 let low_space = if last_space_check.elapsed() >= Duration::from_secs(1) {
                     last_space_check = Instant::now();
@@ -760,6 +793,9 @@ pub(crate) fn prepare(
     let mut read_next = |frame: &mut [u8]| -> Result<Option<u64>, String> {
         match receiver.recv_timeout(IDLE_TIMEOUT) {
             Ok(Ok((index, pts))) => {
+                if let Some(plan) = plan {
+                    removal_plan::verify_point(&plan.points, input_frames as usize, pts)?;
+                }
                 if index != input_frames || pts >= duration_ns {
                     return Err(
                         "Decoded picture timing does not match the retained interval.".into(),
@@ -789,7 +825,103 @@ pub(crate) fn prepare(
     let video_end_ns =
         ((probe.video_end_s.unwrap_or(end_s) - start_s).max(0.0) * 1_000_000_000.0).round() as u64;
     let mut anti_stutter_diagnostics = None;
-    if settings.anti_stutter {
+    if let Some(plan) = plan {
+        let mut diagnostics = plan.diagnostics.clone();
+        diagnostics.repaired_runs = 0;
+        diagnostics.repaired_frames = 0;
+        for interval in &mut diagnostics.intervals {
+            interval.repaired_frames = 0;
+        }
+        let mut right = vec![0u8; frame_bytes];
+        let mut source_index = 0u32;
+        for span in &plan.spans {
+            span.verify(&plan.points, source_index, left_pts)?;
+            let original_next = if span.end == u32::MAX {
+                None
+            } else {
+                if span.end <= source_index {
+                    return Err("Cleanup replay contains an invalid span.".into());
+                }
+                while source_index < span.end {
+                    let pts = read_next(&mut right)?
+                        .ok_or("Source ended before its analyzed endpoint.")?;
+                    source_index += 1;
+                    if plan.points.get(source_index as usize) != Some(&pts) {
+                        return Err("Cleanup replay endpoint timing changed.".into());
+                    }
+                }
+                Some(plan.points[span.end as usize])
+            };
+            let a = plan.map.map_ns(left_pts);
+            let b = original_next.map(|t| plan.map.map_ns(t));
+            let active_leading = plan.map.map_ns(leading_gap_ns);
+            let active_end = plan.map.map_ns(video_end_ns);
+            let mut repaired = 0;
+            while output_frames < count && b.is_none_or(|t| rate.sample_before(output_frames, t)) {
+                process::check_cancelled().map_err(|_| "Canceled.".to_string())?;
+                if timed_out.load(Ordering::Relaxed) {
+                    return Err("Interpolation stalled or exceeded its scratch quota.".into());
+                }
+                let alpha = b
+                    .map(|t| rate.alpha(output_frames, a, t))
+                    .transpose()?
+                    .unwrap_or(0.);
+                let pixels = if rate.sample_before(output_frames, active_leading)
+                    || !rate.sample_before(output_frames, active_end)
+                {
+                    output.fill(0);
+                    held_frames += 1;
+                    &output[..]
+                } else if alpha > 0. && alpha < 1. && !span.cut() && left != right {
+                    worker_input
+                        .write_all(&alpha.to_le_bytes())
+                        .and_then(|_| worker_input.write_all(&left))
+                        .and_then(|_| worker_input.write_all(&right))
+                        .and_then(|_| worker_input.flush())
+                        .map_err(|_| {
+                            "Native interpolation stopped while receiving a picture.".to_string()
+                        })?;
+                    read_picture(&mut worker_output, &mut output)?;
+                    inferred_frames += 1;
+                    repaired += u64::from(span.repaired() && span.remove_start.is_none());
+                    &output[..]
+                } else {
+                    held_frames += 1;
+                    &left[..]
+                };
+                assembled
+                    .write_all(pixels)
+                    .map_err(|_| "Could not store interpolated pictures.".to_string())?;
+                output_frames += 1;
+                last_progress.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+                progress(0.9 * output_frames as f64 / count as f64);
+            }
+            if span.repaired() && span.remove_start.is_none() {
+                diagnostics.repaired_frames += repaired;
+                if repaired > 0 {
+                    diagnostics.repaired_runs += 1;
+                } else {
+                    diagnostics.unchanged_runs += 1;
+                }
+                if let Some(detail) = diagnostics.intervals.get_mut(span.detail as usize) {
+                    detail.repaired_frames = repaired;
+                    if repaired == 0 {
+                        detail.reason = "noOutputSamples".into();
+                    }
+                }
+            }
+            if let Some(t) = original_next {
+                std::mem::swap(&mut left, &mut right);
+                left_pts = t;
+            }
+        }
+        if read_next(&mut right)?.is_some() || input_frames != plan.points.len() as u64 {
+            return Err("Source EOF/count changed after cleanup analysis.".into());
+        }
+        plan.verify(source, probe, request)?;
+        cut_pairs = plan.cut_pairs;
+        anti_stutter_diagnostics = Some(diagnostics);
+    } else if settings.anti_stutter {
         // Historical motion lives in compact summaries, not retained pictures.
         // The first buffer transfers ownership into this bounded window; there
         // is no unused original right-frame buffer on the enabled path.

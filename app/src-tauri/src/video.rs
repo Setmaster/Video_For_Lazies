@@ -1,3 +1,5 @@
+#[path = "target_duration.rs"]
+mod target_duration;
 use crate::process::{self, JobContext, JobScope, ManagedChild, ProcessGroup};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -9,6 +11,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+pub use target_duration::TargetDurationDiagnostics;
+use target_duration::{ordinary_target_timing, resolve_target_duration, target_timing_requested};
 
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -393,6 +397,13 @@ fn deserialize_anti_stutter_strength<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_duration_s: Option<f64>,
+    #[serde(default)]
+    pub is_sample: bool,
+    /// Transient target-derived sample; its full-export speed is already resolved.
+    #[serde(default)]
+    pub target_duration_sample: bool,
     #[serde(default)]
     pub thumbnail: Option<ThumbnailSettings>,
     #[serde(default)]
@@ -531,6 +542,8 @@ pub struct SubtitleInspection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_duration: Option<TargetDurationDiagnostics>,
     /// Final output timeline after cleanup, speed and looping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_duration_s: Option<f64>,
@@ -580,6 +593,7 @@ pub fn failed_encode_diagnostics(request: &EncodeRequest, reason: &str) -> Expor
     let requested_size_bytes = target_bytes_from_size_limit_mb(request.size_limit_mb);
     let redacted_reason = safe_failure_diagnostic_reason(request, reason);
     ExportDiagnostics {
+        target_duration: None,
         output_duration_s: None,
         interpolation: None,
         mode: "failed".to_string(),
@@ -1983,6 +1997,69 @@ fn push_video_output_policy_args(
     }
 }
 
+fn push_ordinary_target_timing_args(
+    args: &mut Vec<String>,
+    request: &EncodeRequest,
+    plan: &EncodeCommandPlan,
+) {
+    if !ordinary_target_timing(request) || plan.video_action != StreamAction::Encode {
+        return;
+    }
+    let time_base = if plan
+        .video_encoder
+        .is_some_and(|c| c.as_ffmpeg_name() == "mpeg4")
+    {
+        "1:60000"
+    } else {
+        "1:1000000000"
+    };
+    args.extend([
+        "-fps_mode".into(),
+        "passthrough".into(),
+        "-enc_time_base".into(),
+        time_base.into(),
+    ]);
+    if !plan.video_reasons.contains(&PlanReason::FrameRateCap) && (request.speed - 1.).abs() > 1e-9
+    {
+        // setpts rescales PTS, not AVFrame/packet duration. Keep original PTS
+        // and DTS explicitly: setts' generic TS default can discard B frames.
+        args.extend([
+            "-bsf:v".into(),
+            format!(
+                "setts=pts=PTS:dts=DTS:duration=DURATION/{:.9}",
+                request.speed
+            ),
+        ]);
+    }
+}
+
+fn require_target_setts(ffmpeg_bin: &str) -> Result<(), String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let probe = || {
+        let output = run_ffmpeg_capability_probe(
+            ffmpeg_bin,
+            "-bsfs",
+            "Target duration packet timing probe",
+        )?;
+        if !output.lines().any(|line| line.trim() == "setts") {
+            return Err("Target duration needs FFmpeg's setts bitstream filter. Use the bundled FFmpeg, or choose manual speed.".into());
+        }
+        Ok(true)
+    };
+    // Bare PATH lookups are deliberately not cached; their selected executable
+    // cannot be identified from the argument alone. Bundled/explicit binaries
+    // use the same file identity guarantees as other source-bound operations.
+    if Path::new(ffmpeg_bin).components().count() > 1 {
+        let identity = crate::media_source::SourceIdentity::capture(Path::new(ffmpeg_bin))?;
+        let key = format!("{}|{}", identity.path().display(), identity.fingerprint());
+        cached_runtime_value(&CACHE, &key, probe)?;
+        identity.verify(Path::new(ffmpeg_bin))?;
+    } else {
+        probe()?;
+    }
+    Ok(())
+}
+
 fn build_single_pass_args(
     input: &str,
     request: &EncodeRequest,
@@ -2076,6 +2153,7 @@ fn build_single_pass_args(
         StreamAction::Drop => args.push("-an".to_string()),
     }
 
+    push_ordinary_target_timing_args(&mut args, request, plan);
     push_metadata_args(&mut args, request);
     push_video_output_policy_args(
         &mut args,
@@ -4554,6 +4632,39 @@ fn validate_interpolation_request(
 }
 
 fn validate_base_request_scalars(request: &EncodeRequest) -> Result<(), String> {
+    if request.target_duration_sample && !(0.05..=16.0).contains(&request.speed) {
+        return Err("Target-duration sample speed must be between 0.05 and 16.".into());
+    }
+    if request.target_duration_sample
+        && request
+            .interpolation
+            .as_ref()
+            .is_some_and(|s| s.anti_stutter && s.anti_stutter_mode == AntiStutterMode::Remove)
+    {
+        return Err("Target duration with repeated-time removal needs a full export.".into());
+    }
+    if request.target_duration_sample && (!request.is_sample || request.target_duration_s.is_some())
+    {
+        return Err("Target-duration sample timing requires a speed-only sample request.".into());
+    }
+    if request
+        .target_duration_s
+        .is_some_and(|v| !v.is_finite() || v <= 0.0)
+    {
+        return Err("Target duration must be a finite number greater than zero seconds.".into());
+    }
+    if request.is_sample
+        && request.target_duration_s.is_some()
+        && request
+            .interpolation
+            .as_ref()
+            .is_some_and(|s| s.anti_stutter && s.anti_stutter_mode == AntiStutterMode::Remove)
+    {
+        return Err("Target duration with repeated-time removal needs a full export. Turn off Target duration or Remove repeated time to export a sample.".into());
+    }
+    if request.is_sample && request.target_duration_s.is_some() {
+        return Err("Sample exports must use the resolved full-video playback speed, not a new duration target.".into());
+    }
     if request.speed <= 0.0 || !request.speed.is_finite() {
         return Err("Speed must be > 0.".to_string());
     }
@@ -5237,7 +5348,7 @@ fn aligns_retained_av_interval(request: &EncodeRequest, probe: &VideoProbe) -> b
     request.format != OutputFormat::Mp3
         && request.audio_enabled
         && probe.has_audio
-        && (request.reverse || request.loop_video)
+        && (request.reverse || request.loop_video || target_timing_requested(request))
 }
 
 fn prepare_temporal_probe(
@@ -5245,7 +5356,9 @@ fn prepare_temporal_probe(
     input: &Path,
     probe: &mut VideoProbe,
 ) -> Result<(), String> {
-    if (aligns_retained_av_interval(request, probe) || request.interpolation.is_some())
+    if (aligns_retained_av_interval(request, probe)
+        || request.interpolation.is_some()
+        || target_timing_requested(request))
         && probe.source_format.as_deref() == Some("nut")
     {
         // NUT indexes omit the final packet duration. Only common A/V padding
@@ -5999,7 +6112,8 @@ fn build_video_filters_with_policy(
 
     // Interpolation already materializes the retained source video interval,
     // including real leading/trailing black gaps. Never pad it a second time.
-    let align_interval = req.interpolation.is_none() && aligns_retained_av_interval(req, probe);
+    let align_interval = req.interpolation.is_none()
+        && (aligns_retained_av_interval(req, probe) || ordinary_target_timing(req));
     if align_interval {
         // Pad the source timeline before selecting a trim, so an interval with
         // no actual pictures still has black frames. This is streaming work;
@@ -6145,6 +6259,9 @@ fn build_video_filters_with_policy(
         filters.push("reverse".to_string());
     }
 
+    if ordinary_target_timing(req) {
+        filters.push("settb=expr=1/1000000000".into());
+    }
     if (req.speed - 1.0).abs() > 1e-9 {
         filters.push(format!("setpts=PTS/{:.9}", req.speed));
     }
@@ -6274,7 +6391,12 @@ fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
     // Reverse and Loop operate on an entire common interval. Materialize gaps
     // after loudnorm so silence does not change its analysis of retained audio.
     let aligned_interval = aligns_retained_av_interval(req, probe);
-    if req.reverse || (req.loop_video && req.format != OutputFormat::Mp3) {
+    let target_grid = target_timing_requested(req) && req.interpolation.is_some();
+    if req.reverse
+        || (req.loop_video && req.format != OutputFormat::Mp3)
+        || target_grid
+        || ordinary_target_timing(req)
+    {
         let duration = retained_source_duration_s(req, probe)?;
         let sample_rate = if req.normalize_audio {
             48_000
@@ -6325,6 +6447,13 @@ fn build_audio_filters(req: &EncodeRequest, probe: &VideoProbe) -> Result<Option
         }
     }
 
+    if target_grid {
+        // Pin each forward/reversed leg to the same admitted CFR picture count.
+        // Padding only the final concatenation would shift the boomerang seam.
+        let duration =
+            planned_output_duration_s(req, probe)? / if req.loop_video { 2.0 } else { 1.0 };
+        filters.push(format!("apad=whole_dur={duration},atrim=end={duration}"));
+    }
     let linear = if filters.is_empty() {
         None
     } else {
@@ -7198,6 +7327,57 @@ pub fn run_encode_job(
     let mut subtitle_inspection = prepared_subtitle
         .as_ref()
         .map(|prepared| prepared.inspection.clone());
+    let removal_requested = request.interpolation.as_ref().is_some_and(|settings| {
+        settings.anti_stutter && settings.anti_stutter_mode == AntiStutterMode::Remove
+    });
+    let removal_plan = if request.target_duration_s.is_some() && removal_requested {
+        let mut validation = request.clone();
+        validation.speed = 1.0;
+        validate_interpolation_request(&validation, &probe)?;
+        require_ffmpeg_capability_subset(
+            "Cleanup duration analysis",
+            ["rawvideo"],
+            ["settb", "showinfo", "format", "scale", "trim", "setpts"],
+            &capability_contract,
+            &runtime_capabilities,
+        )?;
+        let mut last = Instant::now() - PROGRESS_EMIT_EVERY;
+        Some(interpolation_media::analyze_removal(
+            &ffmpeg_bin,
+            &input_path,
+            &probe,
+            &request,
+            cancel,
+            child_slot,
+            |fraction| {
+                if last.elapsed() >= PROGRESS_EMIT_EVERY || fraction >= 1.0 {
+                    emit_progress_payload(
+                        Some(window),
+                        EncodeProgressPayload {
+                            attempt_id,
+                            job_id,
+                            phase: EncodeProgressPhase::Preparing,
+                            step_index: 1,
+                            step_count: 1,
+                            pass: 1,
+                            total_passes: 1,
+                            pass_pct: fraction,
+                            overall_pct: 0.1 * fraction,
+                        },
+                    );
+                    last = Instant::now();
+                }
+            },
+        )?)
+    } else {
+        None
+    };
+    let retained = if let Some(plan) = &removal_plan {
+        plan.retained_duration_s()
+    } else {
+        estimate_output_duration_s(probe.duration_s, &request.trim, 1.0, false)?
+    };
+    let target_duration = resolve_target_duration(&mut request, retained)?;
     let codec_selection = select_codec_plan(
         request.format,
         &runtime_capabilities.encoder_names,
@@ -7206,19 +7386,39 @@ pub fn run_encode_job(
     let resolved_perturb_seed = request
         .perturb_first_frame
         .then(|| request.perturb_seed.unwrap_or_else(random_perturb_seed));
-    let removal_requested = request.interpolation.as_ref().is_some_and(|settings| {
-        settings.anti_stutter && settings.anti_stutter_mode == AntiStutterMode::Remove
-    });
+
     // Removal duration is not known yet. Validate encoding capabilities now,
     // but defer size feasibility until cleanup has established the real clock.
     let mut preflight_request = request.clone();
-    if removal_requested {
+    let mut preflight_probe = probe.clone();
+    if let Some(plan) = &removal_plan {
+        if plan.has_cuts() {
+            let audio = if request.audio_enabled && probe.has_audio {
+                Some((
+                    probe
+                        .audio_sample_rate
+                        .ok_or("Cleanup needs a known audio sample rate.")?,
+                    probe
+                        .audio_channels
+                        .ok_or("Cleanup needs a known audio channel count.")?,
+                ))
+            } else {
+                None
+            };
+            apply_compacted_timeline(
+                &mut preflight_request,
+                &mut preflight_probe,
+                retained,
+                audio,
+            )?;
+        }
+    } else if removal_requested {
         preflight_request.size_limit_mb = 0.0;
         preflight_request.strict_fit = false;
     }
     let mut command_plan = build_encode_command_plan(
         &preflight_request,
-        &probe,
+        &preflight_probe,
         codec_selection,
         resolved_perturb_seed,
     )?;
@@ -7227,6 +7427,15 @@ pub fn run_encode_job(
         &capability_contract,
         &runtime_capabilities,
     )?;
+    if ordinary_target_timing(&request)
+        && command_plan.video_action == StreamAction::Encode
+        && !command_plan
+            .video_reasons
+            .contains(&PlanReason::FrameRateCap)
+        && (request.speed - 1.).abs() > 1e-9
+    {
+        require_target_setts(&ffmpeg_bin)?;
+    }
 
     let resolved_model = if let Some(settings) = &request.interpolation {
         validate_interpolation_request(&request, &probe)?;
@@ -7270,38 +7479,57 @@ pub fn run_encode_job(
                 pass: 1,
                 total_passes: 1,
                 pass_pct: 0.0,
-                overall_pct: 0.0,
+                overall_pct: if removal_plan.is_some() { 0.1 } else { 0.0 },
             },
         );
         let mut last_progress = Instant::now() - PROGRESS_EMIT_EVERY;
-        let result = interpolation_media::prepare(
-            &ffmpeg_bin,
-            &input_path,
-            &probe,
-            &request,
-            model,
-            cancel,
-            child_slot,
-            |fraction| {
-                if last_progress.elapsed() >= PROGRESS_EMIT_EVERY || fraction >= 1.0 {
-                    emit_progress_payload(
-                        Some(window),
-                        EncodeProgressPayload {
-                            attempt_id,
-                            job_id,
-                            phase: EncodeProgressPhase::Interpolating,
-                            step_index: 1,
-                            step_count: 1,
-                            pass: 1,
-                            total_passes: 1,
-                            pass_pct: fraction,
-                            overall_pct: 0.35 * fraction,
+        let mut on_progress = |fraction| {
+            if last_progress.elapsed() >= PROGRESS_EMIT_EVERY || fraction >= 1.0 {
+                emit_progress_payload(
+                    Some(window),
+                    EncodeProgressPayload {
+                        attempt_id,
+                        job_id,
+                        phase: EncodeProgressPhase::Interpolating,
+                        step_index: 1,
+                        step_count: 1,
+                        pass: 1,
+                        total_passes: 1,
+                        pass_pct: fraction,
+                        overall_pct: if removal_plan.is_some() {
+                            0.1 + 0.25 * fraction
+                        } else {
+                            0.35 * fraction
                         },
-                    );
-                    last_progress = Instant::now();
-                }
-            },
-        );
+                    },
+                );
+                last_progress = Instant::now();
+            }
+        };
+        let result = if let Some(plan) = removal_plan.as_ref() {
+            interpolation_media::prepare_planned(
+                &ffmpeg_bin,
+                &input_path,
+                &probe,
+                &request,
+                model,
+                cancel,
+                child_slot,
+                Some(plan),
+                &mut on_progress,
+            )
+        } else {
+            interpolation_media::prepare(
+                &ffmpeg_bin,
+                &input_path,
+                &probe,
+                &request,
+                model,
+                cancel,
+                child_slot,
+                &mut on_progress,
+            )
+        };
         let mut prepared = result.map_err(|error| {
             if cancel.load(Ordering::Relaxed) {
                 "Canceled.".to_string()
@@ -7489,6 +7717,7 @@ pub fn run_encode_job(
                 .as_ref()
                 .map(|result| exact_target_message(result.status, out_size, target_bytes)),
             diagnostics: Some(ExportDiagnostics {
+                target_duration: target_duration.clone(),
                 output_duration_s: Some(output_duration_s),
                 interpolation: prepared_video
                     .as_ref()
@@ -7640,6 +7869,7 @@ pub fn run_encode_job(
                             target_result: Some(target_result),
                             message: Some("Fit confirmed by exact output bytes.".to_string()),
                             diagnostics: Some(ExportDiagnostics {
+                                target_duration: target_duration.clone(),
                                 output_duration_s: Some(output_duration_s),
                                 interpolation: prepared_video
                                     .as_ref()
@@ -7828,6 +8058,7 @@ pub fn run_encode_job(
                         target_result: None,
                         message: None,
                         diagnostics: Some(ExportDiagnostics {
+                            target_duration: target_duration.clone(),
                             output_duration_s: Some(output_duration_s),
                             interpolation: prepared_video
                                 .as_ref()
@@ -7998,6 +8229,7 @@ pub fn run_encode_job(
         {
             push_encoded_video_format_args(&mut pass1, active_command_plan.media_policy);
         }
+        push_ordinary_target_timing_args(&mut pass1, &active_request, &active_command_plan);
         pass1.push("-f".to_string());
         pass1.push("null".to_string());
         pass1.push(null_sink().to_string());
@@ -8102,6 +8334,7 @@ pub fn run_encode_job(
             StreamAction::Drop
         };
 
+        push_ordinary_target_timing_args(&mut pass2, &active_request, &active_command_plan);
         push_metadata_args(&mut pass2, &active_request);
         push_video_output_policy_args(
             &mut pass2,
@@ -8338,6 +8571,7 @@ pub fn run_encode_job(
         .map(|encoder| encoder.as_codec_name().to_string());
     let message = exact_target_message(final_status, selected.actual_size_bytes, target_bytes);
     let diagnostics = ExportDiagnostics {
+        target_duration: target_duration.clone(),
         output_duration_s: Some(output_duration_s),
         interpolation: prepared_video
             .as_ref()
@@ -8413,6 +8647,13 @@ mod selected_audio_tests;
 #[cfg(test)]
 #[path = "anti_stutter_media_tests.rs"]
 mod anti_stutter_media_tests;
+#[cfg(test)]
+#[path = "ordinary_target_media_tests.rs"]
+mod ordinary_target_media_tests;
+
+#[cfg(test)]
+#[path = "target_duration_media_tests.rs"]
+mod target_duration_media_tests;
 
 #[cfg(test)]
 #[path = "video_media_tests.rs"]
@@ -8424,6 +8665,9 @@ mod tests {
 
     pub(super) fn base_request() -> EncodeRequest {
         EncodeRequest {
+            target_duration_s: None,
+            is_sample: false,
+            target_duration_sample: false,
             thumbnail: None,
             audio_stream_index: None,
             audio_source_identity: None,
@@ -8981,6 +9225,83 @@ mod tests {
                 .unwrap_err()
                 .contains("requires an MP4 or WebM size target")
         );
+    }
+
+    #[test]
+    fn ordinary_target_clock_preserves_manual_samples_caps_and_codec_limits() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.;
+        req.target_duration_s = Some(5.);
+        let probe = probe_10s_1920x1080_audio();
+        resolve_target_duration(&mut req, 10.).unwrap();
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        let args = build_single_pass_args("in.mp4", &req, &plan).unwrap();
+        assert!(
+            args.windows(2)
+                .any(|p| p[0] == "-fps_mode" && p[1] == "passthrough")
+        );
+        assert!(
+            args.windows(2)
+                .any(|p| p[0] == "-enc_time_base" && p[1] == "1:1000000000")
+        );
+        assert!(
+            args.iter()
+                .any(|p| p == "setts=pts=PTS:dts=DTS:duration=DURATION/2.000000000")
+        );
+        assert!(
+            plan.video_filters
+                .as_deref()
+                .unwrap()
+                .contains("settb=expr=1/1000000000")
+        );
+        req.advanced.frame_rate_cap_fps = Some(30);
+        let capped = test_command_plan(&req, &probe, 1_000_000);
+        let args = build_single_pass_args("in.mp4", &req, &capped).unwrap();
+        assert!(!args.iter().any(|a| a == "-bsf:v"));
+        req.advanced.frame_rate_cap_fps = Some(120);
+        let nonbinding = test_command_plan(&req, &probe, 1_000_000);
+        let args = build_single_pass_args("in.mp4", &req, &nonbinding).unwrap();
+        assert!(args.iter().any(|a| a == "-bsf:v"));
+        req.advanced.video_codec = Some(VideoCodecPreference::Mpeg4);
+        let mpeg = test_command_plan(&req, &probe, 1_000_000);
+        let args = build_single_pass_args("in.mp4", &req, &mpeg).unwrap();
+        assert!(
+            args.windows(2)
+                .any(|p| p[0] == "-enc_time_base" && p[1] == "1:60000")
+        );
+        req.advanced.video_codec = None;
+        req.target_duration_s = None;
+        req.is_sample = true;
+        let manual = test_command_plan(&req, &probe, 1_000_000);
+        let args = build_single_pass_args("in.mp4", &req, &manual).unwrap();
+        assert!(!args.iter().any(|a| a == "-fps_mode" || a == "-bsf:v"));
+        req.target_duration_sample = true;
+        assert!(validate_base_request_scalars(&req).is_ok());
+        let sample = test_command_plan(&req, &probe, 1_000_000);
+        let args = build_single_pass_args("in.mp4", &req, &sample).unwrap();
+        assert!(args.iter().any(|a| a == "-bsf:v"));
+        req.speed = 32.;
+        assert!(validate_base_request_scalars(&req).is_err());
+        req.speed = 2.;
+        req.is_sample = false;
+        assert!(validate_base_request_scalars(&req).is_err());
+        req.is_sample = true;
+        req.interpolation=Some(serde_json::from_value(serde_json::json!({"targetFps":60,"modelId":"rife-v4.25","antiStutter":true,"antiStutterMode":"remove"})).unwrap());
+        assert!(validate_base_request_scalars(&req).is_err());
+    }
+
+    #[test]
+    fn target_duration_resolves_before_copy_size_and_memory_plans() {
+        let mut req = base_request();
+        req.size_limit_mb = 0.;
+        req.speed = 1.;
+        req.target_duration_s = Some(5.);
+        let probe = probe_10s_1920x1080_audio();
+        resolve_target_duration(&mut req, 10.).unwrap();
+        assert_eq!(req.speed, 2.);
+        let plan = test_command_plan(&req, &probe, 1_000_000);
+        assert_eq!(plan.video_action, StreamAction::Encode);
+        assert_eq!(plan.audio_action, StreamAction::Encode);
     }
 
     fn test_command_plan(

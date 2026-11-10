@@ -152,6 +152,8 @@ function queueItemFromRequest(id, request, durationS) {
   if (typeof request.outputPath !== "string" || request.outputPath.length === 0) return null;
 
   const snapshot = cloneJson(request);
+  delete snapshot.isSample;
+  delete snapshot.targetDurationSample;
   return {
     id,
     inputPath: snapshot.inputPath,

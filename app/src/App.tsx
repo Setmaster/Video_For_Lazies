@@ -10,6 +10,8 @@ import { SmoothMotionControl } from "./components/SmoothMotionControl";
 import { AntiStutterControl } from "./components/AntiStutterControl";
 import { AntiStutterResult } from "./components/AntiStutterResult";
 import { ThumbnailControl } from "./components/ThumbnailControl";
+import { TargetDurationControl, TargetDurationResult } from "./components/TargetDurationControl";
+import { planTargetDuration, prepareTargetSample, validTargetDuration, targetSampleBlockingReason as sampleTargetReason } from "./lib/targetDuration";
 import { normalizeInterpolation, interpolationConflict, interpolationModelLabel, ANTI_STUTTER_DEFAULT_STRENGTH, antiStutterMode, antiStutterRemovesTime, antiStutterPlanSummary, resolvedOutputDuration } from "./lib/interpolation";
 import { CropPixelFields } from "./components/CropPixelFields";
 import { ModalDialog } from "./components/ModalDialog";
@@ -592,6 +594,7 @@ function QueueDiagnosticsDetails({
       {diagnostics.copyFallbackReason ? (
         <div className="vfl-export-result-note">Copy fallback: {diagnostics.copyFallbackReason}</div>
       ) : null}
+      <TargetDurationResult value={diagnostics.targetDuration} />
       <AntiStutterResult value={diagnostics.interpolation?.antiStutter} />
       {diagnostics.colorAction ? (
         <div className="vfl-export-result-note">Color: {diagnostics.colorAction}</div>
@@ -794,6 +797,23 @@ function App() {
   const [reverse, setReverse] = useState(false);
   const [loopVideo, setLoopVideo] = useState(false);
   const [speed, setSpeed] = useState("1.0");
+  const [targetDurationEnabled, setTargetDurationEnabled] = useState(false);
+  const [targetDurationText, setTargetDurationText] = useState("");
+  const targetDurationPlan = useMemo(() => planTargetDuration({
+    enabled: targetDurationEnabled, targetS: targetDurationText,
+    sourceDurationS: !audioProbePending && probedInputPath.current === inputPath ? probe?.durationS : null,
+    trimStartS: trimStart, trimEndS: trimEnd, loopVideo, format, manualSpeed: speed,
+    cleanupPending: format !== "mp3" && antiStutterRemovesTime(interpolation),
+    timelinePending: probe?.sourceFormat === "nut",
+    interpolationTargetFps: format === "mp3" ? null : interpolation?.targetFps,
+  }), [targetDurationEnabled, targetDurationText, probe, inputPath, audioProbePending, trimStart, trimEnd, loopVideo, format, speed, interpolation]);
+  const speedPlanningPending = targetDurationEnabled && targetDurationPlan.pending;
+  const planningSpeed = targetDurationPlan.effectiveSpeed ?? (targetDurationEnabled ? 1 : Number(speed));
+  const targetDurationBlockingReason = targetDurationEnabled
+    ? targetDurationPlan.error ?? (targetDurationPlan.pending && !targetDurationPlan.waitingForCleanup && !targetDurationPlan.waitingForTimeline ? "Wait for the source before calculating target speed." : null) : null;
+  const targetSampleBlockingReason = sampleTargetReason({ enabled: targetDurationEnabled, format, interpolation, sourceFormat: probe?.sourceFormat });
+  const timingCalculationHint = antiStutterRemovesTime(interpolation) && format !== "mp3" ? "after cleanup"
+    : targetDurationPlan.waitingForTimeline ? "after full timeline analysis" : "when the source is ready";
   const [rotateDeg, setRotateDeg] = useState(0);
 
   const [cropEnabled, setCropEnabled] = useState(false);
@@ -1701,6 +1721,8 @@ function App() {
     setReverse(false);
     setLoopVideo(false);
     setSpeed("1.0");
+    setTargetDurationEnabled(false);
+    setTargetDurationText("");
     setRotateDeg(0);
 
     setCropEnabled(false);
@@ -2054,6 +2076,8 @@ function App() {
     setReverse(smokeConfig.reverse ?? false);
     setLoopVideo(smokeConfig.loopVideo ?? false);
     setSpeed("1.0");
+    setTargetDurationEnabled(false);
+    setTargetDurationText("");
     setRotateDeg(0);
     setCropEnabled(false);
     setCropRect({ x: 0, y: 0, w: 1, h: 1 });
@@ -2107,7 +2131,8 @@ function App() {
     if (!Number.isFinite(sizeMb) || sizeMb < 0) return null;
     if (sizeMb > 0 && exactTargetBytesFromMegabytes(sizeMb) === null) return null;
 
-    const speedNum = Number(speed);
+    const speedNum = planningSpeed;
+    if (targetDurationEnabled && targetDurationPlan.error) return null;
     if (!Number.isFinite(speedNum) || speedNum <= 0) return null;
 
     const startRaw = trimStart.trim() === "" ? 0 : Number(trimStart);
@@ -2122,9 +2147,11 @@ function App() {
     if (endS <= startS) return null;
 
     const baseDurationS = Math.max(0.001, (endS - startS) / speedNum);
-    const durationS = format !== "mp3" && loopVideo ? baseDurationS * 2 : baseDurationS;
+    const durationS = targetDurationEnabled && !speedPlanningPending && targetDurationPlan.estimatedOutputDurationS !== null
+      ? targetDurationPlan.estimatedOutputDurationS
+      : format !== "mp3" && loopVideo ? baseDurationS * 2 : baseDurationS;
     const sizeLimitEnabled = sizeMb > 0;
-    const durationUnknown = format !== "mp3" && antiStutterRemovesTime(interpolation);
+    const durationUnknown = speedPlanningPending || format !== "mp3" && antiStutterRemovesTime(interpolation);
     const totalKbps = sizeLimitEnabled && !durationUnknown
       ? Math.max(1, Math.floor((sizeMb * 1_000_000 * 8 * 0.95) / durationS / 1000))
       : null;
@@ -2247,6 +2274,11 @@ function App() {
     probe,
     sizeLimitMb,
     speed,
+    planningSpeed,
+    speedPlanningPending,
+    timingCalculationHint,
+    targetDurationEnabled,
+    targetDurationPlan,
     trimStart,
     trimEnd,
     format,
@@ -2392,8 +2424,8 @@ function App() {
   const sourceFrameRate = probe?.frameRate ?? null;
   const frameRatePlan = effectiveFrameRatePlan({
     format,
-    sourceFrameRate,
-    speed: Number(speed),
+    sourceFrameRate: speedPlanningPending ? null : sourceFrameRate,
+    speed: planningSpeed,
     frameRateCapFps: advancedFrameRateCapRequest,
   });
   const frameRateCapApplies = frameRatePlan.capApplies;
@@ -2513,7 +2545,7 @@ function App() {
     reverse ||
     loopVideo ||
     rotateDeg !== 0 ||
-    timelineSpeedChanges(speed) ||
+    speedPlanningPending || timelineSpeedChanges(planningSpeed) ||
     (format !== "mp3" && resizeMode !== "source") ||
     !colorIsDefault(brightness, contrast, saturation) ||
     (format !== "mp3" && perturbFirstFrame) ||
@@ -2742,7 +2774,7 @@ function App() {
       : format === "webm"
         ? probe?.audioCodec === "opus" || probe?.audioCodec === "vorbis"
         : false;
-  const sizeTargetSpeedChangesTimeline = timelineSpeedChanges(speed);
+  const sizeTargetSpeedChangesTimeline = speedPlanningPending || timelineSpeedChanges(planningSpeed);
   const sizeTargetRetainedAudioNeedsEncode = Boolean(plannedSummary?.audioIncluded) &&
     (trimIsActive ||
       reverse ||
@@ -2865,7 +2897,7 @@ function App() {
       ? `No compatible video encoder is available for ${format.toUpperCase()} exact sample export.`
       : null;
   const retainedAudioForPlan = Boolean(probe?.hasAudio && plannedSummary?.audioIncluded);
-  const speedChangesTimeline = timelineSpeedChanges(speed);
+  const speedChangesTimeline = speedPlanningPending || timelineSpeedChanges(planningSpeed);
   const coreRequiredFiltersFor = (exactTrimRequired: boolean, videoEncoderRequired: boolean) => {
     const filters = new Set<string>();
     if (format !== "mp3") {
@@ -2951,6 +2983,7 @@ function App() {
         })
       : null;
   const transformMemoryEstimate = useMemo(() => {
+    if (speedPlanningPending) return { bytes: null, severity: "ok" as const, reason: `Decoded memory calculated ${timingCalculationHint}.`, videoBytes: null, audioBytes: null };
     if (!probe || !plannedEncodeSummary || (format !== "mp3" && (plannedEncodeSummary.w === null || plannedEncodeSummary.h === null))) {
       return reverse || (format !== "mp3" && loopVideo)
         ? {
@@ -2969,7 +3002,7 @@ function App() {
       loopVideo: format !== "mp3" && loopVideo,
       trimStartS: trimTimeline?.start ?? 0,
       trimEndS: trimTimeline?.end ?? probe.durationS,
-      speed: Number(speed),
+      speed: planningSpeed,
       frameRateCapFps: advancedFrameRateCapRequest,
       width: plannedEncodeSummary.w ?? 1,
       height: plannedEncodeSummary.h ?? 1,
@@ -2991,6 +3024,11 @@ function App() {
     format,
     trimTimeline,
     speed,
+    planningSpeed,
+    speedPlanningPending,
+    timingCalculationHint,
+    targetDurationEnabled,
+    targetDurationPlan,
     advancedFrameRateCapRequest,
     audioEnabled,
     normalizeAudio,
@@ -3005,6 +3043,7 @@ function App() {
     ? Math.min(sampleDurationS, Math.max(0, trimTimeline.end - trimTimeline.start))
     : null;
   const exactSampleTransformMemoryEstimate = useMemo(() => {
+    if (speedPlanningPending) return { bytes: null, severity: "ok" as const, reason: `Decoded memory calculated ${timingCalculationHint}.`, videoBytes: null, audioBytes: null };
     if (
       !probe ||
       exactSampleSourceDurationS === null ||
@@ -3031,7 +3070,7 @@ function App() {
       loopVideo: format !== "mp3" && loopVideo,
       trimStartS: 0,
       trimEndS: exactSampleSourceDurationS,
-      speed: Number(speed),
+      speed: planningSpeed,
       frameRateCapFps: advancedFrameRateCapRequest,
       width: exactSamplePlannedEncodeSummary.w ?? 1,
       height: exactSamplePlannedEncodeSummary.h ?? 1,
@@ -3053,6 +3092,11 @@ function App() {
     loopVideo,
     format,
     speed,
+    planningSpeed,
+    speedPlanningPending,
+    timingCalculationHint,
+    targetDurationEnabled,
+    targetDurationPlan,
     advancedFrameRateCapRequest,
     normalizeAudio,
     advancedAudioChannels,
@@ -3074,11 +3118,11 @@ function App() {
         ? `${plannedEncodeSummary.w}x${plannedEncodeSummary.h}`
         : "audio only";
     const bitrate = plannedEncodeSummary.durationUnknown && plannedEncodeSummary.sizeLimitEnabled
-      ? "bitrate calculated after cleanup"
+      ? `bitrate calculated ${timingCalculationHint}`
       : plannedEncodeSummary.totalKbps !== null ? `~${plannedEncodeSummary.totalKbps} kbps` : "no size limit";
-    const duration = plannedEncodeSummary.durationUnknown ? "duration calculated after cleanup" : formatClock(currentPlannedDurationS ?? plannedEncodeSummary.durationS);
+    const duration = plannedEncodeSummary.durationUnknown ? `duration calculated ${timingCalculationHint}` : formatClock(currentPlannedDurationS ?? plannedEncodeSummary.durationS);
     return `${shape}${interpolation && format !== "mp3" ? ` • ${interpolation.targetFps} fps` : ""} • ${duration} • ${bitrate}`;
-  }, [plannedEncodeSummary, currentPlannedDurationS, interpolation, format]);
+  }, [plannedEncodeSummary, currentPlannedDurationS, interpolation, format, timingCalculationHint]);
   const trimAccuracySummary = !trimIsActive
     ? "No active trim"
     : "Frame/sample accurate boundaries";
@@ -3107,6 +3151,7 @@ function App() {
     (thumbnail && format === "mp3" ? "Remove the thumbnail or choose MP4 or WebM video output." : null) ??
     (thumbnail && !thumbnailInspection ? "Validate the thumbnail image before exporting." : null) ??
     (thumbnail ? describeMissingFeature("thumbnail", "Thumbnail images") : null) ??
+    targetDurationBlockingReason ??
     interpolationBlockingReason ??
     encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
@@ -3125,11 +3170,13 @@ function App() {
     queueOutputBlockingReason ??
     (selectedVideoCodecUnavailable ? "Choose an available codec before exporting." : null);
   const exactSamplePlanBlockingReason =
+    targetSampleBlockingReason ??
     (!updateStartupReady ? "Finishing the app startup check before export." : null) ??
     (thumbnailInspecting ? "Wait for thumbnail validation to finish." : null) ??
     (thumbnail && format === "mp3" ? "Remove the thumbnail or choose MP4 or WebM video output." : null) ??
     (thumbnail && !thumbnailInspection ? "Validate the thumbnail image before exporting." : null) ??
     (thumbnail ? describeMissingFeature("thumbnail", "Thumbnail images") : null) ??
+    targetDurationBlockingReason ??
     interpolationBlockingReason ??
     encodeEventBlockingReason ??
     sizeTargetExactnessBlockingReason ??
@@ -3187,8 +3234,9 @@ function App() {
 
     if (cropFilterPlanned) chips.push("Crop");
 
-    const speedNum = Number(speed);
-    if (timelineSpeedChanges(speedNum)) {
+    const speedNum = planningSpeed;
+    if (targetDurationEnabled) chips.push(`Target ${targetDurationText || "?"} s`);
+    if (!speedPlanningPending && timelineSpeedChanges(speedNum)) {
       chips.push(`${speedNum.toFixed(2).replace(/\.?0+$/, "")}x speed`);
     }
 
@@ -3228,6 +3276,11 @@ function App() {
     interpolation,
     cropFilterPlanned,
     speed,
+    planningSpeed,
+    speedPlanningPending,
+    timingCalculationHint,
+    targetDurationEnabled,
+    targetDurationPlan,
     rotateDeg,
     reverse,
     loopVideo,
@@ -3963,7 +4016,7 @@ function App() {
       if (!smokeInteractionDoneRef.current) {
         const trimStartS = Math.max(0, smokeConfig.trimStartS);
         const trimEndS = Math.max(trimStartS, Math.min(probe.durationS, smokeConfig.trimEndS ?? probe.durationS));
-        const smokeSpeed = Number(speed);
+        const smokeSpeed = planningSpeed;
         const effectiveSmokeSpeed = Number.isFinite(smokeSpeed) && smokeSpeed > 0 ? smokeSpeed : 1;
         const expectedDurationS = (Math.max(0, trimEndS - trimStartS) / effectiveSmokeSpeed) *
           (smokeConfig.loopVideo && smokeConfig.format !== "mp3" ? 2 : 1);
@@ -4056,6 +4109,11 @@ function App() {
     jobId,
     trimTimeline,
     speed,
+    planningSpeed,
+    speedPlanningPending,
+    timingCalculationHint,
+    targetDurationEnabled,
+    targetDurationPlan,
     status,
     subtitlePath,
     subtitleInspection,
@@ -4828,7 +4886,13 @@ function App() {
     const size = parseNum("Size limit (MB)", sizeLimitMb, { min: 0 });
     if (size !== 0 && size < 0.1) throw new Error("Size limit must be >= 0.1 MB (or 0/empty to disable).");
     if (exactTargetBytesFromMegabytes(size) === null) throw new Error(SIZE_TARGET_EXACTNESS_ERROR);
-    const s = parseNum("Speed", speed, { min: 0.05, max: 16 });
+    if (targetDurationEnabled && (targetDurationBlockingReason || !validTargetDuration(targetDurationPlan.targetDurationS))) {
+      throw new Error(targetDurationBlockingReason ?? "Enter a target duration greater than zero seconds.");
+    }
+    const savedManualSpeed = Number(speed);
+    const s = targetDurationEnabled
+      ? Number.isFinite(savedManualSpeed) && savedManualSpeed >= 0.05 && savedManualSpeed <= 16 ? savedManualSpeed : 1
+      : parseNum("Speed", speed, { min: 0.05, max: 16 });
     const resizeRequest = buildResizeRequest();
     const requestStrictFit = format !== "mp3" && size > 0 && strictFit;
 
@@ -4875,6 +4939,7 @@ function App() {
       crop,
       reverse,
       speed: s,
+      ...(targetDurationEnabled ? { targetDurationS: targetDurationPlan.targetDurationS } : {}),
       rotateDeg,
       resize: resizeRequest.resize,
       maxEdgePx: resizeRequest.legacyMaxEdgePx,
@@ -5092,6 +5157,8 @@ function App() {
     setReverse(request.reverse);
     setLoopVideo(request.format === "mp3" ? false : request.loopVideo);
     setSpeed(String(request.speed));
+    setTargetDurationEnabled(request.targetDurationS != null);
+    setTargetDurationText(request.targetDurationS == null ? "" : String(request.targetDurationS));
     setRotateDeg(request.rotateDeg);
 
     setCropEnabled(Boolean(crop));
@@ -5583,7 +5650,16 @@ function App() {
       const request = options?.request ?? buildRequest();
       const requestUsesLoadedSource = request.inputPath === inputPath && probe !== null;
       const sourceRate = requestUsesLoadedSource ? probe.frameRate ?? null : null;
-      const speedAdjustedRate = sourceRate === null ? null : sourceRate * request.speed;
+      const requestTimingPlan = planTargetDuration({
+        enabled: request.targetDurationS != null, targetS: request.targetDurationS,
+        sourceDurationS: requestUsesLoadedSource ? probe.durationS : null,
+        trimStartS: request.trim?.startS ?? 0, trimEndS: request.trim?.endS ?? null,
+        loopVideo: request.loopVideo, format: request.format, manualSpeed: request.speed,
+        cleanupPending: request.format !== "mp3" && antiStutterRemovesTime(request.interpolation),
+        timelinePending: requestUsesLoadedSource && probe.sourceFormat === "nut", interpolationTargetFps: request.interpolation?.targetFps,
+      });
+      const speedAdjustedRate = sourceRate === null || requestTimingPlan.pending || requestTimingPlan.effectiveSpeed === null
+        ? null : sourceRate * requestTimingPlan.effectiveSpeed;
       const requestedRateCap = request.advanced?.frameRateCapFps ?? null;
       const plannedFrameRateFps = request.interpolation?.targetFps ?? (speedAdjustedRate === null
         ? null
@@ -5595,7 +5671,8 @@ function App() {
         jobId: null,
         cancelRequested: false,
         outputPath: request.outputPath,
-        durationS: antiStutterRemovesTime(request.interpolation) ? null : options?.durationS ?? currentPlannedDurationS,
+        durationS: antiStutterRemovesTime(request.interpolation) ? null
+          : request.targetDurationS != null ? requestTimingPlan.estimatedOutputDurationS : options?.durationS ?? currentPlannedDurationS,
         format: request.format,
         queueItemId: options?.queueItemId ?? null,
         queueRunId: options?.queueRunId ?? null,
@@ -5660,6 +5737,7 @@ function App() {
   }
 
   async function exportSample() {
+    if (targetSampleBlockingReason) { setStatus(targetSampleBlockingReason); return; }
     if (
       !sampleExportReady ||
       !inputPath ||
@@ -5670,7 +5748,7 @@ function App() {
     ) return;
 
     try {
-      const request = buildRequest();
+      const request = prepareTargetSample(buildRequest(), targetDurationPlan);
       const extension = request.format;
       const defaultPath = `${dirname(request.outputPath || inputPath)}${stem(request.outputPath || inputPath)}-sample.${extension}`;
       const selected = await saveDialog({
@@ -8877,8 +8955,10 @@ function App() {
                   <div className="vfl-stack-md">
                     <div className="vfl-row2">
                       <div className="vfl-field">
-                        <label htmlFor="vfl-speed">Speed</label>
-                        <input id="vfl-speed" value={speed} onChange={(e) => setSpeed(e.currentTarget.value)} disabled={encodeBusy} />
+                        <label htmlFor="vfl-speed">{targetDurationEnabled ? "Speed (calculated)" : "Speed"}</label>
+                        <input id="vfl-speed" value={targetDurationEnabled ? targetDurationPlan.effectiveSpeed === null ? "" : String(targetDurationPlan.effectiveSpeed) : speed}
+                          placeholder={targetDurationEnabled ? targetDurationPlan.waitingForCleanup ? "After cleanup" : targetDurationPlan.waitingForTimeline ? "After analysis" : "Pending" : undefined} readOnly={targetDurationEnabled}
+                          onChange={(e) => setSpeed(e.currentTarget.value)} disabled={encodeBusy || targetDurationEnabled} />
                       </div>
                       <div className="vfl-field">
                         <label htmlFor="vfl-rotate">Rotate</label>
@@ -8895,6 +8975,15 @@ function App() {
                         </select>
                       </div>
                     </div>
+                    <TargetDurationControl enabled={targetDurationEnabled} value={targetDurationText} plan={targetDurationPlan} disabled={encodeBusy}
+                      onChange={setTargetDurationText}
+                      onEnabled={(enabled) => {
+                        if (enabled && !targetDurationText.trim()) {
+                          const available = plannedSummary?.durationS;
+                          setTargetDurationText(available && Number.isFinite(available) ? String(available) : "10");
+                        }
+                        setTargetDurationEnabled(enabled);
+                      }} />
                     <label className="vfl-check">
                       <input
                         type="checkbox"
@@ -9358,7 +9447,7 @@ function App() {
                     </div>
                     <div className="vfl-summary-row">
                       <div className="vfl-summary-label">Size target</div>
-                      <div className="vfl-summary-value">{sizeLimitEnabled ? plannedEncodeSummary?.durationUnknown ? "Bitrate calculated after cleanup from target size" : "Bitrate planned from target size" : "Quality mode with no size cap"}</div>
+                      <div className="vfl-summary-value">{sizeLimitEnabled ? plannedEncodeSummary?.durationUnknown ? `Bitrate calculated ${timingCalculationHint} from target size` : "Bitrate planned from target size" : "Quality mode with no size cap"}</div>
                     </div>
                   </div>
                   {planWarnings.length ? (
@@ -9482,6 +9571,7 @@ function App() {
                         {new Date(lastExport.completedAtMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </div>
                       {lastExport.message ? <div className="vfl-export-result-note">{lastExport.message}</div> : null}
+                      <TargetDurationResult value={lastExport.diagnostics?.targetDuration} />
                       <AntiStutterResult value={lastExport.diagnostics?.interpolation?.antiStutter} />
                       <div className="vfl-export-result-path">{formatPathForDisplay(lastExport.outputPath)}</div>
                       {lastExport.targetResult ? <TargetResultDetails targetResult={lastExport.targetResult} /> : null}
@@ -9704,6 +9794,7 @@ function App() {
                         {outcome?.outputSizeBytes ? ` • ${formatByteSize(outcome.outputSizeBytes)}` : ""}
                       </div>
                       <div className="vfl-queue-item-meta">{queuedTrimSummary}</div>
+                      {item.request.targetDurationS != null ? <div className="vfl-queue-item-meta">Target {item.request.targetDurationS} s; speed calculated for this source and trim.</div> : null}
                       <div className="vfl-queue-item-meta">Audio: {item.request.audioStreamIndex == null ? "Default track" : `stream ${item.request.audioStreamIndex}`}{item.request.audioEnabled || item.format === "mp3" ? "" : " · excluded from export"}</div>
                       {actualOutputPath && actualOutputPath !== item.outputPath ? (
                         <div className="vfl-queue-item-meta">Actual result: {actualOutputPath}</div>

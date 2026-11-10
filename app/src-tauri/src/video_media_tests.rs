@@ -2648,6 +2648,23 @@ fn bundled_interpolation_nut_endpoint_probe_preserves_normal_export_gaps() {
     );
     let source = temp.path().join("gap.nut");
     let mut probe = probe_video(source.to_string_lossy().into_owned()).unwrap();
+    let mut auto_request = request();
+    auto_request.target_duration_s = Some(1.);
+    auto_request.speed = 1.;
+    auto_request.reverse = false;
+    auto_request.loop_video = false;
+    auto_request.interpolation = None;
+    let mut auto_probe = probe.clone();
+    prepare_temporal_probe(&auto_request, &source, &mut auto_probe).unwrap();
+    assert!((auto_probe.duration_s - 0.5).abs() < 0.00001);
+    let retained = retained_source_duration_s(&auto_request, &auto_probe).unwrap();
+    let resolved = resolve_target_duration(&mut auto_request, retained)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        resolved.effective_speed, 0.5,
+        "plain Target must use the complete NUT endpoint"
+    );
     let model = crate::interpolation_components::resolve_test_model("rife-v4.25").unwrap();
     let mut req = request();
     req.audio_enabled = true;

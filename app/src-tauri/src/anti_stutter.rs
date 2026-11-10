@@ -666,7 +666,7 @@ pub(super) struct Span {
     pub repaired: bool,
     pub cut: bool,
     pub remove_start: Option<u64>,
-    detail: Option<usize>,
+    pub(super) detail: Option<usize>,
     motion: Option<Evidence>,
 }
 

@@ -56,7 +56,8 @@ test("frontend Loop planning mirrors backend duration semantics", async () => {
   // Only video exports double their planned duration, and the size-target
   // bitrate calculation consumes that adjusted duration.
   assert.match(plannedSummary, /const baseDurationS = Math\.max\(0\.001, \(endS - startS\) \/ speedNum\);/);
-  assert.match(plannedSummary, /const durationS = format !== "mp3" && loopVideo \? baseDurationS \* 2 : baseDurationS;/);
+  assert.match(plannedSummary, /: format !== "mp3" && loopVideo \? baseDurationS \* 2 : baseDurationS;/);
+  assert.match(plannedSummary, /\? targetDurationPlan\.estimatedOutputDurationS/);
   assert.match(plannedSummary, /\/ durationS \/ 1000/);
   assert.match(plannedSummary, /\r?\n    loopVideo,\r?\n/);
 
