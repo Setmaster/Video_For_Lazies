@@ -20,6 +20,10 @@
     "2.9.0": {
       "targets": ["windows-x64"],
       "makeLatest": false
+    },
+    "2.10.0": {
+      "targets": ["windows-x64"],
+      "makeLatest": false
     }
   }
 }
